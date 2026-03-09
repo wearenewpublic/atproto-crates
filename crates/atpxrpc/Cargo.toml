@@ -1,0 +1,31 @@
+[package]
+name = "atpxrpc"
+version = "0.14.1"
+description = "AT Protocol XRPC client with persistent session management"
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+atproto-client.workspace = true
+atproto-identity = { workspace = true, features = ["hickory-dns"] }
+
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+dirs.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "atproto-extras"
-version = "0.14.0"
+version = "0.14.1"
 description = "AT Protocol extras - facet parsing and rich text utilities"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

@@ -33,6 +33,9 @@ All CLI tools now use clap for consistent command-line argument processing. Use 
 - **Verify records**: `cargo run --package atproto-attestation --features clap,tokio --bin atproto-attestation-verify -- <record>` (verifies all signatures)
 - **Verify attestation**: `cargo run --package atproto-attestation --features clap,tokio --bin atproto-attestation-verify -- <record> <attestation>` (verifies specific attestation)
 
+#### DASL Operations
+- **Compute CID**: `cargo run --features clap --bin atpcid -- '<json_or_data>'` (auto-detects record vs raw CID; use `-` for stdin, `--raw` to force RAW CID, `--record` to force DAG-CBOR record CID)
+
 #### Record Operations
 - **Generate CID**: `cat record.json | cargo run --features clap --bin atproto-record-cid` (reads JSON from stdin, outputs CID)
 
@@ -156,6 +159,9 @@ struct Args {
 - **`src/url.rs`**: URL utilities for AT Protocol services
 
 ### CLI Tools (require --features clap)
+
+#### DASL Operations (atproto-dasl)
+- **`crates/atproto-dasl/src/bin/atpcid.rs`**: Compute CIDs from input data (auto-detects DAG-CBOR record vs RAW CID)
 
 #### Identity Management (atproto-identity)
 - **`src/bin/atproto-identity-resolve.rs`**: Resolve AT Protocol handles and DIDs to canonical identifiers

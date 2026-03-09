@@ -1,6 +1,6 @@
 [package]
 name = "atproto-record"
-version = "0.14.0"
+version = "0.14.1"
 description = "AT Protocol record signature operations - cryptographic signing and verification for AT Protocol records"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

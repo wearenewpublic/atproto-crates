@@ -1,12 +1,12 @@
-# AT Protocol Identity Rust Components
+# AT Protocol Rust Crates
 
-A comprehensive collection of Rust components for creating AT Protocol applications. This workspace provides essential building blocks for content-addressed data, identity management, repository operations, record signing, OAuth 2.0 authentication flows, HTTP client operations, XRPC services, and real-time event streaming.
+A Rust workspace of crates for building AT Protocol applications. This collection provides building blocks for content-addressed data, identity management, repository operations, record signing, OAuth 2.0 authentication flows, HTTP client operations, XRPC services, real-time event streaming, and developer tooling.
 
 **Origin**: Parts of this project were extracted from the open-source [smokesignal.events](https://tangled.sh/@smokesignal.events/smokesignal) project, an AT Protocol event and RSVP management application. This library is released under the MIT license to enable broader AT Protocol ecosystem development.
 
 ## Components
 
-This workspace contains 15 specialized crates that work together to provide complete AT Protocol application development capabilities:
+This workspace contains 17 crates that work together to provide complete AT Protocol application development capabilities:
 
 ### Data Foundations
 
@@ -34,11 +34,16 @@ This workspace contains 15 specialized crates that work together to provide comp
 - **[`atproto-client`](crates/atproto-client/)** - HTTP client library supporting multiple authentication methods (DPoP, Bearer tokens, sessions) with native XRPC protocol operations and repository management. *Includes 4 CLI tools.*
 - **[`atproto-xrpcs`](crates/atproto-xrpcs/)** - XRPC service framework providing JWT authorization extractors, DID resolution integration, and Axum middleware for building AT Protocol services.
 - **[`atproto-xrpcs-helloworld`](crates/atproto-xrpcs-helloworld/)** - Complete example XRPC service demonstrating DID:web identity, service document generation, and JWT authentication patterns. *Includes 1 service binary.*
+- **[`atpxrpc`](crates/atpxrpc/)** - XRPC CLI client with persistent session management for making authenticated AT Protocol API calls. *Includes 1 CLI tool.*
 
 ### Real-time Event Processing
 
 - **[`atproto-jetstream`](crates/atproto-jetstream/)** - WebSocket consumer for AT Protocol Jetstream events with Zstandard compression, automatic reconnection, and configurable event filtering. *Includes 1 CLI tool.*
 - **[`atproto-tap`](crates/atproto-tap/)** - TAP (Trusted Attestation Protocol) service consumer for filtered, verified AT Protocol repository events with MST integrity checks, automatic backfill, and acknowledgment-based delivery. *Includes 2 CLI tools.*
+
+### Developer Tools
+
+- **[`atpmcp`](crates/atpmcp/)** - MCP (Model Context Protocol) server for AT Protocol DAG-CBOR CID generation, enabling AI assistants to compute content identifiers for records. *Includes 1 server binary.*
 
 ### Utilities
 
@@ -50,17 +55,17 @@ Add the crates to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-atproto-dasl = "0.14.0"
-atproto-identity = "0.14.0"
-atproto-attestation = "0.14.0"
-atproto-record = "0.14.0"
-atproto-repo = "0.14.0"
-atproto-lexicon = "0.14.0"
-atproto-oauth = "0.14.0"
-atproto-oauth-aip = "0.14.0"
-atproto-client = "0.14.0"
-atproto-extras = "0.14.0"
-atproto-tap = "0.14.0"
+atproto-dasl = "0.14.1"
+atproto-identity = "0.14.1"
+atproto-attestation = "0.14.1"
+atproto-record = "0.14.1"
+atproto-repo = "0.14.1"
+atproto-lexicon = "0.14.1"
+atproto-oauth = "0.14.1"
+atproto-oauth-aip = "0.14.1"
+atproto-client = "0.14.1"
+atproto-extras = "0.14.1"
+atproto-tap = "0.14.1"
 # Add others as needed
 ```
 
@@ -235,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Command Line Tools
 
-The workspace includes 23 command-line tools across 11 crates, providing ready-to-use utilities for AT Protocol development and testing. Most CLI tools require the `clap` feature:
+The workspace includes command-line tools and server binaries across the crates, providing ready-to-use utilities for AT Protocol development and testing. Most CLI tools require the `clap` feature:
 
 ```bash
 # Build with CLI support
@@ -290,6 +295,12 @@ cargo run --package atproto-tap --features clap --bin atproto-tap-extras -- --he
 
 # Rich text utilities (atproto-extras crate)
 cargo run --package atproto-extras --features clap,cli,hickory-dns --bin atproto-extras-parse-facets -- "Hello @alice.bsky.social"
+
+# XRPC CLI client (atpxrpc crate)
+cargo run --package atpxrpc --bin atpxrpc -- --help
+
+# MCP server (atpmcp crate)
+cargo build -p atpmcp
 ```
 
 ## Development

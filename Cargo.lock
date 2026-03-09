@@ -109,8 +109,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atpmcp"
+version = "0.14.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "atproto-client",
+ "atproto-dasl",
+ "atproto-extras",
+ "atproto-identity",
+ "atproto-lexicon",
+ "atproto-record",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "atproto-attestation"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -136,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-client"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -160,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-dasl"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -188,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-extras"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -203,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-identity"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -234,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-jetstream"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -256,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-lexicon"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -281,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -312,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth-aip"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "atproto-identity",
@@ -327,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth-axum"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -356,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-record"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -377,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-repo"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -400,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-tap"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "atproto-client",
  "atproto-identity",
@@ -423,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-xrpcs"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -449,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-xrpcs-helloworld"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -472,6 +493,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "atpxrpc"
+version = "0.14.1"
+dependencies = [
+ "anyhow",
+ "atproto-client",
+ "atproto-identity",
+ "bytes",
+ "clap",
+ "dirs",
+ "reqwest",
+ "rpassword",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -996,6 +1036,27 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "subtle",
+]
+
+[[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1733,6 +1794,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
+name = "libredox"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d0b95e02c851351f877147b7deea7b1afb1df71b63aa5f8270716e0c5720616"
+dependencies = [
+ "bitflags",
+ "libc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1917,6 +1988,12 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "option-ext"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "p256"
@@ -2271,6 +2348,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "redox_users"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
+dependencies = [
+ "getrandom 0.2.17",
+ "libredox",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

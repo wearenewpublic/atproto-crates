@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-03-08
+### Added
+- `atpxrpc` CLI tool for persistent XRPC session management with proxy support
+- `--out` argument for atpxrpc proxy and base commands for output control
+- `--bytes` and `--manual` proxy flags to atpxrpc CLI
+- 5 new tools to atpmcp MCP server
+
+### Changed
+- Updated GitHub Actions workflow to build atpxrpc and atpmcp release binaries
+- Updated README to reflect full Rust crates workspace
+
 ## [0.14.0] - 2026-02-21
 
 ## [0.13.0] - 2025-09-21
@@ -183,6 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.14.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.1
 [0.14.0]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.0
 [0.13.0]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.13.0
 [0.12.0]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.12.0
