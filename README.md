@@ -16,7 +16,7 @@ This workspace contains 17 crates that work together to provide complete AT Prot
 
 - **[`atproto-identity`](crates/atproto-identity/)** - Core identity management with multi-method DID resolution (plc, web, key), DNS/HTTP handle resolution, PLC directory operations, and P-256/P-384/K-256 cryptographic operations. *Includes 6 CLI tools.*
 - **[`atproto-attestation`](crates/atproto-attestation/)** - CID-first attestation utilities for creating and verifying cryptographic signatures on AT Protocol records, supporting both inline and remote attestation workflows. *Includes 2 CLI tools.*
-- **[`atproto-record`](crates/atproto-record/)** - Record utilities including TID generation, AT-URI parsing, datetime formatting, and CID generation using IPLD DAG-CBOR serialization. *Includes 1 CLI tool.*
+- **[`atproto-record`](crates/atproto-record/)** - Record utilities including TID generation, AT-URI parsing, datetime formatting, and CID generation using IPLD DAG-CBOR serialization. *Includes 2 CLI tools.*
 - **[`atproto-lexicon`](crates/atproto-lexicon/)** - Lexicon schema resolution and validation for AT Protocol, supporting recursive resolution, NSID validation, and DNS-based lexicon discovery. *Includes 1 CLI tool.*
 
 ### Repository
@@ -55,17 +55,17 @@ Add the crates to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-atproto-dasl = "0.14.1"
-atproto-identity = "0.14.1"
-atproto-attestation = "0.14.1"
-atproto-record = "0.14.1"
-atproto-repo = "0.14.1"
-atproto-lexicon = "0.14.1"
-atproto-oauth = "0.14.1"
-atproto-oauth-aip = "0.14.1"
-atproto-client = "0.14.1"
-atproto-extras = "0.14.1"
-atproto-tap = "0.14.1"
+atproto-dasl = "0.14.2"
+atproto-identity = "0.14.2"
+atproto-attestation = "0.14.2"
+atproto-record = "0.14.2"
+atproto-repo = "0.14.2"
+atproto-lexicon = "0.14.2"
+atproto-oauth = "0.14.2"
+atproto-oauth-aip = "0.14.2"
+atproto-client = "0.14.2"
+atproto-extras = "0.14.2"
+atproto-tap = "0.14.2"
 # Add others as needed
 ```
 
@@ -247,7 +247,7 @@ The workspace includes command-line tools and server binaries across the crates,
 cargo build --features clap --bins
 
 # DASL operations (atproto-dasl crate)
-cargo run --package atproto-dasl --features clap --bin atproto-dasl -- --help
+cargo run --package atproto-dasl --features clap --bin atpcid -- '{"text":"hello"}'
 
 # Identity operations (atproto-identity crate)
 cargo run --features clap,hickory-dns --bin atproto-identity-resolve -- alice.bsky.social
@@ -263,6 +263,8 @@ cargo run --package atproto-attestation --features clap,tokio --bin atproto-atte
 
 # Record operations (atproto-record crate)
 cat record.json | cargo run --features clap --bin atproto-record-cid
+cargo run --package atproto-record --features clap --bin atptid
+cargo run --package atproto-record --features clap --bin atptid -- -n 5
 
 # Repository operations (atproto-repo crate)
 cargo run --package atproto-repo --features clap --bin atproto-repo-car -- ls repo.car

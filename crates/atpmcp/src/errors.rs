@@ -49,4 +49,25 @@ pub enum ToolError {
         /// Description of the retrieval failure.
         reason: String,
     },
+
+    /// Lexicon retrieval failed.
+    #[error("error-atpmcp-tool-7 Lexicon retrieval failed: {reason}")]
+    LexiconRetrievalFailed {
+        /// Description of the retrieval failure.
+        reason: String,
+    },
+
+    /// XRPC request failed.
+    #[error("error-atpmcp-tool-8 XRPC request failed: {reason}")]
+    XrpcRequestFailed {
+        /// Description of the request failure.
+        reason: String,
+    },
+
+    /// XRPC parameter validation failed.
+    #[error("error-atpmcp-tool-9 XRPC validation failed: {reason}")]
+    XrpcValidationFailed {
+        /// Description of the validation failure.
+        reason: String,
+    },
 }

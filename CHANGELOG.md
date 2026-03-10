@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-03-09
+### Added
+- `atptid` CLI tool for generating and parsing AT Protocol Timestamp Identifiers
+- `get_lexicon` tool to atpmcp MCP server for fetching lexicon schema records
+- `invoke_xrpc` tool to atpmcp MCP server
+- `generate_tid` tool to atpmcp MCP server
+- `validate_xrpc` tool to atpmcp MCP server
+
+### Changed
+- Updated release workflow and README to include atptid and atpcid binaries
+
 ## [0.14.1] - 2026-03-08
 ### Added
 - `atpxrpc` CLI tool for persistent XRPC session management with proxy support
@@ -194,6 +205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.14.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.2
 [0.14.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.1
 [0.14.0]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.0
 [0.13.0]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.13.0

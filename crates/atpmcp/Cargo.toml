@@ -1,6 +1,6 @@
 [package]
 name = "atpmcp"
-version = "0.14.1"
+version = "0.14.2"
 description = "AT Protocol MCP server for DAG-CBOR CID generation"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
 documentation = "https://docs.rs/atpmcp"
@@ -27,6 +27,7 @@ atproto-identity = { workspace = true, features = ["hickory-dns"] }
 atproto-lexicon.workspace = true
 atproto-record.workspace = true
 
+dirs.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true

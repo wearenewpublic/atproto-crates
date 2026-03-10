@@ -1,6 +1,6 @@
 [package]
 name = "atproto-repo"
-version = "0.14.1"
+version = "0.14.2"
 description = "AT Protocol repository handling - CAR v1 serialization and Merkle Search Tree operations"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

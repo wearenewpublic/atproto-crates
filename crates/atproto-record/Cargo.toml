@@ -1,6 +1,6 @@
 [package]
 name = "atproto-record"
-version = "0.14.1"
+version = "0.14.2"
 description = "AT Protocol record signature operations - cryptographic signing and verification for AT Protocol records"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -16,6 +16,13 @@ categories.workspace = true
 
 [[bin]]
 name = "atproto-record-cid"
+test = false
+bench = false
+doc = true
+required-features = ["clap"]
+
+[[bin]]
+name = "atptid"
 test = false
 bench = false
 doc = true

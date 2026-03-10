@@ -27,7 +27,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-atproto-lexicon = "0.14.1"
+atproto-lexicon = "0.14.2"
 ```
 
 ## Usage

@@ -113,7 +113,7 @@ pub async fn resolve_lexicon_dns<R: DnsResolver + ?Sized>(
 
 /// Get PDS endpoint from DID document.
 #[instrument(skip(http_client), err)]
-async fn get_pds_from_did(http_client: &reqwest::Client, did: &str) -> Result<String> {
+pub async fn get_pds_from_did(http_client: &reqwest::Client, did: &str) -> Result<String> {
     use atproto_identity::{
         model::Document,
         plc,
@@ -145,7 +145,7 @@ async fn get_pds_from_did(http_client: &reqwest::Client, did: &str) -> Result<St
 
 /// Fetch lexicon schema from PDS using XRPC.
 #[instrument(skip(http_client), err)]
-async fn fetch_lexicon_from_pds(
+pub async fn fetch_lexicon_from_pds(
     http_client: &reqwest::Client,
     pds_endpoint: &str,
     did: &str,
@@ -187,4 +187,42 @@ async fn fetch_lexicon_from_pds(
             .into())
         }
     }
+}
+
+/// Fetch a lexicon schema record by NSID.
+///
+/// If `repo` is provided, the lexicon is fetched from that repository's PDS.
+/// If `repo` is `None`, the authority is resolved from the NSID via DNS TXT
+/// lookup on the `_lexicon` prefixed domain.
+///
+/// # Parameters
+/// - `http_client`: HTTP client for making requests
+/// - `dns_resolver`: DNS resolver for TXT lookups and handle resolution
+/// - `nsid`: The NSID of the lexicon to fetch (e.g., "app.bsky.feed.post")
+/// - `repo`: Optional repository DID or handle to fetch the lexicon from
+#[instrument(skip(http_client, dns_resolver), err)]
+pub async fn get_lexicon<R: DnsResolver + ?Sized>(
+    http_client: &reqwest::Client,
+    dns_resolver: &R,
+    nsid: &str,
+    repo: Option<&str>,
+) -> Result<Value> {
+    if !validation::is_valid_nsid(nsid) {
+        return Err(LexiconResolveError::InvalidNsid {
+            nsid: nsid.to_string(),
+        }
+        .into());
+    }
+
+    let resolved_did = match repo {
+        Some(subject) => resolve_subject(http_client, dns_resolver, subject).await?,
+        None => {
+            let dns_name = validation::nsid_to_dns_name(nsid)?;
+            let did = resolve_lexicon_dns(dns_resolver, &dns_name).await?;
+            resolve_subject(http_client, dns_resolver, &did).await?
+        }
+    };
+
+    let pds_endpoint = get_pds_from_did(http_client, &resolved_did).await?;
+    fetch_lexicon_from_pds(http_client, &pds_endpoint, &resolved_did, nsid).await
 }

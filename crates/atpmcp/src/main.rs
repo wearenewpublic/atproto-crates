@@ -20,14 +20,24 @@
 //! - `resolve_identity` — Resolve a DID to its full DID document
 //! - `parse_facets` — Parse rich text facets from plain text
 //! - `get_record` — Retrieve an AT Protocol record by AT-URI
+//! - `get_lexicon` — Fetch a lexicon schema record by NSID
+//! - `validate_xrpc` — Validate XRPC parameters against a lexicon schema
+//! - `invoke_xrpc` — Make an XRPC request to an AT Protocol service
 
 mod errors;
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
+use atproto_client::client::{
+    AppPasswordAuth, get_apppassword_json_with_headers, get_json_with_headers,
+    post_apppassword_json_with_headers, post_json_with_headers,
+};
+use atproto_client::com::atproto::server::{create_session, refresh_session};
 use atproto_identity::resolve::{HickoryDnsResolver, InnerIdentityResolver};
+use atproto_identity::url::build_url;
 use errors::ToolError;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
@@ -230,6 +240,110 @@ fn handle_tools_list() -> Value {
                     "required": ["uri"],
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "get_lexicon",
+                "description": "Fetch a lexicon schema record by NSID. Resolves the authority from the NSID via DNS if no repository is provided, then retrieves the lexicon from the repository's PDS.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "nsid": {
+                            "type": "string",
+                            "description": "The NSID of the lexicon to fetch (e.g. 'app.bsky.feed.post')."
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": "Optional repository DID or handle. If omitted, the authority is resolved from the NSID via DNS."
+                        }
+                    },
+                    "required": ["nsid"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "validate_xrpc",
+                "description": "Validate XRPC parameters and input body against a lexicon schema. Fetches the lexicon for the given NSID, determines whether it defines a query or procedure, and validates the provided params and/or body accordingly.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "nsid": {
+                            "type": "string",
+                            "description": "The XRPC method NSID (e.g. 'com.atproto.repo.describeRepo')."
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "Query or procedure parameters to validate."
+                        },
+                        "body": {
+                            "type": "object",
+                            "description": "Procedure input body to validate."
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": "Optional repository DID or handle for lexicon resolution. If omitted, the authority is resolved from the NSID via DNS."
+                        }
+                    },
+                    "required": ["nsid"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "invoke_xrpc",
+                "description": "Make an XRPC request to an AT Protocol service. Supports queries (GET) and procedures (POST). If a JSON body is provided, a POST is made; otherwise GET. Supports unauthenticated, authenticated (via stored atpxrpc credentials), and proxied requests (via the atproto-proxy header through the authenticated user's PDS).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "nsid": {
+                            "type": "string",
+                            "description": "The XRPC method NSID (e.g. 'com.atproto.repo.describeRepo')."
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "Query parameters as key-value string pairs for GET requests.",
+                            "additionalProperties": { "type": "string" }
+                        },
+                        "body": {
+                            "type": "object",
+                            "description": "JSON body for POST (procedure) requests. If present, the request is a POST."
+                        },
+                        "endpoint": {
+                            "type": "string",
+                            "description": "Explicit service endpoint URL (e.g. 'https://bsky.network'). Either endpoint, identity, or auth_handle is required."
+                        },
+                        "identity": {
+                            "type": "string",
+                            "description": "Handle or DID to resolve for PDS endpoint discovery. Either endpoint, identity, or auth_handle is required."
+                        },
+                        "auth_handle": {
+                            "type": "string",
+                            "description": "Handle of a stored atpxrpc account for authenticated requests. If omitted, the request is unauthenticated."
+                        },
+                        "proxy": {
+                            "type": "string",
+                            "description": "Service audience for proxied requests in DID#serviceId format (e.g. 'did:web:api.bsky.app#bsky_fg'). Requires auth_handle. The request is sent to the authenticated user's PDS with the atproto-proxy header set to this value."
+                        }
+                    },
+                    "required": ["nsid"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "generate_tid",
+                "description": "Generate AT Protocol Timestamp Identifiers (TIDs). TIDs are 13-character base32-sortable strings used as record keys. Optionally generate multiple TIDs or generate from a specific microsecond timestamp.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "count": {
+                            "type": "integer",
+                            "description": "Number of TIDs to generate (default 1, max 100)."
+                        },
+                        "timestamp_micros": {
+                            "type": "integer",
+                            "description": "Specific microsecond UNIX timestamp to generate from. If omitted, uses current time."
+                        }
+                    },
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -266,6 +380,16 @@ async fn handle_tools_call(
             JsonRpcResponse::success(id, handle_parse_facets(arguments, resolver).await)
         }
         "get_record" => JsonRpcResponse::success(id, handle_get_record(arguments, resolver).await),
+        "get_lexicon" => {
+            JsonRpcResponse::success(id, handle_get_lexicon(arguments, resolver).await)
+        }
+        "validate_xrpc" => {
+            JsonRpcResponse::success(id, handle_validate_xrpc(arguments, resolver).await)
+        }
+        "invoke_xrpc" => {
+            JsonRpcResponse::success(id, handle_invoke_xrpc(arguments, resolver).await)
+        }
+        "generate_tid" => JsonRpcResponse::success(id, handle_generate_tid(arguments)),
         _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("Unknown tool: {name}")),
     }
 }
@@ -492,6 +616,569 @@ async fn handle_get_record(arguments: Value, default_resolver: &InnerIdentityRes
     }
 }
 
+/// Execute the `validate_xrpc` tool.
+async fn handle_validate_xrpc(arguments: Value, resolver: &InnerIdentityResolver) -> Value {
+    let Some(nsid) = arguments.get("nsid").and_then(Value::as_str) else {
+        return tool_error("The 'nsid' argument must be a string.");
+    };
+
+    let params = arguments.get("params").cloned();
+    let body = arguments.get("body").cloned();
+    let repo = arguments.get("repo").and_then(Value::as_str);
+
+    // Fetch the lexicon schema.
+    let lexicon_value = match atproto_lexicon::resolve::get_lexicon(
+        &resolver.http_client,
+        resolver.dns_resolver.as_ref(),
+        nsid,
+        repo,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let tool_err = ToolError::XrpcValidationFailed {
+                reason: format!("Failed to fetch lexicon for {nsid}: {error}"),
+            };
+            tracing::error!(error = ?error, nsid = %nsid, "Lexicon retrieval failed for validation.");
+            return tool_error(&tool_err.to_string());
+        }
+    };
+
+    // Parse into a SchemaFile.
+    let schema_file =
+        match atproto_lexicon::validation::schema_file::SchemaFile::from_value(lexicon_value) {
+            Ok(sf) => sf,
+            Err(error) => {
+                let tool_err = ToolError::XrpcValidationFailed {
+                    reason: format!("Invalid lexicon schema for {nsid}: {error}"),
+                };
+                tracing::error!(error = ?error, nsid = %nsid, "Lexicon schema parse failed.");
+                return tool_error(&tool_err.to_string());
+            }
+        };
+
+    // Determine method type from the main definition.
+    let main_def = match schema_file.defs.get("main") {
+        Some(def) => def,
+        None => {
+            let tool_err = ToolError::XrpcValidationFailed {
+                reason: format!("Lexicon {nsid} has no main definition"),
+            };
+            return tool_error(&tool_err.to_string());
+        }
+    };
+
+    let is_query = matches!(main_def, atproto_lexicon::validation::SchemaDef::Query(_));
+    let is_procedure = matches!(
+        main_def,
+        atproto_lexicon::validation::SchemaDef::Procedure(_)
+    );
+
+    if !is_query && !is_procedure {
+        let tool_err = ToolError::XrpcValidationFailed {
+            reason: format!("Lexicon {nsid} main definition is not a query or procedure"),
+        };
+        return tool_error(&tool_err.to_string());
+    }
+
+    // Build a catalog with this schema.
+    let mut catalog = atproto_lexicon::validation::BaseCatalog::new();
+    catalog.add_schema(schema_file);
+    let flags = atproto_lexicon::validation::ValidateFlags::empty();
+
+    let mut validated = Vec::new();
+    let mut errors = Vec::new();
+
+    // Validate params if provided.
+    if let Some(ref params_value) = params {
+        let result = if is_query {
+            atproto_lexicon::validation::validate_query_params(nsid, params_value, &catalog, flags)
+        } else {
+            atproto_lexicon::validation::validate_procedure_params(
+                nsid,
+                params_value,
+                &catalog,
+                flags,
+            )
+        };
+        match result {
+            Ok(()) => validated.push("params"),
+            Err(error) => errors.push(format!("params: {error}")),
+        }
+    }
+
+    // Validate body if provided (only for procedures).
+    if let Some(ref body_value) = body {
+        if is_query {
+            errors.push("body: queries do not accept an input body".to_string());
+        } else {
+            match atproto_lexicon::validation::validate_procedure_input(
+                nsid, body_value, &catalog, flags,
+            ) {
+                Ok(()) => validated.push("body"),
+                Err(error) => errors.push(format!("body: {error}")),
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        let tool_err = ToolError::XrpcValidationFailed {
+            reason: errors.join("; "),
+        };
+        tracing::error!(nsid = %nsid, "XRPC validation failed.");
+        return tool_error(&tool_err.to_string());
+    }
+
+    let method_type = if is_query { "query" } else { "procedure" };
+    if validated.is_empty() {
+        tool_success(&format!(
+            "Lexicon {nsid} is a valid {method_type}. No params or body were provided to validate."
+        ))
+    } else {
+        tool_success(&format!(
+            "Validation passed for {method_type} {nsid}: {} validated successfully.",
+            validated.join(" and ")
+        ))
+    }
+}
+
+/// Execute the `get_lexicon` tool.
+async fn handle_get_lexicon(arguments: Value, resolver: &InnerIdentityResolver) -> Value {
+    let Some(nsid) = arguments.get("nsid").and_then(Value::as_str) else {
+        return tool_error("The 'nsid' argument must be a string.");
+    };
+
+    let repo = arguments.get("repo").and_then(Value::as_str);
+
+    match atproto_lexicon::resolve::get_lexicon(
+        &resolver.http_client,
+        resolver.dns_resolver.as_ref(),
+        nsid,
+        repo,
+    )
+    .await
+    {
+        Ok(value) => match serde_json::to_string(&value) {
+            Ok(json) => tool_success(&json),
+            Err(error) => {
+                let tool_err = ToolError::LexiconRetrievalFailed {
+                    reason: error.to_string(),
+                };
+                tracing::error!(error = ?error, "Failed to serialize lexicon.");
+                tool_error(&tool_err.to_string())
+            }
+        },
+        Err(error) => {
+            let tool_err = ToolError::LexiconRetrievalFailed {
+                reason: error.to_string(),
+            };
+            tracing::error!(error = ?error, nsid = %nsid, "Lexicon retrieval failed.");
+            tool_error(&tool_err.to_string())
+        }
+    }
+}
+
+/// A stored atpxrpc account with session credentials.
+#[derive(Clone, Serialize, Deserialize)]
+struct XrpcAccount {
+    /// The account handle.
+    handle: String,
+    /// The resolved DID.
+    did: String,
+    /// The PDS endpoint URL.
+    pds_endpoint: String,
+    /// The app password used for re-authentication.
+    app_password: String,
+    /// The current JWT access token.
+    access_jwt: String,
+    /// The current JWT refresh token.
+    refresh_jwt: String,
+}
+
+/// Persistent atpxrpc configuration.
+#[derive(Serialize, Deserialize)]
+struct XrpcConfig {
+    /// List of authenticated accounts.
+    accounts: Vec<XrpcAccount>,
+}
+
+/// Returns the path to the atpxrpc config file.
+fn xrpc_config_path() -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("ATPXRPC_CONFIG") {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    let config_dir = dirs::config_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "error-atpmcp-tool-8 XRPC request failed: could not determine config directory"
+        )
+    })?;
+    Ok(config_dir.join("atpxrpc").join("config.json"))
+}
+
+/// Loads the atpxrpc config from disk.
+fn load_xrpc_config() -> anyhow::Result<XrpcConfig> {
+    let path = xrpc_config_path()?;
+
+    let content = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "error-atpmcp-tool-8 XRPC request failed: could not read config file {}: {error}",
+            path.display()
+        )
+    })?;
+
+    let config: XrpcConfig = serde_json::from_str(&content).map_err(|error| {
+        anyhow::anyhow!(
+            "error-atpmcp-tool-8 XRPC request failed: could not parse config file {}: {error}",
+            path.display()
+        )
+    })?;
+
+    Ok(config)
+}
+
+/// Saves the atpxrpc config to disk.
+fn save_xrpc_config(config: &XrpcConfig) -> anyhow::Result<()> {
+    let path = xrpc_config_path()?;
+    let content = serde_json::to_string_pretty(config).map_err(|error| {
+        anyhow::anyhow!(
+            "error-atpmcp-tool-8 XRPC request failed: could not serialize config: {error}"
+        )
+    })?;
+    std::fs::write(&path, content).map_err(|error| {
+        anyhow::anyhow!(
+            "error-atpmcp-tool-8 XRPC request failed: could not write config file {}: {error}",
+            path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
+/// Updates a single account in the config file by matching on DID.
+fn update_xrpc_account(account: &XrpcAccount) -> anyhow::Result<()> {
+    let mut config = load_xrpc_config()?;
+    if let Some(existing) = config.accounts.iter_mut().find(|a| a.did == account.did) {
+        *existing = account.clone();
+    }
+    save_xrpc_config(&config)?;
+    Ok(())
+}
+
+/// Loads an atpxrpc account by handle, returning the account or a tool error.
+fn load_xrpc_account(handle: &str) -> Result<XrpcAccount, Value> {
+    let config = load_xrpc_config().map_err(|error| {
+        let tool_err = ToolError::XrpcRequestFailed {
+            reason: error.to_string(),
+        };
+        tracing::error!(error = ?error, "Failed to load atpxrpc config.");
+        tool_error(&tool_err.to_string())
+    })?;
+
+    let account = config
+        .accounts
+        .into_iter()
+        .find(|a| a.handle == handle)
+        .ok_or_else(|| {
+            let tool_err = ToolError::XrpcRequestFailed {
+                reason: format!("No account found for handle '{handle}'"),
+            };
+            tool_error(&tool_err.to_string())
+        })?;
+
+    Ok(account)
+}
+
+/// Checks if an XRPC JSON response indicates an expired token.
+fn is_expired_token_error(response: &serde_json::Value) -> bool {
+    response
+        .get("error")
+        .and_then(|v| v.as_str())
+        .is_some_and(|e| e == "ExpiredToken")
+}
+
+/// Execute the `invoke_xrpc` tool.
+async fn handle_invoke_xrpc(arguments: Value, default_resolver: &InnerIdentityResolver) -> Value {
+    let Some(nsid) = arguments.get("nsid").and_then(Value::as_str) else {
+        return tool_error("The 'nsid' argument must be a string.");
+    };
+
+    let endpoint = arguments.get("endpoint").and_then(Value::as_str);
+    let identity = arguments.get("identity").and_then(Value::as_str);
+    let auth_handle = arguments.get("auth_handle").and_then(Value::as_str);
+    let proxy = arguments.get("proxy").and_then(Value::as_str);
+    let body = arguments.get("body").cloned();
+    let params = arguments.get("params").and_then(Value::as_object);
+
+    // Proxy requires auth_handle.
+    if proxy.is_some() && auth_handle.is_none() {
+        return tool_error("The 'proxy' parameter requires 'auth_handle' to be set.");
+    }
+
+    // Determine the service endpoint.
+    let service_endpoint = if let Some(ep) = endpoint {
+        ep.to_string()
+    } else if let Some(id) = identity {
+        match default_resolver.resolve(id).await {
+            Ok(document) => {
+                let pds_endpoints = document.pds_endpoints();
+                match pds_endpoints.first() {
+                    Some(ep) => ep.to_string(),
+                    None => {
+                        let tool_err = ToolError::XrpcRequestFailed {
+                            reason: "No PDS endpoint found in DID document".to_string(),
+                        };
+                        tracing::error!(identity = %id, "No PDS endpoint found.");
+                        return tool_error(&tool_err.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                let tool_err = ToolError::XrpcRequestFailed {
+                    reason: format!("Failed to resolve identity: {error}"),
+                };
+                tracing::error!(error = ?error, identity = %id, "Identity resolution failed.");
+                return tool_error(&tool_err.to_string());
+            }
+        }
+    } else if let Some(handle) = auth_handle {
+        // Fall back to the PDS endpoint from the auth account.
+        match load_xrpc_account(handle) {
+            Ok(account) => account.pds_endpoint,
+            Err(err) => return err,
+        }
+    } else {
+        return tool_error("Either 'endpoint', 'identity', or 'auth_handle' must be provided.");
+    };
+
+    // Build query parameters from the params object.
+    let query_pairs: Vec<(String, String)> = params
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let is_procedure = body.is_some();
+
+    // Build the URL.
+    let url = if is_procedure {
+        match build_url(
+            &service_endpoint,
+            &format!("/xrpc/{nsid}"),
+            std::iter::empty::<(&str, &str)>(),
+        ) {
+            Ok(u) => u.to_string(),
+            Err(error) => {
+                let tool_err = ToolError::XrpcRequestFailed {
+                    reason: format!("Failed to build URL: {error}"),
+                };
+                return tool_error(&tool_err.to_string());
+            }
+        }
+    } else {
+        match build_url(
+            &service_endpoint,
+            &format!("/xrpc/{nsid}"),
+            query_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ) {
+            Ok(u) => u.to_string(),
+            Err(error) => {
+                let tool_err = ToolError::XrpcRequestFailed {
+                    reason: format!("Failed to build URL: {error}"),
+                };
+                return tool_error(&tool_err.to_string());
+            }
+        }
+    };
+
+    // Build headers, including the atproto-proxy header for proxied requests.
+    let mut headers = HeaderMap::new();
+    if let Some(audience) = proxy {
+        match reqwest::header::HeaderValue::from_str(audience) {
+            Ok(value) => {
+                headers.insert(
+                    reqwest::header::HeaderName::from_static("atproto-proxy"),
+                    value,
+                );
+            }
+            Err(error) => {
+                let tool_err = ToolError::XrpcRequestFailed {
+                    reason: format!("Invalid proxy audience header value: {error}"),
+                };
+                return tool_error(&tool_err.to_string());
+            }
+        }
+    }
+
+    // Make the request.
+    let result = if let Some(handle) = auth_handle {
+        let mut account = match load_xrpc_account(handle) {
+            Ok(a) => a,
+            Err(err) => return err,
+        };
+
+        let app_auth = AppPasswordAuth {
+            access_token: account.access_jwt.clone(),
+        };
+
+        let first_result = if is_procedure {
+            let data = body.clone().unwrap_or(Value::Null);
+            post_apppassword_json_with_headers(
+                &default_resolver.http_client,
+                &app_auth,
+                &url,
+                data,
+                &headers,
+            )
+            .await
+        } else {
+            get_apppassword_json_with_headers(
+                &default_resolver.http_client,
+                &app_auth,
+                &url,
+                &headers,
+            )
+            .await
+        };
+
+        // Check for expired token and attempt refresh.
+        match &first_result {
+            Ok(response) if is_expired_token_error(response) => {
+                tracing::info!(handle = %handle, "Session expired, attempting refresh.");
+
+                let refreshed = match refresh_session(
+                    &default_resolver.http_client,
+                    &account.pds_endpoint,
+                    &account.refresh_jwt,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        account.access_jwt = r.access_jwt;
+                        account.refresh_jwt = r.refresh_jwt;
+                        true
+                    }
+                    Err(refresh_err) => {
+                        tracing::warn!(error = ?refresh_err, "Refresh failed, re-authenticating.");
+                        match create_session(
+                            &default_resolver.http_client,
+                            &account.pds_endpoint,
+                            &account.handle,
+                            &account.app_password,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(session) => {
+                                account.access_jwt = session.access_jwt;
+                                account.refresh_jwt = session.refresh_jwt;
+                                true
+                            }
+                            Err(auth_err) => {
+                                tracing::error!(error = ?auth_err, "Re-authentication failed.");
+                                false
+                            }
+                        }
+                    }
+                };
+
+                if refreshed {
+                    if let Err(error) = update_xrpc_account(&account) {
+                        tracing::warn!(error = ?error, "Failed to persist refreshed tokens.");
+                    }
+
+                    let new_auth = AppPasswordAuth {
+                        access_token: account.access_jwt.clone(),
+                    };
+
+                    if is_procedure {
+                        let data = body.unwrap_or(Value::Null);
+                        post_apppassword_json_with_headers(
+                            &default_resolver.http_client,
+                            &new_auth,
+                            &url,
+                            data,
+                            &headers,
+                        )
+                        .await
+                    } else {
+                        get_apppassword_json_with_headers(
+                            &default_resolver.http_client,
+                            &new_auth,
+                            &url,
+                            &headers,
+                        )
+                        .await
+                    }
+                } else {
+                    first_result
+                }
+            }
+            _ => first_result,
+        }
+    } else if is_procedure {
+        let data = body.unwrap_or(Value::Null);
+        post_json_with_headers(&default_resolver.http_client, &url, data, &headers).await
+    } else {
+        get_json_with_headers(&default_resolver.http_client, &url, &headers).await
+    };
+
+    match result {
+        Ok(value) => match serde_json::to_string(&value) {
+            Ok(json) => tool_success(&json),
+            Err(error) => {
+                let tool_err = ToolError::XrpcRequestFailed {
+                    reason: error.to_string(),
+                };
+                tracing::error!(error = ?error, "Failed to serialize XRPC response.");
+                tool_error(&tool_err.to_string())
+            }
+        },
+        Err(error) => {
+            let tool_err = ToolError::XrpcRequestFailed {
+                reason: error.to_string(),
+            };
+            tracing::error!(error = ?error, nsid = %nsid, "XRPC request failed.");
+            tool_error(&tool_err.to_string())
+        }
+    }
+}
+
+/// Execute the `generate_tid` tool.
+fn handle_generate_tid(arguments: Value) -> Value {
+    let count = arguments.get("count").and_then(Value::as_u64).unwrap_or(1);
+
+    if count == 0 || count > 100 {
+        return tool_error("The 'count' argument must be between 1 and 100.");
+    }
+
+    let timestamp_micros = arguments.get("timestamp_micros").and_then(Value::as_u64);
+
+    let tids: Vec<String> = (0..count)
+        .map(|_| {
+            let tid = match timestamp_micros {
+                Some(ts) => atproto_record::tid::Tid::new_with_time(ts),
+                None => atproto_record::tid::Tid::new(),
+            };
+            tid.to_string()
+        })
+        .collect();
+
+    if tids.len() == 1 {
+        tool_success(&tids[0])
+    } else {
+        tool_success(&tids.join("\n"))
+    }
+}
+
 /// Build a successful tool call result.
 fn tool_success(text: &str) -> Value {
     serde_json::json!({
@@ -632,13 +1319,17 @@ mod tests {
     fn test_handle_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 10);
         assert_eq!(tools[0]["name"], "create_record_cid");
         assert_eq!(tools[1]["name"], "validate_lexicon_schema");
         assert_eq!(tools[2]["name"], "resolve_handle_to_did");
         assert_eq!(tools[3]["name"], "resolve_identity");
         assert_eq!(tools[4]["name"], "parse_facets");
         assert_eq!(tools[5]["name"], "get_record");
+        assert_eq!(tools[6]["name"], "get_lexicon");
+        assert_eq!(tools[7]["name"], "validate_xrpc");
+        assert_eq!(tools[8]["name"], "invoke_xrpc");
+        assert_eq!(tools[9]["name"], "generate_tid");
         for tool in tools {
             assert!(tool["inputSchema"].is_object());
         }
@@ -900,6 +1591,34 @@ mod tests {
         assert!(text.contains("Invalid AT-URI"));
     }
 
+    // -- get_lexicon tests --
+
+    #[tokio::test]
+    async fn test_get_lexicon_missing_nsid() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({});
+        let result = handle_get_lexicon(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn test_get_lexicon_non_string_nsid() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({ "nsid": 123 });
+        let result = handle_get_lexicon(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn test_get_lexicon_invalid_nsid() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({ "nsid": "invalid" });
+        let result = handle_get_lexicon(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Invalid NSID"));
+    }
+
     // -- message routing tests --
 
     #[tokio::test]
@@ -961,5 +1680,119 @@ mod tests {
         };
         let resp = route_message(msg, &resolver).await.unwrap();
         assert!(resp.error.is_some());
+    }
+
+    // -- invoke_xrpc tests --
+
+    #[tokio::test]
+    async fn test_invoke_xrpc_missing_nsid() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({});
+        let result = handle_invoke_xrpc(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn test_invoke_xrpc_non_string_nsid() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({ "nsid": 123 });
+        let result = handle_invoke_xrpc(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn test_invoke_xrpc_missing_endpoint_and_identity() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({ "nsid": "com.atproto.repo.describeRepo" });
+        let result = handle_invoke_xrpc(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_xrpc_proxy_requires_auth_handle() {
+        let resolver = create_test_resolver();
+        let args = serde_json::json!({
+            "nsid": "app.bsky.feed.getAuthorFeed",
+            "endpoint": "https://bsky.network",
+            "proxy": "did:web:api.bsky.app#bsky_fg"
+        });
+        let result = handle_invoke_xrpc(args, &resolver).await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("proxy"));
+        assert!(text.contains("auth_handle"));
+    }
+
+    // -- validate_xrpc tests --
+
+    #[test]
+    fn test_validate_xrpc_missing_nsid() {
+        let args = serde_json::json!({});
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let resolver = create_test_resolver();
+        let result = rt.block_on(handle_validate_xrpc(args, &resolver));
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("nsid"));
+    }
+
+    #[test]
+    fn test_validate_xrpc_non_string_nsid() {
+        let args = serde_json::json!({"nsid": 123});
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let resolver = create_test_resolver();
+        let result = rt.block_on(handle_validate_xrpc(args, &resolver));
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("nsid"));
+    }
+
+    // -- generate_tid tests --
+
+    #[test]
+    fn test_generate_tid_default() {
+        let args = serde_json::json!({});
+        let result = handle_generate_tid(args);
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.len(), 13);
+    }
+
+    #[test]
+    fn test_generate_tid_with_count() {
+        let args = serde_json::json!({ "count": 3 });
+        let result = handle_generate_tid(args);
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let tids: Vec<&str> = text.lines().collect();
+        assert_eq!(tids.len(), 3);
+        for tid in &tids {
+            assert_eq!(tid.len(), 13);
+        }
+    }
+
+    #[test]
+    fn test_generate_tid_with_timestamp() {
+        let args = serde_json::json!({ "timestamp_micros": 1773067572000000_u64 });
+        let result = handle_generate_tid(args);
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.len(), 13);
+    }
+
+    #[test]
+    fn test_generate_tid_count_zero() {
+        let args = serde_json::json!({ "count": 0 });
+        let result = handle_generate_tid(args);
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn test_generate_tid_count_over_max() {
+        let args = serde_json::json!({ "count": 101 });
+        let result = handle_generate_tid(args);
+        assert_eq!(result["isError"], true);
     }
 }

@@ -54,6 +54,13 @@ pub enum LexiconResolveError {
         /// Error message from PDS
         message: String,
     },
+
+    /// Invalid NSID provided for resolution.
+    #[error("error-atproto-lexicon-resolve-7 Invalid NSID: {nsid}")]
+    InvalidNsid {
+        /// The invalid NSID string
+        nsid: String,
+    },
 }
 
 /// Errors that can occur during lexicon validation.

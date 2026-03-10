@@ -38,6 +38,7 @@ All CLI tools now use clap for consistent command-line argument processing. Use 
 
 #### Record Operations
 - **Generate CID**: `cat record.json | cargo run --features clap --bin atproto-record-cid` (reads JSON from stdin, outputs CID)
+- **Generate TID**: `cargo run --features clap --bin atptid` (generates a TID; use `-n 5` for batch, pass a TID to parse, or pass a microsecond timestamp to generate from)
 
 #### Client Tools
 - **App password auth**: `cargo run --features clap --bin atproto-client-app-password -- <subject> <access_token> <xrpc_path>`
@@ -175,6 +176,7 @@ struct Args {
 
 #### Record Operations (atproto-record)
 - **`src/bin/atproto-record-cid.rs`**: Generate CID (Content Identifier) for AT Protocol records using DAG-CBOR serialization
+- **`src/bin/atptid.rs`**: Generate and parse AT Protocol Timestamp Identifiers (TIDs)
 
 #### Client Tools (atproto-client)
 - **`src/bin/atproto-client-app-password.rs`**: Make XRPC calls using app password authentication

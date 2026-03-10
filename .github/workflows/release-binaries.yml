@@ -39,6 +39,9 @@ jobs:
           - name: atpxrpc
             package: atpxrpc
             features: ""
+          - name: atptid
+            package: atproto-record
+            features: clap
 
     runs-on: ${{ matrix.target.os }}
 
