@@ -12,7 +12,7 @@ use crate::datetime::format as datetime_format;
 use crate::datetime::optional_format as optional_datetime_format;
 use crate::lexicon::TypedBlob;
 use crate::lexicon::app::bsky::richtext::facet::Facet;
-use crate::lexicon::community::lexicon::location::Locations;
+use crate::lexicon::community::lexicon::location::LocationOrRef;
 use crate::typed::{LexiconType, TypedLexicon};
 
 /// Lexicon namespace identifier for calendar events.
@@ -194,6 +194,24 @@ pub type TypedMedia = TypedLexicon<Media>;
 /// posters, thumbnails, or promotional images.
 pub type MediaList = Vec<TypedMedia>;
 
+/// Enum that can hold a location, URI reference, or unknown type for calendar events.
+///
+/// Extends `LocationOrRef` with URI location support specific to calendar events.
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[serde(untagged)]
+pub enum EventLocation {
+    /// An inline URI location
+    InlineUri(TypedNamedUri),
+    /// A known location type (address, geo, h3, fsq, or reference)
+    Location(LocationOrRef),
+    /// An unknown or unrecognized location type
+    Unknown(serde_json::Value),
+}
+
+/// A vector of event locations.
+pub type EventLocations = Vec<EventLocation>;
+
 /// Calendar event structure.
 ///
 /// Represents a calendar event with comprehensive metadata including
@@ -263,7 +281,7 @@ pub struct Event {
 
     /// Event locations (can be inline or referenced)
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub locations: Locations,
+    pub locations: EventLocations,
 
     /// Related URIs/links for the event
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -305,6 +323,17 @@ mod tests {
 
     use super::*;
     use anyhow::Result;
+
+    #[test]
+    fn test_event_location_uri() {
+        let json_str = r#"{
+            "$type": "community.lexicon.calendar.event#uri",
+            "uri": "https://example.com/location",
+            "name": "Example"
+        }"#;
+        let location: EventLocation = serde_json::from_str(json_str).unwrap();
+        assert!(matches!(location, EventLocation::InlineUri(_)));
+    }
 
     #[test]
     fn test_typed_named_uri() -> Result<()> {
@@ -524,6 +553,155 @@ mod tests {
             "community.lexicon.calendar.event#media"
         );
         assert_eq!(json["media"][0]["alt"], "Event poster");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_with_address_location() -> Result<()> {
+        let json_str = r#"{
+            "$type": "community.lexicon.calendar.event",
+            "name": "Office Meetup",
+            "description": "Team gathering",
+            "createdAt": "2025-06-01T10:00:00Z",
+            "locations": [
+                {
+                    "$type": "community.lexicon.location.address",
+                    "country": "USA",
+                    "region": "California",
+                    "locality": "San Francisco",
+                    "street": "123 Main St"
+                }
+            ]
+        }"#;
+
+        let event: TypedEvent = serde_json::from_str(json_str)?;
+        assert_eq!(event.inner.locations.len(), 1);
+        assert!(matches!(
+            &event.inner.locations[0],
+            EventLocation::Location(LocationOrRef::InlineAddress(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_with_geo_location() -> Result<()> {
+        let json_str = r#"{
+            "$type": "community.lexicon.calendar.event",
+            "name": "Park Picnic",
+            "description": "Outdoor event",
+            "createdAt": "2025-06-01T10:00:00Z",
+            "locations": [
+                {
+                    "$type": "community.lexicon.location.geo",
+                    "latitude": "37.7749",
+                    "longitude": "-122.4194",
+                    "name": "Golden Gate Park"
+                }
+            ]
+        }"#;
+
+        let event: TypedEvent = serde_json::from_str(json_str)?;
+        assert_eq!(event.inner.locations.len(), 1);
+        assert!(matches!(
+            &event.inner.locations[0],
+            EventLocation::Location(LocationOrRef::InlineGeo(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_with_uri_location() -> Result<()> {
+        let json_str = r#"{
+            "$type": "community.lexicon.calendar.event",
+            "name": "Virtual Meetup",
+            "description": "Online event",
+            "createdAt": "2025-06-01T10:00:00Z",
+            "locations": [
+                {
+                    "$type": "community.lexicon.calendar.event#uri",
+                    "uri": "https://meet.example.com/room",
+                    "name": "Meeting Room"
+                }
+            ]
+        }"#;
+
+        let event: TypedEvent = serde_json::from_str(json_str)?;
+        assert_eq!(event.inner.locations.len(), 1);
+        assert!(matches!(
+            &event.inner.locations[0],
+            EventLocation::InlineUri(_)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_event_with_mixed_locations() -> Result<()> {
+        let json_str = r#"{
+            "$type": "community.lexicon.calendar.event",
+            "name": "Hybrid Conference",
+            "description": "In-person and online",
+            "createdAt": "2025-06-01T10:00:00Z",
+            "mode": "community.lexicon.calendar.event#hybrid",
+            "locations": [
+                {
+                    "$type": "community.lexicon.location.address",
+                    "country": "USA",
+                    "locality": "Austin"
+                },
+                {
+                    "$type": "community.lexicon.calendar.event#uri",
+                    "uri": "https://stream.example.com/live"
+                },
+                {
+                    "$type": "community.lexicon.location.geo",
+                    "latitude": "30.2672",
+                    "longitude": "-97.7431"
+                },
+                {
+                    "$type": "community.lexicon.location.hthree",
+                    "value": "8a2a1072b59ffff"
+                },
+                {
+                    "$type": "community.lexicon.location.fsq",
+                    "fsq_place_id": "4a27f3d4f964a520a4891fe3"
+                },
+                {
+                    "$type": "some.future.location.type",
+                    "data": "opaque"
+                }
+            ]
+        }"#;
+
+        let event: TypedEvent = serde_json::from_str(json_str)?;
+        assert_eq!(event.inner.locations.len(), 6);
+        assert!(matches!(
+            &event.inner.locations[0],
+            EventLocation::Location(LocationOrRef::InlineAddress(_))
+        ));
+        assert!(matches!(
+            &event.inner.locations[1],
+            EventLocation::InlineUri(_)
+        ));
+        assert!(matches!(
+            &event.inner.locations[2],
+            EventLocation::Location(LocationOrRef::InlineGeo(_))
+        ));
+        assert!(matches!(
+            &event.inner.locations[3],
+            EventLocation::Location(LocationOrRef::InlineHthree(_))
+        ));
+        assert!(matches!(
+            &event.inner.locations[4],
+            EventLocation::Location(LocationOrRef::InlineFsq(_))
+        ));
+        assert!(matches!(
+            &event.inner.locations[5],
+            EventLocation::Location(LocationOrRef::Unknown(_))
+        ));
 
         Ok(())
     }

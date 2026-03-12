@@ -57,6 +57,8 @@ pub enum LocationOrRef {
     InlineHthree(TypedHthree),
     /// An inline Foursquare location
     InlineFsq(TypedFsq),
+    /// An unknown or unrecognized location type
+    Unknown(serde_json::Value),
 }
 
 /// A vector of locations that can be either inline or referenced.
@@ -364,6 +366,16 @@ mod tests {
         assert_eq!(deserialized.inner.value, "8928308280fffff");
         assert_eq!(deserialized.inner.name, None);
         assert!(deserialized.has_type_field());
+    }
+
+    #[test]
+    fn test_location_or_ref_unknown() {
+        let json_str = r#"{
+            "$type": "some.unknown.type",
+            "foo": "bar"
+        }"#;
+        let location: LocationOrRef = serde_json::from_str(json_str).unwrap();
+        assert!(matches!(location, LocationOrRef::Unknown(_)));
     }
 
     #[test]

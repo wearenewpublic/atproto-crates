@@ -1,6 +1,6 @@
 [package]
 name = "atproto-xrpcs-helloworld"
-version = "0.14.2"
+version = "0.14.3"
 description = "Complete example implementation of an AT Protocol XRPC service with DID web functionality and JWT authentication"
 edition.workspace = true
 rust-version.workspace = true

@@ -55,17 +55,17 @@ Add the crates to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-atproto-dasl = "0.14.2"
-atproto-identity = "0.14.2"
-atproto-attestation = "0.14.2"
-atproto-record = "0.14.2"
-atproto-repo = "0.14.2"
-atproto-lexicon = "0.14.2"
-atproto-oauth = "0.14.2"
-atproto-oauth-aip = "0.14.2"
-atproto-client = "0.14.2"
-atproto-extras = "0.14.2"
-atproto-tap = "0.14.2"
+atproto-dasl = "0.14.3"
+atproto-identity = "0.14.3"
+atproto-attestation = "0.14.3"
+atproto-record = "0.14.3"
+atproto-repo = "0.14.3"
+atproto-lexicon = "0.14.3"
+atproto-oauth = "0.14.3"
+atproto-oauth-aip = "0.14.3"
+atproto-client = "0.14.3"
+atproto-extras = "0.14.3"
+atproto-tap = "0.14.3"
 # Add others as needed
 ```
 

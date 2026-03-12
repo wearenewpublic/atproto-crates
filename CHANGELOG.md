@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-03-12
+### Added
+- Unknown variant to LocationOrRef and EventLocation enums for calendar events
+- `--version` flag to atpmcp CLI
+
 ## [0.14.2] - 2026-03-09
 ### Added
 - `atptid` CLI tool for generating and parsing AT Protocol Timestamp Identifiers
@@ -205,6 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.14.3]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.3
 [0.14.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.2
 [0.14.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.1
 [0.14.0]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.0
