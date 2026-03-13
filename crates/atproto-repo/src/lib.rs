@@ -76,7 +76,7 @@ pub use errors::{MstError, RepoError};
 pub use mst::{Mst, MstDiff, MstNode, TreeEntry};
 
 // Re-export repository types
-pub use repo::{Commit, RecordPath, Repository};
+pub use repo::{Commit, DiskRepository, MemoryRepository, RecordPath, Repository};
 
 #[cfg(test)]
 mod tests {

@@ -44,7 +44,7 @@ use crate::errors::RepoError;
 use crate::mst::Mst;
 use atproto_dasl::CarReader;
 use atproto_dasl::Cid;
-use atproto_dasl::storage::{BlockStorage, MemoryStorage};
+use atproto_dasl::storage::{BlockStorage, DiskStorage, MemoryStorage};
 use tokio::io::AsyncRead;
 
 /// Read-only view of a repository backed by pluggable storage.
@@ -213,6 +213,51 @@ impl<S: BlockStorage> Repository<S> {
     pub fn config(&self) -> &RepoConfig {
         &self.config
     }
+
+    /// Load repository from an async CAR reader into pre-built storage.
+    async fn from_car_with_storage<R: AsyncRead + Unpin>(
+        reader: R,
+        config: RepoConfig,
+        mut storage: S,
+    ) -> Result<Self, RepoError> {
+        let car_reader = CarReader::with_config(reader, config.car_config()).await?;
+
+        let root_cid = car_reader
+            .root()
+            .ok_or_else(|| RepoError::InvalidCommit {
+                reason: "CAR has no root".to_string(),
+            })?
+            .clone();
+
+        let _header = car_reader.stream_to_storage(&mut storage).await?;
+
+        let commit_bytes = storage
+            .get(&root_cid.clone().into())
+            .await?
+            .ok_or_else(|| RepoError::InvalidCommit {
+                reason: "root block not found".to_string(),
+            })?;
+
+        let commit: Commit =
+            atproto_dasl::from_slice(&commit_bytes).map_err(|e| RepoError::InvalidCommit {
+                reason: format!("failed to decode commit: {}", e),
+            })?;
+
+        if commit.version != 3 {
+            return Err(RepoError::UnsupportedCommitVersion {
+                version: commit.version,
+            });
+        }
+
+        let mst = Mst::from_root(commit.data.clone().into(), storage, config.clone());
+
+        Ok(Self {
+            commit,
+            mst,
+            config,
+            signature_verified: None,
+        })
+    }
 }
 
 /// Convenience type for in-memory repository.
@@ -228,49 +273,8 @@ impl MemoryRepository {
         reader: R,
         config: RepoConfig,
     ) -> Result<Self, RepoError> {
-        let car_reader = CarReader::with_config(reader, config.car_config()).await?;
-
-        // Get root CID
-        let root_cid = car_reader
-            .root()
-            .ok_or_else(|| RepoError::InvalidCommit {
-                reason: "CAR has no root".to_string(),
-            })?
-            .clone();
-
-        // Stream all blocks to memory storage
-        let mut storage = MemoryStorage::with_limits(config.limits.clone());
-        let _header = car_reader.stream_to_storage(&mut storage).await?;
-
-        // Load commit from root
-        let commit_bytes = storage
-            .get(&root_cid.clone().into())
-            .await?
-            .ok_or_else(|| RepoError::InvalidCommit {
-                reason: "root block not found".to_string(),
-            })?;
-
-        let commit: Commit =
-            atproto_dasl::from_slice(&commit_bytes).map_err(|e| RepoError::InvalidCommit {
-                reason: format!("failed to decode commit: {}", e),
-            })?;
-
-        // Validate commit version
-        if commit.version != 3 {
-            return Err(RepoError::UnsupportedCommitVersion {
-                version: commit.version,
-            });
-        }
-
-        // Create MST from commit data CID
-        let mst = Mst::from_root(commit.data.clone().into(), storage, config.clone());
-
-        Ok(Self {
-            commit,
-            mst,
-            config,
-            signature_verified: None,
-        })
+        let storage = MemoryStorage::with_limits(config.limits.clone());
+        Self::from_car_with_storage(reader, config, storage).await
     }
 
     /// Get the total number of records in the repository.
@@ -281,6 +285,24 @@ impl MemoryRepository {
     pub async fn record_count(&self) -> Result<usize, RepoError> {
         let entries = self.mst.entries().await?;
         Ok(entries.len())
+    }
+}
+
+/// Convenience type for disk-backed repository.
+pub type DiskRepository = Repository<DiskStorage>;
+
+impl DiskRepository {
+    /// Load repository from an async CAR reader with disk-backed storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RepoError` if loading or storage initialization fails.
+    pub async fn from_car<R: AsyncRead + Unpin>(
+        reader: R,
+        config: RepoConfig,
+    ) -> Result<Self, RepoError> {
+        let storage = DiskStorage::new(config.limits.clone()).await?;
+        Self::from_car_with_storage(reader, config, storage).await
     }
 }
 
