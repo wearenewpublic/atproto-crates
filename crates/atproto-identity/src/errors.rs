@@ -17,6 +17,7 @@
 //!
 //! All errors use the standardized format: `error-atproto-identity-{domain}-{number} {message}: {details}`
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Error types that can occur when working with Web DIDs
@@ -383,6 +384,263 @@ pub enum KeyError {
         /// The underlying conversion error
         error: String,
     },
+
+    /// Occurs when Ed25519 key operations fail
+    #[error("error-atproto-identity-key-13 Ed25519 key operation failed: {error}")]
+    Ed25519Error {
+        /// Description of the Ed25519 error
+        error: String,
+    },
+}
+
+/// Error types that can occur when working with WebVH DIDs
+#[derive(Debug, Error)]
+pub enum WebVHDIDError {
+    /// Occurs when the DID is missing the 'did:webvh:' prefix
+    #[error("error-atproto-identity-webvh-1 Invalid DID format: missing 'did:webvh:' prefix")]
+    InvalidDIDPrefix,
+
+    /// Occurs when the DID is missing a SCID component
+    #[error("error-atproto-identity-webvh-2 Invalid DID format: missing SCID component")]
+    MissingSCID,
+
+    /// Occurs when the DID is missing a hostname component
+    #[error("error-atproto-identity-webvh-3 Invalid DID format: missing hostname component")]
+    MissingHostname,
+
+    /// Occurs when the HTTP request to fetch the DID log fails
+    #[error("error-atproto-identity-webvh-4 HTTP request failed: {url} {error}")]
+    HttpRequestFailed {
+        /// The URL that was requested
+        url: String,
+        /// The underlying HTTP error
+        error: reqwest::Error,
+    },
+
+    /// Occurs when a log entry cannot be parsed from the JSONL response
+    #[error("error-atproto-identity-webvh-5 Failed to parse log entry at line {line}: {details}")]
+    LogEntryParseFailed {
+        /// The line number (1-indexed) that failed to parse
+        line: usize,
+        /// Details about the parse failure
+        details: String,
+    },
+
+    /// Occurs when the DID log file is empty
+    #[error("error-atproto-identity-webvh-6 Empty log file")]
+    EmptyLog,
+
+    /// Occurs when a version ID is invalid or has incorrect format
+    #[error("error-atproto-identity-webvh-7 Invalid version ID at entry {entry}: {details}")]
+    InvalidVersionId {
+        /// The entry number (1-indexed) with the invalid version ID
+        entry: usize,
+        /// Details about the validation failure
+        details: String,
+    },
+
+    /// Occurs when version times are not monotonically increasing
+    #[error(
+        "error-atproto-identity-webvh-8 Version time not monotonically increasing at entry {entry}"
+    )]
+    VersionTimeNotMonotonic {
+        /// The entry number (1-indexed) with the non-monotonic timestamp
+        entry: usize,
+    },
+
+    /// Occurs when the SCID does not match the computed value from the genesis entry
+    #[error("error-atproto-identity-webvh-9 SCID verification failed on genesis entry")]
+    SCIDVerificationFailed,
+
+    /// Occurs when an entry's hash does not match the expected value in the version ID
+    #[error("error-atproto-identity-webvh-10 Entry hash verification failed at entry {entry}")]
+    EntryHashVerificationFailed {
+        /// The entry number (1-indexed) with the hash mismatch
+        entry: usize,
+    },
+
+    /// Occurs when a Data Integrity proof cannot be verified
+    #[error(
+        "error-atproto-identity-webvh-11 Proof verification failed at entry {entry}: {details}"
+    )]
+    ProofVerificationFailed {
+        /// The entry number (1-indexed) with the failed proof
+        entry: usize,
+        /// Details about the verification failure
+        details: String,
+    },
+
+    /// Occurs when pre-rotation key hashes do not match
+    #[error("error-atproto-identity-webvh-12 Pre-rotation key hash mismatch at entry {entry}")]
+    PreRotationKeyMismatch {
+        /// The entry number (1-indexed) with the key mismatch
+        entry: usize,
+    },
+
+    /// Occurs when log entry parameters are invalid
+    #[error("error-atproto-identity-webvh-13 Invalid parameters at entry {entry}: {details}")]
+    InvalidParameters {
+        /// The entry number (1-indexed) with the invalid parameters
+        entry: usize,
+        /// Details about the validation failure
+        details: String,
+    },
+
+    /// Occurs when witness verification fails
+    #[error(
+        "error-atproto-identity-webvh-14 Witness verification failed at entry {entry}: {details}"
+    )]
+    WitnessVerificationFailed {
+        /// The entry number (1-indexed) with the failed witness verification
+        entry: usize,
+        /// Details about the verification failure
+        details: String,
+    },
+
+    /// Occurs when the DID document cannot be extracted from the log state
+    #[error("error-atproto-identity-webvh-15 DID document extraction failed: {details}")]
+    DocumentExtractionFailed {
+        /// Details about the extraction failure
+        details: String,
+    },
+
+    /// Occurs when the SCID format is invalid
+    #[error("error-atproto-identity-webvh-16 Invalid SCID format: {details}")]
+    InvalidSCIDFormat {
+        /// Details about the format violation
+        details: String,
+    },
+
+    /// Occurs when the resolved DID has been deactivated
+    #[error("error-atproto-identity-webvh-17 Deactivated DID: {did}")]
+    DeactivatedDID {
+        /// The deactivated DID
+        did: String,
+    },
+
+    /// Occurs when a requested version is not found in the log
+    #[error("error-atproto-identity-webvh-18 Version not found: {details}")]
+    VersionNotFound {
+        /// Details about the lookup that failed
+        details: String,
+    },
+
+    /// Occurs when a version time is in the future
+    #[error(
+        "error-atproto-identity-webvh-19 Version time is in the future at entry {entry}: {version_time}"
+    )]
+    VersionTimeInFuture {
+        /// The entry number (1-indexed) with the future timestamp
+        entry: usize,
+        /// The future timestamp value
+        version_time: String,
+    },
+
+    /// Occurs when the DIDDoc id does not match the DID
+    #[error(
+        "error-atproto-identity-webvh-20 DIDDoc id mismatch at entry {entry}: expected '{expected}', found '{found}'"
+    )]
+    DIDDocIdMismatch {
+        /// The entry number (1-indexed) with the mismatch
+        entry: usize,
+        /// The expected DID
+        expected: String,
+        /// The actual id found in the DIDDoc
+        found: String,
+    },
+
+    /// Occurs when the hash algorithm in the SCID is not supported
+    #[error("error-atproto-identity-webvh-21 Unsupported hash algorithm in SCID: {details}")]
+    UnsupportedHashAlgorithm {
+        /// Details about the unsupported algorithm
+        details: String,
+    },
+
+    /// Occurs when an unknown parameter is found in a log entry
+    #[error("error-atproto-identity-webvh-22 Unknown parameter at entry {entry}: {parameter}")]
+    UnknownParameter {
+        /// The entry number (1-indexed) with the unknown parameter
+        entry: usize,
+        /// The unknown parameter name
+        parameter: String,
+    },
+
+    /// Occurs when hostname normalization fails
+    #[error("error-atproto-identity-webvh-23 Hostname normalization failed: {details}")]
+    HostnameNormalizationFailed {
+        /// Details about the normalization failure
+        details: String,
+    },
+}
+
+/// Resolution error codes as defined by the did:webvh specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionError {
+    /// Error code: "notFound" or "invalidDid".
+    pub error: ResolutionErrorCode,
+    /// Optional RFC 9457 problem details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem_details: Option<ProblemDetails>,
+}
+
+/// Resolution error code per the did:webvh specification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResolutionErrorCode {
+    /// The DID was not found.
+    #[serde(rename = "notFound")]
+    NotFound,
+    /// The DID is invalid or failed verification.
+    #[serde(rename = "invalidDid")]
+    InvalidDid,
+}
+
+/// RFC 9457 Problem Details structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProblemDetails {
+    /// Problem type URI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// Short human-readable summary.
+    pub title: String,
+    /// Detailed explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl WebVHDIDError {
+    /// Converts this error to a spec-compliant resolution error.
+    pub fn to_resolution_error(&self) -> ResolutionError {
+        match self {
+            WebVHDIDError::HttpRequestFailed { .. } | WebVHDIDError::EmptyLog => ResolutionError {
+                error: ResolutionErrorCode::NotFound,
+                problem_details: Some(ProblemDetails {
+                    r#type: None,
+                    title: "DID not found".to_string(),
+                    detail: Some(self.to_string()),
+                }),
+            },
+            WebVHDIDError::InvalidDIDPrefix
+            | WebVHDIDError::MissingSCID
+            | WebVHDIDError::MissingHostname
+            | WebVHDIDError::InvalidSCIDFormat { .. } => ResolutionError {
+                error: ResolutionErrorCode::InvalidDid,
+                problem_details: Some(ProblemDetails {
+                    r#type: None,
+                    title: "Invalid DID format".to_string(),
+                    detail: Some(self.to_string()),
+                }),
+            },
+            _ => ResolutionError {
+                error: ResolutionErrorCode::InvalidDid,
+                problem_details: Some(ProblemDetails {
+                    r#type: None,
+                    title: "DID verification failed".to_string(),
+                    detail: Some(self.to_string()),
+                }),
+            },
+        }
+    }
 }
 
 /// Error types that can occur when working with storage operations

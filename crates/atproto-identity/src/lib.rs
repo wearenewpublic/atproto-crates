@@ -25,3 +25,4 @@ pub mod traits;
 pub mod url;
 pub mod validation;
 pub mod web;
+pub mod webvh;

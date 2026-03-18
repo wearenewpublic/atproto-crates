@@ -92,6 +92,9 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(Into::into),
             Ok(InputType::Web(did)) => web_query(&http_client, &did).await.map_err(Into::into),
+            Ok(InputType::WebVH(did)) => atproto_identity::webvh::query(&http_client, &did)
+                .await
+                .map_err(Into::into),
             Ok(InputType::Handle(_)) => {
                 eprintln!("error: subject resolved to handle");
                 continue;

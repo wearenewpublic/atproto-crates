@@ -37,7 +37,7 @@ pub const NSID: &str = "community.lexicon.attestation.signature";
 /// let reference = SignatureOrRef::Reference(typed_strong_ref);
 /// ```
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[serde(untagged)]
 pub enum SignatureOrRef {
     /// A reference to a signature stored elsewhere
@@ -76,7 +76,7 @@ pub type Signatures = Vec<SignatureOrRef>;
 /// };
 /// ```
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Signature {
     /// The cryptographic signature bytes
     pub signature: Bytes,

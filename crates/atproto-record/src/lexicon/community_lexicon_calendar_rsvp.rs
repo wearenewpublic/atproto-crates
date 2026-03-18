@@ -19,7 +19,7 @@ pub const NSID: &str = "community.lexicon.calendar.rsvp";
 ///
 /// Represents the response status for an event invitation.
 #[derive(Serialize, Deserialize, PartialEq, Clone, Default)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum RsvpStatus {
     /// Attendee is planning to attend
     #[default]
@@ -63,7 +63,7 @@ pub enum RsvpStatus {
 /// let typed_rsvp = TypedRsvp::new(rsvp);
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Rsvp {
     /// Reference to the event being responded to
     pub subject: StrongRef,

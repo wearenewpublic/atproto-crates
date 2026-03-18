@@ -29,8 +29,9 @@ use tracing::{Instrument, instrument};
 use crate::errors::ResolveError;
 use crate::model::Document;
 use crate::plc::query as plc_query;
-use crate::validation::{is_valid_did_method_plc, is_valid_handle};
+use crate::validation::{is_valid_did_method_plc, is_valid_did_method_webvh, is_valid_handle};
 use crate::web::query as web_query;
+use crate::webvh::query as webvh_query;
 
 pub use crate::traits::{DnsResolver, IdentityResolver};
 
@@ -91,6 +92,8 @@ pub enum InputType {
     Plc(String),
     /// Web DID identifier (e.g., "did:web:example.com").
     Web(String),
+    /// Web Verifiable History DID identifier (e.g., "did:webvh:SCID:example.com").
+    WebVH(String),
 }
 
 /// Resolves a handle to DID using DNS TXT records.
@@ -160,7 +163,9 @@ pub fn parse_input(input: &str) -> Result<InputType, ResolveError> {
     if trimmed.is_empty() {
         return Err(ResolveError::InvalidInput);
     }
-    if trimmed.starts_with("did:web:") {
+    if trimmed.starts_with("did:webvh:") && is_valid_did_method_webvh(trimmed, false) {
+        Ok(InputType::WebVH(trimmed.to_string()))
+    } else if trimmed.starts_with("did:web:") {
         Ok(InputType::Web(trimmed.to_string()))
     } else if trimmed.starts_with("did:plc:") && is_valid_did_method_plc(trimmed) {
         Ok(InputType::Plc(trimmed.to_string()))
@@ -193,6 +198,53 @@ mod tests {
             }
             Ok(self.document.clone())
         }
+    }
+
+    #[test]
+    fn test_parse_input_webvh() {
+        let result = parse_input("did:webvh:z6MkTest123:example.com");
+        assert!(result.is_ok());
+        assert!(
+            matches!(result.unwrap(), InputType::WebVH(did) if did == "did:webvh:z6MkTest123:example.com")
+        );
+    }
+
+    #[test]
+    fn test_parse_input_webvh_with_path() {
+        let result = parse_input("did:webvh:z6MkTest123:example.com:path:sub");
+        assert!(result.is_ok());
+        assert!(
+            matches!(result.unwrap(), InputType::WebVH(did) if did == "did:webvh:z6MkTest123:example.com:path:sub")
+        );
+    }
+
+    #[test]
+    fn test_parse_input_webvh_simple_hostname() {
+        let result = parse_input("did:webvh:z6MkTest123:example.com");
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), InputType::WebVH(_)));
+    }
+
+    #[test]
+    fn test_parse_input_webvh_with_at_prefix() {
+        let result = parse_input("at://did:webvh:z6MkTest123:example.com");
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), InputType::WebVH(_)));
+    }
+
+    #[test]
+    fn test_parse_input_web_not_webvh() {
+        // did:web should not be parsed as did:webvh
+        let result = parse_input("did:web:example.com");
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), InputType::Web(_)));
+    }
+
+    #[test]
+    fn test_parse_input_plc_not_webvh() {
+        let result = parse_input("did:plc:ewvi7nxzyoun6zhxrhs64oiz");
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), InputType::Plc(_)));
     }
 
     #[tokio::test]
@@ -313,7 +365,7 @@ pub async fn resolve_subject<R: DnsResolver + ?Sized>(
 ) -> Result<String, ResolveError> {
     match parse_input(subject)? {
         InputType::Handle(handle) => resolve_handle(http_client, dns_resolver, &handle).await,
-        InputType::Plc(did) | InputType::Web(did) => Ok(did),
+        InputType::Plc(did) | InputType::Web(did) | InputType::WebVH(did) => Ok(did),
     }
 }
 
@@ -362,6 +414,9 @@ impl IdentityResolver for InnerIdentityResolver {
                 .await
                 .map_err(Into::into),
             Ok(InputType::Web(did)) => web_query(&self.http_client, &did).await.map_err(Into::into),
+            Ok(InputType::WebVH(did)) => webvh_query(&self.http_client, &did)
+                .await
+                .map_err(Into::into),
             Ok(InputType::Handle(_)) => Err(ResolveError::SubjectResolvedToHandle.into()),
             Err(err) => Err(err.into()),
         }

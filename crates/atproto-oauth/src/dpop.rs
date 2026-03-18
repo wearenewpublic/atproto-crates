@@ -433,7 +433,7 @@ pub fn extract_jwk_thumbprint(dpop_jwt: &str) -> Result<String> {
 /// Configuration for DPoP JWT validation.
 ///
 /// This struct allows callers to specify what aspects of the DPoP JWT should be validated.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone)]
 pub struct DpopValidationConfig {
     /// Expected HTTP method (e.g., "POST", "GET"). If None, method validation is skipped.

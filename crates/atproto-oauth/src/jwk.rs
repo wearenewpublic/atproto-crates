@@ -18,7 +18,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A wrapped JSON Web Key with additional metadata.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[cfg_attr(feature = "zeroize", derive(Zeroize, ZeroizeOnDrop))]
 pub struct WrappedJsonWebKey {
     /// Key identifier (kid) for the JWK.
@@ -57,6 +57,7 @@ pub fn generate(key_data: &KeyData) -> Result<WrappedJsonWebKey> {
         KeyType::P384Private => Some("ES384".to_string()),
         KeyType::K256Public => Some("ES256K".to_string()),
         KeyType::K256Private => Some("ES256K".to_string()),
+        KeyType::Ed25519Public | KeyType::Ed25519Private => Some("EdDSA".to_string()),
     };
     let jwk = key_data.try_into()?;
 

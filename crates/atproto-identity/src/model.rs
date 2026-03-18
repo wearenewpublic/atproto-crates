@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 /// AT Protocol service configuration from a DID document.
 /// Represents services like Personal Data Servers (PDS).
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Service {
@@ -27,7 +27,7 @@ pub struct Service {
 
 /// Cryptographic verification method from a DID document.
 /// Used to verify signatures and authenticate identity operations.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum VerificationMethod {
@@ -58,7 +58,7 @@ pub enum VerificationMethod {
 
 /// Complete DID document containing identity information.
 /// Contains services, verification methods, and aliases for a DID.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Document {
@@ -269,7 +269,7 @@ impl Document {
 
 /// Resolved handle information linking DID to human-readable identifier.
 /// Contains the complete identity resolution result.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Handle {
     /// The resolved DID identifier.

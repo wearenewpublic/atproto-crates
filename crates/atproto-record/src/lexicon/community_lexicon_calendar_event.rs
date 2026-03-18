@@ -24,7 +24,7 @@ pub const NSID: &str = "community.lexicon.calendar.event";
 ///
 /// Represents the current status of a calendar event.
 #[derive(Serialize, Deserialize, PartialEq, Clone, Default)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum Status {
     /// Event is scheduled and confirmed
     #[default]
@@ -52,7 +52,7 @@ pub enum Status {
 ///
 /// Represents how attendees can participate in the event.
 #[derive(Serialize, Deserialize, PartialEq, Clone, Default)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub enum Mode {
     /// In-person attendance only
     #[default]
@@ -78,7 +78,7 @@ pub const NAMED_URI_NSID: &str = "community.lexicon.calendar.event#uri";
 /// Represents a URI with an optional human-readable name.
 /// Used for linking to external resources related to an event.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct NamedUri {
     /// The URI/URL
     pub uri: String,
@@ -111,7 +111,7 @@ pub const EVENT_LINK_NSID: &str = "community.lexicon.calendar.event#uri";
 /// Similar to NamedUri but kept as a separate type for semantic clarity
 /// and type safety when dealing with event-specific links.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct EventLink {
     /// The URI/URL for the event link
     pub uri: String,
@@ -143,7 +143,7 @@ pub type EventLinks = Vec<TypedEventLink>;
 ///
 /// Represents the width-to-height ratio of visual media.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct AspectRatio {
     /// Width component of the ratio
     pub width: u64,
@@ -160,7 +160,7 @@ pub const MEDIA_NSID: &str = "community.lexicon.calendar.event#media";
 ///
 /// Represents images, videos, or other media associated with an event.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Media {
     /// The media content as a blob reference
     pub content: TypedBlob,
@@ -198,7 +198,7 @@ pub type MediaList = Vec<TypedMedia>;
 ///
 /// Extends `LocationOrRef` with URI location support specific to calendar events.
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[serde(untagged)]
 pub enum EventLocation {
     /// An inline URI location
@@ -241,7 +241,7 @@ pub type EventLocations = Vec<EventLocation>;
 /// let typed_event = TypedEvent::new(event);
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Event {
     /// Name/title of the event
     pub name: String,

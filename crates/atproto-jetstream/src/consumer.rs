@@ -56,7 +56,7 @@ use tracing::Instrument;
 const MAX_MESSAGE_SIZE: usize = 56000;
 
 /// Configuration for the Jetstream consumer task
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone)]
 pub struct ConsumerTaskConfig {
     /// User-Agent header value for WebSocket connections
@@ -80,7 +80,7 @@ pub struct ConsumerTaskConfig {
 }
 
 /// Event data structure for Jetstream events
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JetstreamEvent {
@@ -134,7 +134,7 @@ pub enum JetstreamEvent {
 }
 
 /// Repository commit operation details
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct JetstreamEventCommit {
     /// Repository revision identifier
@@ -152,7 +152,7 @@ pub struct JetstreamEventCommit {
 }
 
 /// Repository delete operation details
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct JetstreamEventDelete {
     /// Repository revision identifier
@@ -180,7 +180,7 @@ pub trait EventHandler: Send + Sync {
     fn handler_id(&self) -> &str;
 }
 
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub(crate) enum SubscriberSourcedMessage {

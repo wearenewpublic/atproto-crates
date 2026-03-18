@@ -19,7 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// JWT header containing algorithm and key metadata.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[cfg_attr(feature = "zeroize", derive(Zeroize, ZeroizeOnDrop))]
 pub struct Header {
     /// Algorithm used for signing (e.g., "ES256", "ES384", "ES256K").
@@ -50,6 +50,7 @@ impl TryFrom<KeyData> for Header {
             KeyType::P384Private => Some("ES384".to_string()),
             KeyType::K256Public => Some("ES256K".to_string()),
             KeyType::K256Private => Some("ES256K".to_string()),
+            KeyType::Ed25519Public | KeyType::Ed25519Private => Some("EdDSA".to_string()),
         };
 
         let public_key = to_public(&value)?;
@@ -65,7 +66,7 @@ impl TryFrom<KeyData> for Header {
 }
 
 /// JWT claims combining standard JOSE claims with custom private claims.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Claims {
     /// Standard JOSE claims.
@@ -90,7 +91,7 @@ impl Claims {
 pub type SecondsSinceEpoch = u64;
 
 /// Standard JOSE claims for JWT tokens.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct JoseClaims {
     /// Issuer of the token.

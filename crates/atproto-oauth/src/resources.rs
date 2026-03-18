@@ -28,7 +28,7 @@ pub struct OAuthProtectedResource {
 /// OAuth 2.0 authorization server metadata from RFC 8414 oauth-authorization-server endpoint.
 ///
 /// AT Protocol requires specific grant types, scopes, authentication methods, and security features.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone, Deserialize, Default)]
 pub struct AuthorizationServer {
     /// URL of the authorization server's token introspection endpoint (optional).

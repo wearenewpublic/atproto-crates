@@ -44,7 +44,7 @@ pub const HTHREE_NSID: &str = "community.lexicon.location.hthree";
 /// let location = LocationOrRef::InlineAddress(TypedAddress::new(address));
 /// ```
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[serde(untagged)]
 pub enum LocationOrRef {
     /// A reference to a location stored elsewhere
@@ -87,7 +87,7 @@ pub type Locations = Vec<LocationOrRef>;
 /// };
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Address {
     /// Country name (required)
     pub country: String,
@@ -143,7 +143,7 @@ pub type TypedAddress = TypedLexicon<Address>;
 /// };
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Geo {
     /// Latitude coordinate as a string
     pub latitude: String,
@@ -181,7 +181,7 @@ pub type TypedGeo = TypedLexicon<Geo>;
 /// };
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Fsq {
     /// Foursquare place identifier
     pub fsq_place_id: String,
@@ -216,7 +216,7 @@ pub type TypedFsq = TypedLexicon<Fsq>;
 /// };
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Hthree {
     /// H3 hexagon identifier
     pub value: String,

@@ -18,7 +18,7 @@ use crate::{
 ///
 /// This enum represents either a successful handle resolution containing a DID,
 /// or an error response from the server.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ResolveHandleResponse {

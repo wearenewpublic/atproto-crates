@@ -90,6 +90,14 @@ pub enum KeyType {
     /// A k256 (K-256 / secp256k1 / ES256K) private key.
     /// The multibase / multicodec prefix is 8126.
     K256Private,
+
+    /// An Ed25519 public key.
+    /// The multibase / multicodec prefix is ed01.
+    Ed25519Public,
+
+    /// An Ed25519 private key.
+    /// The multibase / multicodec prefix is 8026.
+    Ed25519Private,
 }
 
 impl std::fmt::Display for KeyType {
@@ -101,6 +109,8 @@ impl std::fmt::Display for KeyType {
             KeyType::P384Private => write!(f, "P384Private"),
             KeyType::K256Public => write!(f, "K256Public"),
             KeyType::K256Private => write!(f, "K256Private"),
+            KeyType::Ed25519Public => write!(f, "Ed25519Public"),
+            KeyType::Ed25519Private => write!(f, "Ed25519Private"),
         }
     }
 }
@@ -152,6 +162,8 @@ impl std::fmt::Display for KeyData {
             KeyType::P384Public => [0x12, 0x00],
             KeyType::K256Private => [0x81, 0x26],
             KeyType::K256Public => [0xe7, 0x01],
+            KeyType::Ed25519Private => [0x80, 0x26],
+            KeyType::Ed25519Public => [0xed, 0x01],
         };
 
         // Combine prefix and key bytes
@@ -240,6 +252,18 @@ pub fn identify_key(key: &str) -> Result<KeyData, KeyError> {
             decoded_multibase_key[2..].to_vec(),
         )),
 
+        // Ed25519 public key
+        [0xed, 0x01] => Ok(KeyData::new(
+            KeyType::Ed25519Public,
+            decoded_multibase_key[2..].to_vec(),
+        )),
+
+        // Ed25519 private key
+        [0x80, 0x26] => Ok(KeyData::new(
+            KeyType::Ed25519Private,
+            decoded_multibase_key[2..].to_vec(),
+        )),
+
         _ => Err(KeyError::InvalidMultibaseKeyType {
             prefix: decoded_multibase_key[..2].to_vec(),
         }),
@@ -308,6 +332,64 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
                 .map_err(|error| KeyError::ECDSAError { error })
         }
+        KeyType::Ed25519Public => {
+            let key_bytes: &[u8; 32] =
+                key_data
+                    .bytes()
+                    .try_into()
+                    .map_err(|_| KeyError::Ed25519Error {
+                        error: format!(
+                            "invalid public key length: expected 32, got {}",
+                            key_data.bytes().len()
+                        ),
+                    })?;
+            let verifying_key =
+                ed25519_dalek::VerifyingKey::from_bytes(key_bytes).map_err(|error| {
+                    KeyError::Ed25519Error {
+                        error: format!("invalid public key: {}", error),
+                    }
+                })?;
+            let sig_bytes: &[u8; 64] =
+                signature.try_into().map_err(|_| KeyError::Ed25519Error {
+                    error: format!(
+                        "invalid signature length: expected 64, got {}",
+                        signature.len()
+                    ),
+                })?;
+            let sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
+            ed25519_dalek::Verifier::verify(&verifying_key, content, &sig).map_err(|error| {
+                KeyError::Ed25519Error {
+                    error: format!("signature verification failed: {}", error),
+                }
+            })
+        }
+        KeyType::Ed25519Private => {
+            let key_bytes: &[u8; 32] =
+                key_data
+                    .bytes()
+                    .try_into()
+                    .map_err(|_| KeyError::Ed25519Error {
+                        error: format!(
+                            "invalid private key length: expected 32, got {}",
+                            key_data.bytes().len()
+                        ),
+                    })?;
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(key_bytes);
+            let verifying_key = signing_key.verifying_key();
+            let sig_bytes: &[u8; 64] =
+                signature.try_into().map_err(|_| KeyError::Ed25519Error {
+                    error: format!(
+                        "invalid signature length: expected 64, got {}",
+                        signature.len()
+                    ),
+                })?;
+            let sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
+            ed25519_dalek::Verifier::verify(&verifying_key, content, &sig).map_err(|error| {
+                KeyError::Ed25519Error {
+                    error: format!("signature verification failed: {}", error),
+                }
+            })
+        }
     }
 }
 
@@ -325,9 +407,10 @@ const ES256K_SIGNATURE_MULTICODEC: [u8; 3] = [0xe1, 0xa1, 0x03];
 /// Returns an error if a public key is provided instead of a private key.
 pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
     match *key_data.key_type() {
-        KeyType::K256Public | KeyType::P256Public | KeyType::P384Public => {
-            Err(KeyError::PrivateKeyRequiredForSignature)
-        }
+        KeyType::K256Public
+        | KeyType::P256Public
+        | KeyType::P384Public
+        | KeyType::Ed25519Public => Err(KeyError::PrivateKeyRequiredForSignature),
         KeyType::P256Private => {
             let secret_key: p256::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
@@ -357,6 +440,21 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
                 .try_sign(content)
                 .map_err(|error| KeyError::ECDSAError { error })?;
             Ok(signature.to_vec())
+        }
+        KeyType::Ed25519Private => {
+            let key_bytes: &[u8; 32] =
+                key_data
+                    .bytes()
+                    .try_into()
+                    .map_err(|_| KeyError::Ed25519Error {
+                        error: format!(
+                            "invalid private key length: expected 32, got {}",
+                            key_data.bytes().len()
+                        ),
+                    })?;
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(key_bytes);
+            let signature = ed25519_dalek::Signer::sign(&signing_key, content);
+            Ok(signature.to_bytes().to_vec())
         }
     }
 }
@@ -391,11 +489,16 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
 /// assert!(encoded.starts_with("z")); // base58btc prefix
 /// # Ok::<(), atproto_identity::errors::KeyError>(())
 /// ```
+/// Multicodec prefix for EdDSA (Ed25519) signatures (0xd002 varint-encoded).
+const EDDSA_SIGNATURE_MULTICODEC: [u8; 3] = [0x02, 0xa0, 0x03];
+
+/// Encodes a signature with its multicodec prefix and returns a multibase base58btc string.
 pub fn multiformat_encode(key_type: &KeyType, signature: &[u8]) -> String {
     let prefix: &[u8] = match key_type {
         KeyType::P256Private | KeyType::P256Public => &ES256_SIGNATURE_MULTICODEC,
         KeyType::P384Private | KeyType::P384Public => &ES384_SIGNATURE_MULTICODEC,
         KeyType::K256Private | KeyType::K256Public => &ES256K_SIGNATURE_MULTICODEC,
+        KeyType::Ed25519Private | KeyType::Ed25519Public => &EDDSA_SIGNATURE_MULTICODEC,
     };
 
     // Combine prefix and signature bytes
@@ -513,6 +616,11 @@ impl TryInto<JwkEcKey> for &KeyData {
                     .map_err(|error| KeyError::SecretKeyError { error })?;
                 Ok(secret_key.to_jwk())
             }
+            KeyType::Ed25519Public | KeyType::Ed25519Private => {
+                Err(KeyError::JWKConversionFailed {
+                    error: "Ed25519 keys use JWK OKP key type, not EC".to_string(),
+                })
+            }
         }
     }
 }
@@ -560,9 +668,17 @@ pub fn generate_key(key_type: KeyType) -> Result<KeyData, KeyError> {
                 secret_key.to_bytes().to_vec(),
             ))
         }
-        KeyType::P256Public => Err(KeyError::PublicKeyGenerationNotSupported),
-        KeyType::P384Public => Err(KeyError::PublicKeyGenerationNotSupported),
-        KeyType::K256Public => Err(KeyError::PublicKeyGenerationNotSupported),
+        KeyType::Ed25519Private => {
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            Ok(KeyData::new(
+                KeyType::Ed25519Private,
+                signing_key.to_bytes().to_vec(),
+            ))
+        }
+        KeyType::P256Public
+        | KeyType::P384Public
+        | KeyType::K256Public
+        | KeyType::Ed25519Public => Err(KeyError::PublicKeyGenerationNotSupported),
     }
 }
 
@@ -618,7 +734,28 @@ pub fn to_public(key_data: &KeyData) -> Result<KeyData, KeyError> {
             let public_key_bytes = public_key.to_sec1_bytes();
             Ok(KeyData::new(KeyType::K256Public, public_key_bytes.to_vec()))
         }
-        KeyType::P256Public | KeyType::P384Public | KeyType::K256Public => {
+        KeyType::Ed25519Private => {
+            let key_bytes: &[u8; 32] =
+                key_data
+                    .bytes()
+                    .try_into()
+                    .map_err(|_| KeyError::Ed25519Error {
+                        error: format!(
+                            "invalid private key length: expected 32, got {}",
+                            key_data.bytes().len()
+                        ),
+                    })?;
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(key_bytes);
+            let verifying_key = signing_key.verifying_key();
+            Ok(KeyData::new(
+                KeyType::Ed25519Public,
+                verifying_key.to_bytes().to_vec(),
+            ))
+        }
+        KeyType::P256Public
+        | KeyType::P384Public
+        | KeyType::K256Public
+        | KeyType::Ed25519Public => {
             // Return a clone of the existing public key
             Ok(key_data.clone())
         }
@@ -1728,6 +1865,241 @@ mod tests {
         assert_ne!(p256_encoded, p384_encoded);
         assert_ne!(p256_encoded, k256_encoded);
         assert_ne!(p384_encoded, k256_encoded);
+
+        Ok(())
+    }
+
+    // ===== ED25519 SPECIFIC TESTS =====
+
+    #[test]
+    fn test_generate_key_ed25519_private() -> Result<()> {
+        let key_data = generate_key(KeyType::Ed25519Private)?;
+        assert_eq!(*key_data.key_type(), KeyType::Ed25519Private);
+        assert_eq!(key_data.bytes().len(), 32);
+
+        let content = "test content for ed25519".as_bytes();
+        let signature = sign(&key_data, content)?;
+        assert_eq!(signature.len(), 64);
+        validate(&key_data, &signature, content)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_key_ed25519_public_not_supported() {
+        let result = generate_key(KeyType::Ed25519Public);
+        assert!(matches!(
+            result,
+            Err(KeyError::PublicKeyGenerationNotSupported)
+        ));
+    }
+
+    #[test]
+    fn test_generate_key_ed25519_uniqueness() -> Result<()> {
+        let key1 = generate_key(KeyType::Ed25519Private)?;
+        let key2 = generate_key(KeyType::Ed25519Private)?;
+        assert_ne!(key1.bytes(), key2.bytes());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sign_and_validate_ed25519() -> Result<()> {
+        let private_key = generate_key(KeyType::Ed25519Private)?;
+        let public_key = to_public(&private_key)?;
+        assert_eq!(*public_key.key_type(), KeyType::Ed25519Public);
+        assert_eq!(public_key.bytes().len(), 32);
+
+        let content = "hello world ed25519 test".as_bytes();
+
+        let signature = sign(&private_key, content)?;
+        assert_eq!(signature.len(), 64);
+
+        // Verify with public key
+        validate(&public_key, &signature, content)?;
+
+        // Verify with private key
+        validate(&private_key, &signature, content)?;
+
+        // Wrong content should fail
+        assert!(validate(&public_key, &signature, b"wrong content").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_tampered_signature() -> Result<()> {
+        let private_key = generate_key(KeyType::Ed25519Private)?;
+        let public_key = to_public(&private_key)?;
+        let content = b"test content";
+
+        let mut signature = sign(&private_key, content)?;
+        // Tamper with the signature
+        signature[0] ^= 0xff;
+
+        assert!(validate(&public_key, &signature, content).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_keydata_display_round_trip() -> Result<()> {
+        let original_key = generate_key(KeyType::Ed25519Private)?;
+
+        let key_string = format!("{}", original_key);
+        assert!(key_string.starts_with("did:key:z"));
+
+        let parsed_key = identify_key(&key_string)?;
+        assert_eq!(original_key.key_type(), parsed_key.key_type());
+        assert_eq!(original_key.bytes(), parsed_key.bytes());
+
+        // Sign with original, verify with parsed
+        let content = b"ed25519 round trip test";
+        let signature = sign(&original_key, content)?;
+        validate(&parsed_key, &signature, content)?;
+
+        // Sign with parsed, verify with original
+        let signature2 = sign(&parsed_key, content)?;
+        validate(&original_key, &signature2, content)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_to_public_key_derivation() -> Result<()> {
+        let private_key = generate_key(KeyType::Ed25519Private)?;
+        let public_key = to_public(&private_key)?;
+
+        assert_eq!(*public_key.key_type(), KeyType::Ed25519Public);
+        assert_eq!(public_key.bytes().len(), 32);
+
+        let public_key_did = format!("{}", public_key);
+        assert!(public_key_did.starts_with("did:key:"));
+
+        let parsed_public_key = identify_key(&public_key_did)?;
+        assert_eq!(*parsed_public_key.key_type(), KeyType::Ed25519Public);
+        assert_eq!(public_key.bytes(), parsed_public_key.bytes());
+
+        // Calling to_public on a public key should return the same key
+        let result = to_public(&public_key)?;
+        assert_eq!(*result.key_type(), KeyType::Ed25519Public);
+        assert_eq!(public_key.bytes(), result.bytes());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_multicodec_prefix_identification() -> Result<()> {
+        let private_key = generate_key(KeyType::Ed25519Private)?;
+        let public_key = to_public(&private_key)?;
+
+        let private_did = format!("{}", private_key);
+        let public_did = format!("{}", public_key);
+
+        let private_value = did_method_key_value(&private_did);
+        let public_value = did_method_key_value(&public_did);
+
+        let (_, private_decoded) = multibase::decode(private_value)?;
+        let (_, public_decoded) = multibase::decode(public_value)?;
+
+        assert_eq!(&private_decoded[..2], &[0x80, 0x26]);
+        assert_eq!(&public_decoded[..2], &[0xed, 0x01]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_sign_with_public_key_fails() {
+        let private_key = generate_key(KeyType::Ed25519Private).unwrap();
+        let public_key = to_public(&private_key).unwrap();
+
+        let result = sign(&public_key, b"test content");
+        assert!(matches!(
+            result,
+            Err(KeyError::PrivateKeyRequiredForSignature)
+        ));
+    }
+
+    #[test]
+    fn test_ed25519_jwk_conversion_fails() -> Result<()> {
+        let private_key = generate_key(KeyType::Ed25519Private)?;
+        let public_key = to_public(&private_key)?;
+
+        let private_jwk: Result<elliptic_curve::JwkEcKey, _> = (&private_key).try_into();
+        assert!(matches!(
+            private_jwk,
+            Err(KeyError::JWKConversionFailed { .. })
+        ));
+
+        let public_jwk: Result<elliptic_curve::JwkEcKey, _> = (&public_key).try_into();
+        assert!(matches!(
+            public_jwk,
+            Err(KeyError::JWKConversionFailed { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_cross_curve_verification_fails() -> Result<()> {
+        let ed25519_key = generate_key(KeyType::Ed25519Private)?;
+        let p256_key = generate_key(KeyType::P256Private)?;
+        let k256_key = generate_key(KeyType::K256Private)?;
+
+        let ed25519_public = to_public(&ed25519_key)?;
+        let p256_public = to_public(&p256_key)?;
+        let k256_public = to_public(&k256_key)?;
+
+        let content = b"cross curve ed25519 test";
+
+        let ed25519_sig = sign(&ed25519_key, content)?;
+        let p256_sig = sign(&p256_key, content)?;
+        let k256_sig = sign(&k256_key, content)?;
+
+        // Each signature verifies with its own key
+        validate(&ed25519_public, &ed25519_sig, content)?;
+        validate(&p256_public, &p256_sig, content)?;
+        validate(&k256_public, &k256_sig, content)?;
+
+        // Cross-verification should fail
+        assert!(validate(&ed25519_public, &p256_sig, content).is_err());
+        assert!(validate(&ed25519_public, &k256_sig, content).is_err());
+        assert!(validate(&p256_public, &ed25519_sig, content).is_err());
+        assert!(validate(&k256_public, &ed25519_sig, content).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_deterministic_signatures() -> Result<()> {
+        // Ed25519 signatures are deterministic (unlike ECDSA)
+        let private_key = generate_key(KeyType::Ed25519Private)?;
+        let content = b"deterministic signature test";
+
+        let sig1 = sign(&private_key, content)?;
+        let sig2 = sign(&private_key, content)?;
+        assert_eq!(sig1, sig2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiformat_encode_ed25519() -> Result<()> {
+        let key = generate_key(KeyType::Ed25519Private)?;
+        let message = b"test message for ed25519 multiformat";
+        let signature = sign(&key, message)?;
+
+        let encoded = multiformat_encode(key.key_type(), &signature);
+
+        // Verify base58btc prefix
+        assert!(encoded.starts_with('z'));
+
+        // Decode and verify EdDSA multicodec prefix
+        let (_, decoded) = multibase::decode(&encoded)?;
+        assert_eq!(&decoded[..3], &EDDSA_SIGNATURE_MULTICODEC);
+
+        // Verify signature bytes are preserved
+        assert_eq!(&decoded[3..], &signature[..]);
 
         Ok(())
     }

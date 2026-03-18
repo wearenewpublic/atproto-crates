@@ -46,7 +46,7 @@ use crate::errors::AturiError;
 ///
 /// This struct provides validated access to these components after successful parsing
 /// and implements `Display` for reconstructing the original URI format.
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 #[derive(Clone)]
 pub struct ATURI {
     /// The authority component as a DID (e.g., "did:plc:abc123")
@@ -89,7 +89,7 @@ impl FromStr for ATURI {
 
         let did = match parse_input(authority) {
             Ok(InputType::Handle(_)) => return Err(AturiError::HandleNotSupported),
-            Ok(InputType::Plc(did)) | Ok(InputType::Web(did)) => did,
+            Ok(InputType::Plc(did)) | Ok(InputType::Web(did)) | Ok(InputType::WebVH(did)) => did,
             Err(error) => return Err(AturiError::AuthorityParsingFailed { error }),
         };
 

@@ -35,7 +35,7 @@ pub const STRONG_REF_NSID: &str = "com.atproto.repo.strongRef";
 /// let typed_ref = TypedStrongRef::new(strong_ref);
 /// ```
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct StrongRef {
     /// AT URI pointing to a specific record
     /// Format: `at://[did]/[collection]/[rkey]`

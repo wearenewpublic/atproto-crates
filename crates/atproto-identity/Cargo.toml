@@ -64,8 +64,10 @@ chrono.workspace = true
 clap = { workspace = true, optional = true }
 data-encoding.workspace = true
 ecdsa.workspace = true
+ed25519-dalek.workspace = true
 elliptic-curve.workspace = true
 hickory-resolver = { workspace = true, optional = true }
+idna.workspace = true
 k256 = { workspace = true, features = ["jwk"] }
 lru = { workspace = true, optional = true }
 multibase.workspace = true

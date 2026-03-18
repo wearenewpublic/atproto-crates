@@ -40,7 +40,7 @@ pub const AWARD_NSID: &str = "community.lexicon.badge.award";
 /// let typed_badge = TypedDefinition::new(badge);
 /// ```
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Definition {
     /// Name of the badge
     pub name: String,
@@ -94,7 +94,7 @@ pub type TypedDefinition = TypedLexicon<Definition>;
 /// let typed_award = TypedAward::new(award);
 /// ```
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Award {
     /// Reference to the badge definition being awarded
     pub badge: StrongRef,
