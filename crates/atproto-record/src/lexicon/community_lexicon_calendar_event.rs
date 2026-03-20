@@ -156,6 +156,11 @@ pub struct AspectRatio {
 /// Used as the `$type` field value for media attachments associated with events.
 pub const MEDIA_NSID: &str = "community.lexicon.calendar.event#media";
 
+/// Default value for the media role field.
+fn default_role() -> String {
+    "banner".to_string()
+}
+
 /// Media structure for event-related visual content.
 ///
 /// Represents images, videos, or other media associated with an event.
@@ -166,9 +171,11 @@ pub struct Media {
     pub content: TypedBlob,
 
     /// Alternative text description for accessibility
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub alt: String,
 
     /// The role/purpose of this media (e.g., "banner", "poster", "thumbnail")
+    #[serde(default = "default_role")]
     pub role: String,
 
     /// Optional aspect ratio information

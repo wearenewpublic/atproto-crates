@@ -303,6 +303,35 @@ pub enum PLCDIDError {
         /// Details about the invalid timestamp
         details: String,
     },
+
+    /// Occurs when submitting an operation to the PLC directory fails
+    #[error("error-atproto-identity-plc-25 Submission failed: {url} status {status}: {body}")]
+    SubmissionFailed {
+        /// The URL that was requested
+        url: String,
+        /// The HTTP status code
+        status: u16,
+        /// The response body
+        body: String,
+    },
+
+    /// Occurs when fetching the audit log from the PLC directory fails
+    #[error("error-atproto-identity-plc-26 Audit log fetch failed: {url} {error}")]
+    AuditLogFetchFailed {
+        /// The URL that was requested
+        url: String,
+        /// The underlying HTTP error
+        error: reqwest::Error,
+    },
+
+    /// Occurs when the audit log response cannot be parsed
+    #[error("error-atproto-identity-plc-27 Audit log parse failed: {url} {error}")]
+    AuditLogParseFailed {
+        /// The URL that was requested
+        url: String,
+        /// The underlying parse error
+        error: reqwest::Error,
+    },
 }
 
 /// Error types that can occur when working with cryptographic keys
@@ -569,6 +598,27 @@ pub enum WebVHDIDError {
     #[error("error-atproto-identity-webvh-23 Hostname normalization failed: {details}")]
     HostnameNormalizationFailed {
         /// Details about the normalization failure
+        details: String,
+    },
+
+    /// Occurs when genesis document creation fails
+    #[error("error-atproto-identity-webvh-24 Genesis creation failed: {details}")]
+    GenesisCreationFailed {
+        /// Details about the creation failure
+        details: String,
+    },
+
+    /// Occurs when update entry creation fails
+    #[error("error-atproto-identity-webvh-25 Update creation failed: {details}")]
+    UpdateCreationFailed {
+        /// Details about the creation failure
+        details: String,
+    },
+
+    /// Occurs when signing a log entry fails
+    #[error("error-atproto-identity-webvh-26 Signing failed: {details}")]
+    SigningFailed {
+        /// Details about the signing failure
         details: String,
     },
 }

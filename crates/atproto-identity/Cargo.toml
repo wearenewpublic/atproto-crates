@@ -56,6 +56,13 @@ bench = false
 doc = true
 required-features = ["clap"]
 
+[[bin]]
+name = "atpdid"
+test = false
+bench = false
+doc = true
+required-features = ["clap", "hickory-dns"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

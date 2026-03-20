@@ -33,6 +33,18 @@ All CLI tools now use clap for consistent command-line argument processing. Use 
 - **Verify records**: `cargo run --package atproto-attestation --features clap,tokio --bin atproto-attestation-verify -- <record>` (verifies all signatures)
 - **Verify attestation**: `cargo run --package atproto-attestation --features clap,tokio --bin atproto-attestation-verify -- <record> <attestation>` (verifies specific attestation)
 
+#### DID Management (atpdid)
+- **Generate keys**: `cargo run --features clap,hickory-dns --bin atpdid -- key generate p256` (supports p256, p384, k256, ed25519)
+- **Inspect keys**: `cargo run --features clap,hickory-dns --bin atpdid -- key inspect <did_key> [--jwk]`
+- **Resolve identities**: `cargo run --features clap,hickory-dns --bin atpdid -- resolve <handle_or_did> [--document]`
+- **Verify PLC audit log**: `cargo run --features clap,hickory-dns --bin atpdid -- plc verify <did_or_handle> [--verbose]`
+- **Create PLC identity**: `cargo run --features clap,hickory-dns --bin atpdid -- plc create --rotation-key <key>`
+- **Update PLC identity**: `cargo run --features clap,hickory-dns --bin atpdid -- plc update <did> --signing-key <key>`
+- **Submit PLC operation**: `cargo run --features clap,hickory-dns --bin atpdid -- plc submit <json> --did <did>`
+- **Verify did:webvh**: `cargo run --features clap,hickory-dns --bin atpdid -- webvh verify <did> [--verbose]`
+- **Create did:webvh**: `cargo run --features clap,hickory-dns --bin atpdid -- webvh create --hostname <host>`
+- **Update did:webvh**: `cargo run --features clap,hickory-dns --bin atpdid -- webvh update <did> --signing-key <key> --log-file <path> --state <json>`
+
 #### DASL Operations
 - **Compute CID**: `cargo run --features clap --bin atpcid -- '<json_or_data>'` (auto-detects record vs raw CID; use `-` for stdin, `--raw` to force RAW CID, `--record` to force DAG-CBOR record CID)
 
@@ -67,7 +79,7 @@ A comprehensive Rust workspace with multiple crates:
 - **atproto-xrpcs-helloworld**: Complete example XRPC service
 
 Features:
-- **13 CLI tools** with consistent clap-based command-line interfaces (optional via `clap` feature)
+- **14 CLI tools** with consistent clap-based command-line interfaces (optional via `clap` feature)
 - **Rust edition 2024** with modern async/await patterns
 - **Comprehensive error handling** with structured error types
 - **Full test coverage** with unit tests across all modules
@@ -163,6 +175,9 @@ struct Args {
 
 #### DASL Operations (atproto-dasl)
 - **`crates/atproto-dasl/src/bin/atpcid.rs`**: Compute CIDs from input data (auto-detects DAG-CBOR record vs RAW CID)
+
+#### DID Management (atproto-identity)
+- **`src/bin/atpdid.rs`**: Unified DID management tool — key generation/inspection, identity resolution, PLC audit/create/update/submit, and did:webvh verify/create/update
 
 #### Identity Management (atproto-identity)
 - **`src/bin/atproto-identity-resolve.rs`**: Resolve AT Protocol handles and DIDs to canonical identifiers

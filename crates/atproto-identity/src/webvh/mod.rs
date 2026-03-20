@@ -18,6 +18,7 @@
 //! 3. Process each log entry sequentially with full verification
 //! 4. Return the latest DID document
 
+pub mod create;
 pub mod jcs;
 pub mod log;
 pub mod model;
