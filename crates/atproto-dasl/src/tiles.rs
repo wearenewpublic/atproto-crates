@@ -23,7 +23,7 @@ pub const MAX_NAME_CHARS: usize = 1000;
 pub const MAX_NAME_GRAPHEMES: usize = 100;
 
 /// Default Content-Security-Policy for tile execution.
-pub const DEFAULT_CSP: &str = "default-src 'self' blob: data:; script-src 'self' blob: data: 'unsafe-inline' 'wasm-unsafe-eval'; plugin-types 'none'; manifest-src 'none'; base-uri 'none'";
+pub const DEFAULT_CSP: &str = "default-src 'self' blob: data:; script-src 'self' blob: data: 'unsafe-inline' 'wasm-unsafe-eval'; media-src 'self' blob: data:; manifest-src 'none'; base-uri 'none'";
 
 /// Default sandbox attributes for tile execution.
 pub const SANDBOX_ATTRS: &str =

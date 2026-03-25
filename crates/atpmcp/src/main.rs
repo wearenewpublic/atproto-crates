@@ -141,13 +141,13 @@ fn handle_tools_list() -> Value {
         "tools": [
             {
                 "name": "create_record_cid",
-                "description": "Compute the DAG-CBOR CID for a JSON record. Accepts a JSON object, serializes it to DAG-CBOR, hashes with SHA-256, and returns the CIDv1 string.",
+                "description": "Serializes a JSON record to deterministic DAG-CBOR, hashes it with SHA-256, and returns a CIDv1 base32 string. Use this when you need to verify record integrity, compare records, or pre-compute CIDs for AT Protocol operations. Returns an error if the record cannot be serialized to DAG-CBOR.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "record": {
                             "type": "object",
-                            "description": "The JSON record object to compute a CID for."
+                            "description": "The JSON record object to compute a CID for (e.g. {\"$type\": \"app.bsky.feed.post\", \"text\": \"Hello\", \"createdAt\": \"2024-01-01T00:00:00.000Z\"})."
                         }
                     },
                     "required": ["record"],
@@ -156,13 +156,13 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "validate_lexicon_schema",
-                "description": "Validate a lexicon schema object. Accepts a JSON object representing a lexicon schema and validates its structure, version, NSID, and definitions.",
+                "description": "Validates an AT Protocol lexicon schema, checking version, NSID, and definition structure. Use this when building or reviewing a Lexicon schema to verify it conforms to the specification before publishing. Returns validation errors describing which fields are invalid or missing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "schema": {
                             "type": "object",
-                            "description": "The lexicon schema to validate."
+                            "description": "The lexicon schema object to validate. Must include 'lexicon' (version integer), 'id' (NSID string), and 'defs' (definitions object)."
                         }
                     },
                     "required": ["schema"],
@@ -171,13 +171,13 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "resolve_handle_to_did",
-                "description": "Resolve an AT Protocol handle to its DID. Accepts a handle string (e.g. 'alice.bsky.social') and returns the resolved DID (e.g. 'did:plc:abc123').",
+                "description": "Resolves an AT Protocol handle (e.g. 'alice.bsky.social') to its DID identifier. Use this when you have a user's handle and need their DID for API calls or record lookups. Returns an error if the handle cannot be resolved via DNS or HTTP.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "handle": {
                             "type": "string",
-                            "description": "The AT Protocol handle to resolve."
+                            "description": "The AT Protocol handle to resolve (e.g. 'alice.bsky.social')."
                         }
                     },
                     "required": ["handle"],
@@ -186,13 +186,13 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "resolve_identity",
-                "description": "Resolve a DID to its full DID document. Accepts a DID string and returns the complete DID document as JSON.",
+                "description": "Retrieves the full DID document for a given DID, with optional PLC directory override. Use this when you need to inspect verification methods, service endpoints, or rotation keys for an identity. Returns an error if the DID cannot be resolved or the document is malformed.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "did": {
                             "type": "string",
-                            "description": "The DID to resolve."
+                            "description": "The DID to resolve (e.g. 'did:plc:ewvi7nxzyoun6zhxrhs64oiz' or 'did:web:example.com')."
                         },
                         "plc_directory_hostname": {
                             "type": "string",
@@ -205,13 +205,13 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "parse_facets",
-                "description": "Parse rich text facets (mentions, URLs, and hashtags) from plain text. Returns AT Protocol facets with correct UTF-8 byte offsets. Mentions are resolved to DIDs when possible.",
+                "description": "Extracts rich text facets (mentions, URLs, hashtags) from plain text with UTF-8 byte offsets, resolving mentions to DIDs when possible. Use this when composing a Bluesky post that contains mentions, links, or hashtags to generate the required facets array. Returns an empty array if no facets are found; unresolvable mentions are included without a DID.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "text": {
                             "type": "string",
-                            "description": "The plain text to parse for facets."
+                            "description": "The plain text to parse for facets (e.g. 'Hello @alice.bsky.social check out https://example.com #atproto')."
                         }
                     },
                     "required": ["text"],
@@ -220,7 +220,7 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "get_record",
-                "description": "Retrieve an AT Protocol record by AT-URI. Resolves the identity, finds the PDS endpoint, and retrieves the record using com.atproto.repo.getRecord with unauthenticated access.",
+                "description": "Retrieves an AT Protocol record by AT-URI, resolving identity and PDS endpoint automatically. Use this when you need to fetch a specific record such as a post, profile, or follow. Returns an error if the AT-URI is malformed, the identity cannot be resolved, or the record does not exist.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -230,7 +230,7 @@ fn handle_tools_list() -> Value {
                         },
                         "cid": {
                             "type": "string",
-                            "description": "Specific version CID to retrieve."
+                            "description": "Optional CID to retrieve a specific version of the record (e.g. 'bafyreig2...')."
                         },
                         "plc_directory_hostname": {
                             "type": "string",
@@ -243,7 +243,7 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "get_lexicon",
-                "description": "Fetch a lexicon schema record by NSID. Resolves the authority from the NSID via DNS if no repository is provided, then retrieves the lexicon from the repository's PDS.",
+                "description": "Retrieves and describes an AT Protocol lexicon schema by NSID, returning its definitions, required fields, and structure. Use this when you need to inspect the schema for a record type or XRPC method before constructing records or API calls. Returns an error if the NSID authority cannot be resolved or the lexicon record is not found.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -253,7 +253,7 @@ fn handle_tools_list() -> Value {
                         },
                         "repo": {
                             "type": "string",
-                            "description": "Optional repository DID or handle. If omitted, the authority is resolved from the NSID via DNS."
+                            "description": "Optional repository DID or handle for lexicon resolution (e.g. 'did:plc:ewvi7nxzyoun6zhxrhs64oiz'). If omitted, the authority is resolved from the NSID via DNS."
                         }
                     },
                     "required": ["nsid"],
@@ -262,7 +262,7 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "validate_xrpc",
-                "description": "Validate XRPC parameters and input body against a lexicon schema. Fetches the lexicon for the given NSID, determines whether it defines a query or procedure, and validates the provided params and/or body accordingly.",
+                "description": "Validates XRPC request parameters and body against an AT Protocol lexicon schema, catching missing or invalid input before making a call. Use this before calling invoke_xrpc to verify that your parameters and body conform to the method's lexicon. Returns validation errors listing which fields are invalid or missing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -272,11 +272,11 @@ fn handle_tools_list() -> Value {
                         },
                         "params": {
                             "type": "object",
-                            "description": "Query or procedure parameters to validate."
+                            "description": "Query or procedure parameters to validate (e.g. {\"repo\": \"alice.bsky.social\"})."
                         },
                         "body": {
                             "type": "object",
-                            "description": "Procedure input body to validate."
+                            "description": "Procedure input body to validate as a JSON object."
                         },
                         "repo": {
                             "type": "string",
@@ -289,7 +289,7 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "invoke_xrpc",
-                "description": "Make an XRPC request to an AT Protocol service. Supports queries (GET) and procedures (POST). If a JSON body is provided, a POST is made; otherwise GET. Supports unauthenticated, authenticated (via stored atpxrpc credentials), and proxied requests (via the atproto-proxy header through the authenticated user's PDS).",
+                "description": "Invokes an XRPC method on an AT Protocol service, supporting both queries (GET) and procedures (POST) with optional authentication and proxied requests. Use this when you need to make API calls to a PDS or AppView service. Requires one of endpoint, identity, or auth_handle to determine the target service. Returns the HTTP error response from the service on failure.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -299,24 +299,24 @@ fn handle_tools_list() -> Value {
                         },
                         "params": {
                             "type": "object",
-                            "description": "Query parameters as key-value string pairs for GET requests.",
+                            "description": "Query parameters as key-value string pairs (e.g. {\"repo\": \"alice.bsky.social\", \"collection\": \"app.bsky.feed.post\"}).",
                             "additionalProperties": { "type": "string" }
                         },
                         "body": {
                             "type": "object",
-                            "description": "JSON body for POST (procedure) requests. If present, the request is a POST."
+                            "description": "JSON body for POST (procedure) requests. If present, the request is sent as POST; otherwise GET."
                         },
                         "endpoint": {
                             "type": "string",
-                            "description": "Explicit service endpoint URL (e.g. 'https://bsky.network'). Either endpoint, identity, or auth_handle is required."
+                            "description": "Explicit service endpoint URL (e.g. 'https://bsky.network'). One of endpoint, identity, or auth_handle is required."
                         },
                         "identity": {
                             "type": "string",
-                            "description": "Handle or DID to resolve for PDS endpoint discovery. Either endpoint, identity, or auth_handle is required."
+                            "description": "Handle or DID to resolve for PDS endpoint discovery (e.g. 'alice.bsky.social' or 'did:plc:ewvi7nxzyoun6zhxrhs64oiz'). One of endpoint, identity, or auth_handle is required."
                         },
                         "auth_handle": {
                             "type": "string",
-                            "description": "Handle of a stored atpxrpc account for authenticated requests. If omitted, the request is unauthenticated."
+                            "description": "Handle of a stored atpxrpc account for authenticated requests (e.g. 'alice.bsky.social'). Configure credentials via the atpxrpc CLI. If omitted, the request is unauthenticated."
                         },
                         "proxy": {
                             "type": "string",
@@ -329,17 +329,17 @@ fn handle_tools_list() -> Value {
             },
             {
                 "name": "generate_tid",
-                "description": "Generate AT Protocol Timestamp Identifiers (TIDs). TIDs are 13-character base32-sortable strings used as record keys. Optionally generate multiple TIDs or generate from a specific microsecond timestamp.",
+                "description": "Generates AT Protocol Timestamp Identifiers (TIDs). TIDs are 13-character base32-sortable strings used as record keys. Use this when creating new records that require a TID as the record key (rkey). Returns an error if count exceeds 100.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "count": {
                             "type": "integer",
-                            "description": "Number of TIDs to generate (default 1, max 100)."
+                            "description": "Number of TIDs to generate (default 1, max 100). Example: 5."
                         },
                         "timestamp_micros": {
                             "type": "integer",
-                            "description": "Specific microsecond UNIX timestamp to generate from. If omitted, uses current time."
+                            "description": "Specific microsecond UNIX timestamp to generate from (e.g. 1704067200000000 for 2024-01-01T00:00:00Z). If omitted, uses current time."
                         }
                     },
                     "additionalProperties": false

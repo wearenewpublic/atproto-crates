@@ -26,6 +26,7 @@
 //!
 //! - [`format`](crate::datetime::format) - Required datetime field serialization with RFC 3339 millisecond precision
 //! - [`optional_format`](crate::datetime::optional_format) - Optional datetime field serialization with proper None handling
+//! - [`lenient_optional_format`](crate::datetime::lenient_optional_format) - Lenient optional datetime deserialization that tolerates malformed values
 
 /// Required datetime field serialization with RFC 3339 formatting.
 ///
@@ -92,5 +93,46 @@ pub mod optional_format {
             .map(|v| v.with_timezone(&Utc))
             .map_err(serde::de::Error::custom)
             .map(Some)
+    }
+}
+
+/// Lenient optional datetime deserialization that tolerates malformed values.
+///
+/// This module accepts any JSON value for deserialization. Valid RFC 3339 strings produce
+/// `Some(DateTime<Utc>)`, while all other values (objects, nulls, numbers, arrays, booleans,
+/// or unparseable strings) produce `None` without error. Serialization matches `optional_format`.
+///
+/// Use with `#[serde(default, with = "atproto_record::datetime::lenient_optional_format")]`
+/// on `Option<DateTime<Utc>>` fields where the data source may contain garbage values.
+pub mod lenient_optional_format {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serializes an `Option<DateTime<Utc>>` to RFC 3339 string or null.
+    pub fn serialize<S>(date: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(d) => {
+                let s = d.to_rfc3339_opts(SecondsFormat::Millis, true);
+                serializer.serialize_str(&s)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Deserializes any JSON value to `Option<DateTime<Utc>>`, returning `None` for non-string or unparseable values.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(s) => Ok(DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|v| v.with_timezone(&Utc))),
+            _ => Ok(None),
+        }
     }
 }

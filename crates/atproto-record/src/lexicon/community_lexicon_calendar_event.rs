@@ -712,4 +712,38 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_event_with_malformed_created_at() {
+        let json_str = r#"{
+            "mode": "community.lexicon.calendar.event#inperson",
+            "name": "Lunch at Copelands!",
+            "uris": [
+              {
+                "uri": "lsdfaopkljdfs/940340cce37871e3f224f.jpg",
+                "name": "Event Image"
+              }
+            ],
+            "$type": "community.lexicon.calendar.event",
+            "endsAt": null,
+            "status": "community.lexicon.calendar.event#scheduled",
+            "startsAt": "2025-04-12T16:00:00.000Z",
+            "createdAt": {},
+            "locations": [
+              {
+                "lat": 33.87734358679921,
+                "lon": -84.45593029260637,
+                "type": "community.lexicon.location.geo",
+                "description": "Copeland's, 3101, Cobb Parkway South, Riverwood, Atlanta, Cobb County, Georgia, 30339, United States"
+              }
+            ],
+            "description": "Lunch!!&nbsp; first one for 2025"
+        }"#;
+
+        let result = serde_json::from_str::<TypedEvent>(json_str);
+        assert!(
+            result.is_err(),
+            "Malformed createdAt (empty object) should fail deserialization"
+        );
+    }
 }
