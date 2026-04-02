@@ -1,6 +1,6 @@
 [package]
 name = "atproto-lexicon"
-version = "0.14.3"
+version = "0.14.4"
 description = "AT Protocol lexicon resolution and validation"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -26,6 +26,7 @@ default = ["hickory-dns"]
 zeroize = ["dep:zeroize"]
 hickory-dns = ["dep:hickory-resolver"]
 clap = ["dep:clap"]
+panproto = ["dep:panproto-core"]
 
 [dependencies]
 atproto-dasl.workspace = true
@@ -47,6 +48,7 @@ tracing.workspace = true
 unicode-segmentation.workspace = true
 zeroize = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
+panproto-core = { workspace = true, optional = true }
 
 [lints]
 workspace = true

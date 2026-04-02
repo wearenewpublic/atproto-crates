@@ -20,6 +20,8 @@
 //! - [`errors`]: Structured error types for all lexicon operations
 //! - [`resolve`]: Core lexicon resolution implementation
 //! - [`resolve_recursive`]: Recursive resolution with dependency tracking
+//! - [`transmogrify`]: Record transformation between lexicon schemas
+//! - [`compatibility`]: Schema compatibility analysis (requires `panproto` feature)
 //! - [`validation`]: NSID validation, parsing, and helper functions
 //!
 //! ## Example Usage
@@ -47,4 +49,8 @@
 pub mod errors;
 pub mod resolve;
 pub mod resolve_recursive;
+pub mod transmogrify;
 pub mod validation;
+
+#[cfg(feature = "panproto")]
+pub mod compatibility;

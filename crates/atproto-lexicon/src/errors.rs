@@ -9,6 +9,8 @@
 //! - **`LexiconResolveError`** (lexicon-resolve-1 to lexicon-resolve-6): Errors during lexicon resolution
 //! - **`LexiconValidationError`** (lexicon-validation-1 to lexicon-validation-8): Validation errors for NSIDs and schemas
 //! - **`LexiconSchemaError`** (lexicon-schema-1 to lexicon-schema-4): Schema parsing and structure errors
+//! - **`TransmogrifyError`** (lexicon-transmogrify-1 to lexicon-transmogrify-6): Record transmogrification errors
+//! - **`CompatibilityError`** (lexicon-compat-1 to lexicon-compat-2): Schema compatibility analysis errors
 //!
 //! ## Error Format
 //!
@@ -146,6 +148,61 @@ pub enum LexiconRecursiveError {
     /// Failed to resolve any lexicons during recursive resolution.
     #[error("error-atproto-lexicon-recursive-1 Failed to resolve any lexicons")]
     NoLexiconsResolved,
+}
+
+/// Errors that can occur during record transmogrification.
+#[derive(Debug, Error)]
+pub enum TransmogrifyError {
+    /// Source schema parsing failed.
+    #[error("error-atproto-lexicon-transmogrify-1 Failed to parse source schema: {0}")]
+    ParseFrom(String),
+
+    /// Destination schema parsing failed.
+    #[error("error-atproto-lexicon-transmogrify-2 Failed to parse destination schema: {0}")]
+    ParseTo(String),
+
+    /// No morphism found between source and destination schemas.
+    #[error(
+        "error-atproto-lexicon-transmogrify-3 No morphism found between source and destination schemas"
+    )]
+    NoMorphismFound,
+
+    /// Failed to compile migration between schemas.
+    #[error("error-atproto-lexicon-transmogrify-4 Failed to compile migration: {0}")]
+    CompileFailed(String),
+
+    /// Failed to parse record against source schema.
+    #[error("error-atproto-lexicon-transmogrify-5 Failed to parse record: {0}")]
+    ParseRecord(String),
+
+    /// Failed to lift record to destination schema.
+    #[error(
+        "error-atproto-lexicon-transmogrify-6 Failed to lift record to destination schema: {0}"
+    )]
+    LiftFailed(String),
+
+    /// Failed to resolve a lexicon schema during transmogrification.
+    #[error(
+        "error-atproto-lexicon-transmogrify-7 Schema resolution failed for '{nsid}': {details}"
+    )]
+    SchemaResolveFailed {
+        /// The NSID that failed to resolve.
+        nsid: String,
+        /// Details about the failure.
+        details: String,
+    },
+}
+
+/// Errors that can occur during schema compatibility analysis.
+#[derive(Debug, Error)]
+pub enum CompatibilityError {
+    /// Failed to parse the source ('from') schema.
+    #[error("error-atproto-lexicon-compat-1 Failed to parse source schema: {0}")]
+    ParseFrom(String),
+
+    /// Failed to parse the destination ('to') schema.
+    #[error("error-atproto-lexicon-compat-2 Failed to parse destination schema: {0}")]
+    ParseTo(String),
 }
 
 // Re-export the validation error for backwards compatibility during migration

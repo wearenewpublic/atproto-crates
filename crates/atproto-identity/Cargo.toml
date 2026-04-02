@@ -1,6 +1,6 @@
 [package]
 name = "atproto-identity"
-version = "0.14.3"
+version = "0.14.4"
 description = "AT Protocol identity management - DID resolution, handle resolution, and cryptographic operations"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

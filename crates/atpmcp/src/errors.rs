@@ -70,4 +70,11 @@ pub enum ToolError {
         /// Description of the validation failure.
         reason: String,
     },
+
+    /// Record transmogrification failed.
+    #[error("error-atpmcp-tool-10 Transmogrification failed: {reason}")]
+    TransmogrifyFailed {
+        /// Description of the transmogrification failure.
+        reason: String,
+    },
 }

@@ -23,6 +23,7 @@
 //! - `get_lexicon` — Fetch a lexicon schema record by NSID
 //! - `validate_xrpc` — Validate XRPC parameters against a lexicon schema
 //! - `invoke_xrpc` — Make an XRPC request to an AT Protocol service
+//! - `transmogrify_record` — Transform a record from one lexicon schema to another
 
 mod errors;
 
@@ -36,6 +37,8 @@ use atproto_client::client::{
 use atproto_client::com::atproto::server::{create_session, refresh_session};
 use atproto_identity::resolve::{HickoryDnsResolver, InnerIdentityResolver};
 use atproto_identity::url::build_url;
+use atproto_lexicon::resolve::DefaultLexiconResolver;
+use atproto_lexicon::transmogrify::{TransmogrifyMappings, transmogrify_record};
 use errors::ToolError;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -344,6 +347,44 @@ fn handle_tools_list() -> Value {
                     },
                     "additionalProperties": false
                 }
+            },
+            {
+                "name": "transmogrify_record",
+                "description": "Transforms an AT Protocol record from one lexicon schema to another using schema morphism discovery with JSON-level property matching as a fallback. Use this when you need to convert a record between similar but different lexicon types (e.g., converting a post from one app's schema to another). Accepts the source record JSON directly along with source and destination NSIDs, fetches both lexicon schemas, then maps fields using structural morphisms or name matching with optional caller-provided overrides. Returns the transformed record JSON with a morphism quality score (0.0–1.0). Returns an error if the schemas cannot be fetched or if no fields can be matched between source and destination.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "record": {
+                            "type": "object",
+                            "description": "The source record JSON object to transform (e.g. {\"$type\": \"app.bsky.feed.post\", \"text\": \"Hello\", \"createdAt\": \"2024-01-01T00:00:00.000Z\"})."
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "The source lexicon NSID of the record (e.g. 'app.bsky.feed.post')."
+                        },
+                        "destination": {
+                            "type": "string",
+                            "description": "The destination lexicon NSID to transform the record into (e.g. 'com.example.feed.post')."
+                        },
+                        "mappings": {
+                            "type": "object",
+                            "description": "Optional mappings to guide the transformation when automatic field matching is insufficient.",
+                            "properties": {
+                                "field_mappings": {
+                                    "type": "object",
+                                    "description": "Source field name to destination field name mappings. Supports dot-notation for nested paths (e.g. {\"content.url\": \"embed.external.uri\"}).",
+                                    "additionalProperties": { "type": "string" }
+                                },
+                                "defaults": {
+                                    "type": "object",
+                                    "description": "Default values for destination fields not matched from the source. Supports dot-notation for nested paths (e.g. {\"embed.$type\": \"app.bsky.embed.external\"})."
+                                }
+                            }
+                        }
+                    },
+                    "required": ["record", "source", "destination"],
+                    "additionalProperties": false
+                }
             }
         ]
     })
@@ -390,6 +431,9 @@ async fn handle_tools_call(
             JsonRpcResponse::success(id, handle_invoke_xrpc(arguments, resolver).await)
         }
         "generate_tid" => JsonRpcResponse::success(id, handle_generate_tid(arguments)),
+        "transmogrify_record" => {
+            JsonRpcResponse::success(id, handle_transmogrify_record(arguments, resolver).await)
+        }
         _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("Unknown tool: {name}")),
     }
 }
@@ -1179,6 +1223,64 @@ fn handle_generate_tid(arguments: Value) -> Value {
     }
 }
 
+/// Execute the `transmogrify_record` tool.
+async fn handle_transmogrify_record(arguments: Value, resolver: &InnerIdentityResolver) -> Value {
+    let Some(record) = arguments.get("record").cloned() else {
+        return tool_error("The 'record' argument must be a JSON object.");
+    };
+    if !record.is_object() {
+        return tool_error("The 'record' argument must be a JSON object.");
+    }
+
+    let Some(source) = arguments.get("source").and_then(Value::as_str) else {
+        return tool_error("The 'source' argument must be a string.");
+    };
+    let Some(destination) = arguments.get("destination").and_then(Value::as_str) else {
+        return tool_error("The 'destination' argument must be a string.");
+    };
+
+    let mappings: Option<TransmogrifyMappings> = arguments
+        .get("mappings")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    let lexicon_resolver =
+        DefaultLexiconResolver::new(resolver.http_client.clone(), resolver.dns_resolver.clone());
+
+    match transmogrify_record(
+        &lexicon_resolver,
+        source,
+        destination,
+        &record,
+        mappings.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => {
+            let result_json = serde_json::to_string_pretty(&result.record)
+                .unwrap_or_else(|_| result.record.to_string());
+
+            tracing::info!(
+                source = %source,
+                destination = %destination,
+                quality = %result.quality,
+                "transmogrify_record completed"
+            );
+
+            tool_success(&format!(
+                "Transmogrified record from '{}' to '{}'.\n\nMorphism quality: {:.2}\n\nResult:\n```json\n{}\n```",
+                source, destination, result.quality, result_json
+            ))
+        }
+        Err(error) => {
+            let tool_err = ToolError::TransmogrifyFailed {
+                reason: error.to_string(),
+            };
+            tracing::error!(error = %error, "Transmogrification failed.");
+            tool_error(&tool_err.to_string())
+        }
+    }
+}
+
 /// Build a successful tool call result.
 fn tool_success(text: &str) -> Value {
     serde_json::json!({
@@ -1325,7 +1427,7 @@ mod tests {
     fn test_handle_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         assert_eq!(tools[0]["name"], "create_record_cid");
         assert_eq!(tools[1]["name"], "validate_lexicon_schema");
         assert_eq!(tools[2]["name"], "resolve_handle_to_did");

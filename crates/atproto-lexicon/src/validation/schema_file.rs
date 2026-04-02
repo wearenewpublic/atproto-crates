@@ -66,14 +66,22 @@ impl SchemaFile {
                 message: "lexicon must have at least one definition".to_string(),
             });
         }
-        if !self.defs.contains_key("main") {
+        let mut primary_count = 0;
+        for (name, def) in &self.defs {
+            if def.is_primary() {
+                primary_count += 1;
+                if name != "main" {
+                    return Err(DataValidationError::SchemaStructureInvalid {
+                        message: format!("primary type definition '{}' must be named 'main'", name),
+                    });
+                }
+            }
+        }
+        if primary_count > 1 {
             return Err(DataValidationError::SchemaStructureInvalid {
-                message: "lexicon must have a 'main' definition".to_string(),
+                message: "lexicon must have at most one primary type definition".to_string(),
             });
         }
-        if let Some(main_def) = self.defs.get("main")
-            && !main_def.is_primary()
-        {}
         for (name, _def) in &self.defs {
             validate_def_name(name)?;
         }
@@ -313,11 +321,34 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_main() {
+    fn test_lexicon_without_main() {
         let json =
             r#"{"lexicon": 1, "id": "com.example.test", "defs": {"other": {"type": "token"}}}"#;
         let result = SchemaFile::parse(json);
+        assert!(result.is_ok());
+        assert!(result.unwrap().main().is_none());
+    }
+
+    #[test]
+    fn test_defs_only_lexicon() {
+        let json = r#"{"lexicon": 1, "id": "com.example.defs", "defs": {"viewBasic": {"type": "object", "properties": {"name": {"type": "string"}}}, "viewDetailed": {"type": "object", "properties": {"name": {"type": "string"}, "bio": {"type": "string"}}}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        assert!(schema.main().is_none());
+        assert!(schema.get_def("viewBasic").is_some());
+        assert!(schema.get_def("viewDetailed").is_some());
+    }
+
+    #[test]
+    fn test_primary_type_must_be_named_main() {
+        let json = r#"{"lexicon": 1, "id": "com.example.test", "defs": {"other": {"type": "record", "record": {"type": "object", "properties": {"name": {"type": "string"}}}}}}"#;
+        let result = SchemaFile::parse(json);
         assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be named 'main'")
+        );
     }
 
     #[test]

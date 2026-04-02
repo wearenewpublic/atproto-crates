@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-04-02
+### Added
+- `transmogrify_record` tool to atpmcp MCP server
+- `transmogrify_record` function in atproto-lexicon library
+- Scenario triggers, parameter examples, and error guidance to atpmcp tool descriptions
+- `lenient_optional_format` datetime module and malformed `createdAt` test
+- Default values to `alt` and `role` fields in Media type
+- Unified `atpdid` CLI tool for DID management (key generate/inspect, resolve, PLC audit/create/update/submit, did:webvh verify/create/update)
+- did:webvh v1.0 resolution with full spec compliance
+- DiskRepository with `from_car` support
+
+### Changed
+- Made lexicon main definition optional per AT Protocol spec
+- Moved transmogrify and compatibility into atproto-lexicon library
+- Replaced deprecated `plugin-types` CSP directive with `media-src`
+
 ## [0.14.3] - 2026-03-12
 ### Added
 - Unknown variant to LocationOrRef and EventLocation enums for calendar events

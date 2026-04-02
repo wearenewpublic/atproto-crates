@@ -1,6 +1,6 @@
 [package]
 name = "atproto-xrpcs"
-version = "0.14.3"
+version = "0.14.4"
 description = "Core building blocks for implementing AT Protocol XRPC services with JWT authorization"
 edition.workspace = true
 rust-version.workspace = true

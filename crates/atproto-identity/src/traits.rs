@@ -26,6 +26,13 @@ pub trait DnsResolver: Send + Sync {
     async fn resolve_txt(&self, domain: &str) -> Result<Vec<String>, ResolveError>;
 }
 
+#[async_trait]
+impl<T: DnsResolver + ?Sized> DnsResolver for std::sync::Arc<T> {
+    async fn resolve_txt(&self, domain: &str) -> Result<Vec<String>, ResolveError> {
+        (**self).resolve_txt(domain).await
+    }
+}
+
 /// Trait for retrieving private keys by identifier.
 #[async_trait]
 /// Trait for resolving key references (e.g., DID verification methods) to [`KeyData`].
