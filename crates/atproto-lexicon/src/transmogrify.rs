@@ -177,7 +177,7 @@ pub fn transmogrify_with_refs(
     resolved_refs: Option<&HashMap<String, Value>>,
 ) -> Result<TransmogrifyResult, TransmogrifyError> {
     #[cfg(feature = "panproto")]
-    {
+    let panproto_result: Option<TransmogrifyResult> = {
         use panproto_core::inst;
         use panproto_core::mig;
         use panproto_core::mig::hom_search::{SearchOptions, morphism_to_migration};
@@ -209,49 +209,79 @@ pub fn transmogrify_with_refs(
                 ..SearchOptions::default()
             };
             let morphisms = mig::find_morphisms(&from_schema, &to_schema, &search_opts);
-            if let Some(morphism) = morphisms.into_iter().next() {
+            let strategy1 = morphisms.into_iter().next().and_then(|morphism| {
                 let quality = morphism.quality;
                 let migration = morphism_to_migration(&morphism);
-                if let Ok(compiled) = mig::compile(&from_schema, &to_schema, &migration)
-                    && let Ok(transformed) =
-                        mig::lift_wtype(&compiled, &from_schema, &to_schema, instance)
-                {
-                    let output = inst::to_json(&to_schema, &transformed);
-                    return Ok(TransmogrifyResult {
-                        record: output,
-                        quality,
-                    });
+                let compiled = mig::compile(&from_schema, &to_schema, &migration).ok()?;
+                let transformed =
+                    mig::lift_wtype(&compiled, &from_schema, &to_schema, instance).ok()?;
+                let output = inst::to_json(&to_schema, &transformed);
+                Some(TransmogrifyResult {
+                    record: output,
+                    quality,
+                })
+            });
+
+            if strategy1.is_some() {
+                strategy1
+            } else {
+                // Strategy 2: Overlap-based partial migration with left Kan extension
+                let overlap = mig::discover_overlap(&from_schema, &to_schema);
+                if !overlap.vertex_pairs.is_empty() {
+                    let mut migration = mig::Migration::empty();
+                    migration.vertex_map = overlap
+                        .vertex_pairs
+                        .iter()
+                        .map(|(l, r)| (l.clone(), r.clone()))
+                        .collect();
+                    migration.edge_map = overlap
+                        .edge_pairs
+                        .iter()
+                        .map(|(l, r)| (l.clone(), r.clone()))
+                        .collect();
+
+                    mig::compile(&from_schema, &to_schema, &migration)
+                        .ok()
+                        .and_then(|compiled| {
+                            mig::lift_wtype_sigma(&compiled, &to_schema, instance).ok()
+                        })
+                        .map(|transformed| {
+                            let output = inst::to_json(&to_schema, &transformed);
+                            let target_vertex_count = to_schema.vertices.len().max(1);
+                            let quality =
+                                overlap.vertex_pairs.len() as f64 / target_vertex_count as f64;
+                            TransmogrifyResult {
+                                record: output,
+                                quality,
+                            }
+                        })
+                } else {
+                    None
                 }
             }
-
-            // Strategy 2: Overlap-based partial migration with left Kan extension
-            let overlap = mig::discover_overlap(&from_schema, &to_schema);
-            if !overlap.vertex_pairs.is_empty() {
-                let mut migration = mig::Migration::empty();
-                migration.vertex_map = overlap
-                    .vertex_pairs
-                    .iter()
-                    .map(|(l, r)| (l.clone(), r.clone()))
-                    .collect();
-                migration.edge_map = overlap
-                    .edge_pairs
-                    .iter()
-                    .map(|(l, r)| (l.clone(), r.clone()))
-                    .collect();
-
-                if let Ok(compiled) = mig::compile(&from_schema, &to_schema, &migration)
-                    && let Ok(transformed) = mig::lift_wtype_sigma(&compiled, &to_schema, instance)
-                {
-                    let output = inst::to_json(&to_schema, &transformed);
-                    let target_vertex_count = to_schema.vertices.len().max(1);
-                    let quality = overlap.vertex_pairs.len() as f64 / target_vertex_count as f64;
-                    return Ok(TransmogrifyResult {
-                        record: output,
-                        quality,
-                    });
-                }
-            }
+        } else {
+            None
         }
+    };
+
+    #[cfg(feature = "panproto")]
+    if let Some(result) = panproto_result {
+        // When resolved_refs are provided, the JSON-level strategy may produce
+        // a better result because it handles $type rewriting for union fields.
+        // Compare both and return the higher-quality result.
+        if resolved_refs.is_some()
+            && let Ok(json_result) = transmogrify_json(
+                record_value,
+                from_schema_json,
+                to_schema_json,
+                mappings,
+                resolved_refs,
+            )
+            && json_result.quality >= result.quality
+        {
+            return Ok(json_result);
+        }
+        return Ok(result);
     }
 
     #[cfg(not(feature = "panproto"))]

@@ -323,8 +323,8 @@ impl Tid {
 
     /// Generates a random 10-bit clock identifier.
     fn random_clock_id() -> u16 {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let mut rng = rand::rng();
         (rng.next_u32() as u16) & (Self::CLOCK_ID_MASK as u16)
     }
 }

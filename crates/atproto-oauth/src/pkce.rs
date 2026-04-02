@@ -27,7 +27,7 @@
 //! - Implements the S256 code challenge method as specified in RFC 7636
 
 use base64::{Engine as _, engine::general_purpose};
-use rand::{Rng, distributions::Alphanumeric};
+use rand::distr::{Alphanumeric, SampleString};
 use sha2::{Digest, Sha256};
 
 /// Generates a PKCE code verifier and code challenge pair.
@@ -52,11 +52,7 @@ use sha2::{Digest, Sha256};
 /// assert!(!challenge.is_empty());
 /// ```
 pub fn generate() -> (String, String) {
-    let token: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(100)
-        .map(char::from)
-        .collect();
+    let token: String = Alphanumeric.sample_string(&mut rand::rng(), 100);
     (token.clone(), challenge(&token))
 }
 

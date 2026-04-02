@@ -1,6 +1,6 @@
 [package]
 name = "atproto-attestation"
-version = "0.14.4"
+version = "0.14.5"
 description = "AT Protocol attestation utilities for creating and verifying record signatures"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -40,10 +40,10 @@ sha2.workspace = true
 thiserror.workspace = true
 
 cid.workspace = true
-elliptic-curve = { version = "0.13", default-features = false, features = ["std"] }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+elliptic-curve = { workspace = true, features = ["std"] }
+k256 = { workspace = true, features = ["ecdsa", "std"] }
 multihash.workspace = true
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256 = { workspace = true, features = ["ecdsa", "std"] }
 
 async-trait = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }

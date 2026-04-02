@@ -72,7 +72,7 @@
 
 use atproto_identity::key::KeyData;
 use chrono::{DateTime, Utc};
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distr::{Alphanumeric, SampleString};
 use reqwest_chain::ChainMiddleware;
 use reqwest_middleware::ClientBuilder;
 use serde::Deserialize;
@@ -290,7 +290,7 @@ pub async fn oauth_init_with_prompt(
         .try_into()
         .map_err(OAuthClientError::JWTHeaderCreationFailed)?;
 
-    let client_assertion_jti = Alphanumeric.sample_string(&mut rand::thread_rng(), 30);
+    let client_assertion_jti = Alphanumeric.sample_string(&mut rand::rng(), 30);
     let client_assertion_claims = Claims::new(JoseClaims {
         issuer: Some(oauth_client.client_id.clone()),
         subject: Some(oauth_client.client_id.clone()),
@@ -389,7 +389,7 @@ pub async fn oauth_complete(
         .try_into()
         .map_err(OAuthClientError::JWTHeaderCreationFailed)?;
 
-    let client_assertion_jti = Alphanumeric.sample_string(&mut rand::thread_rng(), 30);
+    let client_assertion_jti = Alphanumeric.sample_string(&mut rand::rng(), 30);
     let client_assertion_claims = Claims::new(JoseClaims {
         issuer: Some(oauth_client.client_id.clone()),
         subject: Some(oauth_client.client_id.clone()),
@@ -477,7 +477,7 @@ pub async fn oauth_refresh(
         .try_into()
         .map_err(OAuthClientError::JWTHeaderCreationFailed)?;
 
-    let client_assertion_jti = Alphanumeric.sample_string(&mut rand::thread_rng(), 30);
+    let client_assertion_jti = Alphanumeric.sample_string(&mut rand::rng(), 30);
     let client_assertion_claims = Claims::new(JoseClaims {
         issuer: Some(oauth_client.client_id.clone()),
         subject: Some(oauth_client.client_id.clone()),

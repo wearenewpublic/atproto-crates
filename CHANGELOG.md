@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-04-02
+### Fixed
+- Fixed panproto strategies bypassing `$type` rewriting for nested union types
+
+### Changed
+- Updated dependency versions: criterion 0.8, compact_str 0.9, data-encoding 2.10, sha2 0.11, tokio 1.50, unicode-segmentation 1.13, proptest 1.11
+
 ## [0.14.4] - 2026-04-02
 ### Added
 - `transmogrify_record` tool to atpmcp MCP server
@@ -226,6 +233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.14.5]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.5
+[0.14.4]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.4
 [0.14.3]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.3
 [0.14.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.2
 [0.14.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.1

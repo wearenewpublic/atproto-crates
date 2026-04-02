@@ -1,6 +1,6 @@
 [package]
 name = "atproto-tap"
-version = "0.14.4"
+version = "0.14.5"
 description = "AT Protocol TAP (Trusted Attestation Protocol) service consumer"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

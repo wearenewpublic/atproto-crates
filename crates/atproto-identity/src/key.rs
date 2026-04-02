@@ -648,28 +648,29 @@ impl TryInto<JwkEcKey> for &KeyData {
 pub fn generate_key(key_type: KeyType) -> Result<KeyData, KeyError> {
     match key_type {
         KeyType::P256Private => {
-            let secret_key = p256::SecretKey::random(&mut rand::thread_rng());
+            let secret_key = p256::SecretKey::random(&mut elliptic_curve::rand_core::OsRng);
             Ok(KeyData::new(
                 KeyType::P256Private,
                 secret_key.to_bytes().to_vec(),
             ))
         }
         KeyType::P384Private => {
-            let secret_key = p384::SecretKey::random(&mut rand::thread_rng());
+            let secret_key = p384::SecretKey::random(&mut elliptic_curve::rand_core::OsRng);
             Ok(KeyData::new(
                 KeyType::P384Private,
                 secret_key.to_bytes().to_vec(),
             ))
         }
         KeyType::K256Private => {
-            let secret_key = k256::SecretKey::random(&mut rand::thread_rng());
+            let secret_key = k256::SecretKey::random(&mut elliptic_curve::rand_core::OsRng);
             Ok(KeyData::new(
                 KeyType::K256Private,
                 secret_key.to_bytes().to_vec(),
             ))
         }
         KeyType::Ed25519Private => {
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            let signing_key =
+                ed25519_dalek::SigningKey::generate(&mut elliptic_curve::rand_core::OsRng);
             Ok(KeyData::new(
                 KeyType::Ed25519Private,
                 signing_key.to_bytes().to_vec(),

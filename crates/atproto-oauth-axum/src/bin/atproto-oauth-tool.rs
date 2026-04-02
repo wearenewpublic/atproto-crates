@@ -53,7 +53,7 @@ use atproto_oauth_axum::{handler_metadata::handle_oauth_metadata, state::OAuthCl
 use axum::{Router, extract::FromRef, routing::get};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distr::{Alphanumeric, SampleString};
 use rpassword::read_password;
 use secrecy::{ExposeSecret, SecretString};
 use std::{
@@ -405,8 +405,8 @@ async fn handle_login_command(
 
     // Generate OAuth security parameters
     let (pkce_verifier, code_challenge) = pkce::generate();
-    let state = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
-    let nonce = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
+    let state = Alphanumeric.sample_string(&mut rand::rng(), 32);
+    let nonce = Alphanumeric.sample_string(&mut rand::rng(), 32);
 
     // Generate DPoP key
     let dpop_key = generate_key(KeyType::P256Private)
