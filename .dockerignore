@@ -1,5 +1,14 @@
 target
+**/target
 Dockerfile
 .dockerignore
 .git
+.github
 .gitignore
+.idea
+.vscode
+**/*.log
+.pds-data
+.claude
+**/.DS_Store
+node_modules

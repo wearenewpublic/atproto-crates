@@ -111,10 +111,10 @@ async fn cmd_ls(path: &PathBuf, show_size: bool, limit: Option<usize>) -> Result
 
     let mut count = 0;
     while let Some(block) = reader.next_block().await? {
-        if let Some(max) = limit {
-            if count >= max {
-                break;
-            }
+        if let Some(max) = limit
+            && count >= max
+        {
+            break;
         }
 
         if show_size {

@@ -479,11 +479,11 @@ mod tests {
         // Create a deeply nested JSON that would exceed serde_json's default recursion limit
         let mut json = String::from(r#"{"id":42,"record":{"nested":"#);
         for _ in 0..200 {
-            json.push_str("[");
+            json.push('[');
         }
-        json.push_str("1");
+        json.push('1');
         for _ in 0..200 {
-            json.push_str("]");
+            json.push(']');
         }
         json.push_str("}}");
 

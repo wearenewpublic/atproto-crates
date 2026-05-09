@@ -41,19 +41,19 @@ fn test_strict_rejects_non_minimal_negative() {
 
 #[test]
 fn test_strict_rejects_indefinite_length() {
-    // Indefinite length array: 0x9f ... 0xff
+    // Indefinite length array: 0x9f .. 0xff
     let indefinite_array = [0x9f, 0x01, 0x02, 0x03, 0xff];
     assert!(from_slice::<Vec<u8>>(&indefinite_array).is_err());
 
-    // Indefinite length map: 0xbf ... 0xff
+    // Indefinite length map: 0xbf .. 0xff
     let indefinite_map = [0xbf, 0x61, 0x61, 0x01, 0xff];
     assert!(from_slice::<std::collections::BTreeMap<String, u8>>(&indefinite_map).is_err());
 
-    // Indefinite length bytes: 0x5f ... 0xff
+    // Indefinite length bytes: 0x5f .. 0xff
     let indefinite_bytes = [0x5f, 0x41, 0x01, 0xff];
     assert!(from_slice::<serde_bytes::ByteBuf>(&indefinite_bytes).is_err());
 
-    // Indefinite length string: 0x7f ... 0xff
+    // Indefinite length string: 0x7f .. 0xff
     let indefinite_string = [0x7f, 0x61, 0x61, 0xff];
     assert!(from_slice::<String>(&indefinite_string).is_err());
 }
@@ -167,7 +167,7 @@ fn test_custom_config_max_depth() {
 
     // Create a deeply nested structure
     let mut bytes = Vec::new();
-    // Each level: map of 1, key "inner", then the next map...
+    // Each level: map of 1, key "inner", then the next map..
     for _ in 0..10 {
         bytes.extend_from_slice(&[0xa1, 0x65, 0x69, 0x6e, 0x6e, 0x65, 0x72]); // {inner:
     }

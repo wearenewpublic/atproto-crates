@@ -1,0 +1,56 @@
+[package]
+name = "atproto-space"
+version = "0.15.0-alpha.1"
+description = "AT Protocol permissioned-data spaces — primitives for the Spaces Design Spec (SetHash, signed commits, MemberGrant/SpaceCredential JWTs)"
+readme = "README.md"
+homepage = "https://tangled.org/ngerakines.me/atproto-crates"
+documentation = "https://docs.rs/atproto-space"
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+atproto-dasl.workspace = true
+atproto-identity.workspace = true
+atproto-record.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+hkdf = "0.13"
+hmac = "0.13"
+rand.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# `ecmh` feature: pulls in k256 for the EcmhSetHash impl (per Spaces Design
+# Spec §ECMH). Gated so default builds stay lightweight; flip the default in
+# Phase 8 once ECMH is the chosen primitive workspace-wide.
+k256 = { workspace = true, optional = true, features = ["arithmetic"] }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+default = []
+ecmh = ["dep:k256"]
+
+[[bench]]
+name = "set_hash"
+harness = false
+required-features = ["ecmh"]
+
+[lints]
+workspace = true

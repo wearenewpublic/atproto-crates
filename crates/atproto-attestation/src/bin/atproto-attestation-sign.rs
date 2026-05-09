@@ -30,23 +30,23 @@
 //! ```bash
 //! # Remote attestation - creates proof record and strongRef
 //! atproto-attestation-sign remote \
-//!   did:plc:sourceRepo... \
+//!   did:plc:sourceRepo.. \
 //!   record.json \
-//!   did:plc:attestationRepo... \
+//!   did:plc:attestationRepo.. \
 //!   metadata.json
 //!
 //! # Inline attestation - embeds signature in record
 //! atproto-attestation-sign inline \
 //!   record.json \
-//!   did:plc:xyz123... \
-//!   did:key:z42tv1pb3... \
+//!   did:plc:xyz123.. \
+//!   did:key:z42tv1pb3.. \
 //!   '{"$type":"com.example.attestation","purpose":"demo"}'
 //!
 //! # Read from stdin
 //! cat record.json | atproto-attestation-sign remote \
-//!   did:plc:sourceRepo... \
+//!   did:plc:sourceRepo.. \
 //!   - \
-//!   did:plc:attestationRepo... \
+//!   did:plc:attestationRepo.. \
 //!   metadata.json
 //! ```
 

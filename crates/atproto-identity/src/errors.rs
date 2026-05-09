@@ -1,4 +1,4 @@
-//! # Structured Error Types  
+//! # Structured Error Types
 //!
 //! Comprehensive error handling for AT Protocol identity operations using structured error types
 //! with the `thiserror` library. All errors follow the project convention of prefixed error codes

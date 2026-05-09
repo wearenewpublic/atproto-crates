@@ -5,6 +5,7 @@
 
 use thiserror::Error;
 
+#[allow(clippy::enum_variant_names)] // each variant ends in *Failed by domain convention.
 /// Errors that can occur during tool operations.
 #[derive(Debug, Error)]
 pub enum ToolError {

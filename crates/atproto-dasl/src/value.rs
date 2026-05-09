@@ -605,7 +605,7 @@ mod tests {
         assert!(Ipld::Null.is_null());
         assert!(Ipld::Bool(true).is_bool());
         assert!(Ipld::Integer(42).is_integer());
-        assert!(Ipld::Float(3.14).is_float());
+        assert!(Ipld::Float(2.5).is_float());
         assert!(Ipld::String("test".into()).is_string());
         assert!(Ipld::Bytes(vec![1, 2, 3]).is_bytes());
         assert!(Ipld::List(vec![]).is_list());
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(Ipld::Integer(42).as_integer(), Some(42));
         assert_eq!(Ipld::Integer(42).as_i64(), Some(42));
         assert_eq!(Ipld::Integer(42).as_u64(), Some(42));
-        assert!((Ipld::Float(3.14).as_float().unwrap() - 3.14).abs() < f64::EPSILON);
+        assert!((Ipld::Float(2.5).as_float().unwrap() - 2.5).abs() < f64::EPSILON);
         assert_eq!(Ipld::String("test".into()).as_str(), Some("test"));
         assert_eq!(
             Ipld::Bytes(vec![1, 2, 3]).as_bytes(),
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip_float() {
-        for f in [0.0, 1.5, -1.5, 3.14159, f64::MAX, f64::MIN_POSITIVE] {
+        for f in [0.0, 1.5, -1.5, 2.5, f64::MAX, f64::MIN_POSITIVE] {
             let original = Ipld::Float(f);
             let bytes = crate::to_vec(&original).unwrap();
             let decoded: Ipld = crate::from_slice(&bytes).unwrap();

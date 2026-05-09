@@ -48,7 +48,7 @@ mod node;
 mod serialize;
 mod tree;
 
-pub use diff::{DiffStats, MstDiff, diff_entries};
+pub use diff::{DiffStats, MstDiff, RepoOp, RepoOpAction, diff_entries, ops_with_prev_cids};
 pub use entry::TreeEntry;
 pub use node::MstNode;
 pub use tree::Mst;

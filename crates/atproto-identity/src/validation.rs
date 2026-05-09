@@ -4,7 +4,7 @@
 //! following RFC 1035 and AT Protocol specifications.
 //! - [`strip_handle_prefixes`] - Removes common handle prefixes (`@`, `at://`)
 //!
-//! ## DID Validation  
+//! ## DID Validation
 //! - [`is_valid_did_method_plc`] - Validates PLC DIDs (`did:plc:...`)
 //! - [`is_valid_did_method_web`] - Validates Web DIDs (`did:web:...`)
 //! - [`is_valid_did_method_webvh`] - Validates WebVH DIDs (`did:webvh:...`)
@@ -360,7 +360,7 @@ pub fn is_valid_did_method_plc(did: &str) -> bool {
 /// - Only a valid hostname is allowed after `did:web:`
 /// - No additional path segments permitted
 ///
-/// # Non-Strict Mode (`strict = false`)  
+/// # Non-Strict Mode (`strict = false`)
 /// - First segment must be a valid hostname
 /// - Additional colon-separated segments are allowed
 /// - Each additional segment must be non-empty and alphanumeric
@@ -557,7 +557,7 @@ pub fn is_valid_did_method_webvh(did: &str, strict: bool) -> bool {
 /// // Invalid - contains excluded characters
 /// assert!(!is_valid_base58_btc("abc0def")); // Contains 0
 /// assert!(!is_valid_base58_btc("abcOdef")); // Contains O
-/// assert!(!is_valid_base58_btc("abcIdef")); // Contains I  
+/// assert!(!is_valid_base58_btc("abcIdef")); // Contains I
 /// assert!(!is_valid_base58_btc("abcldef")); // Contains l
 ///
 /// // Invalid - empty or non-alphanumeric

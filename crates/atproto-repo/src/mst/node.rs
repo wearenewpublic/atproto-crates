@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 ///   "l": CID,                    // optional left subtree
 ///   "e": [                       // entries array
 ///     { "p": 0, "k": "...", "v": CID, "t": CID },
-///     ...
+///     ..
 ///   ]
 /// }
 /// ```

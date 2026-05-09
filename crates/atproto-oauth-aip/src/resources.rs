@@ -52,7 +52,7 @@ pub async fn oauth_protected_resource(
 /// the well-known endpoint of an AT Protocol Identity Provider (AIP) server.
 /// The metadata includes essential information such as:
 /// - Authorization endpoint URL
-/// - Token endpoint URL  
+/// - Token endpoint URL
 /// - Pushed Authorization Request (PAR) endpoint URL
 /// - Supported OAuth flows and capabilities
 /// - JWKS (JSON Web Key Set) endpoint

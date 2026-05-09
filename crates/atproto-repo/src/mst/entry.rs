@@ -232,7 +232,7 @@ mod tests {
     fn test_key_reconstructor() {
         let cid = test_cid();
 
-        let entries = vec![
+        let entries = [
             TreeEntry::first("app.bsky.feed.post/abc", cid.clone()),
             TreeEntry::new(19, b"def".to_vec(), cid.clone()),
             TreeEntry::new(19, b"ghi".to_vec(), cid),

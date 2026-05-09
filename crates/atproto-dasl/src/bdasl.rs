@@ -195,7 +195,7 @@ mod tests {
         let data = b"streaming verification test";
         let cid = crate::cid::compute_raw_cid_blake3(data);
 
-        let mut verifier = Box::new(Blake3Verifier::new(cid.clone()));
+        let mut verifier = Box::new(Blake3Verifier::new(cid));
         verifier.update(&data[..10]);
         verifier.update(&data[10..]);
         assert_eq!(verifier.finalize(), VerificationResult::Valid);

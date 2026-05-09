@@ -704,8 +704,8 @@ mod tests {
     #[test]
     fn test_deserialize_primitives() {
         // Boolean
-        assert_eq!(deserialize::<bool>(&[0xf4]).unwrap(), false);
-        assert_eq!(deserialize::<bool>(&[0xf5]).unwrap(), true);
+        assert!(!deserialize::<bool>(&[0xf4]).unwrap());
+        assert!(deserialize::<bool>(&[0xf5]).unwrap());
 
         // Integers
         assert_eq!(deserialize::<u8>(&[0x00]).unwrap(), 0);

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0-alpha.1] - 2026-05-09
+### Added
+- AT Protocol PDS + permissioned-data Spaces (alpha-ready) — new `atproto-pds` and `atproto-space` crates introducing a Personal Data Server implementation and permissioned-data Space primitives (commits, credentials, recon, set hashing, members, repo, storage).
+- `atproto-repo`: inductive verification (`src/repo/inductive.rs`) and MST diffing (`src/mst/diff.rs`).
+
+## [0.14.6] - 2026-04-22
+### Added
+- `atpmcp login <identifier> [password]` subcommand mirroring the atpxrpc login UX. Resolves the identifier, creates a session via `com.atproto.server.createSession`, and upserts the account into the shared `~/.config/atpxrpc/config.json` so credentials are usable by both binaries.
+
 ## [0.14.5] - 2026-04-02
 ### Fixed
 - Fixed panproto strategies bypassing `$type` rewriting for nested union types
@@ -233,6 +242,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.15.0-alpha.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.1
+[0.14.6]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.6
 [0.14.5]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.5
 [0.14.4]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.4
 [0.14.3]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.3

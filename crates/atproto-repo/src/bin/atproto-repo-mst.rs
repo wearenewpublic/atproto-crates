@@ -130,17 +130,14 @@ async fn cmd_ls(path: &PathBuf, collection: Option<String>, limit: Option<usize>
         }
     };
 
-    let mut count = 0;
-    for (path, cid) in entries {
-        if let Some(max) = limit {
-            if count >= max {
-                break;
-            }
+    for (count, (path, cid)) in entries.into_iter().enumerate() {
+        if let Some(max) = limit
+            && count >= max
+        {
+            break;
         }
         println!("{}\t{}", path, cid);
-        count += 1;
     }
-
     Ok(())
 }
 

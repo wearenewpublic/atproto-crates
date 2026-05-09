@@ -59,7 +59,7 @@
 //!     par_response.request_uri
 //! );
 //!
-//! // After user authorization and callback...
+//! // After user authorization and callback..
 //! let token_response = oauth_complete(
 //!     &http_client,
 //!     &oauth_client,

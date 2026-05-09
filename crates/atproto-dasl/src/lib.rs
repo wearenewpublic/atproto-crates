@@ -89,7 +89,7 @@ mod tests {
     fn test_roundtrip_primitives() {
         // Boolean
         let bytes = to_vec(&true).unwrap();
-        assert_eq!(from_slice::<bool>(&bytes).unwrap(), true);
+        assert!(from_slice::<bool>(&bytes).unwrap());
 
         // Integer
         let bytes = to_vec(&42i32).unwrap();

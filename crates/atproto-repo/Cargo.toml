@@ -1,6 +1,6 @@
 [package]
 name = "atproto-repo"
-version = "0.14.5"
+version = "0.15.0-alpha.1"
 description = "AT Protocol repository handling - CAR v1 serialization and Merkle Search Tree operations"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -30,10 +30,8 @@ required-features = ["clap"]
 
 [dependencies]
 atproto-dasl.workspace = true
-atproto-identity.workspace = true
 
 anyhow.workspace = true
-async-trait.workspace = true
 cid.workspace = true
 multihash.workspace = true
 serde.workspace = true
@@ -43,7 +41,6 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "fs", "sync"] }
 tempfile.workspace = true
-futures.workspace = true
 tracing.workspace = true
 
 clap = { workspace = true, optional = true }
@@ -53,9 +50,8 @@ reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 
 [features]
-default = ["hickory-dns"]
+default = []
 clap = ["dep:clap"]
-hickory-dns = ["atproto-identity/hickory-dns"]
 http = ["dep:reqwest"]
 
 [lints]

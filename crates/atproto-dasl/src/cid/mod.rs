@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn test_cid_roundtrip() {
         let original = create_test_cid();
-        let cid = Cid::new(original.clone());
+        let cid = Cid::new(original);
 
         let bytes = cid.to_dag_cbor_bytes();
         assert_eq!(bytes[0], MULTIBASE_IDENTITY);
@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn test_cid_conversions() {
         let original = create_test_cid();
-        let cid = Cid::from(original.clone());
+        let cid = Cid::from(original);
         let back: CidCore = cid.into();
         assert_eq!(back, original);
     }

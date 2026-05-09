@@ -1,7 +1,9 @@
 [package]
 name = "atproto-xrpcs"
-version = "0.14.5"
+version = "0.15.0-alpha.1"
 description = "Core building blocks for implementing AT Protocol XRPC services with JWT authorization"
+homepage = "https://tangled.org/ngerakines.me/atproto-crates"
+documentation = "https://docs.rs/atproto-xrpcs"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -12,7 +14,6 @@ categories.workspace = true
 
 [dependencies]
 atproto-identity = {workspace = true}
-atproto-record.workspace = true
 atproto-oauth.workspace = true
 
 anyhow.workspace = true

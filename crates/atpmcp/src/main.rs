@@ -27,7 +27,7 @@
 
 mod errors;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
 
 use atproto_client::client::{
@@ -39,8 +39,11 @@ use atproto_identity::resolve::{HickoryDnsResolver, InnerIdentityResolver};
 use atproto_identity::url::build_url;
 use atproto_lexicon::resolve::DefaultLexiconResolver;
 use atproto_lexicon::transmogrify::{TransmogrifyMappings, transmogrify_record};
+use clap::{Parser, Subcommand};
 use errors::ToolError;
 use reqwest::header::HeaderMap;
+use rpassword::read_password;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
@@ -861,8 +864,14 @@ fn xrpc_config_path() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Loads the atpxrpc config from disk.
+///
+/// Returns an empty config if the file does not yet exist.
 fn load_xrpc_config() -> anyhow::Result<XrpcConfig> {
     let path = xrpc_config_path()?;
+
+    if !path.exists() {
+        return Ok(XrpcConfig { accounts: vec![] });
+    }
 
     let content = std::fs::read_to_string(&path).map_err(|error| {
         anyhow::anyhow!(
@@ -881,9 +890,17 @@ fn load_xrpc_config() -> anyhow::Result<XrpcConfig> {
     Ok(config)
 }
 
-/// Saves the atpxrpc config to disk.
+/// Saves the atpxrpc config to disk, creating parent directories as needed.
 fn save_xrpc_config(config: &XrpcConfig) -> anyhow::Result<()> {
     let path = xrpc_config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "error-atpmcp-tool-8 XRPC request failed: could not create config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
     let content = serde_json::to_string_pretty(config).map_err(|error| {
         anyhow::anyhow!(
             "error-atpmcp-tool-8 XRPC request failed: could not serialize config: {error}"
@@ -1328,19 +1345,124 @@ async fn route_message(
     Some(response)
 }
 
+/// Command-line interface for atpmcp.
+///
+/// When invoked without a subcommand, atpmcp runs as an MCP server over stdio.
+#[derive(Parser)]
+#[command(
+    name = "atpmcp",
+    version,
+    about = "AT Protocol MCP server (defaults to serving MCP over stdio)",
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+/// Subcommands supported by the atpmcp binary.
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Log in with a handle and app password, storing the session in
+    /// ~/.config/atpxrpc/config.json (shared with atpxrpc).
+    Login {
+        /// Handle or DID to authenticate as.
+        identifier: String,
+        /// App password (prompted securely if not provided).
+        #[arg(env = "ATPROTO_PASSWORD")]
+        password: Option<String>,
+    },
+}
+
+/// Handles the `login` subcommand.
+///
+/// Resolves the identifier to a PDS endpoint, creates a session via the
+/// `com.atproto.server.createSession` XRPC procedure, and upserts the
+/// resulting account into the shared atpxrpc config file.
+async fn handle_login(identifier: &str, password: Option<String>) -> anyhow::Result<()> {
+    let password = if let Some(p) = password {
+        SecretString::new(p.into())
+    } else {
+        eprint!("Enter app password: ");
+        io::stderr().flush()?;
+        let p = read_password()?;
+        if p.is_empty() {
+            anyhow::bail!("Password cannot be empty");
+        }
+        SecretString::new(p.into())
+    };
+
+    let dns_resolver = HickoryDnsResolver::create_resolver(&[]);
+    let http_client = reqwest::Client::new();
+    let resolver = InnerIdentityResolver {
+        dns_resolver: Arc::new(dns_resolver),
+        http_client: http_client.clone(),
+        plc_hostname: "plc.directory".to_string(),
+    };
+
+    eprintln!("Resolving {}...", identifier);
+    let document = resolver.resolve(identifier).await?;
+    let did = document.id.clone();
+    let pds_endpoint = document
+        .pds_endpoints()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No PDS endpoint found for {did}"))?
+        .to_string();
+    let handle = document
+        .handles()
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| identifier.to_string());
+    eprintln!("Resolved to {} ({})", did, pds_endpoint);
+
+    eprintln!("Creating session...");
+    let session = create_session(
+        &http_client,
+        &pds_endpoint,
+        identifier,
+        password.expose_secret(),
+        None,
+    )
+    .await?;
+
+    let account = XrpcAccount {
+        handle: handle.clone(),
+        did: session.did.clone(),
+        pds_endpoint: pds_endpoint.clone(),
+        app_password: password.expose_secret().to_string(),
+        access_jwt: session.access_jwt,
+        refresh_jwt: session.refresh_jwt,
+    };
+
+    let mut config = load_xrpc_config()?;
+    if let Some(existing) = config.accounts.iter_mut().find(|a| a.did == account.did) {
+        *existing = account;
+    } else {
+        config.accounts.push(account);
+    }
+    save_xrpc_config(&config)?;
+
+    eprintln!("Logged in as {} ({})", handle, session.did);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("atpmcp {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+    let cli = Cli::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
+
+    if let Some(command) = cli.command {
+        match command {
+            CliCommand::Login {
+                identifier,
+                password,
+            } => return handle_login(&identifier, password).await,
+        }
+    }
 
     tracing::info!("Starting atpmcp MCP server");
 

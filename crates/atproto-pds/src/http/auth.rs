@@ -1,0 +1,270 @@
+//! Unified bearer-token authentication for XRPC handlers.
+//!
+//! every authenticated XRPC must:
+//!
+//! 1. Verify the `Authorization: Bearer <jwt>` header.
+//! 2. Accept either an app-password session (`typ=at-pp-access`) or an OAuth
+//!    access token (`typ=at-oauth-access`). The two flavors are HS256-signed
+//!    with the same shared secret; the `typ` distinguishes them.
+//! 3. When the token is OAuth-flavored AND carries a `cnf.jkt` thumbprint,
+//!    enforce the DPoP proof (RFC 9449) and check its `jti` against the
+//!    replay guard.
+//!
+//! The previous codebase had a dozen handlers each open-coding the bearer
+//! extraction + `session::verify_access` call. They all rejected OAuth
+//! tokens (different `typ`) and never enforced DPoP. This module
+//! centralizes the flow:
+//!
+//! - [`require_authn`] does the full check and returns an [`AuthSubject`].
+//! - Handlers can call `subject.sub()` for the bare DID, or pattern-match
+//!   on [`AuthSubject`] for OAuth-specific concerns (scope, client_id).
+
+use crate::account::session::{self, SessionClaims};
+use crate::http::errors::XrpcError;
+use crate::http::state::HttpState;
+use crate::oauth::dpop::verify_dpop_proof;
+use crate::oauth::token::{OAuthClaims, TYP_ACCESS as OAUTH_TYP_ACCESS, verify_oauth_jwt};
+use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
+
+/// Result of a successful bearer-token verification.
+///
+/// Carries the underlying claim shape so callers can branch on
+/// app-password-vs-OAuth concerns (e.g. scope checks). For most handlers
+/// only [`Self::sub`] (the subject DID) is interesting.
+#[derive(Debug, Clone)]
+pub enum AuthSubject {
+    /// App-password session JWT (`typ=at-pp-access`).
+    AppPassword(SessionClaims),
+    /// OAuth access JWT (`typ=at-oauth-access`).
+    OAuth(OAuthClaims),
+}
+
+impl AuthSubject {
+    /// Subject DID (the account the token authorizes).
+    #[must_use]
+    pub fn sub(&self) -> &str {
+        match self {
+            AuthSubject::AppPassword(c) => &c.sub,
+            AuthSubject::OAuth(c) => &c.sub,
+        }
+    }
+
+    /// JWT-id of the bearer token (for revocation/audit).
+    #[must_use]
+    pub fn jti(&self) -> &str {
+        match self {
+            AuthSubject::AppPassword(c) => &c.jti,
+            AuthSubject::OAuth(c) => &c.jti,
+        }
+    }
+
+    /// `true` when this is an OAuth token bound to a DPoP key (the
+    /// `cnf.jkt` claim is present).
+    #[must_use]
+    pub fn is_dpop_bound(&self) -> bool {
+        matches!(self, AuthSubject::OAuth(c) if c.cnf.is_some())
+    }
+
+    /// `true` if the token is allowed to perform privileged operations
+    /// (those gated to sensitive paths like `importRepo`,
+    /// `getServiceAuth`, account migration). For app-password sessions
+    /// this maps to the `privileged` claim. For OAuth tokens we look for
+    /// the `transition:generic` scope, which is the AT Protocol convention
+    /// for "anything app-password can do".
+    #[must_use]
+    pub fn privileged(&self) -> bool {
+        match self {
+            AuthSubject::AppPassword(c) => c.privileged,
+            AuthSubject::OAuth(c) => c
+                .scope
+                .split_whitespace()
+                .any(|s| s == "transition:generic"),
+        }
+    }
+}
+
+/// Read the `Authorization: Bearer <token>` header. Returns the raw token
+/// (no `Bearer ` prefix). Failure is a 401 `AuthenticationRequired`.
+pub fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
+    let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "no Authorization header",
+        )
+    })?;
+    let raw = header.to_str().map_err(|_| {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Authorization header is not valid UTF-8",
+        )
+    })?;
+    raw.strip_prefix("Bearer ").ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "expected Bearer scheme",
+        )
+    })
+}
+
+/// The full XRPC authentication path: bearer extraction → session-or-OAuth
+/// verification → DPoP proof check (when bound).
+///
+/// `htm` and `htu` are the canonical HTTP method + URL the DPoP proof must
+/// pin to. Caller must derive these from the live request — see
+/// [`request_htm_htu`] for an axum-friendly helper. They are unused for
+/// non-DPoP-bound tokens.
+pub async fn require_authn(
+    parts: &Parts,
+    state: &HttpState,
+    htm: &str,
+    htu: &str,
+) -> Result<AuthSubject, XrpcError> {
+    let raw = bearer_token(parts)?;
+
+    // Try app-password first — that's the dominant path today.
+    if let Ok(claims) = session::verify_access(raw, &state.jwt_secret) {
+        return Ok(AuthSubject::AppPassword(claims));
+    }
+
+    // Fall back to OAuth. If the token isn't OAuth-flavored either, we
+    // surface a generic 401 (don't disclose which JWT shape was tried).
+    let claims = verify_oauth_jwt(raw, OAUTH_TYP_ACCESS, &state.jwt_secret).map_err(|e| {
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            format!("bearer token rejected: {e}"),
+        )
+    })?;
+
+    // DPoP enforcement: when `cnf.jkt` is bound, the request MUST carry a
+    // valid DPoP proof keyed to the same thumbprint.
+    if claims.cnf.is_some() {
+        verify_dpop_proof(&parts.headers, &claims, htm, htu, raw, &state.jti_guard).await?;
+    }
+
+    Ok(AuthSubject::OAuth(claims))
+}
+
+/// Convenience wrapper: same as [`require_authn`] but discards the full
+/// claims shape and returns just the subject DID. Suitable for the dozens
+/// of handlers that only care about *which account* is calling.
+pub async fn require_authn_sub(
+    parts: &Parts,
+    state: &HttpState,
+    htm: &str,
+    htu: &str,
+) -> Result<String, XrpcError> {
+    require_authn(parts, state, htm, htu)
+        .await
+        .map(|s| s.sub().to_string())
+}
+
+/// Derive the canonical `htm` + `htu` for a DPoP proof from the request.
+///
+/// `htu` is `scheme://authority/path` per RFC 9449 §4.2 — query and
+/// fragment are stripped because the proof spec normalizes them away. The
+/// scheme + authority are reconstructed from the `Host` (or
+/// `X-Forwarded-Host` / `X-Forwarded-Proto`) headers when proxied; falls
+/// back to the request's URI authority + scheme.
+pub fn request_htm_htu(parts: &Parts) -> (String, String) {
+    let htm = parts.method.as_str().to_string();
+
+    let path = parts.uri.path();
+    let scheme = parts
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| parts.uri.scheme_str().map(str::to_string))
+        .unwrap_or_else(|| "http".to_string());
+    let authority = parts
+        .headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            parts
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .or_else(|| parts.uri.authority().map(|a| a.to_string()))
+        .unwrap_or_else(|| "localhost".to_string());
+
+    let htu = format!("{scheme}://{authority}{path}");
+    (htm, htu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+
+    fn parts_with(method: Method, uri: &str, headers: &[(&str, &str)]) -> Parts {
+        let mut req = axum::http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = req.body(()).unwrap();
+        req.into_parts().0
+    }
+
+    #[test]
+    fn request_htm_htu_strips_query() {
+        let parts = parts_with(
+            Method::POST,
+            "/xrpc/com.atproto.foo?since=abc",
+            &[("host", "pds.example")],
+        );
+        let (htm, htu) = request_htm_htu(&parts);
+        assert_eq!(htm, "POST");
+        // Default scheme is http when no x-forwarded-proto is set.
+        assert_eq!(htu, "http://pds.example/xrpc/com.atproto.foo");
+    }
+
+    #[test]
+    fn request_htm_htu_honors_forwarded_proto() {
+        let parts = parts_with(
+            Method::GET,
+            "/xrpc/com.atproto.bar",
+            &[
+                ("host", "pds.example"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-host", "public.example"),
+            ],
+        );
+        let (htm, htu) = request_htm_htu(&parts);
+        assert_eq!(htm, "GET");
+        assert_eq!(htu, "https://public.example/xrpc/com.atproto.bar");
+    }
+
+    #[test]
+    fn bearer_token_strips_prefix() {
+        let parts = parts_with(
+            Method::POST,
+            "/x",
+            &[("authorization", "Bearer abc.def.ghi")],
+        );
+        assert_eq!(bearer_token(&parts).unwrap(), "abc.def.ghi");
+    }
+
+    #[test]
+    fn bearer_token_rejects_missing_header() {
+        let parts = parts_with(Method::POST, "/x", &[]);
+        let err = bearer_token(&parts).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn bearer_token_rejects_non_bearer_scheme() {
+        let parts = parts_with(Method::POST, "/x", &[("authorization", "Basic xyz")]);
+        let err = bearer_token(&parts).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+}

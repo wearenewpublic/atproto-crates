@@ -43,7 +43,7 @@ fn test_roundtrip_primitives() {
     }
 
     // Floats
-    for f in [0.0f64, 1.0, -1.0, 3.14159, 1e10, 1e-10] {
+    for f in [0.0f64, 1.0, -1.0, 2.5, 1e10, 1e-10] {
         let bytes = to_vec(&f).unwrap();
         let decoded: f64 = from_slice(&bytes).unwrap();
         assert!(

@@ -2,7 +2,7 @@
 //!
 //! Production-ready OAuth handlers for authorization flows, callbacks,
 //! JWKS endpoints, and metadata with secure state management.
-//! - **`handle_complete`**: OAuth callback and completion handler  
+//! - **`handle_complete`**: OAuth callback and completion handler
 //! - **`handle_jwks`**: JWKS (JSON Web Key Set) endpoint handler
 //! - **`handler_metadata`**: OAuth authorization server metadata handler
 //! - **`state`**: Shared application state management for OAuth operations

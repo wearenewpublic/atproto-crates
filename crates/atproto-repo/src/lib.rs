@@ -73,10 +73,13 @@ pub use config::RepoConfig;
 pub use errors::{MstError, RepoError};
 
 // Re-export MST types
-pub use mst::{Mst, MstDiff, MstNode, TreeEntry};
+pub use mst::{Mst, MstDiff, MstNode, RepoOp, RepoOpAction, TreeEntry, ops_with_prev_cids};
 
 // Re-export repository types
-pub use repo::{Commit, DiskRepository, MemoryRepository, RecordPath, Repository};
+pub use repo::{
+    Commit, DiskRepository, InductiveVerification, MemoryRepository, RecordPath, Repository,
+    SignatureVerification, UnsignedCommit, verify_inductive,
+};
 
 #[cfg(test)]
 mod tests {

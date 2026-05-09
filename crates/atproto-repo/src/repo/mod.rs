@@ -34,9 +34,11 @@
 //! ```
 
 mod commit;
+mod inductive;
 mod types;
 
 pub use commit::{Commit, SignatureVerification, UnsignedCommit};
+pub use inductive::{InductiveVerification, verify_inductive};
 pub use types::RecordPath;
 
 use crate::config::RepoConfig;

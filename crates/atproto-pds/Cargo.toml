@@ -1,0 +1,139 @@
+[package]
+name = "atproto-pds"
+version = "0.15.0-alpha.1"
+description = "AT Protocol Personal Data Server — server library and `pds` binary"
+readme = "README.md"
+homepage = "https://tangled.org/ngerakines.me/atproto-crates"
+documentation = "https://docs.rs/atproto-pds"
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "pds"
+test = false
+bench = false
+doc = true
+required-features = ["clap"]
+
+[[bin]]
+name = "atproto-pds-admin"
+test = false
+bench = false
+doc = true
+required-features = ["clap"]
+
+[dependencies]
+atproto-dasl.workspace = true
+atproto-identity.workspace = true
+atproto-oauth.workspace = true
+atproto-record.workspace = true
+atproto-repo.workspace = true
+atproto-space.workspace = true
+
+anyhow.workspace = true
+argon2 = "0.5"
+async-trait.workspace = true
+axum = { workspace = true, features = ["ws"], optional = true }
+base64.workspace = true
+chrono.workspace = true
+cid.workspace = true
+dashmap = "6"
+elliptic-curve.workspace = true
+fjall = { workspace = true, optional = true }
+hmac = "0.13"
+k256.workspace = true
+p256.workspace = true
+p384.workspace = true
+lettre = { workspace = true, optional = true }
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+hex = "0.4"
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+clap = { workspace = true, optional = true }
+
+# §5.1 metrics — Prometheus exporter dependencies (gated behind `metrics` feature).
+prometheus-client = { workspace = true, optional = true }
+
+# §5.2 valkey — Redis-protocol client (gated behind `valkey` feature).
+redis = { workspace = true, optional = true }
+
+# §5.3 s3 — AWS SDK v2 for blob storage (gated behind `s3` feature).
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+
+# §5.5 otel — OpenTelemetry OTLP exporter (gated behind `otel` feature).
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = ["sqlite", "hickory-dns", "http"]
+sqlite = ["dep:sqlx"]
+http = ["dep:axum"]
+fjall = ["dep:fjall"]
+# `postgres` — adds the PostgreSQL adapter for the accounts directory.
+# Connection plumbing + `PostgresAccountStore` shim + per-table query
+# dispatch through `AccountPool` for the high-level helpers. The
+# auth_handlers email-token + lifecycle sites also dispatch.
+postgres = ["dep:sqlx"]
+# `postgres-live-tests` — opts in to the live-CRUD acceptance suite
+# in `tests/feature_postgres_live.rs`. Reads the target DSN from
+# `PDS_POSTGRES_TEST_URL`. When the env var is unset the suite emits
+# `INFO`-level skip messages and reports OK so CI without a Postgres
+# instance still passes.
+postgres-live-tests = ["postgres"]
+# `s3` — adds the AWS SDK v2 blob backend. Selected at
+# runtime via `PDS_BLOB_STORE_URL=s3://...`.
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-credential-types"]
+# `valkey` — adds the Valkey/Redis-backed JTI replay guard + sliding-window
+# limiter. Selected via `PDS_VALKEY_URL`.
+valkey = ["dep:redis"]
+# `otel` — wires the existing `tracing` instrumentation through OTLP
+# Endpoint comes from `PDS_OTEL_ENDPOINT`.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+# `smtp` — opts in real outbound email via `lettre`. When the feature is off
+# (the default), `EmailService::Disabled` is wired and email-issuing
+# endpoints fall back to dev-only INFO logging of the confirmation URL.
+smtp = ["dep:lettre"]
+# `metrics` — Prometheus exporter at `/metrics` + axum request-counter
+# middleware.
+metrics = ["dep:prometheus-client"]
+# `ecmh` — replaces the placeholder `XorSha256SetHash` with the production
+# `EcmhSetHash` (secp256k1 multiset hash) for all Spaces commitments. The
+# digest size changes from 32 to 33 bytes; consumers must mirror.
+ecmh = ["atproto-space/ecmh"]
+clap = ["dep:clap"]
+hickory-dns = ["atproto-identity/hickory-dns"]
+
+[lints]
+workspace = true

@@ -190,7 +190,7 @@ impl Chainer for DpopRetry {
 /// let header1 = r#"DPoP algs="ES256", error="invalid_dpop_proof", error_description="DPoP proof required""#;
 /// assert!(is_dpop_error(header1));
 ///
-/// // Valid DPoP error: use_dpop_nonce  
+/// // Valid DPoP error: use_dpop_nonce
 /// let header2 = r#"DPoP algs="ES256", error="use_dpop_nonce", error_description="Authorization server requires nonce in DPoP proof""#;
 /// assert!(is_dpop_error(header2));
 ///

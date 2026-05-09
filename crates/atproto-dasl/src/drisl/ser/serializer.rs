@@ -541,7 +541,7 @@ mod tests {
         // Value: Map of 1: 0xa1
         //   Key "value": 0x65 + "value"
         //   Value 42: 0x18 0x2a
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
     }
 
     #[test]

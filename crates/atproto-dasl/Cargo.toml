@@ -1,6 +1,6 @@
 [package]
 name = "atproto-dasl"
-version = "0.14.5"
+version = "0.15.0-alpha.1"
 description = "DASL (Data-Addressed Structures & Links) implementation for AT Protocol"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -36,7 +36,6 @@ multihash.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "fs", "sync"] }
 tempfile.workspace = true
-futures.workspace = true
 tracing.workspace = true
 serde_bytes.workspace = true
 blake3.workspace = true

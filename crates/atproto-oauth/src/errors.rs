@@ -10,7 +10,7 @@
 //! - **`JWKError`** (jwk-1 to jwk-7): JSON Web Key conversion, processing, and thumbprint errors
 //! - **`OAuthClientError`** (client-1 to client-14): OAuth client operations and server communication errors
 //! - **`ResourceValidationError`** (resource-1 to resource-2): OAuth protected resource configuration validation errors
-//! - **`AuthServerValidationError`** (auth-server-1 to auth-server-12): OAuth authorization server configuration validation errors  
+//! - **`AuthServerValidationError`** (auth-server-1 to auth-server-12): OAuth authorization server configuration validation errors
 //! - **`DpopError`** (dpop-1 to dpop-6): DPoP (Demonstration of Proof-of-Possession) operation errors
 //! - **`OAuthStorageError`** (storage-1 to storage-4): OAuth request storage operations including cache lock failures and data access errors
 //!

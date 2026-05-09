@@ -139,6 +139,77 @@ pub fn diff_entries(old: &[(String, Cid)], new: &[(String, Cid)]) -> Vec<MstDiff
     diffs
 }
 
+/// Action kind for Sync 1.1 repository operation.
+///
+/// Wire-format value strings: `"create"`, `"update"`, `"delete"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoOpAction {
+    /// New record created.
+    Create,
+    /// Existing record updated.
+    Update,
+    /// Record deleted.
+    Delete,
+}
+
+/// A Sync 1.1 repository operation as it appears in `#commit` payloads.
+///
+/// This is the wire shape produced by [`ops_with_prev_cids`] and consumed by
+/// firehose subscribers. The `prev` field carries the prior record CID for
+/// `Update` and `Delete` ops (and is `None` for `Create`), enabling subscribers
+/// to invert operations against their local state without retaining the full
+/// history.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RepoOp {
+    /// Action kind: create, update, or delete.
+    pub action: RepoOpAction,
+    /// Repo path (`<collection>/<rkey>`).
+    pub path: String,
+    /// New record CID. `None` only for delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid: Option<Cid>,
+    /// Prior record CID. Required by Sync 1.1 for update and delete; `None` for create.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev: Option<Cid>,
+}
+
+/// Convert a slice of [`MstDiff`] entries into Sync 1.1 [`RepoOp`] wire format.
+///
+/// `Add` → `Create` with `cid=Some(new)`, `prev=None`.
+/// `Update` → `Update` with `cid=Some(new)`, `prev=Some(old)`.
+/// `Delete` → `Delete` with `cid=None`, `prev=Some(old)`.
+#[must_use]
+pub fn ops_with_prev_cids(diffs: &[MstDiff]) -> Vec<RepoOp> {
+    diffs
+        .iter()
+        .map(|diff| match diff {
+            MstDiff::Add { key, cid } => RepoOp {
+                action: RepoOpAction::Create,
+                path: key.clone(),
+                cid: Some(cid.clone()),
+                prev: None,
+            },
+            MstDiff::Update {
+                key,
+                old_cid,
+                new_cid,
+            } => RepoOp {
+                action: RepoOpAction::Update,
+                path: key.clone(),
+                cid: Some(new_cid.clone()),
+                prev: Some(old_cid.clone()),
+            },
+            MstDiff::Delete { key, cid } => RepoOp {
+                action: RepoOpAction::Delete,
+                path: key.clone(),
+                cid: None,
+                prev: Some(cid.clone()),
+            },
+        })
+        .collect()
+}
+
 /// Statistics about a diff operation.
 #[derive(Debug, Clone, Default)]
 pub struct DiffStats {
@@ -251,6 +322,45 @@ mod tests {
         assert_eq!(stats.deletes, 1); // "a" deleted
         assert_eq!(stats.updates, 1); // "b" updated
         assert_eq!(stats.adds, 1); // "d" added
+    }
+
+    #[test]
+    fn test_ops_with_prev_cids_create() {
+        let diffs = vec![MstDiff::Add {
+            key: "app.bsky.feed.post/3jui7kd2z2y2e".to_string(),
+            cid: test_cid(b"new"),
+        }];
+        let ops = ops_with_prev_cids(&diffs);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].action, RepoOpAction::Create);
+        assert_eq!(ops[0].path, "app.bsky.feed.post/3jui7kd2z2y2e");
+        assert!(ops[0].cid.is_some());
+        assert!(ops[0].prev.is_none());
+    }
+
+    #[test]
+    fn test_ops_with_prev_cids_update() {
+        let diffs = vec![MstDiff::Update {
+            key: "app.bsky.actor.profile/self".to_string(),
+            old_cid: test_cid(b"old"),
+            new_cid: test_cid(b"new"),
+        }];
+        let ops = ops_with_prev_cids(&diffs);
+        assert_eq!(ops[0].action, RepoOpAction::Update);
+        assert!(ops[0].cid.is_some());
+        assert!(ops[0].prev.is_some());
+    }
+
+    #[test]
+    fn test_ops_with_prev_cids_delete() {
+        let diffs = vec![MstDiff::Delete {
+            key: "app.bsky.feed.post/3jui7kd2z2y2e".to_string(),
+            cid: test_cid(b"deleted"),
+        }];
+        let ops = ops_with_prev_cids(&diffs);
+        assert_eq!(ops[0].action, RepoOpAction::Delete);
+        assert!(ops[0].cid.is_none());
+        assert!(ops[0].prev.is_some());
     }
 
     #[test]

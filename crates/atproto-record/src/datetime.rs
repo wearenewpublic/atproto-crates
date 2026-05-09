@@ -16,7 +16,7 @@
 //! struct Signature {
 //!     #[serde(with = "atproto_record::datetime::format")]
 //!     issued_at: DateTime<Utc>,
-//!     
+//!
 //!     #[serde(with = "atproto_record::datetime::optional_format")]
 //!     expires_at: Option<DateTime<Utc>>,
 //! }

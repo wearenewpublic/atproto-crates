@@ -29,7 +29,7 @@ pub const TOTAL_LENGTH: usize = 32; // "did:plc:" (8) + identifier (24)
 /// base32-encoded and truncated to 24 characters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Did {
-    /// The full did:plc:xyz... string
+    /// The full did:plc:xyz.. string
     full: String,
     /// The 24-character identifier portion
     identifier: String,

@@ -192,6 +192,26 @@ pub fn did_method_key_value(key: &str) -> &str {
     }
 }
 
+/// JWS `alg` header value for a [`KeyData`].
+///
+/// Maps each [`KeyType`] to the canonical JWS algorithm string
+/// [RFC 7518 §3.4](https://datatracker.ietf.org/doc/html/rfc7518#section-3.4)
+/// the SECP256K1 ext (`ES256K`) and the EdDSA RFC 8037 (`EdDSA`).
+///
+/// Centralized here so JWT minters across the workspace agree on alg
+/// strings without each module re-implementing the same match arm
+/// (`atproto-pds::oauth::jwks`, `atproto-pds::http::service_auth_handlers`,
+/// `atproto-space::credential` were all carrying a copy).
+#[must_use]
+pub fn jws_alg(key: &KeyData) -> &'static str {
+    match key.key_type() {
+        KeyType::P256Private | KeyType::P256Public => "ES256",
+        KeyType::P384Private | KeyType::P384Public => "ES384",
+        KeyType::K256Private | KeyType::K256Public => "ES256K",
+        KeyType::Ed25519Private | KeyType::Ed25519Public => "EdDSA",
+    }
+}
+
 /// Identifies the key type and extracts the key data from a multibase-encoded key.
 ///
 /// Returns a KeyData instance containing the key type and the raw key bytes.

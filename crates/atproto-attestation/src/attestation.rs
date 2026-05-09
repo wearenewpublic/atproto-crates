@@ -363,7 +363,7 @@ pub fn create_inline_attestation<R: Serialize + Clone, M: Serialize + Clone>(
 ///     "$type": "com.example.attestation",
 ///     "issuer": "did:plc:issuer",
 ///     "cid": "bafyrei...",  // Content CID computed from record+metadata+repository
-///     // ... other attestation fields
+///     // .. other attestation fields
 /// });
 ///
 /// let repository_did = "did:plc:repo123";

@@ -22,10 +22,18 @@ use serde::{Deserialize, Serialize};
 ///   "version": 3,
 ///   "data": CID,         // MST root
 ///   "rev": "3jui7kd2z2y2e",
-///   "prev": CID,         // optional
+///   "prev": CID,         // optional, deprecated by Sync 1.1
+///   "prevData": CID,     // optional, Sync 1.1 — prior MST root for inductive verification
 ///   "sig": bytes         // signature
 /// }
 /// ```
+///
+/// # Sync 1.1
+///
+/// The `prev_data` field carries the **prior MST root CID** (not the prior commit CID).
+/// It enables inductive verification: a verifier with the prior `data` CID can verify
+/// the new commit's MST against the operations in the firehose `#commit` payload without
+/// retaining full repo state. See [`crate::repo::verify_inductive`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
     /// DID of the repository owner.
@@ -43,6 +51,10 @@ pub struct Commit {
     /// CID of previous commit (None for initial commit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev: Option<Cid>,
+
+    /// Prior MST root CID for Sync 1.1 inductive verification (None for initial commit).
+    #[serde(rename = "prevData", skip_serializing_if = "Option::is_none")]
+    pub prev_data: Option<Cid>,
 
     /// Signature bytes (raw ECDSA signature).
     #[serde(with = "serde_bytes")]
@@ -70,6 +82,10 @@ pub struct UnsignedCommit {
     /// CID of previous commit (None for initial commit).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev: Option<Cid>,
+
+    /// Prior MST root CID for Sync 1.1 inductive verification (None for initial commit).
+    #[serde(rename = "prevData", skip_serializing_if = "Option::is_none")]
+    pub prev_data: Option<Cid>,
 }
 
 impl Commit {
@@ -82,6 +98,26 @@ impl Commit {
             data,
             rev,
             prev,
+            prev_data: None,
+        }
+    }
+
+    /// Create an unsigned commit including the Sync 1.1 `prevData` field.
+    #[must_use]
+    pub fn new_unsigned_with_prev_data(
+        did: String,
+        data: Cid,
+        rev: String,
+        prev: Option<Cid>,
+        prev_data: Option<Cid>,
+    ) -> UnsignedCommit {
+        UnsignedCommit {
+            did,
+            version: 3,
+            data,
+            rev,
+            prev,
+            prev_data,
         }
     }
 
@@ -97,6 +133,7 @@ impl Commit {
             data: self.data.clone(),
             rev: self.rev.clone(),
             prev: self.prev.clone(),
+            prev_data: self.prev_data.clone(),
         };
 
         atproto_dasl::to_vec(&unsigned).map_err(|e| RepoError::InvalidCommit {
@@ -192,6 +229,26 @@ impl UnsignedCommit {
             data,
             rev,
             prev,
+            prev_data: None,
+        }
+    }
+
+    /// Create a new unsigned commit including the Sync 1.1 `prevData` field.
+    #[must_use]
+    pub fn new_with_prev_data(
+        did: String,
+        data: Cid,
+        rev: String,
+        prev: Option<Cid>,
+        prev_data: Option<Cid>,
+    ) -> Self {
+        Self {
+            did,
+            version: 3,
+            data,
+            rev,
+            prev,
+            prev_data,
         }
     }
 
@@ -215,6 +272,7 @@ impl UnsignedCommit {
             data: self.data,
             rev: self.rev,
             prev: self.prev,
+            prev_data: self.prev_data,
             sig,
         }
     }
@@ -299,6 +357,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
+            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -320,6 +379,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: Some(prev_cid),
+            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -337,6 +397,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
+            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -351,6 +412,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
+            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -368,6 +430,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
+            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -385,6 +448,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
+            prev_data: None,
             sig: vec![],
         };
 
@@ -395,6 +459,43 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_with_prev_data() {
+        let prev_cid: Cid = compute_cid(b"prev").into();
+        let prev_data_cid: Cid = compute_cid(b"prev_data").into();
+        let commit = Commit {
+            did: "did:plc:test".to_string(),
+            version: 3,
+            data: test_cid(),
+            rev: "3jui7kd2z2y2e".to_string(),
+            prev: Some(prev_cid),
+            prev_data: Some(prev_data_cid.clone()),
+            sig: vec![1, 2, 3, 4],
+        };
+
+        let bytes = commit.to_bytes().unwrap();
+        let decoded = Commit::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.prev_data, Some(prev_data_cid));
+    }
+
+    #[test]
+    fn test_unsigned_commit_with_prev_data() {
+        let prev_data_cid: Cid = compute_cid(b"prev_data").into();
+        let unsigned = UnsignedCommit::new_with_prev_data(
+            "did:plc:test".to_string(),
+            test_cid(),
+            "3jui7kd2z2y2e".to_string(),
+            None,
+            Some(prev_data_cid.clone()),
+        );
+
+        assert_eq!(unsigned.prev_data, Some(prev_data_cid.clone()));
+
+        let signed = unsigned.sign(vec![9, 9, 9]);
+        assert_eq!(signed.prev_data, Some(prev_data_cid));
+    }
+
+    #[test]
     fn test_signing_bytes() {
         let commit = Commit {
             did: "did:plc:test".to_string(),
@@ -402,6 +503,7 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
+            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 

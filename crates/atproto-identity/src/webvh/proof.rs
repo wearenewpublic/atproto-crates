@@ -331,7 +331,7 @@ mod tests {
     fn make_ed25519_keypair() -> (ed25519_dalek::SigningKey, String) {
         let private_key = generate_key(KeyType::Ed25519Private).unwrap();
         let public_key = to_public(&private_key).unwrap();
-        // Display formats as did:key:z...
+        // Display formats as did:key:z..
         let did_key = format!("{}", &public_key);
         let multikey = did_key.strip_prefix("did:key:").unwrap().to_string();
 
@@ -416,7 +416,7 @@ mod tests {
             proof_value,
         };
 
-        entry["proof"] = serde_json::to_value(&[&proof]).unwrap();
+        entry["proof"] = serde_json::to_value([&proof]).unwrap();
 
         let update_keys = vec![multikey];
         let result = verify_proof(&entry, &proof, &update_keys, 1);
@@ -449,7 +449,7 @@ mod tests {
         // Tamper with the entry
         let mut tampered = entry;
         tampered["state"]["id"] = json!("did:webvh:test:evil.com");
-        tampered["proof"] = serde_json::to_value(&[&proof]).unwrap();
+        tampered["proof"] = serde_json::to_value([&proof]).unwrap();
 
         let update_keys = vec![multikey];
         let result = verify_proof(&tampered, &proof, &update_keys, 1);

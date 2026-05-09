@@ -1,6 +1,6 @@
 [package]
 name = "atpmcp"
-version = "0.14.5"
+version = "0.15.0-alpha.1"
 description = "AT Protocol MCP server for DAG-CBOR CID generation"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
 documentation = "https://docs.rs/atpmcp"
@@ -30,7 +30,10 @@ atproto-record.workspace = true
 dirs.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+clap.workspace = true
 reqwest.workspace = true
+rpassword.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

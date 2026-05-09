@@ -2,7 +2,8 @@
 
 use atproto_dasl::cid::compute_cid;
 use atproto_dasl::{compute_cid_blake3, compute_cid_for, verify_cid_bytes};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn make_data(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i % 256) as u8).collect()

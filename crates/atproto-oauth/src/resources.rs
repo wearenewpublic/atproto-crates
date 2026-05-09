@@ -137,7 +137,7 @@ pub async fn oauth_protected_resource(
 ///
 /// Retrieves OAuth 2.0 authorization server configuration from `/.well-known/oauth-authorization-server`
 /// and validates AT Protocol requirements including:
-/// - Required grant types: authorization_code, refresh_token  
+/// - Required grant types: authorization_code, refresh_token
 /// - Required scopes: atproto, transition:generic
 /// - Required security features: PKCE (S256), DPoP (ES256), PAR
 /// - Required authentication methods: none, private_key_jwt

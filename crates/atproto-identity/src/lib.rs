@@ -6,7 +6,7 @@
 //! When built with the `clap` feature, provides comprehensive CLI tools:
 //!
 //! - **`atproto-identity-resolve`**: Resolve AT Protocol handles and DIDs to canonical identifiers
-//! - **`atproto-identity-key`**: Generate and manage cryptographic keys (P-256, P-384, K-256)  
+//! - **`atproto-identity-key`**: Generate and manage cryptographic keys (P-256, P-384, K-256)
 //! - **`atproto-identity-sign`**: Create cryptographic signatures of JSON data
 //! - **`atproto-identity-validate`**: Validate cryptographic signatures
 

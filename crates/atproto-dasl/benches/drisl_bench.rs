@@ -1,9 +1,10 @@
 //! Benchmarks for DRISL (DAG-CBOR) encoding and decoding.
 
 use atproto_dasl::{Ipld, from_slice, to_vec};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::hint::black_box;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Post {
@@ -42,7 +43,7 @@ fn bench_encode(c: &mut Criterion) {
     });
 
     group.bench_function("f64", |b| {
-        b.iter(|| to_vec(black_box(&3.14159f64)).unwrap());
+        b.iter(|| to_vec(black_box(&2.5_f64)).unwrap());
     });
 
     group.bench_function("string_short", |b| {
@@ -80,7 +81,7 @@ fn bench_decode(c: &mut Criterion) {
         b.iter(|| from_slice::<i64>(black_box(&i64_bytes)).unwrap());
     });
 
-    let f64_bytes = to_vec(&3.14159f64).unwrap();
+    let f64_bytes = to_vec(&2.5_f64).unwrap();
     group.bench_function("f64", |b| {
         b.iter(|| from_slice::<f64>(black_box(&f64_bytes)).unwrap());
     });

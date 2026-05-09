@@ -978,8 +978,10 @@ mod tests {
 
     #[test]
     fn test_merge_entry_params_portable_constraint() {
-        let mut params = MergedParameters::default();
-        params.portable = false;
+        let mut params = MergedParameters {
+            portable: false,
+            ..MergedParameters::default()
+        };
 
         let update = json!({"portable": true});
         let result = merge_entry_params(&mut params, &update, 2);

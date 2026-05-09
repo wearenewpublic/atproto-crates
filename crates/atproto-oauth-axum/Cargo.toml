@@ -1,6 +1,6 @@
 [package]
 name = "atproto-oauth-axum"
-version = "0.14.5"
+version = "0.15.0-alpha.1"
 description = "Axum web framework integration for AT Protocol OAuth workflows"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -23,7 +23,6 @@ required-features = ["clap"]
 
 [dependencies]
 atproto-identity.workspace = true
-atproto-record.workspace = true
 atproto-oauth.workspace = true
 
 anyhow.workspace = true

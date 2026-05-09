@@ -61,27 +61,27 @@ use crate::workflow::OAuthRequest;
 ///         let requests = self.requests.read().await;
 ///         Ok(requests.get(state).cloned())
 ///     }
-///     
+///
 ///     async fn insert_oauth_request(&self, request: OAuthRequest) -> Result<()> {
 ///         let mut requests = self.requests.write().await;
 ///         requests.insert(request.oauth_state.clone(), request);
 ///         Ok(())
 ///     }
-///     
+///
 ///     async fn delete_oauth_request_by_state(&self, state: &str) -> Result<()> {
 ///         let mut requests = self.requests.write().await;
 ///         requests.remove(state);
 ///         Ok(())
 ///     }
-///     
+///
 ///     async fn clear_expired_oauth_requests(&self) -> Result<u64> {
 ///         let mut requests = self.requests.write().await;
 ///         let now = Utc::now();
 ///         let initial_count = requests.len();
-///         
+///
 ///         requests.retain(|_, req| req.expires_at > now);
 ///         let final_count = requests.len();
-///         
+///
 ///         Ok((initial_count - final_count) as u64)
 ///     }
 /// }
@@ -103,10 +103,10 @@ use crate::workflow::OAuthRequest;
 ///         .bind(state)
 ///         .fetch_optional(&self.pool)
 ///         .await?;
-///         
+///
 ///         Ok(row.map(|r| r.into_oauth_request()))
 ///     }
-///     
+///
 ///     async fn insert_oauth_request(&self, request: OAuthRequest) -> Result<()> {
 ///         sqlx::query!(
 ///             "INSERT INTO oauth_requests
@@ -127,14 +127,14 @@ use crate::workflow::OAuthRequest;
 ///         .await?;
 ///         Ok(())
 ///     }
-///     
+///
 ///     async fn delete_oauth_request_by_state(&self, state: &str) -> Result<()> {
 ///         sqlx::query!("DELETE FROM oauth_requests WHERE oauth_state = $1", state)
 ///             .execute(&self.pool)
 ///             .await?;
 ///         Ok(())
 ///     }
-///     
+///
 ///     async fn clear_expired_oauth_requests(&self) -> Result<u64> {
 ///         let result = sqlx::query!("DELETE FROM oauth_requests WHERE expires_at <= NOW()")
 ///             .execute(&self.pool)
