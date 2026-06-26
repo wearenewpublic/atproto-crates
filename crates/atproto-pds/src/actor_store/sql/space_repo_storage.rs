@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use atproto_space::SpaceError;
 use atproto_space::errors::SpaceResult;
 use atproto_space::storage::{
-    OplogEntry, OplogPage, PreparedCommitRecords, RecordChange, RecordPage, RecordRow, RepoState,
-    SpaceRepoStorage,
+    OplogCursor, OplogEntry, OplogPage, PreparedCommitRecords, RecordChange, RecordPage, RecordRow,
+    RepoState, SpaceRepoStorage,
 };
 use atproto_space::types::SpaceUri;
 use sqlx::SqlitePool;
@@ -251,7 +251,7 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
     async fn read_oplog(
         &self,
         space: &SpaceUri,
-        since: Option<&str>,
+        since: Option<&OplogCursor>,
         limit: u32,
     ) -> SpaceResult<OplogPage> {
         let limit = limit.clamp(1, 1000);
@@ -264,14 +264,19 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
             Option<String>,
             Option<String>,
         )> = match since {
-            Some(s) => {
+            Some(cur) => {
+                // `(rev, idx) > (since.rev, since.idx)` so an atomic batch
+                // (entries sharing a rev) that exceeds `limit` pages fully.
                 sqlx::query_as(
                     "SELECT rev, idx, action, collection, rkey, cid, prev
-                     FROM space_record_oplog WHERE space = ? AND rev > ?
+                     FROM space_record_oplog
+                     WHERE space = ? AND (rev > ? OR (rev = ? AND idx > ?))
                      ORDER BY rev ASC, idx ASC LIMIT ?",
                 )
                 .bind(space.to_string())
-                .bind(s)
+                .bind(&cur.rev)
+                .bind(&cur.rev)
+                .bind(cur.idx as i64)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
@@ -313,7 +318,7 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
 mod tests {
     use super::*;
     use crate::actor_store::sql::SqlActorStore;
-    use atproto_space::set_hash::{SetHash, XorSha256SetHash};
+    use atproto_space::set_hash::{LtHash, SetHash};
     use atproto_space::space_repo::{Op, OpAction, SpaceRepo};
     use atproto_space::types::{SpaceKey, SpaceType};
 
@@ -330,7 +335,7 @@ mod tests {
         SqlSpaceRepoStorage::new(store.pool().clone())
     }
 
-    type TestRepo = SpaceRepo<SqlSpaceRepoStorage, XorSha256SetHash>;
+    type TestRepo = SpaceRepo<SqlSpaceRepoStorage, LtHash>;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn create_and_read_record() {
@@ -388,6 +393,54 @@ mod tests {
         assert_eq!(page.ops[0].rev, page.ops[1].rev);
         assert_eq!(page.ops[0].idx, 0);
         assert_eq!(page.ops[1].idx, 1);
+    }
+
+    /// Regression: a single atomic batch larger than the page `limit` pages
+    /// fully via the SQL `(rev > ? OR (rev = ? AND idx > ?))` predicate, with no
+    /// tail skipped. A bare-rev `rev > ?` cursor would skip ops `limit..N`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_larger_than_limit_pages_fully() {
+        let space = test_space();
+        let repo: TestRepo = SpaceRepo::new(space.clone(), fresh_storage().await);
+
+        const N: usize = 7;
+        const LIMIT: u32 = 3;
+
+        let ops: Vec<Op> = (0..N)
+            .map(|i| Op {
+                action: OpAction::Create,
+                collection: "c".to_string(),
+                rkey: format!("k{i}"),
+                cid: Some(format!("cid{i}")),
+                value: Some(vec![]),
+            })
+            .collect();
+        let prepared = repo.format_commit(&ops).await.unwrap();
+        repo.apply_commit(prepared).await.unwrap();
+
+        let mut seen: Vec<(String, u32)> = Vec::new();
+        let mut cursor: Option<OplogCursor> = None;
+        loop {
+            let page = repo.read_oplog(cursor.as_ref(), LIMIT).await.unwrap();
+            for op in &page.ops {
+                seen.push((op.rev.clone(), op.idx));
+            }
+            let caught_up = (page.ops.len() as u32) < LIMIT;
+            cursor = page
+                .ops
+                .last()
+                .map(|o| OplogCursor::new(o.rev.clone(), o.idx));
+            if caught_up {
+                break;
+            }
+        }
+
+        assert_eq!(seen.len(), N, "all batch ops delivered, none skipped");
+        let rev = &seen[0].0;
+        for (i, (r, idx)) in seen.iter().enumerate() {
+            assert_eq!(r, rev, "all ops share the batch rev");
+            assert_eq!(*idx as usize, i, "idx is dense and monotonic");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -454,12 +507,15 @@ mod tests {
         assert!(repo.get_record("c", "k").await.unwrap().is_none());
     }
 
+    /// The persisted lattice state round-trips through
+    /// `state_bytes()`/`from_state_bytes()`, preserving both state and digest.
     #[test]
-    fn xor_set_hash_matches_in_memory() {
-        let mut h1 = XorSha256SetHash::empty();
-        let mut h2 = XorSha256SetHash::empty();
-        h1.add(b"x");
-        h2.add(b"x");
-        assert_eq!(h1.digest(), h2.digest());
+    fn set_hash_state_round_trips() {
+        let mut h = LtHash::empty();
+        h.add(b"x");
+        let state = h.state_bytes();
+        let rehydrated = LtHash::from_state_bytes(&state).unwrap();
+        assert_eq!(rehydrated.state_bytes(), state);
+        assert_eq!(rehydrated.digest(), h.digest());
     }
 }

@@ -251,6 +251,38 @@ impl Document {
         })
     }
 
+    /// Returns the `publicKeyMultibase` of the Multikey verification method
+    /// whose id ends with `#{fragment}` (e.g. `atproto` or `atproto_space`).
+    ///
+    /// DID documents render verification-method ids as either the absolute
+    /// `did:plc:xxx#fragment` or the relative `#fragment`; both forms match.
+    pub fn verification_method_multibase(&self, fragment: &str) -> Option<&str> {
+        let suffix = format!("#{fragment}");
+        self.verification_method
+            .iter()
+            .find_map(|method| match method {
+                VerificationMethod::Multikey {
+                    id,
+                    public_key_multibase,
+                    ..
+                } if id.ends_with(&suffix) => Some(public_key_multibase.as_str()),
+                _ => None,
+            })
+    }
+
+    /// Returns the endpoint of the service entry whose id ends with
+    /// `#{fragment}` (e.g. `atproto_pds` or `atproto_space_host`).
+    ///
+    /// Service ids are rendered as either the absolute `did:plc:xxx#fragment`
+    /// or the relative `#fragment`; both forms match.
+    pub fn service_endpoint(&self, fragment: &str) -> Option<&str> {
+        let suffix = format!("#{fragment}");
+        self.service
+            .iter()
+            .find(|svc| svc.id.ends_with(&suffix))
+            .map(|svc| svc.service_endpoint.as_str())
+    }
+
     /// Extracts multibase public keys from verification methods.
     /// Returns public keys from Multikey verification methods only.
     pub fn did_keys(&self) -> Vec<&str> {
@@ -359,6 +391,47 @@ mod tests {
 
         assert_eq!(doc.service.len(), 1);
         assert_eq!(doc.service[0].r#type, "CustomService");
+    }
+
+    #[test]
+    fn test_verification_method_and_service_lookup_by_fragment() {
+        // A DID document exposing both the public-data entries and the
+        // dedicated 0016 space entries (lines 87-92).
+        let document = serde_json::from_str::<Document>(
+            r##"{
+              "id":"did:plc:authority",
+              "verificationMethod":[
+                {"id":"did:plc:authority#atproto","type":"Multikey","controller":"did:plc:authority","publicKeyMultibase":"zATPROTO"},
+                {"id":"#atproto_space","type":"Multikey","controller":"did:plc:authority","publicKeyMultibase":"zSPACE"}
+              ],
+              "service":[
+                {"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"},
+                {"id":"did:plc:authority#atproto_space_host","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://host.example.com"}
+              ]
+            }"##,
+        )
+        .expect("document parses");
+
+        // Absolute-form id and relative-form id both resolve by fragment.
+        assert_eq!(
+            document.verification_method_multibase("atproto"),
+            Some("zATPROTO")
+        );
+        assert_eq!(
+            document.verification_method_multibase("atproto_space"),
+            Some("zSPACE")
+        );
+        assert_eq!(document.verification_method_multibase("missing"), None);
+
+        assert_eq!(
+            document.service_endpoint("atproto_pds"),
+            Some("https://pds.example.com")
+        );
+        assert_eq!(
+            document.service_endpoint("atproto_space_host"),
+            Some("https://host.example.com")
+        );
+        assert_eq!(document.service_endpoint("missing"), None);
     }
 
     #[test]

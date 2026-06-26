@@ -1,8 +1,8 @@
 //! Production-hardening primitives: JTI replay guard, sliding-window
 //! rate limiter, and supporting plumbing.
 //!
-//! Every JWT-verify step in OAuth / DPoP / MemberGrant /
-//! SpaceCredential / service-auth checks the token's `jti` against a replay
+//! Every JWT-verify step in OAuth / DPoP / delegation-token /
+//! client-attestation / service-auth checks the token's `jti` against a replay
 //! filter; every authenticated XRPC call passes through a rate limiter.
 //!
 //! Two backends per primitive:

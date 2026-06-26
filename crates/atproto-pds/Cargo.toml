@@ -1,6 +1,6 @@
 [package]
 name = "atproto-pds"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 description = "AT Protocol Personal Data Server — server library and `pds` binary"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -32,6 +32,7 @@ required-features = ["clap"]
 [dependencies]
 atproto-dasl.workspace = true
 atproto-identity.workspace = true
+atproto-lexicon.workspace = true
 atproto-oauth.workspace = true
 atproto-record.workspace = true
 atproto-repo.workspace = true
@@ -128,10 +129,6 @@ smtp = ["dep:lettre"]
 # `metrics` — Prometheus exporter at `/metrics` + axum request-counter
 # middleware.
 metrics = ["dep:prometheus-client"]
-# `ecmh` — replaces the placeholder `XorSha256SetHash` with the production
-# `EcmhSetHash` (secp256k1 multiset hash) for all Spaces commitments. The
-# digest size changes from 32 to 33 bytes; consumers must mirror.
-ecmh = ["atproto-space/ecmh"]
 clap = ["dep:clap"]
 hickory-dns = ["atproto-identity/hickory-dns"]
 

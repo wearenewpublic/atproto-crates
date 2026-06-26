@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0-alpha.2] - 2026-06-26
+### Changed
+- Re-aligned permissioned-data Spaces (`atproto-space`, `atproto-pds`) to the published [0016 "Permissioned Data"](https://github.com/bluesky-social/proposals/blob/06d439e6be9004a086f392008e41acddd1a444ff/0016-permissioned-data/README.md) draft, taking the spec as the source of truth over the reference implementation: LtHash set-hash commits, the delegation-token / space-credential JWT shapes, the OAuth `space:` scope grammar, and the `com.atproto.simplespace` mint-policy / `appAccess` / `managingApp` configuration.
+- Unified space-declaration resolution across the OAuth consent screen and the `space:` scope gate behind a shared resolver.
+
+### Removed
+- Permissioned-data member-sync machinery (`getMemberState` / `getMemberOplog` / `notifyMembership`); member-list management (`addMember` / `removeMember` / `listMembers`) is retained.
+
 ## [0.15.0-alpha.1] - 2026-05-09
 ### Added
 - AT Protocol PDS + permissioned-data Spaces (alpha-ready) — new `atproto-pds` and `atproto-space` crates introducing a Personal Data Server implementation and permissioned-data Space primitives (commits, credentials, recon, set hashing, members, repo, storage).
@@ -242,6 +250,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.15.0-alpha.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.2
 [0.15.0-alpha.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.1
 [0.14.6]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.6
 [0.14.5]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.5

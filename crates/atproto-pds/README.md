@@ -57,11 +57,17 @@ XRPC endpoints (default features):
   (RFC 7009), `/oauth/jwks`, `/.well-known/oauth-authorization-server`,
   `/.well-known/oauth-protected-resource`. Multi-key JWK rotation is
   supported via `PDS_OAUTH_KEYS_JWK_SET`.
-- **Spaces (`com.atproto.space.*`)** — `createSpace`, `getSpace`, `listSpaces`,
-  `addMember`, `removeMember`, `getMembers`, `applyWrites` (permissioned),
-  `getRecord`, `listRecords`, `getRepoState`, `getRepoOplog`, `getMemberState`,
-  `getMemberOplog`, `getMemberGrant`, `getSpaceCredential` (replay-protected
-  via the in-memory JTI guard, with optional Valkey/Redis backing).
+- **Spaces** — owner-side management under `com.atproto.simplespace.*`
+  (`createSpace`, `updateSpace`, `deleteSpace`, `addMember`, `removeMember`,
+  `listMembers`) and the permissioned realm under `com.atproto.space.*`
+  (`getSpace`, `listSpaces`, `applyWrites`, `createRecord`, `putRecord`,
+  `deleteRecord`, `getRecord`, `listRecords` (keys-only), `getBlob`,
+  `listRepos`, `getRepoState`, `listRepoOps`, `getDelegationToken` →
+  `getSpaceCredential` (the two-step delegation-token/credential exchange,
+  replay-protected via the in-memory JTI guard with optional Valkey/Redis
+  backing), `registerNotify`, and the contentless
+  `notifyWrite`/`notifySpaceDeleted` inbound hooks). Aligned to the published
+  0016 Permissioned Data spec.
 - **Admin** (`com.atproto.admin.*`) — `getAccountInfo`, `getAccountInfos`,
   `getSubjectStatus`, `updateSubjectStatus`, `deleteAccount`,
   `searchAccounts`, `getInviteCodes`, `disableInviteCodes`,
@@ -81,8 +87,8 @@ metrics at `GET /metrics` when the `metrics` feature is on.
 Two compile-time-mutually-exclusive backends for the per-actor store:
 
 - **SQLite (default)** — per-actor SQLite files. Matches the upstream
-  Spaces Design Spec exactly. `cargo build` (or `cargo install`) produces
-  this profile.
+  0016 Permissioned Data draft exactly. `cargo build` (or `cargo install`)
+  produces this profile.
 - **fjall** — single fjall `Database` per data-dir with one `Keyspace`
   per logical table. Lower-overhead single-host alternative; build with
   `--no-default-features --features fjall,smtp,metrics,hickory-dns`. The
@@ -110,7 +116,6 @@ Per-actor SQLite vs fjall is independent of the accounts-DB choice.
 | `http` | yes | axum router + WebSocket subscribeRepos. |
 | `clap` | | Build the `pds` and `atproto-pds-admin` binaries. |
 | `hickory-dns` | yes | Hickory resolver via `atproto-identity/hickory-dns`. |
-| `ecmh` | | Production `EcmhSetHash` over secp256k1 (replaces the placeholder `XorSha256SetHash`). |
 | `smtp` | | SMTP integration via `lettre`. When off, email-issuing endpoints fall back to dev-only INFO logging. |
 | `metrics` | | `prometheus-client` exporter at `GET /metrics` + axum request-counter middleware. |
 | `valkey` | | Valkey/Redis-backed JTI replay guard + sliding-window rate limiter. Wins over `--durability-profile` when `PDS_VALKEY_URL` is set. |
@@ -176,15 +181,6 @@ cargo test --workspace --all-features
 PDS_POSTGRES_TEST_URL=postgres://pds:pds@127.0.0.1:5432/pds_live \
   cargo test -p atproto-pds --features postgres-live-tests \
     --test feature_postgres_live
-```
-
-## Benchmarks
-
-`atproto-space` ships criterion benches comparing `XorSha256SetHash` and
-`EcmhSetHash`:
-
-```bash
-cargo bench -p atproto-space --features ecmh
 ```
 
 ## License

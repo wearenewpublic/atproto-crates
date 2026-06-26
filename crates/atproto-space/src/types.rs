@@ -1,15 +1,15 @@
 //! Core types for permissioned-data spaces.
 //!
-//! `SpaceUri`, `SpaceType`, `SpaceKey` are wrapper newtypes around strings
-//! that validate at construction time. They are abstracted so the URI scheme
-//! (`ats://` per the Spaces Design Spec, provisional) can change without
+//! `SpaceUri`, `SpaceType`, `SpaceKey`, `RecordUri` are wrapper newtypes around
+//! strings that validate at construction time. They are abstracted so the URI
+//! scheme (`ats://` per the 0016 Permissioned Data draft) can change without
 //! callers needing to update.
 
 use crate::errors::{SpaceError, SpaceResult};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// URI scheme for permissioned data spaces (provisional per Spaces Design Spec).
+/// URI scheme for permissioned data spaces (per the 0016 Permissioned Data draft).
 pub const ATS_SCHEME: &str = "ats://";
 
 /// A space type — an NSID describing the space modality (e.g., `app.bsky.group`).
@@ -44,22 +44,30 @@ impl fmt::Display for SpaceType {
     }
 }
 
-/// A space key — an arbitrary identifier scoped under (owner, type).
+/// Maximum `skey` length in UTF-8 bytes (per `com.atproto.simplespace.createSpace`).
+pub const SPACE_KEY_MAX_BYTES: usize = 512;
+
+/// A space key — an arbitrary identifier scoped under (authority, type).
 ///
-/// Cannot contain `/` (would corrupt the URI segment structure) and cannot be empty.
+/// Per the 0016 Permissioned Data draft (line 134), an `skey` has a maximum
+/// length of 512 bytes and the same syntax requirements as an `rkey`: the
+/// characters are restricted to `[A-Za-z0-9._:~-]`, and the reserved values
+/// `.` and `..` are disallowed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SpaceKey(String);
 
 impl SpaceKey {
-    /// Construct a new `SpaceKey`. Validates non-empty and slash-free.
+    /// Construct a new `SpaceKey`. Validates that the value is non-empty, within
+    /// the 512-byte length cap, restricted to the record-key character set
+    /// `[A-Za-z0-9._:~-]`, and is not a reserved value (`.` or `..`).
     ///
     /// # Errors
     ///
     /// Returns [`SpaceError::InvalidSpaceKey`] if validation fails.
     pub fn new(value: impl Into<String>) -> SpaceResult<Self> {
         let value = value.into();
-        if value.is_empty() || value.contains('/') {
+        if value.len() > SPACE_KEY_MAX_BYTES || !is_valid_record_key(&value) {
             return Err(SpaceError::InvalidSpaceKey { value });
         }
         Ok(Self(value))
@@ -78,15 +86,15 @@ impl fmt::Display for SpaceKey {
     }
 }
 
-/// A space URI: `ats://<owner-did>/<space-type>/<space-key>`.
+/// A space URI: `ats://<authority-did>/<space-type>/<space-key>`.
 ///
 /// The components are validated at construction. The full URI is round-trip
 /// stable through `Display` and `parse`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct SpaceUri {
-    /// DID of the space owner.
-    pub owner_did: String,
+    /// Space authority DID.
+    pub space_did: String,
     /// Space type (NSID).
     pub space_type: SpaceType,
     /// Space key.
@@ -95,9 +103,9 @@ pub struct SpaceUri {
 
 impl SpaceUri {
     /// Construct a new `SpaceUri` from validated components.
-    pub fn new(owner_did: String, space_type: SpaceType, space_key: SpaceKey) -> Self {
+    pub fn new(space_did: String, space_type: SpaceType, space_key: SpaceKey) -> Self {
         Self {
-            owner_did,
+            space_did,
             space_type,
             space_key,
         }
@@ -114,10 +122,10 @@ impl SpaceUri {
             .strip_prefix(ATS_SCHEME)
             .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
 
-        // Split into 3 parts: owner_did, space_type, space_key.
-        // owner_did itself may contain `:` but no `/`, so we split on `/`.
+        // Split into 3 parts: space_did, space_type, space_key.
+        // space_did itself may contain `:` but no `/`, so we split on `/`.
         let mut parts = stripped.splitn(3, '/');
-        let owner_did = parts
+        let space_did = parts
             .next()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?
@@ -131,12 +139,12 @@ impl SpaceUri {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
 
-        if !owner_did.starts_with("did:") {
+        if !space_did.starts_with("did:") {
             return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
         }
 
         Ok(Self {
-            owner_did,
+            space_did,
             space_type: SpaceType::new(space_type_str)?,
             space_key: SpaceKey::new(space_key_str)?,
         })
@@ -148,7 +156,7 @@ impl fmt::Display for SpaceUri {
         write!(
             f,
             "{}{}/{}/{}",
-            ATS_SCHEME, self.owner_did, self.space_type, self.space_key
+            ATS_SCHEME, self.space_did, self.space_type, self.space_key
         )
     }
 }
@@ -173,6 +181,105 @@ impl std::str::FromStr for SpaceUri {
     fn from_str(s: &str) -> SpaceResult<Self> {
         Self::parse(s)
     }
+}
+
+/// A permissioned **record** URI of six components:
+/// `ats://<spaceDid>/<spaceType>/<skey>/<authorDid>/<collection>/<rkey>`.
+///
+/// The first three components are the [`SpaceUri`]; the remaining three
+/// identify a record authored by `author_did` within that space. All six
+/// segments are required to identify a permissioned record (the space does not
+/// colocate records — each author's records live in their own permissioned
+/// repo, so the author DID is part of the address).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RecordUri {
+    /// The space the record belongs to (first three URI segments).
+    pub space: SpaceUri,
+    /// DID of the record's author.
+    pub author_did: String,
+    /// Record collection (NSID).
+    pub collection: String,
+    /// Record key.
+    pub rkey: String,
+}
+
+impl RecordUri {
+    /// Construct a record URI from its parts.
+    #[must_use]
+    pub fn new(space: SpaceUri, author_did: String, collection: String, rkey: String) -> Self {
+        Self {
+            space,
+            author_did,
+            collection,
+            rkey,
+        }
+    }
+
+    /// Parse from the canonical six-segment wire form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpaceError::InvalidSpaceUri`] if the URI does not have exactly
+    /// six non-empty segments or a component fails validation.
+    pub fn parse(s: &str) -> SpaceResult<Self> {
+        let stripped = s
+            .strip_prefix(ATS_SCHEME)
+            .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
+        // A record URI has EXACTLY six segments; a 7th `/` (or any extra
+        // segment) is rejected rather than absorbed into the rkey.
+        let parts: Vec<&str> = stripped.split('/').collect();
+        if parts.len() != 6 || parts.iter().any(|p| p.is_empty()) {
+            return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
+        }
+        let space = SpaceUri::new(
+            {
+                if !parts[0].starts_with("did:") {
+                    return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
+                }
+                parts[0].to_string()
+            },
+            SpaceType::new(parts[1])?,
+            SpaceKey::new(parts[2])?,
+        );
+        if !parts[3].starts_with("did:") {
+            return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
+        }
+        // The collection segment is typed as an NSID by the spec (Addressing,
+        // line 73).
+        if !is_valid_nsid(parts[4]) {
+            return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
+        }
+        Ok(Self {
+            space,
+            author_did: parts[3].to_string(),
+            collection: parts[4].to_string(),
+            rkey: parts[5].to_string(),
+        })
+    }
+}
+
+impl fmt::Display for RecordUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}/{}",
+            self.space, self.author_did, self.collection, self.rkey
+        )
+    }
+}
+
+/// Record-key syntax validation per AT Protocol (the `rkey` baseline the 0016
+/// draft references for `skey`, line 134): 1-512 characters drawn from
+/// `[A-Za-z0-9._:~-]`, and not the reserved values `.` or `..`.
+fn is_valid_record_key(s: &str) -> bool {
+    if s.is_empty() || s.len() > SPACE_KEY_MAX_BYTES {
+        return false;
+    }
+    if s == "." || s == ".." {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | ':'))
 }
 
 /// Minimal NSID validation per AT Protocol — at least three dot-separated segments,
@@ -218,9 +325,73 @@ mod tests {
     }
 
     #[test]
+    fn space_key_valid_rkey_charset() {
+        // Full record-key charset is accepted.
+        assert!(SpaceKey::new("key-with-hyphens").is_ok());
+        assert!(SpaceKey::new("key_with_underscores").is_ok());
+        assert!(SpaceKey::new("key~with~tildes").is_ok());
+        assert!(SpaceKey::new("key:with:colons").is_ok());
+        assert!(SpaceKey::new("example.com").is_ok());
+        assert!(SpaceKey::new("self").is_ok());
+    }
+
+    #[test]
     fn space_key_invalid() {
         assert!(SpaceKey::new("").is_err());
         assert!(SpaceKey::new("with/slash").is_err());
+        // Reserved record-key values.
+        assert!(SpaceKey::new(".").is_err());
+        assert!(SpaceKey::new("..").is_err());
+        // Out-of-charset values rejected (rkey syntax, spec line 134).
+        assert!(SpaceKey::new("has space").is_err());
+        assert!(SpaceKey::new("a@b").is_err());
+        assert!(SpaceKey::new("emoji\u{1f600}").is_err());
+    }
+
+    #[test]
+    fn space_key_length_cap() {
+        assert!(SpaceKey::new("a".repeat(SPACE_KEY_MAX_BYTES)).is_ok());
+        assert!(SpaceKey::new("a".repeat(SPACE_KEY_MAX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn record_uri_round_trip() {
+        let s = "ats://did:plc:auth/app.bsky.group/default/did:plc:alice/app.bsky.feed.post/3jui";
+        let parsed = RecordUri::parse(s).unwrap();
+        assert_eq!(parsed.author_did, "did:plc:alice");
+        assert_eq!(parsed.collection, "app.bsky.feed.post");
+        assert_eq!(parsed.rkey, "3jui");
+        assert_eq!(parsed.space.space_did, "did:plc:auth");
+        assert_eq!(parsed.to_string(), s);
+    }
+
+    #[test]
+    fn record_uri_parse_failures() {
+        // 3-segment (space only) is not a record URI.
+        assert!(RecordUri::parse("ats://did:plc:auth/app.bsky.group/default").is_err());
+        // author segment must be a DID.
+        assert!(
+            RecordUri::parse(
+                "ats://did:plc:auth/app.bsky.group/default/alice/app.bsky.feed.post/k"
+            )
+            .is_err()
+        );
+        // wrong scheme.
+        assert!(RecordUri::parse("https://x/y/z/a/b/c").is_err());
+        // collection segment must be a valid NSID (spec line 73).
+        assert!(
+            RecordUri::parse(
+                "ats://did:plc:auth/app.bsky.group/default/did:plc:alice/notanNSID/rk"
+            )
+            .is_err()
+        );
+        // a 7th segment is rejected rather than absorbed into the rkey.
+        assert!(
+            RecordUri::parse(
+                "ats://did:plc:auth/app.bsky.group/default/did:plc:alice/app.bsky.feed.post/rk/extra"
+            )
+            .is_err()
+        );
     }
 
     #[test]

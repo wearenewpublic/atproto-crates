@@ -762,7 +762,7 @@ pub async fn takedown_space_record(
             format!("invalid space URI: {e}"),
         )
     })?;
-    let store = crate::actor_store::sql::SqlActorStore::open(manager.data_dir(), &space.owner_did)
+    let store = crate::actor_store::sql::SqlActorStore::open(manager.data_dir(), &space.space_did)
         .await
         .map_err(XrpcError::from)?;
     if input.takedown {

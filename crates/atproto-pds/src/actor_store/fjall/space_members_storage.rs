@@ -1,14 +1,11 @@
 //! `FjallSpaceMembersStorage` — `SpaceMembersStorage` impl over fjall.
 
-use super::keyspace::{
-    FjallActorStore, member_key, member_prefix, oplog_after_rev, oplog_key, oplog_prefix_by_space,
-};
+use super::keyspace::{FjallActorStore, member_key, member_prefix, oplog_key};
 use async_trait::async_trait;
 use atproto_space::SpaceError;
 use atproto_space::errors::SpaceResult;
 use atproto_space::storage::{
-    MemberChange, MemberPage, MemberRow, MemberState, OplogEntry, OplogPage, PreparedCommitMembers,
-    SpaceMembersStorage,
+    MemberChange, MemberPage, MemberRow, MemberState, PreparedCommitMembers, SpaceMembersStorage,
 };
 use atproto_space::types::SpaceUri;
 use serde::{Deserialize, Serialize};
@@ -174,68 +171,12 @@ impl SpaceMembersStorage for FjallSpaceMembersStorage {
             .map_err(|e| fjall_err(format!("commit batch: {e}")))?;
         Ok(())
     }
-
-    async fn read_oplog(
-        &self,
-        space: &SpaceUri,
-        since: Option<&str>,
-        limit: u32,
-    ) -> SpaceResult<OplogPage> {
-        let space_uri = space.to_string();
-        let limit = limit.clamp(1, 1000) as usize;
-        let part = self.store.space_member_oplog();
-
-        let prefix = oplog_prefix_by_space(&space_uri);
-        let cursor = since.map(|s| oplog_after_rev(&space_uri, s));
-
-        let mut ops = Vec::with_capacity(limit);
-        for kv in part.prefix(&prefix) {
-            let (k, v) = kv
-                .into_inner()
-                .map_err(|e| fjall_err(format!("scan oplog: {e}")))?;
-            if let Some(c) = cursor.as_ref()
-                && k.as_ref() <= c.as_slice()
-            {
-                continue;
-            }
-            let suffix = &k[prefix.len()..];
-            let null_pos = suffix
-                .iter()
-                .position(|b| *b == 0)
-                .ok_or_else(|| fjall_err("oplog key missing rev separator".to_string()))?;
-            let rev = std::str::from_utf8(&suffix[..null_pos])
-                .map_err(|e| fjall_err(format!("rev utf-8: {e}")))?
-                .to_string();
-            let idx_str = std::str::from_utf8(&suffix[null_pos + 1..])
-                .map_err(|e| fjall_err(format!("idx utf-8: {e}")))?;
-            let idx: u32 = idx_str
-                .parse()
-                .map_err(|e| fjall_err(format!("idx parse: {e}")))?;
-
-            let row: MemberOplogRow = decode(&v)?;
-            ops.push(OplogEntry {
-                rev,
-                idx,
-                action: row.action,
-                collection: None,
-                rkey: None,
-                cid: None,
-                prev: None,
-                did: Some(row.did),
-            });
-            if ops.len() >= limit {
-                break;
-            }
-        }
-        let state = self.current_state(space).await?;
-        Ok(OplogPage { ops, state })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atproto_space::set_hash::XorSha256SetHash;
+    use atproto_space::set_hash::LtHash;
     use atproto_space::space_members::{MemberOp, MemberOpAction, SpaceMembers};
     use atproto_space::types::{SpaceKey, SpaceType};
     use tempfile::TempDir;
@@ -248,7 +189,7 @@ mod tests {
         )
     }
 
-    type TestMembers = SpaceMembers<FjallSpaceMembersStorage, XorSha256SetHash>;
+    type TestMembers = SpaceMembers<FjallSpaceMembersStorage, LtHash>;
 
     fn fresh() -> (FjallSpaceMembersStorage, TempDir) {
         let tmp = TempDir::new().unwrap();
@@ -287,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn list_paginates_and_oplog_round_trips() {
+    async fn list_paginates() {
         let (storage, _tmp) = fresh();
         let space = test_space();
         let m: TestMembers = SpaceMembers::new(space.clone(), storage);
@@ -306,9 +247,6 @@ mod tests {
         let page = m.list_members(None, 2).await.unwrap();
         assert_eq!(page.members.len(), 2);
         assert_eq!(page.members[0].did, "did:plc:a");
-
-        let oplog = m.read_oplog(None, 100).await.unwrap();
-        assert_eq!(oplog.ops.len(), 3);
-        assert!(oplog.ops.iter().all(|o| o.action == "add"));
+        assert_eq!(page.cursor.as_deref(), Some("did:plc:b"));
     }
 }

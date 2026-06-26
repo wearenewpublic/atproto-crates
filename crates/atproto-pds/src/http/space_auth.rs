@@ -4,35 +4,31 @@
 //! 1. **OAuth bearer** — same DPoP-bound HS256 token used for the public
 //!    realm. Verified by [`crate::oauth::token::verify_oauth_jwt`]. Used for
 //!    own-PDS reads and writes.
-//! 2. **MemberGrant JWT** (`typ=space_member_grant`) — passed to
-//!    `getSpaceCredential`. Signed by the member's atproto signing key.
-//! 3. **SpaceCredential JWT** (`typ=space_credential`) — passed to
+//! 2. **Delegation token** (`typ=atproto-space-delegation+jwt`) — presented in
+//!    the `Authorization: Bearer` header to `getSpaceCredential`. Signed by the
+//!    member's atproto signing key (header `kid="#atproto"`).
+//! 3. **SpaceCredential JWT** (`typ=atproto-space-credential+jwt`) — passed to
 //!    `getRecord`/`listRecords`/`getRepoState`/etc. by remote consumers.
-//!    Signed by the space owner's atproto signing key.
+//!    Signed by the space authority's `#atproto_space` signing key.
 //!
-//! the design (§15.7), MemberGrant verification at the owner's PDS
-//! requires resolving the member's DID document to obtain their signing
-//! key. The **same-PDS** case (the member is also a locally-managed
-//! account on this PDS) looks up the signing key directly via the
-//! `AccountManager` + `KeyStore`. Cross-PDS resolution through
-//! `atproto-identity` is wired — the resolver picks the path automatically based on
-//! whether the DID is locally managed.
+//! Delegation-token verification at the authority's PDS requires resolving the
+//! member's DID document to obtain their `#atproto` signing key. The
+//! **same-PDS** case (the member is also a locally-managed account on this PDS)
+//! looks up the signing key directly via the `AccountManager` + `KeyStore`.
+//! Cross-PDS resolution through `atproto-identity` is wired — the resolver
+//! picks the path automatically based on whether the DID is locally managed.
 
 use crate::account::AccountManager;
 use crate::http::errors::XrpcError;
-use crate::security::JtiReplayGuard;
 use atproto_identity::key::{KeyData, to_public};
 use atproto_space::credential::{
-    LXM_GET_SPACE_CREDENTIAL, MemberGrant, TYP_MEMBER_GRANT, TYP_SPACE_CREDENTIAL,
-    verify_member_grant,
+    DelegationToken, TYP_DELEGATION_TOKEN, TYP_SPACE_CREDENTIAL, verify_delegation_token,
 };
 use atproto_space::types::SpaceUri;
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// JWT typ discriminator inspection.
 #[derive(Debug, Deserialize)]
@@ -55,9 +51,9 @@ pub fn classify_token_typ(token: &str) -> Option<String> {
 /// Recognised Spaces token shapes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpaceTokenKind {
-    /// `space_member_grant`.
-    MemberGrant,
-    /// `space_credential`.
+    /// `atproto-space-delegation+jwt`.
+    DelegationToken,
+    /// `atproto-space-credential+jwt`.
     SpaceCredential,
     /// Anything else (likely an OAuth access token).
     Other(String),
@@ -68,7 +64,7 @@ pub enum SpaceTokenKind {
 pub fn classify(token: &str) -> Option<SpaceTokenKind> {
     let typ = classify_token_typ(token)?;
     Some(match typ.as_str() {
-        TYP_MEMBER_GRANT => SpaceTokenKind::MemberGrant,
+        TYP_DELEGATION_TOKEN => SpaceTokenKind::DelegationToken,
         TYP_SPACE_CREDENTIAL => SpaceTokenKind::SpaceCredential,
         _ => SpaceTokenKind::Other(typ),
     })
@@ -107,7 +103,7 @@ pub async fn local_signing_key(accounts: &AccountManager, did: &str) -> Result<K
 }
 
 /// Resolve a locally-managed account's *public* signing key (used for
-/// verifying MemberGrants issued by that account).
+/// verifying delegation tokens issued by that account).
 pub async fn local_public_key(accounts: &AccountManager, did: &str) -> Result<KeyData, XrpcError> {
     let private = local_signing_key(accounts, did).await?;
     to_public(&private).map_err(|e| {
@@ -119,36 +115,18 @@ pub async fn local_public_key(accounts: &AccountManager, did: &str) -> Result<Ke
     })
 }
 
-/// Verify a MemberGrant against a same-PDS member's signing key, with replay
-/// protection.
-///
-/// MemberGrants don't carry an explicit `jti` claim — instead we synthesize
-/// one from `(iss, iat, lxm, space, clientId)` so the replay guard rejects
-/// duplicate exchanges of the same grant. TTL is the grant's remaining
-/// lifetime (`exp - now`).
-///
-/// Returns the decoded payload on success. Used by `getSpaceCredential`.
+/// Peek the unverified `iss` claim of a delegation token without checking the
+/// signature, so the caller knows which member key to resolve.
 ///
 /// # Errors
 ///
-/// - 400 `InvalidToken` if the grant is unparseable / expired / claim mismatch.
-/// - 401 `AuthenticationRequired` if the issuer (member) is not known on this PDS.
-/// - 409 `Replay` if the same grant has already been exchanged within its TTL.
-pub async fn verify_local_member_grant(
-    accounts: &Arc<AccountManager>,
-    jti_guard: &JtiReplayGuard,
-    grant_jwt: &str,
-    expected_owner_did: &str,
-    expected_space: &SpaceUri,
-    expected_client_id: &str,
-) -> Result<MemberGrant, XrpcError> {
-    // Peek the issuer claim without verifying signature, so we know which
-    // member's key to fetch. We re-verify with the proper key below.
+/// Returns 400 `InvalidToken` when the token is structurally malformed.
+pub fn peek_delegation_token(grant_jwt: &str) -> Result<DelegationToken, XrpcError> {
     let payload_b64 = grant_jwt.split('.').nth(1).ok_or_else(|| {
         XrpcError::new(
             StatusCode::BAD_REQUEST,
             "InvalidToken",
-            "MemberGrant: missing payload",
+            "delegation token: missing payload",
         )
     })?;
     let payload_bytes = general_purpose::URL_SAFE_NO_PAD
@@ -157,128 +135,85 @@ pub async fn verify_local_member_grant(
             XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "InvalidToken",
-                "MemberGrant: payload not base64url",
+                "delegation token: payload not base64url",
             )
         })?;
-    let unverified: MemberGrant = serde_json::from_slice(&payload_bytes).map_err(|_| {
+    serde_json::from_slice(&payload_bytes).map_err(|_| {
         XrpcError::new(
             StatusCode::BAD_REQUEST,
             "InvalidToken",
-            "MemberGrant: payload not JSON",
+            "delegation token: payload not JSON",
         )
-    })?;
+    })
+}
 
-    if unverified.lxm != LXM_GET_SPACE_CREDENTIAL {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            format!("MemberGrant lxm mismatch: {}", unverified.lxm),
-        ));
-    }
+/// Verify a delegation token against a same-PDS member's signing key.
+///
+/// Returns the decoded payload on success. Used by `getSpaceCredential`.
+///
+/// # Errors
+///
+/// - 400 `InvalidToken` if the token is unparseable / expired / claim mismatch.
+/// - 404 `AccountNotFound` if the issuer (member) is not known on this PDS.
+pub async fn verify_local_delegation_token(
+    accounts: &Arc<AccountManager>,
+    grant_jwt: &str,
+    expected_authority_did: &str,
+    expected_space: &SpaceUri,
+) -> Result<DelegationToken, XrpcError> {
+    // Peek the issuer claim without verifying signature, so we know which
+    // member's key to fetch. We re-verify with the proper key below.
+    let unverified = peek_delegation_token(grant_jwt)?;
 
     let member_pub = local_public_key(accounts, &unverified.iss).await?;
-    let payload = verify_member_grant(
+    let payload = verify_delegation_token(
         grant_jwt,
-        expected_owner_did,
+        expected_authority_did,
         expected_space,
-        expected_client_id,
         &member_pub,
     )
     .map_err(|e| {
         XrpcError::new(
             StatusCode::FORBIDDEN,
             "InvalidToken",
-            format!("MemberGrant verification: {e}"),
+            format!("delegation token verification: {e}"),
         )
     })?;
-
-    // Replay protection. Synthesize a JTI from the structural identity of the
-    // grant; record with TTL = remaining lifetime so the guard self-cleans.
-    let synthetic_jti = synthesize_member_grant_jti(&payload);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let ttl = Duration::from_secs(payload.exp.saturating_sub(now));
-    jti_guard
-        .check_and_insert(&synthetic_jti, ttl)
-        .await
-        .map_err(|e| {
-            XrpcError::new(
-                StatusCode::CONFLICT,
-                "Replay",
-                format!("MemberGrant replay rejected: {e}"),
-            )
-        })?;
 
     Ok(payload)
 }
 
-/// Verify a MemberGrant issued by a member on a *remote* PDS by resolving
+/// Verify a delegation token issued by a member on a *remote* PDS by resolving
 /// their DID document for the atproto signing key.
 ///
-/// The flow mirrors [`verify_local_member_grant`] but the public-key
+/// The flow mirrors [`verify_local_delegation_token`] but the public-key
 /// lookup goes through `atproto-identity` instead of the local
 /// `AccountManager`:
 ///
-/// 1. Peek the JWT payload to learn the issuer DID + claim shape.
+/// 1. Peek the JWT payload to learn the issuer DID.
 /// 2. Resolve the issuer's DID document via the configured PLC directory
 ///    (for `did:plc`) or `.well-known/did.json` (for `did:web`).
 /// 3. Find the verification method whose id ends in `#atproto`; decode the
 ///    multibase public key into a `KeyData`.
-/// 4. Re-verify the JWT against that key, plus the same JTI replay guard
-///    used on the local path.
+/// 4. Re-verify the JWT against that key.
 ///
 /// `plc_directory_hostname` is the configured PLC directory (e.g.
 /// `plc.directory`); pass `None` to use the upstream default.
 ///
 /// # Errors
 ///
-/// - 400 `InvalidToken` — grant unparseable / wrong `lxm` / claim mismatch.
+/// - 400 `InvalidToken` — token unparseable / claim mismatch.
 /// - 401 `AuthenticationRequired` — DID document doesn't resolve, or
 ///   doesn't carry an `#atproto` verification method.
 /// - 403 `InvalidToken` — signature verification failed.
-/// - 409 `Replay` — the same grant has already been exchanged.
-pub async fn verify_remote_member_grant(
+pub async fn verify_remote_delegation_token(
     http: &reqwest::Client,
-    jti_guard: &JtiReplayGuard,
     grant_jwt: &str,
-    expected_owner_did: &str,
+    expected_authority_did: &str,
     expected_space: &SpaceUri,
-    expected_client_id: &str,
     plc_directory_hostname: Option<&str>,
-) -> Result<MemberGrant, XrpcError> {
-    let payload_b64 = grant_jwt.split('.').nth(1).ok_or_else(|| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "MemberGrant: missing payload",
-        )
-    })?;
-    let payload_bytes = general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64.as_bytes())
-        .map_err(|_| {
-            XrpcError::new(
-                StatusCode::BAD_REQUEST,
-                "InvalidToken",
-                "MemberGrant: payload not base64url",
-            )
-        })?;
-    let unverified: MemberGrant = serde_json::from_slice(&payload_bytes).map_err(|_| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "MemberGrant: payload not JSON",
-        )
-    })?;
-
-    if unverified.lxm != LXM_GET_SPACE_CREDENTIAL {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            format!("MemberGrant lxm mismatch: {}", unverified.lxm),
-        ));
-    }
+) -> Result<DelegationToken, XrpcError> {
+    let unverified = peek_delegation_token(grant_jwt)?;
 
     let member_pub = remote_atproto_signing_key(http, &unverified.iss, plc_directory_hostname)
         .await
@@ -289,107 +224,129 @@ pub async fn verify_remote_member_grant(
                 format!("resolve member DID document for {}: {e}", unverified.iss),
             )
         })?;
-    let payload = verify_member_grant(
+    let payload = verify_delegation_token(
         grant_jwt,
-        expected_owner_did,
+        expected_authority_did,
         expected_space,
-        expected_client_id,
         &member_pub,
     )
     .map_err(|e| {
         XrpcError::new(
             StatusCode::FORBIDDEN,
             "InvalidToken",
-            format!("MemberGrant verification: {e}"),
+            format!("delegation token verification: {e}"),
         )
     })?;
-
-    let synthetic_jti = synthesize_member_grant_jti(&payload);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let ttl = Duration::from_secs(payload.exp.saturating_sub(now));
-    jti_guard
-        .check_and_insert(&synthetic_jti, ttl)
-        .await
-        .map_err(|e| {
-            XrpcError::new(
-                StatusCode::CONFLICT,
-                "Replay",
-                format!("MemberGrant replay rejected: {e}"),
-            )
-        })?;
 
     Ok(payload)
 }
 
+/// Fetch a `did:plc:`/`did:web:` DID document for remote verification.
+async fn fetch_remote_document(
+    http: &reqwest::Client,
+    did: &str,
+    plc_directory_hostname: Option<&str>,
+) -> anyhow::Result<atproto_identity::model::Document> {
+    use atproto_identity::plc::query as plc_query;
+    use atproto_identity::web::query as web_query;
+    if did.starts_with("did:plc:") {
+        let host = plc_directory_hostname.unwrap_or("plc.directory");
+        Ok(plc_query(http, host, did).await?)
+    } else if did.starts_with("did:web:") {
+        Ok(web_query(http, did).await?)
+    } else {
+        anyhow::bail!("unsupported DID method for remote space verification: {did}")
+    }
+}
+
+/// Turn a multibase / `did:key:` value into `KeyData`.
+fn multibase_to_key(mb: &str) -> anyhow::Result<KeyData> {
+    use atproto_identity::key::identify_key;
+    // `identify_key` accepts either a bare multibase value or a `did:key:`
+    // wrapper. Normalize so the call site is robust to either form.
+    let did_key = if mb.starts_with("did:key:") {
+        mb.to_string()
+    } else {
+        format!("did:key:{mb}")
+    };
+    Ok(identify_key(&did_key)?)
+}
+
 /// Resolve a remote DID's atproto signing key (the `#atproto` verification
 /// method's `publicKeyMultibase`). Returns `KeyData` ready for
-/// `verify_member_grant` etc.
+/// `verify_delegation_token` etc. The delegation token's `kid` is `#atproto`
+/// per 0016 line 162, so this resolves the member's public-data signing key.
 async fn remote_atproto_signing_key(
     http: &reqwest::Client,
     did: &str,
     plc_directory_hostname: Option<&str>,
 ) -> anyhow::Result<KeyData> {
-    use atproto_identity::key::identify_key;
-    use atproto_identity::model::VerificationMethod;
-    use atproto_identity::plc::query as plc_query;
-    use atproto_identity::web::query as web_query;
-    let document = if did.starts_with("did:plc:") {
-        let host = plc_directory_hostname.unwrap_or("plc.directory");
-        plc_query(http, host, did).await?
-    } else if did.starts_with("did:web:") {
-        web_query(http, did).await?
-    } else {
-        anyhow::bail!("unsupported DID method for remote member-grant verification: {did}");
-    };
-    let mut atproto_pub: Option<String> = None;
-    for method in &document.verification_method {
-        if let VerificationMethod::Multikey {
-            id,
-            public_key_multibase,
-            ..
-        } = method
-        {
-            // Match either `#atproto` (relative) or
-            // `did:plc:xxx#atproto` (absolute). Spec allows either form.
-            if id.ends_with("#atproto") {
-                atproto_pub = Some(public_key_multibase.clone());
-                break;
-            }
-        }
-    }
-    let mb = atproto_pub.ok_or_else(|| {
-        anyhow::anyhow!("DID document has no #atproto Multikey verification method")
-    })?;
-    // `identify_key` accepts either a bare multibase value or a `did:key:`
-    // wrapper. Normalize so the call site is robust to either form.
-    let did_key = if mb.starts_with("did:key:") {
-        mb
-    } else {
-        format!("did:key:{}", mb)
-    };
-    Ok(identify_key(&did_key)?)
+    let document = fetch_remote_document(http, did, plc_directory_hostname).await?;
+    let mb = document
+        .verification_method_multibase("atproto")
+        .ok_or_else(|| {
+            anyhow::anyhow!("DID document has no #atproto Multikey verification method")
+        })?;
+    multibase_to_key(mb)
 }
 
-/// Build a deterministic JTI for a MemberGrant payload. We hash the load-bearing
-/// claims so two grants with the same `(iss, iat, lxm, space, clientId)`
-/// collide (replay) but distinct issuances do not.
-fn synthesize_member_grant_jti(grant: &MemberGrant) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"mg:");
-    hasher.update(grant.iss.as_bytes());
-    hasher.update(b"|");
-    hasher.update(grant.iat.to_be_bytes());
-    hasher.update(b"|");
-    hasher.update(grant.lxm.as_bytes());
-    hasher.update(b"|");
-    hasher.update(grant.space.as_bytes());
-    hasher.update(b"|");
-    hasher.update(grant.client_id.as_bytes());
-    let digest = hasher.finalize();
-    hex::encode(digest)
+/// Resolve a remote space authority's credential-verification key.
+///
+/// Per 0016 §"Space authority" (lines 87-92) the authority DID exposes the
+/// credential-signing public key as the `#atproto_space` verification method,
+/// which MAY coincide in value with `#atproto` (line 92). This prefers the
+/// dedicated `#atproto_space` entry and falls back to `#atproto` for authority
+/// DID documents that exercise the coincidence allowance without publishing a
+/// distinct entry.
+pub async fn remote_space_credential_key(
+    http: &reqwest::Client,
+    authority_did: &str,
+    plc_directory_hostname: Option<&str>,
+) -> anyhow::Result<KeyData> {
+    let document = fetch_remote_document(http, authority_did, plc_directory_hostname).await?;
+    let mb = space_credential_multibase(&document).ok_or_else(|| {
+        anyhow::anyhow!(
+            "authority DID document has no #atproto_space or #atproto Multikey verification method"
+        )
+    })?;
+    multibase_to_key(mb)
+}
+
+/// Select the authority's credential-verification public key from a DID
+/// document: prefer `#atproto_space`, fall back to `#atproto` (0016 line 92).
+fn space_credential_multibase(document: &atproto_identity::model::Document) -> Option<&str> {
+    document
+        .verification_method_multibase("atproto_space")
+        .or_else(|| document.verification_method_multibase("atproto"))
+}
+
+/// Resolve a remote space authority's host endpoint.
+///
+/// Per 0016 §"Space authority" (lines 87-92) the authority DID exposes its host
+/// as the `#atproto_space_host` service, which MAY coincide with `#atproto_pds`
+/// (line 92). This prefers the dedicated `#atproto_space_host` entry and falls
+/// back to `#atproto_pds`.
+pub async fn remote_space_host_endpoint(
+    http: &reqwest::Client,
+    authority_did: &str,
+    plc_directory_hostname: Option<&str>,
+) -> anyhow::Result<String> {
+    let document = fetch_remote_document(http, authority_did, plc_directory_hostname).await?;
+    space_host_endpoint(&document)
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "authority DID document has no #atproto_space_host or #atproto_pds service"
+            )
+        })
+}
+
+/// Select the authority's host endpoint from a DID document: prefer
+/// `#atproto_space_host`, fall back to `#atproto_pds` (0016 line 92).
+fn space_host_endpoint(document: &atproto_identity::model::Document) -> Option<&str> {
+    document
+        .service_endpoint("atproto_space_host")
+        .or_else(|| document.service_endpoint("atproto_pds"))
 }
 
 #[cfg(test)]
@@ -398,10 +355,79 @@ mod tests {
     use crate::account::{AccountDirectory, AccountManager, CreateAccountParams};
     use crate::keys::{KeyStore, MemoryKeyStore};
     use atproto_identity::key::KeyType;
-    use atproto_space::credential::{MEMBER_GRANT_TTL_SECS, create_member_grant};
+    use atproto_identity::model::Document;
+    use atproto_space::credential::{DELEGATION_TOKEN_TTL_SECS, create_delegation_token};
     use atproto_space::types::{SpaceKey, SpaceType};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn doc_from(json: &str) -> Document {
+        serde_json::from_str(json).expect("DID document parses")
+    }
+
+    #[test]
+    fn space_credential_key_prefers_atproto_space_vm() {
+        // 0016 lines 87-92: prefer the dedicated #atproto_space VM when present.
+        let doc = doc_from(
+            r##"{"id":"did:plc:authority",
+              "verificationMethod":[
+                {"id":"#atproto","type":"Multikey","controller":"did:plc:authority","publicKeyMultibase":"zATPROTO"},
+                {"id":"#atproto_space","type":"Multikey","controller":"did:plc:authority","publicKeyMultibase":"zSPACE"}
+              ]}"##,
+        );
+        assert_eq!(space_credential_multibase(&doc), Some("zSPACE"));
+    }
+
+    #[test]
+    fn space_credential_key_falls_back_to_atproto_vm() {
+        // Line 92 MAY-coincide: authorities that don't publish a distinct
+        // #atproto_space entry fall back to the #atproto signing key.
+        let doc = doc_from(
+            r##"{"id":"did:plc:authority",
+              "verificationMethod":[
+                {"id":"#atproto","type":"Multikey","controller":"did:plc:authority","publicKeyMultibase":"zATPROTO"}
+              ]}"##,
+        );
+        assert_eq!(space_credential_multibase(&doc), Some("zATPROTO"));
+    }
+
+    #[test]
+    fn space_credential_key_absent_when_neither_present() {
+        let doc = doc_from(r##"{"id":"did:plc:authority","verificationMethod":[]}"##);
+        assert_eq!(space_credential_multibase(&doc), None);
+    }
+
+    #[test]
+    fn space_host_prefers_atproto_space_host_service() {
+        // 0016 lines 87-92: prefer the dedicated #atproto_space_host service.
+        let doc = doc_from(
+            r##"{"id":"did:plc:authority",
+              "service":[
+                {"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"},
+                {"id":"#atproto_space_host","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://host.example.com"}
+              ]}"##,
+        );
+        assert_eq!(space_host_endpoint(&doc), Some("https://host.example.com"));
+    }
+
+    #[test]
+    fn space_host_falls_back_to_atproto_pds_service() {
+        // Line 92 MAY-coincide: fall back to #atproto_pds when no dedicated
+        // host service is published.
+        let doc = doc_from(
+            r##"{"id":"did:plc:authority",
+              "service":[
+                {"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}
+              ]}"##,
+        );
+        assert_eq!(space_host_endpoint(&doc), Some("https://pds.example.com"));
+    }
+
+    #[test]
+    fn space_host_absent_when_neither_present() {
+        let doc = doc_from(r##"{"id":"did:plc:authority","service":[]}"##);
+        assert_eq!(space_host_endpoint(&doc), None);
+    }
 
     async fn fresh_manager(dir: &std::path::Path) -> Arc<AccountManager> {
         let accounts_db = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -441,101 +467,57 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn classify_token_kinds() {
         // synthetic header-only jwt-shaped strings
-        let mg_header = general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"alg":"ES256","typ":"space_member_grant"}"#);
-        let sc_header =
-            general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"space_credential"}"#);
-        let jwt_a = format!("{}.payload.sig", mg_header);
+        let dt_header = general_purpose::URL_SAFE_NO_PAD
+            .encode(br##"{"alg":"ES256","typ":"atproto-space-delegation+jwt","kid":"#atproto"}"##);
+        let sc_header = general_purpose::URL_SAFE_NO_PAD.encode(
+            br##"{"alg":"ES256","typ":"atproto-space-credential+jwt","kid":"#atproto_space"}"##,
+        );
+        let jwt_a = format!("{}.payload.sig", dt_header);
         let jwt_b = format!("{}.payload.sig", sc_header);
-        assert_eq!(classify(&jwt_a), Some(SpaceTokenKind::MemberGrant));
+        assert_eq!(classify(&jwt_a), Some(SpaceTokenKind::DelegationToken));
         assert_eq!(classify(&jwt_b), Some(SpaceTokenKind::SpaceCredential));
     }
 
-    fn fresh_jti_guard() -> JtiReplayGuard {
-        JtiReplayGuard::new(1024)
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn local_member_grant_round_trip() {
+    async fn local_delegation_token_round_trip() {
         let tmp = TempDir::new().unwrap();
         let manager = fresh_manager(tmp.path()).await;
         let alice_priv = local_signing_key(&manager, "did:plc:alice").await.unwrap();
 
         let space = test_space();
-        let grant = create_member_grant(
+        let grant = create_delegation_token(
             "did:plc:alice",
-            "did:plc:owner",
             &space,
-            "https://app.example/client-metadata.json",
             &alice_priv,
-            MEMBER_GRANT_TTL_SECS,
+            DELEGATION_TOKEN_TTL_SECS,
         )
         .unwrap();
 
-        let guard = fresh_jti_guard();
-        let payload = verify_local_member_grant(
-            &manager,
-            &guard,
-            &grant,
-            "did:plc:owner",
-            &space,
-            "https://app.example/client-metadata.json",
-        )
-        .await
-        .unwrap();
+        let payload = verify_local_delegation_token(&manager, &grant, "did:plc:owner", &space)
+            .await
+            .unwrap();
         assert_eq!(payload.iss, "did:plc:alice");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn member_grant_replay_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let manager = fresh_manager(tmp.path()).await;
-        let alice_priv = local_signing_key(&manager, "did:plc:alice").await.unwrap();
-
-        let space = test_space();
-        let grant = create_member_grant(
-            "did:plc:alice",
-            "did:plc:owner",
-            &space,
-            "client",
-            &alice_priv,
-            MEMBER_GRANT_TTL_SECS,
-        )
-        .unwrap();
-
-        let guard = fresh_jti_guard();
-
-        // First exchange: succeeds.
-        verify_local_member_grant(&manager, &guard, &grant, "did:plc:owner", &space, "client")
-            .await
-            .unwrap();
-
-        // Second exchange of the same grant: rejected as a replay.
-        let result =
-            verify_local_member_grant(&manager, &guard, &grant, "did:plc:owner", &space, "client")
-                .await;
-        assert!(result.is_err(), "second exchange should be rejected");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn member_grant_unknown_issuer_rejected() {
+    async fn delegation_token_unknown_issuer_rejected() {
         let tmp = TempDir::new().unwrap();
         let manager = fresh_manager(tmp.path()).await;
         let alice_priv = local_signing_key(&manager, "did:plc:alice").await.unwrap();
 
         let space = test_space();
         // Issue with a *different* iss claim — verify lookup of the unknown
-        // issuer fails. We hand-craft the payload to bypass create_member_grant.
+        // issuer fails. We hand-craft the payload to bypass
+        // create_delegation_token.
         let header = general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"alg":"ES256K","typ":"space_member_grant"}"#);
+            .encode(br##"{"alg":"ES256K","typ":"atproto-space-delegation+jwt","kid":"#atproto"}"##);
         let bad_payload = serde_json::to_vec(&serde_json::json!({
             "iss": "did:plc:nobody",
-            "aud": "did:plc:owner",
-            "space": space.to_string(),
-            "clientId": "client",
-            "lxm": "com.atproto.space.getSpaceCredential",
+            "aud": "did:plc:owner#atproto_space_host",
+            "sub": space.to_string(),
             "iat": 1_700_000_000,
             "exp": 9_999_999_999u64,
+            "jti": "nonce",
         }))
         .unwrap();
         let payload_b64 = general_purpose::URL_SAFE_NO_PAD.encode(&bad_payload);
@@ -547,10 +529,7 @@ mod tests {
             general_purpose::URL_SAFE_NO_PAD.encode(&sig)
         );
 
-        let guard = fresh_jti_guard();
-        let result =
-            verify_local_member_grant(&manager, &guard, &token, "did:plc:owner", &space, "client")
-                .await;
+        let result = verify_local_delegation_token(&manager, &token, "did:plc:owner", &space).await;
         assert!(result.is_err());
     }
 }

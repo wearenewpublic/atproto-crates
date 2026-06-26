@@ -2,12 +2,12 @@
 //!
 //! Mirrors `SpaceRepo` in shape but operates over the owner's `space_member`
 //! commitment. Add and Remove are the two op kinds; the SetHash is over DID
-//! UTF-8 bytes per the Spaces Design Spec.
+//! UTF-8 bytes per the 0016 Permissioned Data draft.
 
 use crate::errors::{SpaceError, SpaceResult};
 use crate::set_hash::{SetHash, member_element_bytes};
 use crate::storage::{
-    MemberChange, MemberPage, MemberRow, MemberState, OplogEntry, OplogPage, PreparedCommitMembers,
+    MemberChange, MemberPage, MemberRow, MemberState, OplogEntry, PreparedCommitMembers,
     SpaceMembersStorage,
 };
 use crate::types::SpaceUri;
@@ -94,7 +94,7 @@ impl<S: SpaceMembersStorage, H: SetHash> SpaceMembers<S, H> {
     pub async fn format_commit(&self, ops: &[MemberOp]) -> SpaceResult<PreparedMemberCommit<H>> {
         let state = self.storage.current_state(&self.space).await?;
         let mut set_hash = match state.set_hash {
-            Some(bytes) => H::from_digest(&bytes)?,
+            Some(bytes) => H::from_state_bytes(&bytes)?,
             None => H::empty(),
         };
 
@@ -143,12 +143,13 @@ impl<S: SpaceMembersStorage, H: SetHash> SpaceMembers<S, H> {
             });
         }
 
-        let new_digest = set_hash.digest();
+        // Persist the full lattice state (rehydrated via `from_state_bytes`).
+        let new_state = set_hash.state_bytes();
         Ok(PreparedMemberCommit {
             set_hash,
             rev: rev.clone(),
             storage_commit: PreparedCommitMembers {
-                new_set_hash: new_digest,
+                new_set_hash: new_state,
                 rev,
                 member_changes,
                 oplog_entries,
@@ -161,11 +162,6 @@ impl<S: SpaceMembersStorage, H: SetHash> SpaceMembers<S, H> {
         self.storage
             .apply_commit(&self.space, prepared.storage_commit)
             .await
-    }
-
-    /// Read member-oplog entries since the given rev.
-    pub async fn read_oplog(&self, since: Option<&str>, limit: u32) -> SpaceResult<OplogPage> {
-        self.storage.read_oplog(&self.space, since, limit).await
     }
 }
 
@@ -184,7 +180,6 @@ pub mod memory {
     struct Inner {
         members: BTreeMap<(SpaceUri, String), MemberRow>,
         states: BTreeMap<SpaceUri, MemberState>,
-        oplog: BTreeMap<(SpaceUri, String, u32), OplogEntry>,
     }
 
     impl InMemorySpaceMembersStorage {
@@ -194,7 +189,6 @@ pub mod memory {
                 inner: Mutex::new(Inner {
                     members: BTreeMap::new(),
                     states: BTreeMap::new(),
-                    oplog: BTreeMap::new(),
                 }),
             }
         }
@@ -274,11 +268,9 @@ pub mod memory {
                     }
                 }
             }
-            for entry in commit.oplog_entries {
-                inner
-                    .oplog
-                    .insert((space.clone(), entry.rev.clone(), entry.idx), entry);
-            }
+            // The 0016 Permissioned Data draft has no member-list oplog read
+            // path, so `commit.oplog_entries` is not retained in this test
+            // store; only the member set + state commitment are updated.
             inner.states.insert(
                 space.clone(),
                 MemberState {
@@ -288,35 +280,6 @@ pub mod memory {
             );
             Ok(())
         }
-
-        async fn read_oplog(
-            &self,
-            space: &SpaceUri,
-            since: Option<&str>,
-            limit: u32,
-        ) -> SpaceResult<OplogPage> {
-            let inner = self.inner.lock().unwrap();
-            let mut ops: Vec<OplogEntry> = inner
-                .oplog
-                .iter()
-                .filter(|((s, rev, _), _)| {
-                    s == space
-                        && match since {
-                            Some(cur) => rev.as_str() > cur,
-                            None => true,
-                        }
-                })
-                .map(|(_, e)| e.clone())
-                .collect();
-            ops.sort_by(|a, b| (a.rev.as_str(), a.idx).cmp(&(b.rev.as_str(), b.idx)));
-            ops.truncate(limit as usize);
-            let state = inner
-                .states
-                .get(space)
-                .cloned()
-                .unwrap_or_else(MemberState::empty);
-            Ok(OplogPage { ops, state })
-        }
     }
 }
 
@@ -324,7 +287,7 @@ pub mod memory {
 mod tests {
     use super::memory::InMemorySpaceMembersStorage;
     use super::*;
-    use crate::set_hash::XorSha256SetHash;
+    use crate::set_hash::LtHash;
     use crate::types::{SpaceKey, SpaceType};
 
     fn test_space() -> SpaceUri {
@@ -335,7 +298,7 @@ mod tests {
         )
     }
 
-    type TestMembers = SpaceMembers<InMemorySpaceMembersStorage, XorSha256SetHash>;
+    type TestMembers = SpaceMembers<InMemorySpaceMembersStorage, LtHash>;
 
     #[tokio::test]
     async fn add_then_remove() {

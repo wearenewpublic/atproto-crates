@@ -10,8 +10,8 @@
 use crate::errors::{SpaceError, SpaceResult};
 use crate::set_hash::{SetHash, record_element_bytes};
 use crate::storage::{
-    OplogEntry, OplogPage, PreparedCommitRecords, RecordChange, RecordPage, RecordRow, RepoState,
-    SpaceRepoStorage,
+    OplogCursor, OplogEntry, OplogPage, PreparedCommitRecords, RecordChange, RecordPage, RecordRow,
+    RepoState, SpaceRepoStorage,
 };
 use crate::types::SpaceUri;
 use atproto_record::tid::Tid;
@@ -127,7 +127,7 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
         // Load current state to derive the new SetHash incrementally.
         let state = self.storage.current_state(&self.space).await?;
         let mut set_hash = match state.set_hash {
-            Some(bytes) => H::from_digest(&bytes)?,
+            Some(bytes) => H::from_state_bytes(&bytes)?,
             None => H::empty(),
         };
 
@@ -258,12 +258,15 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
             }
         }
 
-        let new_digest = set_hash.digest();
+        // The persisted value is the full lattice STATE (2048 bytes for
+        // LtHash), rehydrated via `from_state_bytes`. The 32-byte commitment
+        // (`sha256(state)`) is computed separately by `create_commit`.
+        let new_state = set_hash.state_bytes();
         Ok(PreparedCommit {
             set_hash,
             rev: rev.clone(),
             storage_commit: PreparedCommitRecords {
-                new_set_hash: new_digest,
+                new_set_hash: new_state,
                 rev,
                 record_changes,
                 oplog_entries,
@@ -278,8 +281,13 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
             .await
     }
 
-    /// Read oplog entries since the given rev (exclusive). `None` = from start.
-    pub async fn read_oplog(&self, since: Option<&str>, limit: u32) -> SpaceResult<OplogPage> {
+    /// Read oplog entries strictly after the given `(rev, idx)` cursor.
+    /// `None` = from start.
+    pub async fn read_oplog(
+        &self,
+        since: Option<&OplogCursor>,
+        limit: u32,
+    ) -> SpaceResult<OplogPage> {
         self.storage.read_oplog(&self.space, since, limit).await
     }
 }
@@ -436,17 +444,17 @@ pub mod memory {
         async fn read_oplog(
             &self,
             space: &SpaceUri,
-            since: Option<&str>,
+            since: Option<&OplogCursor>,
             limit: u32,
         ) -> SpaceResult<OplogPage> {
             let inner = self.inner.lock().unwrap();
             let mut ops: Vec<OplogEntry> = inner
                 .oplog
                 .iter()
-                .filter(|((s, rev, _), _)| {
+                .filter(|((s, rev, idx), _)| {
                     s == space
                         && match since {
-                            Some(cur) => rev.as_str() > cur,
+                            Some(cur) => (rev.as_str(), *idx) > (cur.rev.as_str(), cur.idx),
                             None => true,
                         }
                 })
@@ -468,7 +476,7 @@ pub mod memory {
 mod tests {
     use super::memory::InMemorySpaceRepoStorage;
     use super::*;
-    use crate::set_hash::XorSha256SetHash;
+    use crate::set_hash::LtHash;
     use crate::types::{SpaceKey, SpaceType};
 
     fn test_space() -> SpaceUri {
@@ -479,7 +487,7 @@ mod tests {
         )
     }
 
-    type TestRepo = SpaceRepo<InMemorySpaceRepoStorage, XorSha256SetHash>;
+    type TestRepo = SpaceRepo<InMemorySpaceRepoStorage, LtHash>;
 
     #[tokio::test]
     async fn create_then_read() {
@@ -617,5 +625,57 @@ mod tests {
         assert_eq!(page.ops[0].rev, page.ops[1].rev, "shared rev");
         assert_eq!(page.ops[0].idx, 0);
         assert_eq!(page.ops[1].idx, 1);
+    }
+
+    /// Regression: a single atomic batch (all ops share one rev) larger than the
+    /// page `limit` must page fully via the `(rev, idx)` cursor without dropping
+    /// the batch's tail. A bare-rev cursor would advance past the whole rev after
+    /// page one, permanently skipping ops `limit..N`.
+    #[tokio::test]
+    async fn batch_larger_than_limit_pages_fully() {
+        let space = test_space();
+        let repo: TestRepo = SpaceRepo::new(space, InMemorySpaceRepoStorage::new());
+
+        const N: usize = 7;
+        const LIMIT: u32 = 3;
+
+        // One commit, N creates -> N oplog entries sharing a single rev.
+        let ops: Vec<Op> = (0..N)
+            .map(|i| Op {
+                action: OpAction::Create,
+                collection: "c".to_string(),
+                rkey: format!("k{i}"),
+                cid: Some(format!("cid{i}")),
+                value: Some(vec![]),
+            })
+            .collect();
+        let prepared = repo.format_commit(&ops).await.unwrap();
+        repo.apply_commit(prepared).await.unwrap();
+
+        // Page through with the (rev, idx) cursor until caught up.
+        let mut seen: Vec<(String, u32)> = Vec::new();
+        let mut cursor: Option<OplogCursor> = None;
+        loop {
+            let page = repo.read_oplog(cursor.as_ref(), LIMIT).await.unwrap();
+            for op in &page.ops {
+                seen.push((op.rev.clone(), op.idx));
+            }
+            let caught_up = (page.ops.len() as u32) < LIMIT;
+            cursor = page
+                .ops
+                .last()
+                .map(|o| OplogCursor::new(o.rev.clone(), o.idx));
+            if caught_up {
+                break;
+            }
+        }
+
+        // All N ops seen exactly once, in order, all within the same rev.
+        assert_eq!(seen.len(), N, "all batch ops delivered, none skipped");
+        let rev = &seen[0].0;
+        for (i, (r, idx)) in seen.iter().enumerate() {
+            assert_eq!(r, rev, "all ops share the batch rev");
+            assert_eq!(*idx as usize, i, "idx is dense and monotonic");
+        }
     }
 }

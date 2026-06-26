@@ -21,6 +21,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
+/// `space:` permission scope (AT Protocol permissioned-data spaces).
+pub mod space_permission;
+
+pub use space_permission::{
+    SpaceAction, SpaceCollection, SpaceCollections, SpaceDid, SpaceManageTarget, SpaceManageVerb,
+    SpacePermission, SpaceSkey, SpaceTarget, SpaceType,
+};
+
 /// Represents an AT Protocol OAuth scope
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
@@ -34,6 +42,8 @@ pub enum Scope {
     Repo(RepoScope),
     /// RPC scope for method access
     Rpc(RpcScope),
+    /// Space scope for permissioned-data space operations
+    Space(SpacePermission),
     /// AT Protocol scope - required to indicate that other AT Protocol scopes will be used
     Atproto,
     /// Transition scope for migration operations
@@ -319,6 +329,7 @@ impl Scope {
             "blob",
             "repo",
             "rpc",
+            "space",
             "atproto",
             "transition",
             "include",
@@ -359,6 +370,7 @@ impl Scope {
             "blob" => Self::parse_blob(suffix),
             "repo" => Self::parse_repo(suffix),
             "rpc" => Self::parse_rpc(suffix),
+            "space" => Self::parse_space(suffix),
             "atproto" => Self::parse_atproto(suffix),
             "transition" => Self::parse_transition(suffix),
             "include" => Self::parse_include(suffix),
@@ -566,6 +578,10 @@ impl Scope {
         Ok(Scope::Rpc(RpcScope { lxm, aud }))
     }
 
+    fn parse_space(suffix: Option<&str>) -> Result<Self, ParseError> {
+        Ok(Scope::Space(SpacePermission::parse_suffix(suffix)?))
+    }
+
     fn parse_atproto(suffix: Option<&str>) -> Result<Self, ParseError> {
         if suffix.is_some() {
             return Err(ParseError::InvalidResource(
@@ -765,6 +781,7 @@ impl Scope {
                     }
                 }
             }
+            Scope::Space(scope) => scope.to_scope_string(),
             Scope::Atproto => "atproto".to_string(),
             Scope::Transition(scope) => match scope {
                 TransitionScope::Generic => "transition:generic".to_string(),
@@ -873,6 +890,10 @@ impl Scope {
 
                 lxm_match && aud_match
             }
+            // Space scopes only grant themselves (exact match). Subset-based
+            // reduction is intentionally not performed for spaces; this keeps
+            // `parse_multiple_reduced` sound (it never drops a distinct grant).
+            (Scope::Space(a), Scope::Space(b)) => a == b,
             _ => false,
         }
     }
@@ -1014,6 +1035,122 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// A set of granted OAuth scopes that can be queried for permission matches.
+///
+/// Mirrors the reference `ScopesSet` / `ScopePermissions`: it stores the raw
+/// granted scope strings and, on demand, parses the ones relevant to a given
+/// resource to evaluate whether a request is allowed.
+///
+/// Scope strings that fail to parse are ignored during matching (they simply
+/// cannot grant anything), matching the reference where `fromString` returning
+/// `null` means the scope does not contribute to a match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopesSet {
+    scopes: Vec<String>,
+}
+
+impl ScopesSet {
+    /// Create an empty scope set.
+    pub fn new() -> Self {
+        ScopesSet::default()
+    }
+
+    /// Build a scope set from a space-separated OAuth scope string.
+    pub fn from_scope_string(scope: &str) -> Self {
+        ScopesSet {
+            scopes: scope.split_whitespace().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Build a scope set from an iterator of individual scope strings.
+    pub fn from_scopes<I, S>(scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ScopesSet {
+            scopes: scopes.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Add a scope string to the set.
+    pub fn insert(&mut self, scope: impl Into<String>) {
+        self.scopes.push(scope.into());
+    }
+
+    /// The raw granted scope strings.
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    /// Returns `true` if any granted `space:` scope satisfies the given record
+    /// target. An omitted-`collection` grant confers no write targets (the
+    /// `spaceType=*` / no-declaration case); use
+    /// [`allows_space_with`](Self::allows_space_with) to resolve the collection
+    /// default against a space type declaration's collections.
+    pub fn allows_space(&self, target: &SpaceTarget) -> bool {
+        self.allows_space_with(target, &[])
+    }
+
+    /// Like [`allows_space`](Self::allows_space) but resolves the per-grant
+    /// `collection` default against `declared` (the space type declaration's
+    /// `collections`) per spec line 413.
+    pub fn allows_space_with(&self, target: &SpaceTarget, declared: &[String]) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(Scope::parse(scope), Ok(Scope::Space(permission)) if permission.matches_with(target, declared))
+        })
+    }
+
+    /// Returns `true` if any granted `space:` scope satisfies the given
+    /// space-management target (spec lines 415-419).
+    pub fn allows_space_manage(&self, target: &SpaceManageTarget) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(Scope::parse(scope), Ok(Scope::Space(permission)) if permission.matches_manage(target))
+        })
+    }
+
+    /// Asserts that some granted `space:` scope satisfies the given record
+    /// target, returning a [`ScopeMissingError`](crate::errors::ScopeMissingError)
+    /// carrying the minimal scope that would satisfy it otherwise.
+    pub fn assert_space(
+        &self,
+        target: &SpaceTarget,
+    ) -> Result<(), crate::errors::ScopeMissingError> {
+        self.assert_space_with(target, &[])
+    }
+
+    /// Like [`assert_space`](Self::assert_space) but resolves the collection
+    /// default against `declared` (spec line 413).
+    pub fn assert_space_with(
+        &self,
+        target: &SpaceTarget,
+        declared: &[String],
+    ) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_space_with(target, declared) {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(
+                SpacePermission::scope_needed_for(target),
+            ))
+        }
+    }
+
+    /// Asserts that some granted `space:` scope satisfies the given
+    /// space-management target (spec lines 415-419).
+    pub fn assert_space_manage(
+        &self,
+        target: &SpaceManageTarget,
+    ) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_space_manage(target) {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(
+                SpacePermission::scope_needed_for_manage(target),
+            ))
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2216,5 +2353,157 @@ mod tests {
         let serialized = scope.to_string_normalized();
         let reparsed = Scope::parse(&serialized).unwrap();
         assert_eq!(scope, reparsed);
+    }
+
+    #[test]
+    fn test_space_scope_parsing_dispatch() {
+        // The `space` prefix is recognized and dispatched (no longer an
+        // UnknownPrefix error).
+        let scope = Scope::parse("space:com.example.space").unwrap();
+        assert!(matches!(scope, Scope::Space(_)));
+
+        // A bare `space` without a type is an error, not UnknownPrefix.
+        assert!(matches!(
+            Scope::parse("space"),
+            Err(ParseError::MissingResource)
+        ));
+    }
+
+    #[test]
+    fn test_space_scope_normalization() {
+        let tests = vec![
+            ("space:com.example.space", "space:com.example.space"),
+            ("space:*", "space:*"),
+            // Explicit defaults stripped.
+            (
+                "space:com.example.space?did=*&skey=*",
+                "space:com.example.space",
+            ),
+            (
+                "space:com.example.space?action=read&action=create&action=update&action=delete",
+                "space:com.example.space",
+            ),
+            (
+                "space:com.example.space?did=did:plc:abc&action=read",
+                "space:com.example.space?did=did:plc:abc&action=read",
+            ),
+            // `manage` is a separate parameter, preserved on normalization.
+            (
+                "space:com.example.space?manage=update&manage=delete",
+                "space:com.example.space?manage=update&manage=delete",
+            ),
+        ];
+
+        for (input, expected) in tests {
+            let scope = Scope::parse(input).unwrap();
+            assert_eq!(scope.to_string_normalized(), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_space_scope_grants_self_only() {
+        let a = Scope::parse("space:com.example.space?action=read").unwrap();
+        let b = Scope::parse("space:com.example.space?action=read").unwrap();
+        let c = Scope::parse("space:com.example.space?manage=update").unwrap();
+        let account = Scope::parse("account:email").unwrap();
+
+        assert!(a.grants(&b));
+        assert!(!a.grants(&c));
+        assert!(!a.grants(&account));
+        assert!(!account.grants(&a));
+    }
+
+    #[test]
+    fn test_space_scope_in_serialize_multiple() {
+        let scopes = vec![
+            Scope::parse("space:com.example.space?action=read").unwrap(),
+            Scope::Atproto,
+            Scope::parse("account:email").unwrap(),
+        ];
+        assert_eq!(
+            Scope::serialize_multiple(&scopes),
+            "account:email atproto space:com.example.space?action=read"
+        );
+    }
+
+    #[test]
+    fn test_scopes_set_allows_space() {
+        let set = ScopesSet::from_scope_string(
+            "atproto space:com.example.space?did=did:plc:abc&skey=s1&collection=com.example.note&action=read&action=create",
+        );
+
+        // read is allowed.
+        assert!(set.allows_space(&SpaceTarget::new(
+            "com.example.space",
+            "did:plc:abc",
+            "s1",
+            SpaceAction::Read,
+        )));
+
+        // create on covered collection is allowed.
+        assert!(set.allows_space(&SpaceTarget::with_collection(
+            "com.example.space",
+            "did:plc:abc",
+            "s1",
+            SpaceAction::Create,
+            "com.example.note",
+        )));
+
+        // delete is not granted.
+        assert!(!set.allows_space(&SpaceTarget::with_collection(
+            "com.example.space",
+            "did:plc:abc",
+            "s1",
+            SpaceAction::Delete,
+            "com.example.note",
+        )));
+
+        // a different space key is not granted.
+        assert!(!set.allows_space(&SpaceTarget::new(
+            "com.example.space",
+            "did:plc:abc",
+            "other",
+            SpaceAction::Read,
+        )));
+    }
+
+    #[test]
+    fn test_scopes_set_assert_space() {
+        let set = ScopesSet::from_scope_string("space:com.example.space?action=read");
+
+        // Satisfied: Ok.
+        assert!(
+            set.assert_space(&SpaceTarget::new(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Read,
+            ))
+            .is_ok()
+        );
+
+        // Not satisfied: returns the minimal needed scope.
+        let target = SpaceTarget::with_collection(
+            "com.example.space",
+            "did:plc:abc",
+            "s1",
+            SpaceAction::Create,
+            "com.example.note",
+        );
+        let err = set.assert_space(&target).unwrap_err();
+        assert_eq!(err.scope, SpacePermission::scope_needed_for(&target));
+        assert!(err.to_string().contains("error-atproto-oauth-scope-1"));
+    }
+
+    #[test]
+    fn test_scopes_set_ignores_unparseable_scopes() {
+        // A non-space and a malformed scope are simply ignored for matching.
+        let set = ScopesSet::from_scopes(["account:email", "space:com.example.space?action=read"]);
+        assert!(set.allows_space(&SpaceTarget::new(
+            "com.example.space",
+            "did:plc:abc",
+            "s1",
+            SpaceAction::Read,
+        )));
     }
 }

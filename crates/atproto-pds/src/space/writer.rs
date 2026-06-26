@@ -1,17 +1,19 @@
 //! `SpaceWriter` — permissioned-record CRUD via per-(DID, space) lock.
 //!
-//! each write batch
-//! holds a per-(member-DID, space-URI) async mutex, computes a new SetHash,
-//! signs the commit (HKDF + HMAC + ECDSA via `atproto-space::create_commit`),
-//! and atomically persists changes + oplog. **/ G35**, the
+//! Each write batch holds a per-(member-DID, space-URI) async mutex, computes a
+//! new SetHash, signs the commit (HKDF + HMAC + ECDSA via
+//! `atproto-space::create_commit`), and atomically persists changes + oplog. The
 //! PDS does not enforce membership at write time; consumers check at sync.
 
 use crate::actor_store::sql::{SqlActorStore, SqlSpaceRepoStorage};
 use crate::errors::{PdsError, PdsResult};
 use crate::realm::PdsSetHash;
-use crate::space::notify::{NotifyWritePayload, enqueue_writes, op_to_notify};
+use crate::space::config::ensure_space_live;
+use crate::space::notify::{NOTIFY_WRITE_NSID, NotifyWritePayload};
+use crate::space::service_auth::{NOTIFY_SERVICE_AUTH_TTL_SECS, mint_service_auth};
+use atproto_identity::key::KeyData;
 use atproto_record::tid::Tid;
-use atproto_space::commit::{CommitScope, SpaceContext, create_commit};
+use atproto_space::commit::{SpaceContext, create_commit};
 use atproto_space::space_repo::{Op, OpAction, SpaceRepo};
 use atproto_space::types::SpaceUri;
 use dashmap::DashMap;
@@ -55,6 +57,8 @@ pub struct SpaceCommitResult {
     pub set_hash: String,
     /// Per-op AT-URIs (`ats://` form).
     pub uris: Vec<String>,
+    /// Per-op record CIDs, parallel to `uris`. `None` for delete ops.
+    pub cids: Vec<Option<String>>,
 }
 
 type WriteLocks = Arc<DashMap<(String, String), Arc<Mutex<()>>>>;
@@ -64,6 +68,9 @@ pub struct SpaceWriter {
     data_dir: PathBuf,
     accounts: Arc<crate::account::AccountManager>,
     locks: WriteLocks,
+    /// PLC directory hostname for resolving the owner PDS endpoint on the
+    /// outbound `notifyWrite` hop. `None` uses the upstream default.
+    plc_directory: Option<String>,
 }
 
 impl SpaceWriter {
@@ -73,7 +80,16 @@ impl SpaceWriter {
             data_dir,
             accounts,
             locks: Arc::new(DashMap::new()),
+            plc_directory: None,
         }
+    }
+
+    /// Set the PLC directory hostname used to resolve the owner PDS endpoint
+    /// for the outbound `notifyWrite` hop (HOP 1, writer PDS → owner PDS).
+    #[must_use]
+    pub fn with_plc_directory(mut self, plc_directory: Option<String>) -> Self {
+        self.plc_directory = plc_directory;
+        self
     }
 
     fn lock_for(&self, did: &str, uri: &SpaceUri) -> Arc<Mutex<()>> {
@@ -100,23 +116,165 @@ impl SpaceWriter {
         let lock = self.lock_for(member_did, space);
         let _guard = lock.lock().await;
 
+        ensure_space_live(&self.data_dir, space).await?;
         let store = SqlActorStore::open(&self.data_dir, member_did).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
             SpaceRepo::new(space.clone(), storage);
 
+        self.apply_writes_locked(member_did, space, &repo, ops)
+            .await
+    }
+
+    /// `createRecord` — single-op `Create`. Errors if the record already
+    /// exists. An empty `rkey` auto-generates a TID.
+    pub async fn create_record(
+        &self,
+        member_did: &str,
+        space: &SpaceUri,
+        collection: String,
+        rkey: String,
+        value: serde_json::Value,
+    ) -> PdsResult<SpaceCommitResult> {
+        self.apply_writes(
+            member_did,
+            space,
+            vec![SpaceWriteOp {
+                action: SpaceWriteAction::Create,
+                collection,
+                rkey,
+                value: Some(value),
+            }],
+        )
+        .await
+    }
+
+    /// `putRecord` — single-op create-or-update. Resolves to `Update` when
+    /// a record already exists at `(collection, rkey)`, else `Create`. The
+    /// existence check runs under the per-(member, space) lock so the chosen
+    /// action cannot race a concurrent write.
+    pub async fn put_record(
+        &self,
+        member_did: &str,
+        space: &SpaceUri,
+        collection: String,
+        rkey: String,
+        value: serde_json::Value,
+    ) -> PdsResult<SpaceCommitResult> {
+        let lock = self.lock_for(member_did, space);
+        let _guard = lock.lock().await;
+
+        ensure_space_live(&self.data_dir, space).await?;
+        let store = SqlActorStore::open(&self.data_dir, member_did).await?;
+        let storage = SqlSpaceRepoStorage::new(store.pool().clone());
+        let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
+            SpaceRepo::new(space.clone(), storage);
+
+        let exists = repo
+            .get_record(&collection, &rkey)
+            .await
+            .map_err(space_err)?
+            .is_some();
+        let action = if exists {
+            SpaceWriteAction::Update
+        } else {
+            SpaceWriteAction::Create
+        };
+        self.apply_writes_locked(
+            member_did,
+            space,
+            &repo,
+            vec![SpaceWriteOp {
+                action,
+                collection,
+                rkey,
+                value: Some(value),
+            }],
+        )
+        .await
+    }
+
+    /// `deleteRecord` — single-op delete that is idempotent: when no record
+    /// exists at `(collection, rkey)` it is a no-op returning the current
+    /// `{rev, set_hash}` rather than erroring. The existence check runs under
+    /// the per-(member, space) lock.
+    pub async fn delete_record(
+        &self,
+        member_did: &str,
+        space: &SpaceUri,
+        collection: String,
+        rkey: String,
+    ) -> PdsResult<SpaceCommitResult> {
+        let lock = self.lock_for(member_did, space);
+        let _guard = lock.lock().await;
+
+        ensure_space_live(&self.data_dir, space).await?;
+        let store = SqlActorStore::open(&self.data_dir, member_did).await?;
+        let storage = SqlSpaceRepoStorage::new(store.pool().clone());
+        let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
+            SpaceRepo::new(space.clone(), storage);
+
+        let exists = repo
+            .get_record(&collection, &rkey)
+            .await
+            .map_err(space_err)?
+            .is_some();
+        if !exists {
+            // Idempotent no-op: report current state without a new commit.
+            let state = repo.current_state().await.map_err(space_err)?;
+            let uri = format!(
+                "ats://{}/{}/{}/{}/{}/{}",
+                space.space_did, space.space_type, space.space_key, member_did, collection, rkey
+            );
+            return Ok(SpaceCommitResult {
+                rev: state.rev.unwrap_or_default(),
+                set_hash: state.set_hash.map(hex::encode).unwrap_or_default(),
+                uris: vec![uri],
+                cids: vec![None],
+            });
+        }
+        self.apply_writes_locked(
+            member_did,
+            space,
+            &repo,
+            vec![SpaceWriteOp {
+                action: SpaceWriteAction::Delete,
+                collection,
+                rkey,
+                value: None,
+            }],
+        )
+        .await
+    }
+
+    /// Commit a batch of writes against an already-opened `repo`, with the
+    /// per-(member, space) lock already held by the caller. Shared by
+    /// `apply_writes` and the single-op `createRecord` / `putRecord` /
+    /// `deleteRecord` wrappers.
+    async fn apply_writes_locked(
+        &self,
+        member_did: &str,
+        space: &SpaceUri,
+        repo: &SpaceRepo<SqlSpaceRepoStorage, PdsSetHash>,
+        ops: Vec<SpaceWriteOp>,
+    ) -> PdsResult<SpaceCommitResult> {
         // Translate ops + auto-generate TIDs for empty rkeys on Create.
         let mut translated = Vec::with_capacity(ops.len());
         let mut output_uris = Vec::with_capacity(ops.len());
+        let mut output_cids = Vec::with_capacity(ops.len());
         for op in ops {
             let rkey = if matches!(op.action, SpaceWriteAction::Create) && op.rkey.is_empty() {
                 Tid::new().to_string()
             } else {
                 op.rkey.clone()
             };
+            // Six-segment permissioned record URI, including the author DID:
+            // ats://<spaceDid>/<spaceType>/<skey>/<authorDid>/<collection>/<rkey>.
+            // The author segment is required — records are not colocated, so two
+            // members writing the same (collection, rkey) must not collide.
             output_uris.push(format!(
-                "ats://{}/{}/{}/{}/{}",
-                space.owner_did, space.space_type, space.space_key, op.collection, rkey
+                "ats://{}/{}/{}/{}/{}/{}",
+                space.space_did, space.space_type, space.space_key, member_did, op.collection, rkey
             ));
             // Compute the value's CID (from DAG-CBOR) for create/update.
             let (cid, value_bytes) = match op.action {
@@ -132,6 +290,7 @@ impl SpaceWriter {
                 }
                 SpaceWriteAction::Delete => (None, None),
             };
+            output_cids.push(cid.clone());
             translated.push(Op {
                 action: match op.action {
                     SpaceWriteAction::Create => OpAction::Create,
@@ -149,11 +308,7 @@ impl SpaceWriter {
         let rev = prepared.rev.clone();
         let set_hash_hex = hex::encode(&prepared.storage_commit.new_set_hash);
         let context = SpaceContext {
-            space_did: space.owner_did.clone(),
-            space_type: space.space_type.to_string(),
-            space_key: space.space_key.to_string(),
-            user_did: member_did.to_string(),
-            scope: CommitScope::Records,
+            space: space.to_string(),
             rev: rev.clone(),
         };
 
@@ -173,41 +328,136 @@ impl SpaceWriter {
             .0;
         let signing_key = self.accounts.key_store().get(&key_ref).await?;
 
-        // Sign the commit. We keep the result here because the signed Commit
-        // is broadcast via `notifyWrite` to subscribed consumers (peers don't
-        // see our durable storage, so they need the signed commit + ops to
-        // apply on their side).
-        let signed_commit =
+        // Sign the commit so the repo's signed state is persisted. The commit
+        // is no longer broadcast — `notifyWrite` is contentless per the
+        // published spec; consumers PULL ops via `listRepoOps`.
+        let _signed_commit =
             create_commit(&prepared.set_hash, &context, &signing_key).map_err(space_err)?;
 
         repo.apply_commit(prepared).await.map_err(space_err)?;
 
-        // Fan out a `notifyWrite` to every registered recipient. Failures
-        // here are logged but non-fatal — the commit is durable; redelivery
-        // of stale missed notifications is a sync-side problem, not a write
-        // failure. (The owner's catch-up oplog at `getRepoOplog` is the
-        // authoritative source.)
-        let payload = NotifyWritePayload {
-            space: space.to_string(),
-            member: member_did.to_string(),
-            commit: signed_commit,
-            ops: translated.iter().map(op_to_notify).collect(),
-        };
-        if let Err(e) = enqueue_writes(self.accounts.pool(), &self.data_dir, space, &payload).await
-        {
-            tracing::warn!(
-                error = ?e,
-                space = %space,
-                member = %member_did,
-                "notifyWrite enqueue failed; recipients may miss this commit until next catch-up sync"
-            );
-        }
+        // HOP 1 (writer PDS → owner PDS): announce that this repo advanced to
+        // `rev`. Contentless payload `{ space, repo, rev }`, service-auth
+        // signed by the writer's key. Best-effort: failures are logged but
+        // never fail the (already-durable) write. The owner-side inbound
+        // handler does the isMember check + fans out to registered recipients.
+        self.fire_notify_write(space, member_did, &rev, &signing_key)
+            .await;
 
         Ok(SpaceCommitResult {
             rev,
             set_hash: set_hash_hex,
             uris: output_uris,
+            cids: output_cids,
         })
+    }
+
+    /// HOP 1 of the reference two-hop notify path: the writer's PDS POSTs a
+    /// contentless `notifyWrite` `{ space, repo, rev }` to the OWNER's PDS,
+    /// authenticated with service auth (iss = writer DID, aud = owner DID).
+    ///
+    /// Resolution: owner DID (`space.space_did`) → DID document →
+    /// `#atproto_pds` service endpoint. Entirely best-effort — every failure
+    /// path is logged and swallowed so a write never fails on a missed
+    /// notification (the owner's `listRepoOps` is the authoritative catch-up
+    /// source).
+    async fn fire_notify_write(
+        &self,
+        space: &SpaceUri,
+        writer_did: &str,
+        rev: &str,
+        writer_signing_key: &KeyData,
+    ) {
+        let owner_did = space.space_did.clone();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent(crate::user_agent())
+            .build()
+            .unwrap_or_default();
+
+        // Resolve the owner's PDS endpoint from their DID document.
+        let owner_pds = match crate::space::recipient::resolve_service_endpoint(
+            &http,
+            &format!("{owner_did}#atproto_pds"),
+            self.plc_directory.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(ep)) => ep,
+            Ok(None) => {
+                tracing::debug!(
+                    space = %space,
+                    owner = %owner_did,
+                    "notifyWrite: owner DID document has no #atproto_pds service; skipping fan-out hop"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    space = %space,
+                    owner = %owner_did,
+                    "notifyWrite: failed to resolve owner PDS endpoint; skipping fan-out hop"
+                );
+                return;
+            }
+        };
+
+        let token = match mint_service_auth(
+            writer_signing_key,
+            writer_did,
+            &owner_did,
+            NOTIFY_WRITE_NSID,
+            NOTIFY_SERVICE_AUTH_TTL_SECS,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    space = %space,
+                    "notifyWrite: failed to mint service-auth token; skipping fan-out hop"
+                );
+                return;
+            }
+        };
+
+        let payload = NotifyWritePayload {
+            space: space.to_string(),
+            repo: writer_did.to_string(),
+            rev: rev.to_string(),
+        };
+        let url = format!(
+            "{}/xrpc/{}",
+            owner_pds.trim_end_matches('/'),
+            NOTIFY_WRITE_NSID
+        );
+        match http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(space = %space, owner = %owner_did, rev = %rev, "notifyWrite delivered to owner PDS");
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    status = %resp.status(),
+                    space = %space,
+                    owner = %owner_did,
+                    "notifyWrite: owner PDS rejected the notification (best-effort, ignored)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    space = %space,
+                    owner = %owner_did,
+                    "notifyWrite: transport error delivering to owner PDS (best-effort, ignored)"
+                );
+            }
+        }
     }
 }
 
@@ -343,5 +593,77 @@ mod tests {
             .unwrap();
         let last_seg = result.uris[0].split('/').next_back().unwrap();
         assert_eq!(last_seg.len(), 13, "TID rkey is 13 chars");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_record_returns_uri_and_cid() {
+        let (w, _tmp, uri) = fresh_writer().await;
+        let result = w
+            .create_record(
+                "did:plc:alice",
+                &uri,
+                "c".to_string(),
+                "k".to_string(),
+                serde_json::json!({"v": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.uris.len(), 1);
+        assert!(result.uris[0].ends_with("/c/k"));
+        assert!(result.cids[0].is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_record_creates_then_updates() {
+        let (w, _tmp, uri) = fresh_writer().await;
+        // First put creates.
+        let first = w
+            .put_record(
+                "did:plc:alice",
+                &uri,
+                "c".to_string(),
+                "k".to_string(),
+                serde_json::json!({"v": 1}),
+            )
+            .await
+            .unwrap();
+        // Second put updates the same rkey (does not error on existing).
+        let second = w
+            .put_record(
+                "did:plc:alice",
+                &uri,
+                "c".to_string(),
+                "k".to_string(),
+                serde_json::json!({"v": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.uris[0], second.uris[0]);
+        assert_ne!(first.cids[0], second.cids[0], "value changed → new CID");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_record_is_idempotent() {
+        let (w, _tmp, uri) = fresh_writer().await;
+        // Delete on a non-existent record is a no-op (does not error).
+        let absent = w
+            .delete_record("did:plc:alice", &uri, "c".to_string(), "k".to_string())
+            .await
+            .unwrap();
+        assert!(absent.cids[0].is_none());
+
+        // Create then delete succeeds.
+        w.create_record(
+            "did:plc:alice",
+            &uri,
+            "c".to_string(),
+            "k".to_string(),
+            serde_json::json!({"v": 1}),
+        )
+        .await
+        .unwrap();
+        w.delete_record("did:plc:alice", &uri, "c".to_string(), "k".to_string())
+            .await
+            .unwrap();
     }
 }

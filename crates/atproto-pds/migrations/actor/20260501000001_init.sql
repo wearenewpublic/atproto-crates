@@ -70,7 +70,17 @@ CREATE TABLE space (
     uri              TEXT PRIMARY KEY,
     is_owner         INTEGER NOT NULL DEFAULT 0,
     is_member        INTEGER NOT NULL DEFAULT 0,
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    -- simplespace config (com.atproto.simplespace.defs#spaceConfig).
+    -- mint_policy: 'public' | 'member-list' (default) | 'managing-app'.
+    mint_policy      TEXT NOT NULL DEFAULT 'member-list',
+    -- app_access: JSON form of the #open / #allowList open union.
+    app_access       TEXT NOT NULL DEFAULT '{"type":"open"}',
+    -- managing_app: optional service identifier of the managing application.
+    managing_app     TEXT,
+    -- deleted_at: tombstone timestamp; non-NULL means the space is deleted
+    -- and all reads/writes must fail with SpaceNotFound.
+    deleted_at       TEXT
 );
 
 CREATE TABLE space_member_state (
@@ -127,10 +137,27 @@ CREATE TABLE space_member_oplog (
     PRIMARY KEY (space, rev, idx)
 );
 
+-- Notify subscriptions (recipients of notifyWrite / notifyMembership fan-out).
+--
+-- A row may be registered two ways:
+--  * `getSpaceCredential` — owner records the credential consumer so future
+--    commits fan out to it (whole-space; `repo` IS NULL).
+--  * `registerNotify` — a space credential holder subscribes an endpoint, either
+--    to the whole space (`repo` IS NULL, space-host case) or to a single repo
+--    (`repo` = that account's DID, repo-host case).
+--
+-- `expires_at` is the registration lifetime (RFC 3339). NULL means no expiry
+-- (the `getSpaceCredential` self-registration path leaves it unset). Uniqueness
+-- is keyed on (space, repo, service_did) so per-repo and whole-space
+-- subscriptions for the same service coexist; `repo` uses the empty string as
+-- the "whole space" sentinel so it participates in the PRIMARY KEY (SQLite
+-- treats NULL as distinct in unique constraints, which would defeat upserts).
 CREATE TABLE space_credential_recipient (
     space            TEXT NOT NULL REFERENCES space(uri) ON DELETE CASCADE,
+    repo             TEXT NOT NULL DEFAULT '',
     service_did      TEXT NOT NULL,
     service_endpoint TEXT NOT NULL,
     last_issued_at   TEXT NOT NULL,
-    PRIMARY KEY (space, service_did)
+    expires_at       TEXT,
+    PRIMARY KEY (space, repo, service_did)
 );

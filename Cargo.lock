@@ -170,7 +170,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atpmcp"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-attestation"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-client"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-dasl"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-extras"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-identity"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-jetstream"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-lexicon"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth-aip"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "atproto-identity",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth-axum"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -441,13 +441,14 @@ dependencies = [
 
 [[package]]
 name = "atproto-pds"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
  "atproto-dasl",
  "atproto-identity",
+ "atproto-lexicon",
  "atproto-oauth",
  "atproto-record",
  "atproto-repo",
@@ -494,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-record"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -515,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-repo"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "atproto-dasl",
@@ -535,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-space"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -543,11 +544,10 @@ dependencies = [
  "atproto-identity",
  "atproto-record",
  "base64",
+ "blake3",
  "chrono",
- "criterion",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "k256",
  "proptest",
  "rand 0.10.0",
  "serde",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-tap"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "atproto-client",
  "atproto-identity",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-xrpcs"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-xrpcs-helloworld"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "atpxrpc"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 dependencies = [
  "anyhow",
  "atproto-client",
@@ -3106,6 +3106,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
+dependencies = [
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4903,6 +4912,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "smallvec"
+version = "2.0.0-alpha.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef784004ca8777809dcdad6ac37629f0a97caee4c685fcea805278d81dd8b857"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]

@@ -281,19 +281,6 @@ pub fn oplog_prefix_by_space(space_uri: &str) -> Vec<u8> {
     buf
 }
 
-/// Strict-greater oplog cursor: `<space_uri>\0<rev>\0\xFF` so iteration
-/// resumes from the next rev forward.
-#[must_use]
-pub fn oplog_after_rev(space_uri: &str, rev: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(space_uri.len() + rev.len() + 3);
-    buf.extend_from_slice(space_uri.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(rev.as_bytes());
-    buf.push(0);
-    buf.push(0xFF);
-    buf
-}
-
 // ---------------------------------------------------------------------------
 //  Public-realm key encodings (§1.2). Each row keys a per-DID prefix so
 //  range scans by DID are cheap and a single fjall keyspace can hold all
@@ -481,11 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn oplog_after_rev_skips_current_rev() {
-        let mid = oplog_key("ats://x/y/z", "abc", 0);
-        let cursor = oplog_after_rev("ats://x/y/z", "abc");
-        assert!(cursor > mid);
-        let next_rev_first = oplog_key("ats://x/y/z", "abd", 0);
-        assert!(cursor < next_rev_first);
+    fn oplog_key_orders_across_revs() {
+        // A composite `(rev, idx)` cursor resumes at the exact op key, so the
+        // last idx of one rev sorts before the first idx of the next rev.
+        let rev_a_last = oplog_key("ats://x/y/z", "abc", 99);
+        let rev_b_first = oplog_key("ats://x/y/z", "abd", 0);
+        assert!(rev_a_last < rev_b_first);
     }
 }

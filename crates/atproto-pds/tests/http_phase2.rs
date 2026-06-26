@@ -82,8 +82,7 @@ async fn get_json(app: axum::Router, path: &str) -> (StatusCode, serde_json::Val
         .unwrap();
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or_else(|_| serde_json::Value::Null);
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     (status, value)
 }
 

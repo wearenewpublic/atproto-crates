@@ -624,7 +624,8 @@ fn validate_value(
         | SchemaDef::Query(_)
         | SchemaDef::Procedure(_)
         | SchemaDef::Subscription(_)
-        | SchemaDef::PermissionSet(_) => Err(DataValidationError::SchemaStructureInvalid {
+        | SchemaDef::PermissionSet(_)
+        | SchemaDef::Space(_) => Err(DataValidationError::SchemaStructureInvalid {
             message: format!(
                 "primary type '{}' cannot be used as a nested schema",
                 schema.type_name()

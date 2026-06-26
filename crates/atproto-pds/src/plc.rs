@@ -164,6 +164,16 @@ impl PlcService {
                 endpoint: self.config.service_endpoint.clone(),
             },
         );
+        // 0016 §"Space authority" (lines 87-92): the authority DID MUST expose
+        // a `#atproto_space_host` service. Per line 92 it MAY resolve to the
+        // same endpoint as `#atproto_pds`; reuse this PDS's endpoint.
+        services.insert(
+            "atproto_space_host".to_string(),
+            ServiceEndpoint {
+                service_type: "AtprotoPersonalDataServer".to_string(),
+                endpoint: self.config.service_endpoint.clone(),
+            },
+        );
         let handle_uri = if handle.starts_with("at://") {
             handle.to_string()
         } else {
@@ -178,10 +188,19 @@ impl PlcService {
         if let Some(extra) = self.config.external_rotation_key.as_ref() {
             builder = builder.add_rotation_key(extra.clone());
         }
+        // 0016 §"Space authority" (lines 87-92): the authority DID MUST expose
+        // a `#atproto_space` verification method carrying the credential-signing
+        // key. Per line 92 it MAY coincide with `#atproto`; reuse the account's
+        // atproto signing key.
         let (did, signed_op, _builder_keys) = builder
-            .add_verification_method("atproto".to_string(), signing_pub)
+            .add_verification_method("atproto".to_string(), signing_pub.clone())
+            .add_verification_method("atproto_space".to_string(), signing_pub)
             .add_also_known_as(handle_uri)
             .add_service("atproto_pds".to_string(), services["atproto_pds"].clone())
+            .add_service(
+                "atproto_space_host".to_string(),
+                services["atproto_space_host"].clone(),
+            )
             .build()
             .map_err(|e| PdsError::PlcRotationKey {
                 reason: format!("build PLC op: {e}"),
@@ -260,12 +279,20 @@ impl PlcService {
             service_type: "AtprotoPersonalDataServer".to_string(),
             endpoint: self.config.service_endpoint.clone(),
         };
+        // 0016 §"Space authority" (lines 87-92): expose `#atproto_space_host`
+        // alongside `#atproto_pds`, reusing this PDS's endpoint (line 92 MAY).
+        let space_host_svc = ServiceEndpoint {
+            service_type: "AtprotoPersonalDataServer".to_string(),
+            endpoint: self.config.service_endpoint.clone(),
+        };
 
         let (did, op, _) = DidBuilder::new()
             .add_rotation_key(rotation_priv.clone())
-            .add_verification_method("atproto".to_string(), signing_pub)
+            .add_verification_method("atproto".to_string(), signing_pub.clone())
+            .add_verification_method("atproto_space".to_string(), signing_pub)
             .add_also_known_as(handle_uri)
             .add_service("atproto_pds".to_string(), svc)
+            .add_service("atproto_space_host".to_string(), space_host_svc)
             .build()
             .map_err(|e| PdsError::PlcRotationKey {
                 reason: format!("build PLC op: {e}"),
@@ -331,5 +358,46 @@ mod tests {
         let services = &json["services"]["atproto_pds"];
         assert_eq!(services["type"], "AtprotoPersonalDataServer");
         assert_eq!(services["endpoint"], "https://pds.example.com");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genesis_dry_run_exposes_atproto_space_verification_method() {
+        // 0016 §"Space authority" (lines 87-92): the authority DID MUST expose
+        // an `#atproto_space` verification method. Per line 92 it MAY coincide
+        // in value with `#atproto`; this PDS reuses the atproto signing key, so
+        // the two entries carry the same did:key.
+        let svc = fresh_service();
+        let (_did, op, _, _) = svc.genesis_dry_run("alice.example").await.unwrap();
+        let json = serde_json::to_value(&op).unwrap();
+        let vms = &json["verificationMethods"];
+        let atproto = vms["atproto"]
+            .as_str()
+            .expect("#atproto verification method present");
+        let atproto_space = vms["atproto_space"]
+            .as_str()
+            .expect("#atproto_space verification method present");
+        assert!(atproto.starts_with("did:key:"));
+        assert_eq!(
+            atproto, atproto_space,
+            "#atproto_space coincides with #atproto per line 92"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genesis_dry_run_exposes_atproto_space_host_service() {
+        // 0016 §"Space authority" (lines 87-92): the authority DID MUST expose
+        // an `#atproto_space_host` service. Per line 92 it MAY resolve to the
+        // same endpoint as `#atproto_pds`.
+        let svc = fresh_service();
+        let (_did, op, _, _) = svc.genesis_dry_run("alice.example").await.unwrap();
+        let json = serde_json::to_value(&op).unwrap();
+        let host = &json["services"]["atproto_space_host"];
+        assert_eq!(host["type"], "AtprotoPersonalDataServer");
+        assert_eq!(host["endpoint"], "https://pds.example.com");
+        // Coincides with the #atproto_pds endpoint.
+        assert_eq!(
+            host["endpoint"],
+            json["services"]["atproto_pds"]["endpoint"]
+        );
     }
 }

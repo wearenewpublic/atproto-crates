@@ -257,11 +257,32 @@ pub fn build_router(state: HttpState) -> Router {
             "/.well-known/oauth-protected-resource",
             get(oauth::oauth_protected_resource),
         )
-        // com.atproto.space.* — permissioned realm
+        // com.atproto.simplespace.* — host-internal space management
         .route(
-            "/xrpc/com.atproto.space.createSpace",
+            "/xrpc/com.atproto.simplespace.createSpace",
             post(space_handlers::create_space),
         )
+        .route(
+            "/xrpc/com.atproto.simplespace.updateSpace",
+            post(space_handlers::update_space),
+        )
+        .route(
+            "/xrpc/com.atproto.simplespace.deleteSpace",
+            post(space_handlers::delete_space),
+        )
+        .route(
+            "/xrpc/com.atproto.simplespace.addMember",
+            post(space_handlers::add_member),
+        )
+        .route(
+            "/xrpc/com.atproto.simplespace.removeMember",
+            post(space_handlers::remove_member),
+        )
+        .route(
+            "/xrpc/com.atproto.simplespace.listMembers",
+            get(space_handlers::get_members),
+        )
+        // com.atproto.space.* — permissioned realm
         .route(
             "/xrpc/com.atproto.space.getSpace",
             get(space_handlers::get_space),
@@ -271,20 +292,20 @@ pub fn build_router(state: HttpState) -> Router {
             get(space_handlers::list_spaces),
         )
         .route(
-            "/xrpc/com.atproto.space.addMember",
-            post(space_handlers::add_member),
-        )
-        .route(
-            "/xrpc/com.atproto.space.removeMember",
-            post(space_handlers::remove_member),
-        )
-        .route(
-            "/xrpc/com.atproto.space.getMembers",
-            get(space_handlers::get_members),
-        )
-        .route(
             "/xrpc/com.atproto.space.applyWrites",
             post(space_handlers::apply_writes),
+        )
+        .route(
+            "/xrpc/com.atproto.space.createRecord",
+            post(space_handlers::create_record_write),
+        )
+        .route(
+            "/xrpc/com.atproto.space.putRecord",
+            post(space_handlers::put_record_write),
+        )
+        .route(
+            "/xrpc/com.atproto.space.deleteRecord",
+            post(space_handlers::delete_record_write),
         )
         .route(
             "/xrpc/com.atproto.space.getRecord",
@@ -295,47 +316,43 @@ pub fn build_router(state: HttpState) -> Router {
             get(space_handlers::list_records),
         )
         .route(
+            "/xrpc/com.atproto.space.getBlob",
+            get(space_handlers::get_blob),
+        )
+        .route(
+            "/xrpc/com.atproto.space.listRepos",
+            get(space_handlers::list_repos),
+        )
+        .route(
             "/xrpc/com.atproto.space.getRepoState",
             get(space_handlers::get_repo_state),
         )
         .route(
-            "/xrpc/com.atproto.space.getRepoOplog",
-            get(space_handlers::get_repo_oplog),
+            "/xrpc/com.atproto.space.listRepoOps",
+            get(space_handlers::list_repo_ops),
         )
         .route(
-            "/xrpc/com.atproto.space.getMemberState",
-            get(space_handlers::get_member_state),
-        )
-        .route(
-            "/xrpc/com.atproto.space.getMemberOplog",
-            get(space_handlers::get_member_oplog),
-        )
-        .route(
-            "/xrpc/com.atproto.space.getMemberGrant",
-            post(space_handlers::get_member_grant),
+            "/xrpc/com.atproto.space.getDelegationToken",
+            get(space_handlers::get_delegation_token),
         )
         .route(
             "/xrpc/com.atproto.space.getSpaceCredential",
             post(space_handlers::get_space_credential),
         )
-        // Inbound notifyWrite + notifyMembership.
-        // Auth is structural: the embedded signed Commit IS the auth.
+        // Notify subscription (space-credential auth).
+        .route(
+            "/xrpc/com.atproto.space.registerNotify",
+            post(space_handlers::register_notify),
+        )
+        // Inbound notifyWrite (service auth; contentless { space, repo, rev }).
         .route(
             "/xrpc/com.atproto.space.notifyWrite",
             post(space_handlers::notify_write),
         )
+        // Space-deletion lifecycle (service auth).
         .route(
-            "/xrpc/com.atproto.space.notifyMembership",
-            post(space_handlers::notify_membership),
-        )
-        // Spaces export/import.
-        .route(
-            "/xrpc/com.atproto.space.exportSpaces",
-            get(space_handlers::export_spaces),
-        )
-        .route(
-            "/xrpc/com.atproto.space.importSpaces",
-            post(space_handlers::import_spaces),
+            "/xrpc/com.atproto.space.notifySpaceDeleted",
+            post(space_handlers::notify_space_deleted),
         )
         // com.atproto.admin.*
         .route(

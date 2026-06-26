@@ -32,7 +32,7 @@ pub const DEFAULT_NOTIFY_DELIVERED_RETENTION_DAYS: i64 = 7;
 pub const DEFAULT_NOTIFY_FAILED_RETENTION_DAYS: i64 = 30;
 /// Default retention for `space_*_oplog` rows.
 /// Receivers that lag behind this window need a full re-sync via
-/// `getRepoState` + `exportSpaces`. Operators tighten via
+/// `getRepoState`. Operators tighten via
 /// `PDS_SPACE_OPLOG_RETENTION_DAYS`.
 pub const DEFAULT_SPACE_OPLOG_RETENTION_DAYS: i64 = 30;
 

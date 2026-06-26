@@ -1,13 +1,19 @@
 //! AT Protocol permissioned-data spaces — primitives.
 //!
 //! This crate implements the protocol primitives from the
-//! [Spaces Design Spec](https://github.com/bluesky-social/atproto/blob/main/docs/superpowers/specs/2026-04-22-permissioned-data-pds-design.md):
+//! [0016 Permissioned Data][spec] draft, which is the authoritative alignment
+//! target for this crate:
 //!
-//! - **`SetHash`** trait + `XorSha256SetHash` placeholder + `EcmhSetHash` (production target).
-//! - **`Commit`** — HKDF-derived HMAC + ECDSA-signed commit over a `SetHash` digest with
-//!   per-commit random IKM for deniability and `scope` domain separation.
-//! - **`SpaceRepo`** / **`SpaceMembers`** — orchestrators over storage trait surfaces.
-//! - **`MemberGrant`** / **`SpaceCredential`** — JWT shapes for the two-step credential flow.
+//! - **`SetHash`** trait + **`LtHash`** (the production primitive).
+//! - **`Commit`** — a signed commit (`com.atproto.space.defs#signedCommit`):
+//!   `mac = HMAC(HKDF(ikm, ctx), hash)` binds the repo hash to the per-commit
+//!   context, while `sig` covers only `ctx` (the space URI, rev, and per-commit
+//!   random `ikm`) — never the hash — so a leaked commit is deniable (spec
+//!   lines 285-316).
+//! - **`SpaceRepo`** — per-(user, space) record orchestrator over the storage
+//!   trait surface. **`SpaceMembers`** — the `simplespace` member-list
+//!   orchestrator (the spec carries no member commits or member sync).
+//! - **`DelegationToken`** / **`SpaceCredential`** — JWT shapes for the two-step credential flow.
 //!
 //! The crate is **server-agnostic** — it does no IO directly and has no network
 //! dependencies. It composes with `atproto-pds` (and AppView consumers) via the
@@ -15,14 +21,13 @@
 //!
 //! # Status
 //!
-//! Experimental. The Spaces Design Spec is still settling. Several primitives
-//! (notably the `SetHash` algorithm) are explicitly marked as "placeholder until
-//! upstream picks ECMH or ltHash" by the spec itself.
+//! Experimental. 0016 is a draft; details may still change upstream.
 //!
 //! # References
 //!
-//! - [Spaces Design Spec](https://github.com/bluesky-social/atproto/blob/main/docs/superpowers/specs/2026-04-22-permissioned-data-pds-design.md)
-//! - Design document: see `` §15.
+//! - [0016 Permissioned Data][spec]
+//!
+//! [spec]: https://github.com/bluesky-social/proposals/blob/main/0016-permissioned-data/README.md
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -30,29 +35,26 @@
 pub mod commit;
 pub mod credential;
 pub mod errors;
-pub mod recon;
 pub mod set_hash;
-#[cfg(feature = "ecmh")]
-pub mod set_hash_ecmh;
 pub mod space_members;
 pub mod space_repo;
 pub mod storage;
 pub mod types;
 
 // Re-exports for the canonical public API surface.
-pub use commit::{Commit, CommitScope, SpaceContext, create_commit, verify_commit};
+pub use commit::{
+    Commit, SpaceContext, create_commit, encode_ctx, verify_commit, verify_commit_signature,
+};
 pub use credential::{
-    MemberGrant, SpaceCredential, create_member_grant, create_space_credential,
-    verify_member_grant, verify_space_credential,
+    DelegationToken, SpaceCredential, create_delegation_token, create_space_credential,
+    verify_delegation_token, verify_space_credential,
 };
 pub use errors::SpaceError;
-pub use set_hash::{SetHash, XorSha256SetHash};
-#[cfg(feature = "ecmh")]
-pub use set_hash_ecmh::EcmhSetHash;
+pub use set_hash::{LtHash, SetHash};
 pub use space_members::{MemberOp, MemberOpAction, SpaceMembers};
 pub use space_repo::{Op, OpAction, PreparedCommit, SpaceRepo};
 pub use storage::{
-    MemberPage, MemberRow, MemberState, OplogEntry, OplogPage, RecordPage, RecordRow, RepoState,
-    SpaceMembersStorage, SpaceRepoStorage,
+    MemberPage, MemberRow, MemberState, OplogCursor, OplogEntry, OplogPage, RecordPage, RecordRow,
+    RepoState, SpaceMembersStorage, SpaceRepoStorage,
 };
-pub use types::{SpaceKey, SpaceType, SpaceUri};
+pub use types::{RecordUri, SpaceKey, SpaceType, SpaceUri};

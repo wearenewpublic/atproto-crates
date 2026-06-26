@@ -22,7 +22,8 @@ pub enum SpaceError {
         value: String,
     },
 
-    /// error-atproto-space-types-3: invalid space key (must be non-empty, no slashes).
+    /// error-atproto-space-types-3: invalid space key (must satisfy `rkey` syntax:
+    /// 1-512 bytes, charset `[A-Za-z0-9._:~-]`, not `.` or `..`).
     #[error("error-atproto-space-types-3 invalid space key: {value}")]
     InvalidSpaceKey {
         /// The value that was not a valid space key.
@@ -158,6 +159,13 @@ pub enum SpaceError {
         since: Option<String>,
         /// Earliest rev still retained.
         earliest: Option<String>,
+    },
+
+    /// error-atproto-space-storage-3: malformed oplog cursor token.
+    #[error("error-atproto-space-storage-3 invalid oplog cursor: {token}")]
+    InvalidCursor {
+        /// The cursor token that failed to parse.
+        token: String,
     },
 }
 

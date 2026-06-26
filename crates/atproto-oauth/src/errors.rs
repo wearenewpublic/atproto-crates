@@ -458,6 +458,27 @@ pub enum DpopError {
     ResponseBodyObjectParsingFailed,
 }
 
+/// Error returned when a required OAuth permission scope is missing.
+///
+/// Mirrors the reference `ScopeMissingError` from `@atproto/oauth-scopes`. The
+/// embedded scope string is the minimal scope that would have satisfied the
+/// attempted operation, as produced by the relevant `scope_needed_for` helper.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("error-atproto-oauth-scope-1 Missing required scope: {scope}")]
+pub struct ScopeMissingError {
+    /// The minimal scope string that would satisfy the attempted operation.
+    pub scope: String,
+}
+
+impl ScopeMissingError {
+    /// Create a new [`ScopeMissingError`] for the given required scope string.
+    pub fn new(scope: impl Into<String>) -> Self {
+        ScopeMissingError {
+            scope: scope.into(),
+        }
+    }
+}
+
 /// Error types that can occur when working with OAuth request storage operations
 #[derive(Debug, Error)]
 pub enum OAuthStorageError {

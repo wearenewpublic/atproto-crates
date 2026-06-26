@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::validation::data_errors::DataValidationError;
 use crate::validation::schema::{
-    PERMISSION_RESOURCES, Permission, PermissionSetSchema, REPO_ACTIONS, SchemaDef,
+    PERMISSION_RESOURCES, Permission, PermissionSetSchema, REPO_ACTIONS, SchemaDef, SpaceSchema,
 };
 use crate::validation::syntax::validate_nsid;
 
@@ -86,8 +86,10 @@ impl SchemaFile {
             validate_def_name(name)?;
         }
         for def in self.defs.values() {
-            if let SchemaDef::PermissionSet(ps) = def {
-                validate_permission_set(ps, &self.id)?;
+            match def {
+                SchemaDef::PermissionSet(ps) => validate_permission_set(ps, &self.id)?,
+                SchemaDef::Space(space) => validate_space(space)?,
+                _ => {}
             }
         }
         Ok(())
@@ -204,7 +206,61 @@ fn validate_permission(
         "rpc" => {
             validate_rpc_permission(permission, namespace)?;
         }
+        "space" => {
+            validate_space_permission(permission, namespace)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Validate a `space` permission entry.
+///
+/// The `collection` list may be wildcard (`*`) or list collections under a
+/// different namespace authority than the space and the permission set, so
+/// collection NSIDs are not constrained here (spec line 465, final sentence).
+///
+/// `spaceType` must be present, must not be the `*` wildcard (a permission set
+/// must target a concrete space type), and must obey the permission set's
+/// [Namespace Authority](https://atproto.com/specs/permission#namespace-authority)
+/// requirement — it must fall under the set's `namespace` (spec line 465), the
+/// same constraint enforced for repo `collection` and rpc `lxm`.
+fn validate_space_permission(
+    permission: &Permission,
+    namespace: &str,
+) -> Result<(), DataValidationError> {
+    let space_type = permission
+        .space_type
+        .as_ref()
+        .ok_or(DataValidationError::SpacePermissionMissingSpaceType)?;
+    if space_type == "*" {
+        return Err(DataValidationError::SpacePermissionWildcardSpaceType);
+    }
+    if !nsid_in_namespace(space_type, namespace) {
+        return Err(DataValidationError::PermissionNsidOutsideNamespace {
+            nsid: space_type.clone(),
+            namespace: namespace.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a `space` definition.
+///
+/// Enforces that `name` has length 1..=64 and that each `collections` entry
+/// is a valid NSID. The `collections` array itself may be empty.
+fn validate_space(space: &SpaceSchema) -> Result<(), DataValidationError> {
+    let len = space.name.len();
+    if !(1..=64).contains(&len) {
+        return Err(DataValidationError::SpaceNameLengthInvalid { length: len });
+    }
+    for nsid in &space.collections {
+        if let Err(e) = validate_nsid(nsid) {
+            return Err(DataValidationError::SpaceInvalidCollectionNsid {
+                nsid: nsid.clone(),
+                reason: e.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -680,5 +736,190 @@ mod tests {
     #[test]
     fn test_extract_namespace_no_dots() {
         assert_eq!(extract_namespace("nodots"), "nodots");
+    }
+
+    #[test]
+    fn test_parse_space_main() {
+        let json = r#"{"lexicon": 1, "id": "com.atmoboards.forum", "defs": {"main": {"type": "space", "key": "tid", "name": "AtmoBoards Forum", "description": "A discussion forum", "name:lang": {"es": "Foro AtmoBoards", "ja": "AtmoBoards 掲示板"}, "collections": ["com.atmoboards.thread", "com.atmoboards.reply"]}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        assert_eq!(schema.id, "com.atmoboards.forum");
+        if let Some(SchemaDef::Space(space)) = schema.main() {
+            assert_eq!(space.key, "tid");
+            assert_eq!(space.name, "AtmoBoards Forum");
+            assert_eq!(space.collections.len(), 2);
+            assert_eq!(
+                space.name_lang.get("es"),
+                Some(&"Foro AtmoBoards".to_string())
+            );
+        } else {
+            panic!("Expected Space schema");
+        }
+    }
+
+    #[test]
+    fn test_space_main_round_trip() {
+        let json = r#"{"lexicon":1,"id":"com.atmoboards.forum","defs":{"main":{"type":"space","key":"tid","name":"AtmoBoards Forum","collections":["com.atmoboards.thread"]}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        let serialized = serde_json::to_string(&schema).unwrap();
+        let reparsed = SchemaFile::parse(&serialized).unwrap();
+        assert_eq!(schema, reparsed);
+    }
+
+    #[test]
+    fn test_space_empty_collections_allowed() {
+        let json = r#"{"lexicon": 1, "id": "com.example.empty", "defs": {"main": {"type": "space", "key": "tid", "name": "Empty Space", "collections": []}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        if let Some(SchemaDef::Space(space)) = schema.main() {
+            assert!(space.collections.is_empty());
+        } else {
+            panic!("Expected Space schema");
+        }
+    }
+
+    #[test]
+    fn test_space_must_be_main() {
+        let json = r#"{"lexicon": 1, "id": "com.example.space", "defs": {"demo": {"type": "space", "key": "tid", "name": "Example Space", "collections": []}}}"#;
+        let result = SchemaFile::parse(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be named 'main'")
+        );
+    }
+
+    #[test]
+    fn test_space_name_empty_rejected() {
+        let json = r#"{"lexicon": 1, "id": "com.example.space", "defs": {"main": {"type": "space", "key": "tid", "name": "", "collections": []}}}"#;
+        let result = SchemaFile::parse(json);
+        assert!(matches!(
+            result,
+            Err(DataValidationError::SpaceNameLengthInvalid { length: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_space_name_too_long_rejected() {
+        let name = "a".repeat(65);
+        let json = format!(
+            r#"{{"lexicon": 1, "id": "com.example.space", "defs": {{"main": {{"type": "space", "key": "tid", "name": "{}", "collections": []}}}}}}"#,
+            name
+        );
+        let result = SchemaFile::parse(&json);
+        assert!(matches!(
+            result,
+            Err(DataValidationError::SpaceNameLengthInvalid { length: 65 })
+        ));
+    }
+
+    #[test]
+    fn test_space_name_max_length_allowed() {
+        let name = "a".repeat(64);
+        let json = format!(
+            r#"{{"lexicon": 1, "id": "com.example.space", "defs": {{"main": {{"type": "space", "key": "tid", "name": "{}", "collections": []}}}}}}"#,
+            name
+        );
+        assert!(SchemaFile::parse(&json).is_ok());
+    }
+
+    #[test]
+    fn test_space_invalid_collection_nsid() {
+        let json = r#"{"lexicon": 1, "id": "com.example.space", "defs": {"main": {"type": "space", "key": "tid", "name": "Example Space", "collections": ["not-a-valid-nsid"]}}}"#;
+        let result = SchemaFile::parse(json);
+        assert!(matches!(
+            result,
+            Err(DataValidationError::SpaceInvalidCollectionNsid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_space_missing_key_rejected() {
+        // `key` is a required field (spec line 125); a declaration omitting it
+        // must fail to parse.
+        let json = r#"{"lexicon": 1, "id": "com.example.space", "defs": {"main": {"type": "space", "name": "Example Space", "collections": []}}}"#;
+        assert!(SchemaFile::parse(json).is_err());
+    }
+
+    #[test]
+    fn test_space_key_round_trips_through_file() {
+        let json = r#"{"lexicon":1,"id":"com.example.space","defs":{"main":{"type":"space","key":"any","name":"Example Space","collections":[]}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        if let Some(SchemaDef::Space(space)) = schema.main() {
+            assert_eq!(space.key, "any");
+        } else {
+            panic!("Expected Space schema");
+        }
+    }
+
+    #[test]
+    fn test_permission_set_space_resource() {
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "com.example.lexicon.group", "did": "*", "skey": "*", "collection": ["com.example.calendar.event"], "action": ["read", "create"]}]}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        if let Some(SchemaDef::PermissionSet(ps)) = schema.main() {
+            assert_eq!(ps.permissions.len(), 1);
+            assert_eq!(ps.permissions[0].resource, "space");
+            assert_eq!(
+                ps.permissions[0].space_type,
+                Some("com.example.lexicon.group".to_string())
+            );
+            assert_eq!(ps.permissions[0].did, Some("*".to_string()));
+            assert_eq!(ps.permissions[0].skey, Some("*".to_string()));
+        } else {
+            panic!("Expected PermissionSet schema");
+        }
+    }
+
+    #[test]
+    fn test_permission_set_space_resource_round_trip() {
+        let json = r#"{"lexicon":1,"id":"com.example.lexicon.perms","defs":{"main":{"type":"permission-set","title":"test case","detail":"test detail","permissions":[{"type":"permission","resource":"space","spaceType":"com.example.lexicon.group","action":["read"]}]}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        let serialized = serde_json::to_string(&schema).unwrap();
+        let reparsed = SchemaFile::parse(&serialized).unwrap();
+        assert_eq!(schema, reparsed);
+    }
+
+    #[test]
+    fn test_space_permission_missing_space_type() {
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "collection": ["com.example.calendar.event"]}]}}}"#;
+        let result = SchemaFile::parse(json);
+        assert!(matches!(
+            result,
+            Err(DataValidationError::SpacePermissionMissingSpaceType)
+        ));
+    }
+
+    #[test]
+    fn test_space_permission_wildcard_space_type_rejected() {
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "*", "action": ["read"]}]}}}"#;
+        let result = SchemaFile::parse(json);
+        assert!(matches!(
+            result,
+            Err(DataValidationError::SpacePermissionWildcardSpaceType)
+        ));
+    }
+
+    #[test]
+    fn test_space_permission_space_type_outside_namespace_rejected() {
+        // The permission set id is `com.example.lexicon.perms` (namespace
+        // `com.example.lexicon`); a `spaceType` under a different namespace
+        // authority must be rejected (spec line 465, Namespace Authority).
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "com.atmoboards.forum", "action": ["read"]}]}}}"#;
+        let result = SchemaFile::parse(json);
+        assert!(
+            matches!(
+                result,
+                Err(DataValidationError::PermissionNsidOutsideNamespace { .. })
+            ),
+            "got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_space_permission_cross_namespace_collection_allowed() {
+        // The collection list MAY reference NSIDs under a different namespace
+        // authority than the space and the permission set (spec line 465).
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "com.example.lexicon.group", "collection": ["org.other.note"], "action": ["read", "create"]}]}}}"#;
+        assert!(SchemaFile::parse(json).is_ok());
     }
 }

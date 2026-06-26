@@ -1,27 +1,29 @@
 //! `SpaceSync` — sync-side reads of state and oplog.
 //!
-//!  syncing apps poll:
-//! - `getRepoState {space, member}` → `{set_hash, rev}` for the per-member
-//!   record commitment.
-//! - `getRepoOplog {space, member, since?, limit?}` → ordered ops since `rev`.
-//! - `getMemberState {space}` → owner-only member-list commitment.
-//! - `getMemberOplog {space, since?, limit?}` → owner-only member-list ops.
+//! Syncing apps poll:
+//! - `getRepoState {space, repo}` → the per-account record commitment as a
+//!   [`RepoState`] (full 2048-byte SetHash state + rev); the HTTP layer signs
+//!   it into a `com.atproto.space.defs#signedCommit`.
+//! - `listRepoOps {space, repo, since?, limit?}` → ordered ops since `rev`.
+//!
+//! This module returns the raw [`RepoState`] / [`OplogPage`]; commit signing
+//! (rehydrating [`PdsSetHash`] and building a signed commit) happens in
+//! `crate::http::space_handlers`, which holds the account signing keys.
 //!
 //! Auth is performed at the HTTP layer; this struct just queries the
-//! per-actor SQLite store. The owner's per-actor store backs both member-list
-//! state and (for their own member-DID) record state. Per-member record
-//! state lives in *each member's* per-actor store (since they wrote it).
+//! per-actor SQLite store. Per-member record state lives in *each member's*
+//! per-actor store (since they wrote it).
 //!
-//! / G35, **the PDS does not enforce membership at sync
-//! time** — consumers verify membership inductively from the owner's
+//! The 0016 Permissioned Data draft has no member commits or member-list sync:
+//! consumers learn the writer set from `listRepos`, not from a signed
 //! member-list oplog.
 
-use crate::actor_store::sql::{SqlActorStore, SqlSpaceMembersStorage, SqlSpaceRepoStorage};
+use crate::actor_store::sql::{SqlActorStore, SqlSpaceRepoStorage};
 use crate::errors::{PdsError, PdsResult};
 use crate::realm::PdsSetHash;
-use atproto_space::space_members::SpaceMembers;
+use crate::space::config::ensure_space_live;
 use atproto_space::space_repo::SpaceRepo;
-use atproto_space::storage::{MemberState, OplogPage, RepoState};
+use atproto_space::storage::{OplogCursor, OplogPage, RepoState};
 use atproto_space::types::SpaceUri;
 use std::path::PathBuf;
 
@@ -37,61 +39,32 @@ impl SpaceSync {
         Self { data_dir }
     }
 
-    /// `getRepoState` — current `{set_hash, rev}` for `(space, member)`'s
-    /// record commitment. Reads from the *member's* per-actor store, since
-    /// each member's writes live in their own store.
-    pub async fn get_repo_state(&self, space: &SpaceUri, member_did: &str) -> PdsResult<RepoState> {
-        let store = SqlActorStore::open(&self.data_dir, member_did).await?;
+    /// `getRepoState` — current `{set_hash, rev}` for `(space, repo)`'s
+    /// record commitment. Reads from the *repo account's* per-actor store,
+    /// since each account's writes live in their own store.
+    pub async fn get_repo_state(&self, space: &SpaceUri, repo_did: &str) -> PdsResult<RepoState> {
+        ensure_space_live(&self.data_dir, space).await?;
+        let store = SqlActorStore::open(&self.data_dir, repo_did).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
             SpaceRepo::new(space.clone(), storage);
         repo.current_state().await.map_err(PdsError::Space)
     }
 
-    /// `getRepoOplog` — per-member record oplog from `since` (exclusive),
-    /// up to `limit` ops.
-    pub async fn get_repo_oplog(
+    /// `listRepoOps` — per-repo record oplog strictly after the `(rev, idx)`
+    /// `since` cursor, up to `limit` ops.
+    pub async fn list_repo_ops(
         &self,
         space: &SpaceUri,
-        member_did: &str,
-        since: Option<&str>,
+        repo_did: &str,
+        since: Option<&OplogCursor>,
         limit: u32,
     ) -> PdsResult<OplogPage> {
-        let store = SqlActorStore::open(&self.data_dir, member_did).await?;
+        let store = SqlActorStore::open(&self.data_dir, repo_did).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
             SpaceRepo::new(space.clone(), storage);
         repo.read_oplog(since, limit).await.map_err(PdsError::Space)
-    }
-
-    /// `getMemberState` — owner-only member-list commitment.
-    ///
-    /// Reads from the owner's per-actor store. Caller is responsible for
-    /// verifying that the request is authorized (e.g. owner-self-auth or
-    /// member-with-credential).
-    pub async fn get_member_state(&self, space: &SpaceUri) -> PdsResult<MemberState> {
-        let store = SqlActorStore::open(&self.data_dir, &space.owner_did).await?;
-        let storage = SqlSpaceMembersStorage::new(store.pool().clone());
-        let members: SpaceMembers<SqlSpaceMembersStorage, PdsSetHash> =
-            SpaceMembers::new(space.clone(), storage);
-        members.current_state().await.map_err(PdsError::Space)
-    }
-
-    /// `getMemberOplog` — owner-only member-list oplog.
-    pub async fn get_member_oplog(
-        &self,
-        space: &SpaceUri,
-        since: Option<&str>,
-        limit: u32,
-    ) -> PdsResult<OplogPage> {
-        let store = SqlActorStore::open(&self.data_dir, &space.owner_did).await?;
-        let storage = SqlSpaceMembersStorage::new(store.pool().clone());
-        let members: SpaceMembers<SqlSpaceMembersStorage, PdsSetHash> =
-            SpaceMembers::new(space.clone(), storage);
-        members
-            .read_oplog(since, limit)
-            .await
-            .map_err(PdsError::Space)
     }
 }
 
@@ -100,7 +73,6 @@ mod tests {
     use super::*;
     use crate::account::{AccountDirectory, AccountManager, CreateAccountParams};
     use crate::keys::{KeyStore, MemoryKeyStore};
-    use crate::space::service::SpaceService;
     use crate::space::writer::{SpaceWriteAction, SpaceWriteOp, SpaceWriter};
     use atproto_identity::key::KeyType;
     use atproto_space::types::{SpaceKey, SpaceType};
@@ -184,38 +156,11 @@ mod tests {
         assert!(state.rev.is_some());
 
         let oplog = sync
-            .get_repo_oplog(&uri, "did:plc:alice", None, 100)
+            .list_repo_ops(&uri, "did:plc:alice", None, 100)
             .await
             .unwrap();
         assert_eq!(oplog.ops.len(), 1);
         assert_eq!(oplog.ops[0].action, "create");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn member_oplog_observes_add_remove() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-        let _manager = fresh_manager(&dir).await;
-        let svc = SpaceService::new(dir.clone());
-        svc.create_space("did:plc:owner", "app.bsky.group", "default")
-            .await
-            .unwrap();
-        let uri = test_space();
-        svc.add_member("did:plc:owner", &uri, "did:plc:alice")
-            .await
-            .unwrap();
-        svc.remove_member("did:plc:owner", &uri, "did:plc:alice")
-            .await
-            .unwrap();
-
-        let sync = SpaceSync::new(dir);
-        let state = sync.get_member_state(&uri).await.unwrap();
-        assert!(state.set_hash.is_some());
-
-        let oplog = sync.get_member_oplog(&uri, None, 100).await.unwrap();
-        assert_eq!(oplog.ops.len(), 2);
-        assert_eq!(oplog.ops[0].action, "add");
-        assert_eq!(oplog.ops[1].action, "remove");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -253,8 +198,9 @@ mod tests {
             .unwrap();
 
         let sync = SpaceSync::new(dir);
+        let cursor = OplogCursor::new(first.rev.clone(), 0);
         let oplog = sync
-            .get_repo_oplog(&uri, "did:plc:alice", Some(&first.rev), 100)
+            .list_repo_ops(&uri, "did:plc:alice", Some(&cursor), 100)
             .await
             .unwrap();
         // Only the second commit's ops should be returned.

@@ -1,12 +1,10 @@
-//! Spaces notifier — `notifyWrite` / `notifyMembership` outbound delivery.
+//! Spaces notifier — `notifyWrite` outbound delivery.
 //!
-//!  Spaces
-//! writes don't fan out via the public firehose; instead the owner's PDS
-//! POSTs the signed `notifyWrite` (records) and `notifyMembership` (member
-//! list) payloads to each consumer service that holds a current
-//! `SpaceCredential`. The set of recipient services lives in the per-actor
-//! `space_credential_recipient` table; delivery attempts (with retry +
-//! exponential backoff) live in the shared `notify_attempt` DLQ.
+//! Spaces writes don't fan out via the public firehose; instead the owner's
+//! PDS POSTs the contentless `notifyWrite` payload to each consumer service
+//! that holds a current `SpaceCredential`. The set of recipient services lives
+//! in the per-actor `space_credential_recipient` table; delivery attempts
+//! (with retry + exponential backoff) live in the shared `notify_attempt` DLQ.
 //!
 //! This module ships:
 //!
@@ -56,29 +54,34 @@ impl AttemptState {
 
 /// Append a notify-attempt row.
 ///
-/// `payload_cbor` is the dag-cbor-encoded request body the consumer will see;
-/// `nsid` distinguishes `com.atproto.space.notifyWrite` vs
-/// `com.atproto.space.notifyMembership` for the worker's POST.
+/// `payload` is the request body the consumer will see (JSON for the
+/// contentless notifyWrite); `nsid` selects the worker's POST URL;
+/// `content_type` is the request `Content-Type`; `auth_token`, when present,
+/// is delivered as a `Bearer` service-auth header.
 pub async fn enqueue_notification(
     pool: &SqlitePool,
     target_service_did: &str,
     target_endpoint: &str,
-    payload_cbor: Vec<u8>,
+    payload: Vec<u8>,
     nsid: &str,
+    content_type: &str,
+    auth_token: Option<&str>,
 ) -> PdsResult<String> {
     let id = format!("n-{}-{}", Utc::now().timestamp_millis(), random_suffix(8));
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO notify_attempt
          (id, target_service_did, target_endpoint, payload_cbor, nsid,
-          attempt_count, next_attempt_at, state)
-         VALUES (?, ?, ?, ?, ?, 0, ?, 'pending')",
+          content_type, auth_token, attempt_count, next_attempt_at, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'pending')",
     )
     .bind(&id)
     .bind(target_service_did)
     .bind(target_endpoint)
-    .bind(&payload_cbor)
+    .bind(&payload)
     .bind(nsid)
+    .bind(content_type)
+    .bind(auth_token)
     .bind(&now)
     .execute(pool)
     .await
@@ -97,25 +100,43 @@ pub struct DueAttempt {
     pub target_service_did: String,
     /// HTTPS endpoint base of the receiving service.
     pub target_endpoint: String,
-    /// DAG-CBOR-encoded request body.
+    /// Request body bytes (DAG-CBOR or JSON depending on `content_type`).
     pub payload_cbor: Vec<u8>,
     /// XRPC NSID — appended to the endpoint to compose the POST URL.
     pub nsid: String,
+    /// Request `Content-Type` header.
+    pub content_type: String,
+    /// Optional `Bearer` service-auth token.
+    pub auth_token: Option<String>,
     /// How many times we've already tried this row.
     pub attempt_count: u32,
 }
+
+/// Raw row shape returned by the `due_now` query (id, service_did, endpoint,
+/// payload, nsid, content_type, auth_token, attempt_count).
+type DueRow = (
+    String,
+    String,
+    String,
+    Vec<u8>,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
 
 /// Read all `pending` rows whose `next_attempt_at <= now`. Caller is
 /// responsible for marking each row as delivered/failed/retry after the POST.
 pub async fn due_now(pool: &SqlitePool, limit: u32) -> PdsResult<Vec<DueAttempt>> {
     let now = Utc::now().to_rfc3339();
     let limit = limit.clamp(1, 1000);
-    let rows: Vec<(String, String, String, Vec<u8>, String, i64)> = sqlx::query_as(
-        "SELECT id, target_service_did, target_endpoint, payload_cbor, nsid, attempt_count
-         FROM notify_attempt
-         WHERE state = 'pending' AND next_attempt_at <= ?
-         ORDER BY next_attempt_at ASC
-         LIMIT ?",
+    let rows: Vec<DueRow> = sqlx::query_as(
+        "SELECT id, target_service_did, target_endpoint, payload_cbor, nsid,
+                    content_type, auth_token, attempt_count
+             FROM notify_attempt
+             WHERE state = 'pending' AND next_attempt_at <= ?
+             ORDER BY next_attempt_at ASC
+             LIMIT ?",
     )
     .bind(&now)
     .bind(limit as i64)
@@ -126,14 +147,18 @@ pub async fn due_now(pool: &SqlitePool, limit: u32) -> PdsResult<Vec<DueAttempt>
     })?;
     Ok(rows
         .into_iter()
-        .map(|(id, did, endpoint, payload, nsid, attempts)| DueAttempt {
-            id,
-            target_service_did: did,
-            target_endpoint: endpoint,
-            payload_cbor: payload,
-            nsid,
-            attempt_count: attempts as u32,
-        })
+        .map(
+            |(id, did, endpoint, payload, nsid, content_type, auth_token, attempts)| DueAttempt {
+                id,
+                target_service_did: did,
+                target_endpoint: endpoint,
+                payload_cbor: payload,
+                nsid,
+                content_type,
+                auth_token,
+                attempt_count: attempts as u32,
+            },
+        )
         .collect())
 }
 
@@ -250,13 +275,15 @@ impl Notifier {
         let mut delivered = 0u32;
         for attempt in due {
             let endpoint = format!("{}/xrpc/{}", attempt.target_endpoint, attempt.nsid);
-            let result = self
+            let mut req = self
                 .client
                 .post(&endpoint)
-                .header(reqwest::header::CONTENT_TYPE, "application/cbor")
-                .body(attempt.payload_cbor.clone())
-                .send()
-                .await;
+                .header(reqwest::header::CONTENT_TYPE, attempt.content_type.clone())
+                .body(attempt.payload_cbor.clone());
+            if let Some(token) = attempt.auth_token.as_deref() {
+                req = req.bearer_auth(token);
+            }
+            let result = req.send().await;
             match result {
                 Ok(resp) if resp.status().is_success() => {
                     mark_delivered(pool, &attempt.id).await?;
@@ -320,6 +347,8 @@ mod tests {
             "https://appview.example",
             b"payload-bytes".to_vec(),
             "com.atproto.space.notifyWrite",
+            "application/json",
+            None,
         )
         .await
         .unwrap();
@@ -339,6 +368,8 @@ mod tests {
             "https://x.example",
             b"data".to_vec(),
             "com.atproto.space.notifyWrite",
+            "application/json",
+            None,
         )
         .await
         .unwrap();
@@ -356,6 +387,8 @@ mod tests {
             "https://x.example",
             b"data".to_vec(),
             "com.atproto.space.notifyWrite",
+            "application/json",
+            None,
         )
         .await
         .unwrap();
@@ -378,6 +411,8 @@ mod tests {
             "https://x.example",
             b"data".to_vec(),
             "com.atproto.space.notifyWrite",
+            "application/json",
+            None,
         )
         .await
         .unwrap();

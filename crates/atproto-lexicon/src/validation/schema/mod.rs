@@ -21,6 +21,8 @@ pub enum SchemaDef {
     /// Permission set
     #[serde(rename = "permission-set")]
     PermissionSet(PermissionSetSchema),
+    /// Space (permissioned-data space type definition)
+    Space(SpaceSchema),
     /// Boolean type
     Boolean(BooleanSchema),
     /// Integer type
@@ -59,6 +61,7 @@ impl SchemaDef {
             SchemaDef::Procedure(_) => "procedure",
             SchemaDef::Subscription(_) => "subscription",
             SchemaDef::PermissionSet(_) => "permission-set",
+            SchemaDef::Space(_) => "space",
             SchemaDef::Boolean(_) => "boolean",
             SchemaDef::Integer(_) => "integer",
             SchemaDef::String(_) => "string",
@@ -75,7 +78,8 @@ impl SchemaDef {
         }
     }
 
-    /// Check if this is a primary type (record, query, procedure, subscription)
+    /// Check if this is a primary type (record, query, procedure,
+    /// subscription, permission-set, space)
     pub fn is_primary(&self) -> bool {
         matches!(
             self,
@@ -84,6 +88,7 @@ impl SchemaDef {
                 | SchemaDef::Procedure(_)
                 | SchemaDef::Subscription(_)
                 | SchemaDef::PermissionSet(_)
+                | SchemaDef::Space(_)
         )
     }
 
@@ -156,6 +161,7 @@ impl SchemaDef {
             }
             // These types don't contain refs
             SchemaDef::PermissionSet(_)
+            | SchemaDef::Space(_)
             | SchemaDef::Boolean(_)
             | SchemaDef::Integer(_)
             | SchemaDef::String(_)
@@ -315,13 +321,71 @@ pub struct Permission {
     /// Whether to inherit audience for rpc resources
     #[serde(rename = "inheritAud", skip_serializing_if = "Option::is_none")]
     pub inherit_aud: Option<bool>,
+
+    /// Space type NSID for `space` resources (the `spaceType` field).
+    ///
+    /// Identifies the concrete space type a permission applies to. Inside a
+    /// permission set this must be a concrete NSID and not the `*` wildcard.
+    #[serde(rename = "spaceType", skip_serializing_if = "Option::is_none")]
+    pub space_type: Option<String>,
+
+    /// Owner DID for `space` resources.
+    ///
+    /// Scopes the permission to spaces owned by a specific DID. May be the
+    /// `*` wildcard to match any owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+
+    /// Record key for `space` resources.
+    ///
+    /// Scopes the permission to a specific space instance. May be the `*`
+    /// wildcard to match any space key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skey: Option<String>,
 }
 
 /// Valid resource types for permissions
-pub const PERMISSION_RESOURCES: &[&str] = &["repo", "rpc", "blob", "identity", "account"];
+pub const PERMISSION_RESOURCES: &[&str] = &["repo", "rpc", "blob", "identity", "account", "space"];
 
 /// Valid actions for repo permissions
 pub const REPO_ACTIONS: &[&str] = &["create", "update", "delete"];
+
+/// Space schema - declares a permissioned-data space type.
+///
+/// A space definition must be the `main` definition of its lexicon. The
+/// `name` is shown on OAuth consent screens when an application requests
+/// access to a space of this type, and `collections` lists the recommended
+/// record collections for clients.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SpaceSchema {
+    /// Description of the space type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Recommended space key (`skey`) type for spaces of this type.
+    ///
+    /// Required. Mirrors the [record key
+    /// types](https://atproto.com/specs/record-key#record-key-type-tid) — e.g.
+    /// `"tid"`, `"literal:self"`, or `"any"`. A declaration missing `key` fails
+    /// deserialization (spec line 125).
+    pub key: String,
+
+    /// Human-readable name for the space type (length 1..=64).
+    pub name: String,
+
+    /// Localization map for name (language code -> translated name).
+    #[serde(
+        rename = "name:lang",
+        default,
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
+    pub name_lang: IndexMap<String, String>,
+
+    /// Recommended record collection NSIDs for clients of this space type.
+    ///
+    /// Required (the field must be present), but may be an empty array.
+    pub collections: Vec<String>,
+}
 
 /// Input schema for procedures
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -748,5 +812,77 @@ mod tests {
         let json = r#"{"type": "cid-link"}"#;
         let schema: SchemaDef = serde_json::from_str(json).unwrap();
         assert!(matches!(schema, SchemaDef::CidLink(_)));
+    }
+
+    #[test]
+    fn test_space_schema_type_name_and_primary() {
+        let space = SchemaDef::Space(SpaceSchema {
+            name: "Example".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(space.type_name(), "space");
+        assert!(space.is_primary());
+    }
+
+    #[test]
+    fn test_deserialize_space_schema() {
+        let json = r#"{
+            "type": "space",
+            "key": "tid",
+            "name": "AtmoBoards Forum",
+            "description": "A discussion forum",
+            "name:lang": {"es": "Foro AtmoBoards"},
+            "collections": ["com.atmoboards.thread", "com.atmoboards.reply"]
+        }"#;
+        let schema: SchemaDef = serde_json::from_str(json).unwrap();
+        if let SchemaDef::Space(s) = schema {
+            assert_eq!(s.key, "tid");
+            assert_eq!(s.name, "AtmoBoards Forum");
+            assert_eq!(s.description, Some("A discussion forum".to_string()));
+            assert_eq!(s.name_lang.get("es"), Some(&"Foro AtmoBoards".to_string()));
+            assert_eq!(s.collections.len(), 2);
+        } else {
+            panic!("Expected Space schema");
+        }
+    }
+
+    #[test]
+    fn test_space_schema_round_trip() {
+        let json = r#"{"type":"space","key":"tid","name":"Example Space","collections":["com.example.thing"]}"#;
+        let schema: SchemaDef = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&schema).unwrap();
+        let reparsed: SchemaDef = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(schema, reparsed);
+    }
+
+    #[test]
+    fn test_space_schema_missing_name_fails() {
+        let json = r#"{"type": "space", "key": "tid", "collections": []}"#;
+        assert!(serde_json::from_str::<SchemaDef>(json).is_err());
+    }
+
+    #[test]
+    fn test_space_schema_missing_collections_fails() {
+        let json = r#"{"type": "space", "key": "tid", "name": "Example Space"}"#;
+        assert!(serde_json::from_str::<SchemaDef>(json).is_err());
+    }
+
+    #[test]
+    fn test_space_schema_missing_key_fails() {
+        let json = r#"{"type": "space", "name": "Example Space", "collections": []}"#;
+        assert!(serde_json::from_str::<SchemaDef>(json).is_err());
+    }
+
+    #[test]
+    fn test_space_schema_key_round_trips() {
+        let json = r#"{"type":"space","key":"literal:self","name":"Profile","collections":[]}"#;
+        let schema: SchemaDef = serde_json::from_str(json).unwrap();
+        if let SchemaDef::Space(s) = &schema {
+            assert_eq!(s.key, "literal:self");
+        } else {
+            panic!("Expected Space schema");
+        }
+        let serialized = serde_json::to_string(&schema).unwrap();
+        assert!(serialized.contains("\"key\":\"literal:self\""));
     }
 }

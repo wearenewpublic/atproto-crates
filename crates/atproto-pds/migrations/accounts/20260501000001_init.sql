@@ -95,6 +95,12 @@ CREATE TABLE notify_attempt (
     target_endpoint        TEXT NOT NULL,
     payload_cbor           BLOB NOT NULL,
     nsid                   TEXT NOT NULL,
+    -- Outbound request content-type. notifyWrite is application/json
+    -- (contentless { space, repo, rev }); notifyMembership is application/cbor.
+    content_type           TEXT NOT NULL DEFAULT 'application/cbor',
+    -- Pre-minted service-auth bearer (iss = owner DID, aud = target service).
+    -- NULL for payloads that don't carry service auth.
+    auth_token             TEXT,
     attempt_count          INTEGER NOT NULL DEFAULT 0,
     last_attempt_at        TEXT,
     next_attempt_at        TEXT NOT NULL,

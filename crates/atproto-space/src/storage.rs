@@ -6,10 +6,62 @@
 //! `fjall` Cargo feature). In-memory impls live in [`crate::space_repo::memory`]
 //! and [`crate::space_members::memory`] for testing.
 
-use crate::errors::SpaceResult;
+use crate::errors::{SpaceError, SpaceResult};
 use crate::types::SpaceUri;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// A `(rev, idx)`-granular oplog cursor.
+///
+/// The oplog `since` cursor must be `(rev, idx)`-granular rather than
+/// rev-granular: an atomic batch (entries sharing a `rev`) can exceed a single
+/// page's `limit`, so paging by bare `rev` would skip the batch's tail. The
+/// cursor names the last op delivered, and the next page resumes strictly after
+/// it (`(rev, idx) > (cursor.rev, cursor.idx)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OplogCursor {
+    /// Rev (TID) of the last delivered op.
+    pub rev: String,
+    /// Index of the last delivered op within its `rev` batch.
+    pub idx: u32,
+}
+
+impl OplogCursor {
+    /// Construct a cursor from a `rev` and `idx`.
+    #[must_use]
+    pub fn new(rev: String, idx: u32) -> Self {
+        Self { rev, idx }
+    }
+
+    /// Encode as an opaque wire token `"<rev>__<idx>"`.
+    #[must_use]
+    pub fn to_token(&self) -> String {
+        format!("{}__{}", self.rev, self.idx)
+    }
+
+    /// Decode an opaque wire token `"<rev>__<idx>"`.
+    ///
+    /// Returns [`SpaceError::InvalidCursor`] if the token is malformed.
+    pub fn from_token(token: &str) -> SpaceResult<Self> {
+        let (rev, idx) = token
+            .rsplit_once("__")
+            .ok_or_else(|| SpaceError::InvalidCursor {
+                token: token.to_string(),
+            })?;
+        let idx: u32 = idx.parse().map_err(|_| SpaceError::InvalidCursor {
+            token: token.to_string(),
+        })?;
+        if rev.is_empty() {
+            return Err(SpaceError::InvalidCursor {
+                token: token.to_string(),
+            });
+        }
+        Ok(Self {
+            rev: rev.to_string(),
+            idx,
+        })
+    }
+}
 
 /// Current per-space record commitment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,13 +267,18 @@ pub trait SpaceRepoStorage: Send + Sync {
         commit: PreparedCommitRecords,
     ) -> SpaceResult<()>;
 
-    /// Read oplog entries since the given rev (exclusive). `None` = from the start.
+    /// Read oplog entries strictly after the given `(rev, idx)` cursor. `None` =
+    /// from the start.
+    ///
+    /// The predicate is `(rev, idx) > (since.rev, since.idx)`, ordered by
+    /// `(rev, idx)`. This keeps atomic batches (entries sharing a `rev`)
+    /// coherent across paging even when a batch exceeds `limit`.
     ///
     /// If `since` predates the retained range, returns [`SpaceError::OplogGap`].
     async fn read_oplog(
         &self,
         space: &SpaceUri,
-        since: Option<&str>,
+        since: Option<&OplogCursor>,
         limit: u32,
     ) -> SpaceResult<OplogPage>;
 }
@@ -249,12 +306,42 @@ pub trait SpaceMembersStorage: Send + Sync {
         space: &SpaceUri,
         commit: PreparedCommitMembers,
     ) -> SpaceResult<()>;
+}
 
-    /// Read member-oplog entries since the given rev.
-    async fn read_oplog(
-        &self,
-        space: &SpaceUri,
-        since: Option<&str>,
-        limit: u32,
-    ) -> SpaceResult<OplogPage>;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oplog_cursor_token_round_trip() {
+        let cur = OplogCursor::new("3kabc".to_string(), 5);
+        let token = cur.to_token();
+        assert_eq!(token, "3kabc__5");
+        assert_eq!(OplogCursor::from_token(&token).unwrap(), cur);
+    }
+
+    #[test]
+    fn oplog_cursor_token_round_trip_idx_zero() {
+        let cur = OplogCursor::new("3kabc".to_string(), 0);
+        assert_eq!(OplogCursor::from_token(&cur.to_token()).unwrap(), cur);
+    }
+
+    #[test]
+    fn oplog_cursor_rejects_malformed() {
+        // Missing separator.
+        assert!(matches!(
+            OplogCursor::from_token("3kabc"),
+            Err(SpaceError::InvalidCursor { .. })
+        ));
+        // Non-numeric idx.
+        assert!(matches!(
+            OplogCursor::from_token("3kabc__x"),
+            Err(SpaceError::InvalidCursor { .. })
+        ));
+        // Empty rev.
+        assert!(matches!(
+            OplogCursor::from_token("__3"),
+            Err(SpaceError::InvalidCursor { .. })
+        ));
+    }
 }

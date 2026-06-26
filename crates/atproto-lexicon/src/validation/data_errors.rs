@@ -521,4 +521,37 @@ pub enum DataValidationError {
         /// The expected namespace.
         namespace: String,
     },
+
+    /// A space definition has a `name` whose length is outside the 1..=64 range.
+    #[error(
+        "error-atproto-lexicon-data-validation-56 Space name length out of range: expected 1..=64, got {length}"
+    )]
+    SpaceNameLengthInvalid {
+        /// The actual length of the name.
+        length: usize,
+    },
+
+    /// A space definition's collection NSID is invalid.
+    #[error(
+        "error-atproto-lexicon-data-validation-57 Space has invalid collection NSID '{nsid}': {reason}"
+    )]
+    SpaceInvalidCollectionNsid {
+        /// The invalid NSID string.
+        nsid: String,
+        /// Description of why the NSID is invalid.
+        reason: String,
+    },
+
+    /// A space permission is missing the required `spaceType` field.
+    #[error(
+        "error-atproto-lexicon-data-validation-58 Space permission missing required 'spaceType' field"
+    )]
+    SpacePermissionMissingSpaceType,
+
+    /// A space permission uses the `*` wildcard for `spaceType`, which is not
+    /// allowed inside a permission set.
+    #[error(
+        "error-atproto-lexicon-data-validation-59 Space permission 'spaceType' must not be the '*' wildcard"
+    )]
+    SpacePermissionWildcardSpaceType,
 }

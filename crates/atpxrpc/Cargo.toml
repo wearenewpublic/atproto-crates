@@ -1,6 +1,6 @@
 [package]
 name = "atpxrpc"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 description = "AT Protocol XRPC client with persistent session management"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
 documentation = "https://docs.rs/atpxrpc"

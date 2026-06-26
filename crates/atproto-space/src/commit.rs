@@ -1,23 +1,39 @@
 //! Permissioned-data commit construction.
 //!
-//!
+//! A signed commit summarizes the current state of a permissioned repo. It is
+//! built to match the 0016 Permissioned Data draft (§ Commit signature):
 //!
 //! ```text
-//! ikm        := random(32 bytes)                              // per-commit, fresh
-//! hkdf_info  := DAG-CBOR(SpaceContext)
-//! hmac_key   := HKDF-Extract-then-Expand(SHA256, ikm, info=hkdf_info, len=32)
-//! tag        := HMAC-SHA-256(hmac_key, set_hash || rev)
-//! sig_bytes  := tag || rev.as_bytes()
-//! sig        := ECDSA-low-S(user_signing_key, SHA256(sig_bytes))
-//! commit     := { set_hash, rev, ikm, tag, sig }
+//! hash := setHash.digest()                        // sha256 of the 2048-byte LtHash state (32 bytes)
+//! ikm  := random(32 bytes)                         // per-commit, fresh
+//! ctx  := encode_ctx(space, rev, ikm)              // TLS-1.3-style vlv (below)
+//! sig  := sign(ctx)                                // user's atproto signing key, over the full ctx
+//! mac  := HMAC-SHA256(HKDF-SHA256(ikm, ctx), hash) // binds the repo hash to this commit's context
+//! commit := { hash, mac, ikm, sig, rev }
 //! ```
 //!
-//! The IKM is included in the commit so a verifier with the relevant
-//! `SpaceContext` can recompute and check; outside that context, the IKM is
-//! meaningless. This is the deniability mechanism per the spec.
+//! `ctx` is the single context string reused for both the signature and the
+//! MAC's HKDF info. It uses the TLS 1.3 (§3.4) variable-length-vector encoding:
+//! a fixed protocol tag followed by each field length-prefixed with a
+//! big-endian `uint16`, per spec lines 288–297:
 //!
-//! `SpaceContext.scope` (Records vs Members) provides domain separation: a
-//! commit signed in one scope must fail verification in the other.
+//! ```text
+//! ctx = "atproto-space-v1"                          // fixed protocol tag, NO length prefix
+//!   || uint16be(len(space)) || space                // space URI (ats://authority/type/skey)
+//!   || uint16be(len(rev))   || rev                  // commit revision (TID)
+//!   || uint16be(len(ikm))   || ikm                  // per-commit nonce
+//! ```
+//!
+//! Deniability: the signature covers only the random `ctx` (which binds
+//! `space`, `rev`, and the public `ikm` — never the repo hash), so a leaked
+//! commit proves nothing about repo contents. The repo hash is bound to the
+//! context by the *symmetric* MAC (key derived from the public `ikm`), so anyone
+//! holding the commit can recompute a valid MAC for any hash — authenticity of
+//! the *content* is not transferable (spec lines 286, 305).
+//!
+//! [`verify_commit`] recomputes the MAC and compares it; a consumer that wants
+//! authenticity additionally calls [`verify_commit_signature`], which verifies
+//! `sig` over the reconstructed `ctx`.
 
 use crate::errors::{SpaceError, SpaceResult};
 use crate::set_hash::SetHash;
@@ -26,98 +42,74 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Scope discriminator for `SpaceContext` — provides domain separation between
-/// record-set commits and member-list commits.
-///
-/// **Critical security property**: a commit signed with `Records` scope must
-/// fail verification under `Members` scope and vice versa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CommitScope {
-    /// Records-set commit (per-user, per-space).
-    Records,
-    /// Member-list commit (owner-only).
-    Members,
-}
+/// Fixed domain-separation tag prefixing the commit `ctx`.
+const DOMAIN_PREFIX: &[u8] = b"atproto-space-v1";
 
-impl CommitScope {
-    /// Spec-defined string value used in the HKDF info bytes.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CommitScope::Records => "records",
-            CommitScope::Members => "members",
-        }
-    }
-}
-
-/// Context for HKDF derivation of the commit's HMAC key.
+/// Context bound into a commit via the signature and the MAC's HKDF info.
 ///
-/// Encoded as DAG-CBOR and used as the HKDF `info` parameter.
+/// Per the 0016 Permissioned Data draft (spec lines 288–297) the on-the-wire
+/// `ctx` is `[space, rev, ikm]` length-prefixed; the `ikm` is supplied per
+/// commit (it is part of the [`Commit`]), so this struct carries only the
+/// stable `[space, rev]` pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceContext {
-    /// Owner DID of the space.
-    #[serde(rename = "spaceDid")]
-    pub space_did: String,
-    /// Space type (NSID).
-    #[serde(rename = "spaceType")]
-    pub space_type: String,
-    /// Space key.
-    #[serde(rename = "spaceKey")]
-    pub space_key: String,
-    /// Committer DID — the user who wrote this commit.
-    #[serde(rename = "userDid")]
-    pub user_did: String,
-    /// Scope discriminator (Records or Members).
-    pub scope: CommitScope,
+    /// Full space URI (`ats://{spaceDid}/{spaceType}/{skey}`).
+    pub space: String,
     /// Rev (TID) for this commit.
     pub rev: String,
 }
 
-impl SpaceContext {
-    /// Encode as DAG-CBOR for use as the HKDF `info` parameter.
-    fn to_cbor(&self) -> SpaceResult<Vec<u8>> {
-        atproto_dasl::to_vec(self).map_err(|e| SpaceError::ContextEncoding {
-            reason: e.to_string(),
-        })
+/// Encode the commit `ctx` (signature message + HKDF info).
+///
+/// `"atproto-space-v1"` followed by each field length-prefixed with a
+/// big-endian `uint16`, in the order `[space, rev, ikm]` (spec lines 293–297).
+#[must_use]
+pub fn encode_ctx(context: &SpaceContext, ikm: &[u8]) -> Vec<u8> {
+    let space = context.space.as_bytes();
+    let rev = context.rev.as_bytes();
+    let mut out = Vec::with_capacity(DOMAIN_PREFIX.len() + space.len() + rev.len() + ikm.len() + 6);
+    out.extend_from_slice(DOMAIN_PREFIX);
+    for field in [space, rev, ikm] {
+        out.extend_from_slice(&(field.len() as u16).to_be_bytes());
+        out.extend_from_slice(field);
     }
+    out
 }
 
-/// A signed permissioned-data commit.
+/// A signed permissioned-data commit (`com.atproto.space.defs#signedCommit`).
 ///
-/// Includes the IKM in the clear so verifiers with `SpaceContext` can
-/// recompute the HMAC; the IKM-randomness gives deniability outside context.
+/// Wire field order matches the lexicon required set `[hash, mac, ikm, sig, rev]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
-    /// SetHash digest at this commit.
-    #[serde(rename = "setHash", with = "serde_bytes")]
-    pub set_hash: Vec<u8>,
-    /// Rev (TID).
-    pub rev: String,
-    /// Per-commit fresh IKM (32 bytes).
+    /// `sha256` of the LtHash state (32 bytes).
+    #[serde(with = "serde_bytes")]
+    pub hash: Vec<u8>,
+    /// `HMAC-SHA256` over `hash`, keyed by `HKDF-Expand(ikm, ctx)`.
+    #[serde(with = "serde_bytes")]
+    pub mac: Vec<u8>,
+    /// Per-commit fresh IKM (32 bytes), also bound into the `ctx`.
     #[serde(with = "serde_bytes")]
     pub ikm: Vec<u8>,
-    /// HMAC-SHA-256 tag over `set_hash || rev` keyed by HKDF(ikm, SpaceContext).
-    #[serde(with = "serde_bytes")]
-    pub tag: Vec<u8>,
-    /// ECDSA signature over SHA256(tag || rev), low-S normalized.
+    /// Signature over `ctx` by the user's atproto signing key.
     #[serde(with = "serde_bytes")]
     pub sig: Vec<u8>,
+    /// Commit revision (TID), also bound into the `ctx`.
+    pub rev: String,
 }
 
-/// Construct a signed commit from a SetHash digest and SpaceContext.
+/// Construct a signed commit from a SetHash and `SpaceContext`.
 ///
-/// Uses a fresh per-commit IKM drawn from the OS RNG (`rand::rng()`).
+/// Uses a fresh per-commit IKM drawn from the OS RNG.
 ///
 /// # Errors
 ///
 /// - [`SpaceError::Hkdf`] — HKDF derivation failure.
-/// - [`SpaceError::Signature`] — signing failure (key/curve mismatch, etc.).
-/// - [`SpaceError::ContextEncoding`] — CBOR encoding of `SpaceContext` failed.
+/// - [`SpaceError::Signature`] — signing failure (e.g. a public key was given).
+/// - [`SpaceError::ContextEncoding`] — `rev` is empty.
 pub fn create_commit<H: SetHash>(
     set_hash: &H,
     context: &SpaceContext,
@@ -128,137 +120,130 @@ pub fn create_commit<H: SetHash>(
     create_commit_with_ikm(&set_hash.digest(), context, signing_key, &ikm)
 }
 
-/// Like [`create_commit`] but takes an explicit IKM. For deterministic tests
-/// or for re-creating commits with caller-controlled randomness.
+/// Like [`create_commit`] but takes the commit `hash` and an explicit IKM.
+///
+/// For deterministic tests or caller-controlled randomness.
 #[doc(hidden)]
 pub fn create_commit_with_ikm(
-    set_hash: &[u8],
+    hash: &[u8],
     context: &SpaceContext,
     signing_key: &KeyData,
     ikm: &[u8; 32],
 ) -> SpaceResult<Commit> {
-    if context.rev != context.rev.trim() || context.rev.is_empty() {
+    if context.rev.is_empty() {
         return Err(SpaceError::ContextEncoding {
-            reason: "rev must be non-empty and untrimmed".to_string(),
+            reason: "rev must be non-empty".to_string(),
         });
     }
 
-    // 2. HKDF-derive HMAC key with DAG-CBOR(SpaceContext) as info.
-    let info = context.to_cbor()?;
-    let hkdf = Hkdf::<Sha256>::new(None, ikm);
-    let mut hmac_key = [0u8; 32];
-    hkdf.expand(&info, &mut hmac_key)
-        .map_err(|e| SpaceError::Hkdf {
-            reason: e.to_string(),
-        })?;
-
-    // 3. HMAC-SHA-256 over set_hash || rev.
-    let mut mac =
-        <HmacSha256 as KeyInit>::new_from_slice(&hmac_key).map_err(|e| SpaceError::Hkdf {
-            reason: format!("hmac key length: {}", e),
-        })?;
-    mac.update(set_hash);
-    mac.update(context.rev.as_bytes());
-    let tag = mac.finalize().into_bytes();
-
-    // 4. ECDSA sign SHA256(tag || rev) with the user's signing key.
-    let mut sig_input = Vec::with_capacity(tag.len() + context.rev.len());
-    sig_input.extend_from_slice(&tag);
-    sig_input.extend_from_slice(context.rev.as_bytes());
-    let sig_hash = Sha256::digest(&sig_input);
-
-    let sig = identity_sign(signing_key, &sig_hash).map_err(|e| SpaceError::Signature {
+    let ctx = encode_ctx(context, ikm);
+    let mac = derive_mac(ikm, hash, &ctx)?;
+    // Per spec line 302: the signature is over the full `ctx` (space, rev, ikm)
+    // — never the hash — so a leaked commit is deniable.
+    let sig = identity_sign(signing_key, &ctx).map_err(|e| SpaceError::Signature {
         reason: e.to_string(),
     })?;
 
     Ok(Commit {
-        set_hash: set_hash.to_vec(),
-        rev: context.rev.clone(),
+        hash: hash.to_vec(),
+        mac,
         ikm: ikm.to_vec(),
-        tag: tag.to_vec(),
         sig,
+        rev: context.rev.clone(),
     })
 }
 
-/// Verify a commit against the supplied `SpaceContext` and verifying key.
+/// Derive `HMAC-SHA256(HKDF-Expand(ikm, ctx), hash)`.
 ///
-/// Returns `Ok(())` on success. The verifying key must be the public half of
-/// the signing key used during `create_commit`.
+/// HKDF is **expand-only** (ikm is the PRK; no extract step, no salt), per spec
+/// line 303 (`HKDF-SHA256(ikm, ctx)`).
+fn derive_mac(ikm: &[u8], hash: &[u8], ctx: &[u8]) -> SpaceResult<Vec<u8>> {
+    let hkdf = Hkdf::<Sha256>::from_prk(ikm).map_err(|e| SpaceError::Hkdf {
+        reason: format!("invalid prk: {e}"),
+    })?;
+    let mut hmac_key = [0u8; 32];
+    hkdf.expand(ctx, &mut hmac_key)
+        .map_err(|e| SpaceError::Hkdf {
+            reason: e.to_string(),
+        })?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(&hmac_key).map_err(|e| SpaceError::Hkdf {
+            reason: format!("hmac key length: {e}"),
+        })?;
+    mac.update(hash);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+/// Verify a commit's MAC against the supplied `SpaceContext`.
+///
+/// Recomputes `ctx` from `space`, `rev`, and the commit's `ikm`, then recomputes
+/// the MAC over `hash` and compares it constant-time (spec line 305). It does
+/// **not** verify the signature (see [`verify_commit_signature`]).
 ///
 /// # Errors
 ///
-/// - [`SpaceError::CommitTagMismatch`] — HMAC tag does not match (commit
-///   tampered or wrong context).
-/// - [`SpaceError::CommitSignatureInvalid`] — ECDSA signature does not verify.
-/// - [`SpaceError::ContextEncoding`] / [`SpaceError::Hkdf`] — internal failure.
-///
-/// # Domain separation
-///
-/// A commit signed with `scope: Records` will fail verification when the
-/// supplied `context.scope` is `Members` (and vice versa) because the HKDF
-/// info bytes differ — this is the load-bearing security property.
-pub fn verify_commit(
-    context: &SpaceContext,
-    commit: &Commit,
-    verifying_key: &KeyData,
-) -> SpaceResult<()> {
-    // Cheap structural checks first.
-    if commit.rev != context.rev {
-        return Err(SpaceError::JwtClaimMismatch {
-            field: "rev".to_string(),
-            expected: context.rev.clone(),
-            actual: commit.rev.clone(),
-        });
-    }
+/// - [`SpaceError::CommitTagMismatch`] — the MAC does not match (commit
+///   tampered, or wrong context).
+/// - [`SpaceError::Hkdf`] — `ikm` is not 32 bytes, or derivation failed.
+pub fn verify_commit(context: &SpaceContext, commit: &Commit) -> SpaceResult<()> {
     if commit.ikm.len() != 32 {
         return Err(SpaceError::Hkdf {
             reason: format!("ikm must be 32 bytes, got {}", commit.ikm.len()),
         });
     }
-
-    // Recompute HMAC.
-    let info = context.to_cbor()?;
-    let hkdf = Hkdf::<Sha256>::new(None, &commit.ikm);
+    let ctx = encode_ctx(context, &commit.ikm);
+    let mac = derive_mac(&commit.ikm, &commit.hash, &ctx)?;
+    if mac.len() != commit.mac.len() {
+        return Err(SpaceError::CommitTagMismatch);
+    }
+    // Constant-time compare via HMAC's verify path.
+    let hkdf = Hkdf::<Sha256>::from_prk(&commit.ikm).map_err(|e| SpaceError::Hkdf {
+        reason: format!("invalid prk: {e}"),
+    })?;
     let mut hmac_key = [0u8; 32];
-    hkdf.expand(&info, &mut hmac_key)
+    hkdf.expand(&ctx, &mut hmac_key)
         .map_err(|e| SpaceError::Hkdf {
             reason: e.to_string(),
         })?;
-
-    let mut mac =
+    let mut verifier =
         <HmacSha256 as KeyInit>::new_from_slice(&hmac_key).map_err(|e| SpaceError::Hkdf {
-            reason: format!("hmac key length: {}", e),
+            reason: format!("hmac key length: {e}"),
         })?;
-    mac.update(&commit.set_hash);
-    mac.update(commit.rev.as_bytes());
-    mac.verify_slice(&commit.tag)
-        .map_err(|_| SpaceError::CommitTagMismatch)?;
+    verifier.update(&commit.hash);
+    verifier
+        .verify_slice(&commit.mac)
+        .map_err(|_| SpaceError::CommitTagMismatch)
+}
 
-    // Verify ECDSA over SHA256(tag || rev).
-    let mut sig_input = Vec::with_capacity(commit.tag.len() + commit.rev.len());
-    sig_input.extend_from_slice(&commit.tag);
-    sig_input.extend_from_slice(commit.rev.as_bytes());
-    let sig_hash = Sha256::digest(&sig_input);
-
-    identity_validate(verifying_key, &commit.sig, &sig_hash)
-        .map_err(|_| SpaceError::CommitSignatureInvalid)?;
-
-    Ok(())
+/// Verify that a commit's `sig` was produced over its `ctx` by `verifying_key`.
+///
+/// Per spec line 305 a reader verifies `sig` against the user's signing key for
+/// authenticity. The `ctx` is reconstructed from `context` (`space`, `rev`) and
+/// the commit's `ikm`.
+///
+/// # Errors
+///
+/// Returns [`SpaceError::CommitSignatureInvalid`] if the signature does not
+/// verify over the reconstructed `ctx`.
+pub fn verify_commit_signature(
+    context: &SpaceContext,
+    commit: &Commit,
+    verifying_key: &KeyData,
+) -> SpaceResult<()> {
+    let ctx = encode_ctx(context, &commit.ikm);
+    identity_validate(verifying_key, &commit.sig, &ctx)
+        .map_err(|_| SpaceError::CommitSignatureInvalid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::set_hash::XorSha256SetHash;
+    use crate::set_hash::LtHash;
     use atproto_identity::key::{KeyType, generate_key, to_public};
 
-    fn test_context(scope: CommitScope) -> SpaceContext {
+    fn test_context() -> SpaceContext {
         SpaceContext {
-            space_did: "did:plc:owner".to_string(),
-            space_type: "app.bsky.group".to_string(),
-            space_key: "default".to_string(),
-            user_did: "did:plc:alice".to_string(),
-            scope,
+            space: "ats://did:plc:owner/app.bsky.group/default".to_string(),
             rev: "3jui7kd2z2y2e".to_string(),
         }
     }
@@ -269,100 +254,135 @@ mod tests {
         (private, public)
     }
 
-    fn fresh_set_hash() -> XorSha256SetHash {
-        let mut h = XorSha256SetHash::empty();
+    fn fresh_set_hash() -> LtHash {
+        let mut h = LtHash::empty();
         h.add(b"app.bsky.feed.post/3jui:bafy123");
         h
     }
 
     #[test]
     fn round_trip_create_and_verify() {
-        let (priv_key, pub_key) = test_keypair();
-        let ctx = test_context(CommitScope::Records);
+        let (priv_key, _pub_key) = test_keypair();
+        let ctx = test_context();
         let h = fresh_set_hash();
 
         let commit = create_commit(&h, &ctx, &priv_key).unwrap();
-        verify_commit(&ctx, &commit, &pub_key).expect("commit must verify");
+        assert_eq!(commit.hash, h.digest());
+        assert_eq!(commit.ikm.len(), 32);
+        verify_commit(&ctx, &commit).expect("commit MAC must verify");
+    }
+
+    #[test]
+    fn signature_is_over_ctx() {
+        let (priv_key, pub_key) = test_keypair();
+        let ctx = test_context();
+        let h = fresh_set_hash();
+        let commit = create_commit(&h, &ctx, &priv_key).unwrap();
+        // sig verifies over the reconstructed ctx...
+        verify_commit_signature(&ctx, &commit, &pub_key).expect("sig over ctx must verify");
+        // ...and the signed message is the ctx, not the hash: an independent
+        // signature over ctx equals the commit's sig (ECDSA is deterministic here).
+        let direct = identity_sign(&priv_key, &encode_ctx(&ctx, &commit.ikm)).unwrap();
+        assert_eq!(direct, commit.sig);
     }
 
     #[test]
     fn ikm_uniqueness_across_two_commits() {
         let (priv_key, _) = test_keypair();
-        let ctx = test_context(CommitScope::Records);
+        let ctx = test_context();
         let h = fresh_set_hash();
         let c1 = create_commit(&h, &ctx, &priv_key).unwrap();
         let c2 = create_commit(&h, &ctx, &priv_key).unwrap();
         assert_ne!(c1.ikm, c2.ikm, "IKM must be fresh per commit");
-        assert_ne!(c1.tag, c2.tag, "tag should change with IKM");
-        assert_ne!(c1.sig, c2.sig, "signature should change with tag");
+        assert_ne!(c1.mac, c2.mac, "mac should change with IKM");
+        assert_eq!(c1.hash, c2.hash, "hash is stable for the same set");
     }
 
-    /// **Domain separation** — the load-bearing security property.
-    ///
-    /// A commit signed with `scope: Records` MUST fail verification when the
-    /// verifier presents `scope: Members`.
+    /// Domain separation — a commit bound to one space must fail verification
+    /// under a different space, because `space` is part of the `ctx`.
     #[test]
-    fn domain_separation_records_vs_members() {
-        let (priv_key, pub_key) = test_keypair();
-        let records_ctx = test_context(CommitScope::Records);
-        let members_ctx = SpaceContext {
-            scope: CommitScope::Members,
-            ..records_ctx.clone()
+    fn domain_separation_by_space() {
+        let (priv_key, _) = test_keypair();
+        let ctx = test_context();
+        let other = SpaceContext {
+            space: "ats://did:plc:owner/app.bsky.group/other".to_string(),
+            ..ctx.clone()
         };
-        let h = fresh_set_hash();
-
-        let commit = create_commit(&h, &records_ctx, &priv_key).unwrap();
-        let result = verify_commit(&members_ctx, &commit, &pub_key);
-        assert!(matches!(result, Err(SpaceError::CommitTagMismatch)));
-    }
-
-    #[test]
-    fn tampered_tag_rejected() {
-        let (priv_key, pub_key) = test_keypair();
-        let ctx = test_context(CommitScope::Records);
-        let h = fresh_set_hash();
-        let mut commit = create_commit(&h, &ctx, &priv_key).unwrap();
-        commit.tag[0] ^= 0xff;
-        let result = verify_commit(&ctx, &commit, &pub_key);
-        assert!(matches!(result, Err(SpaceError::CommitTagMismatch)));
-    }
-
-    #[test]
-    fn tampered_rev_rejected_via_mismatch() {
-        let (priv_key, pub_key) = test_keypair();
-        let ctx = test_context(CommitScope::Records);
-        let h = fresh_set_hash();
-        let mut commit = create_commit(&h, &ctx, &priv_key).unwrap();
-        commit.rev = "different".to_string();
-        // Field-level mismatch happens first.
-        let result = verify_commit(&ctx, &commit, &pub_key);
-        assert!(matches!(result, Err(SpaceError::JwtClaimMismatch { .. })));
-    }
-
-    #[test]
-    fn tampered_set_hash_rejected() {
-        let (priv_key, pub_key) = test_keypair();
-        let ctx = test_context(CommitScope::Records);
-        let h = fresh_set_hash();
-        let mut commit = create_commit(&h, &ctx, &priv_key).unwrap();
-        commit.set_hash[0] ^= 0xff;
-        // The HMAC was over the original set_hash; mutated set_hash → tag mismatch.
-        let result = verify_commit(&ctx, &commit, &pub_key);
-        assert!(matches!(result, Err(SpaceError::CommitTagMismatch)));
-    }
-
-    #[test]
-    fn wrong_user_context_rejected() {
-        let (priv_key, pub_key) = test_keypair();
-        let ctx = test_context(CommitScope::Records);
         let h = fresh_set_hash();
         let commit = create_commit(&h, &ctx, &priv_key).unwrap();
+        assert!(matches!(
+            verify_commit(&other, &commit),
+            Err(SpaceError::CommitTagMismatch)
+        ));
+    }
 
-        let wrong_ctx = SpaceContext {
-            user_did: "did:plc:eve".to_string(),
+    #[test]
+    fn tampered_mac_rejected() {
+        let (priv_key, _) = test_keypair();
+        let ctx = test_context();
+        let mut commit = create_commit(&fresh_set_hash(), &ctx, &priv_key).unwrap();
+        commit.mac[0] ^= 0xff;
+        assert!(matches!(
+            verify_commit(&ctx, &commit),
+            Err(SpaceError::CommitTagMismatch)
+        ));
+    }
+
+    #[test]
+    fn tampered_hash_rejected() {
+        let (priv_key, _) = test_keypair();
+        let ctx = test_context();
+        let mut commit = create_commit(&fresh_set_hash(), &ctx, &priv_key).unwrap();
+        commit.hash[0] ^= 0xff;
+        // mac was over the original hash → mismatch.
+        assert!(matches!(
+            verify_commit(&ctx, &commit),
+            Err(SpaceError::CommitTagMismatch)
+        ));
+    }
+
+    #[test]
+    fn wrong_rev_context_rejected() {
+        let (priv_key, _) = test_keypair();
+        let ctx = test_context();
+        let commit = create_commit(&fresh_set_hash(), &ctx, &priv_key).unwrap();
+        let wrong = SpaceContext {
+            rev: "3zzzzzzzzzzzz".to_string(),
             ..ctx
         };
-        let result = verify_commit(&wrong_ctx, &commit, &pub_key);
-        assert!(matches!(result, Err(SpaceError::CommitTagMismatch)));
+        assert!(matches!(
+            verify_commit(&wrong, &commit),
+            Err(SpaceError::CommitTagMismatch)
+        ));
+    }
+
+    #[test]
+    fn tampered_signature_rejected() {
+        let (priv_key, pub_key) = test_keypair();
+        let ctx = test_context();
+        let mut commit = create_commit(&fresh_set_hash(), &ctx, &priv_key).unwrap();
+        commit.sig[0] ^= 0xff;
+        assert!(matches!(
+            verify_commit_signature(&ctx, &commit, &pub_key),
+            Err(SpaceError::CommitSignatureInvalid)
+        ));
+    }
+
+    /// The `ctx` byte layout: tag, then uint16be-length-prefixed fields in the
+    /// fixed order `[space, rev, ikm]` (spec lines 293–297).
+    #[test]
+    fn commit_ctx_layout() {
+        let ctx = SpaceContext {
+            space: "s".to_string(),
+            rev: "r".to_string(),
+        };
+        let ikm = [0xABu8; 4];
+        let encoded = encode_ctx(&ctx, &ikm);
+        let mut expected = b"atproto-space-v1".to_vec();
+        for f in [b"s".as_slice(), b"r".as_slice(), &ikm] {
+            expected.extend_from_slice(&(f.len() as u16).to_be_bytes());
+            expected.extend_from_slice(f);
+        }
+        assert_eq!(encoded, expected);
     }
 }

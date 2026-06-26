@@ -50,6 +50,16 @@ impl From<PdsError> for XrpcError {
             PdsError::NotFound { what } => {
                 XrpcError::new(StatusCode::BAD_REQUEST, "NotFound", what)
             }
+            PdsError::SpaceNotFound { uri } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "SpaceNotFound",
+                format!("no such space {uri}"),
+            ),
+            PdsError::NotSpaceOwner { uri } => XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "NotSpaceOwner",
+                format!("not the owner of {uri}"),
+            ),
             PdsError::AuthDenied { reason } => {
                 XrpcError::new(StatusCode::FORBIDDEN, "Forbidden", reason)
             }

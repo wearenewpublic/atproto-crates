@@ -1,6 +1,6 @@
 [package]
 name = "atproto-client"
-version = "0.15.0-alpha.1"
+version = "0.15.0-alpha.2"
 description = "HTTP client for AT Protocol services with OAuth and identity integration"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

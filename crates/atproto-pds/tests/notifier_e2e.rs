@@ -31,12 +31,11 @@ async fn count_handler(State(counter): State<Counter>) -> StatusCode {
 
 async fn spawn_test_server() -> (Counter, std::net::SocketAddr) {
     let counter = Counter::default();
+    // The notifier delivers contentless `notifyWrite` events to registered
+    // recipients (spec lines 343-351). The member-sync `notifyMembership` route
+    // was removed in the 0016 re-alignment, so only `notifyWrite` is served.
     let app: Router = Router::new()
         .route("/xrpc/com.atproto.space.notifyWrite", post(count_handler))
-        .route(
-            "/xrpc/com.atproto.space.notifyMembership",
-            post(count_handler),
-        )
         .with_state(counter.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -64,6 +63,8 @@ async fn notifier_tick_delivers_to_recipient_within_timeout() {
         &endpoint,
         b"payload-bytes".to_vec(),
         "com.atproto.space.notifyWrite",
+        "application/json",
+        None,
     )
     .await
     .unwrap();
@@ -131,6 +132,8 @@ async fn notifier_tick_marks_failure_on_5xx() {
         &format!("http://{addr}"),
         b"x".to_vec(),
         "com.atproto.space.notifyWrite",
+        "application/json",
+        None,
     )
     .await
     .unwrap();

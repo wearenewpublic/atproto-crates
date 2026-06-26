@@ -1,25 +1,31 @@
 //! `SpaceReader` — dual-auth permissioned-record reads.
 //!
-//!  Spaces reads accept
-//! either:
+//! Spaces reads accept either:
 //! - **Own-PDS OAuth** — the caller holds an OAuth bearer for the local
 //!   member's account and can read whatever rows their per-actor store has.
 //!   The PDS itself is the auth boundary.
 //! - **Remote `SpaceCredential`** — a JWT minted by the space owner via
 //!   `getSpaceCredential` and bound to a `clientId`. The owner's PDS verifies
 //!   the credential against its own signing key, then serves rows from the
-//!   *owner's* per-actor store.
+//!   per-actor store of the `repo` DID supplied by the caller.
 //!
 //! `SpaceReader` is intentionally storage-agnostic above the
 //! `SpaceRepoStorage` trait: **the PDS does not enforce
-//! membership at read time** for own-PDS-OAuth callers (G35) — the consumer
+//! membership at read time** for own-PDS-OAuth callers — the consumer
 //! is responsible for membership checks at sync. For SpaceCredential callers,
 //! the credential itself acts as proof that the owner has authorized this
 //! `clientId` to read the space.
+//!
+//! Both auth modes accept an explicit `target_repo` (the DID whose per-actor
+//! store to read from). For OAuth, the caller may omit `repo` and the read
+//! defaults to their own subject; for SpaceCredential the caller MUST supply
+//! `repo` — handler-level validation rejects missing values before they reach
+//! the reader.
 
 use crate::actor_store::sql::{SqlActorStore, SqlSpaceRepoStorage};
 use crate::errors::{PdsError, PdsResult};
 use crate::realm::PdsSetHash;
+use crate::space::config::ensure_space_live;
 use atproto_identity::key::{KeyData, to_public};
 use atproto_space::credential::{SpaceCredential, verify_space_credential};
 use atproto_space::space_repo::SpaceRepo;
@@ -33,19 +39,18 @@ use std::sync::Arc;
 pub enum SpaceReadAuth<'a> {
     /// Caller holds an OAuth bearer for the named account on this PDS.
     /// Reads happen against that account's per-actor store. No membership
-    /// check is performed here (G35) — consumers verify at sync time.
+    /// check is performed here — consumers verify at sync time.
     OwnPds {
         /// DID of the local account whose per-actor store to read from.
         account_did: &'a str,
     },
-    /// Caller presented a `SpaceCredential` JWT minted by the space owner.
-    /// Reads happen against the *owner's* per-actor store.
+    /// Caller presented a `SpaceCredential` JWT minted by the space authority.
+    /// Reads happen against the *authority's* per-actor store. The credential's
+    /// `client_id` claim is advisory (the trust comes from the authority's
+    /// signature), so no expected-client check is performed here.
     SpaceCredential {
         /// The compact-form JWT.
         token: &'a str,
-        /// `client_id` the credential is expected to be bound to (from the
-        /// HTTP-layer DPoP/auth check).
-        expected_client_id: &'a str,
     },
 }
 
@@ -62,22 +67,40 @@ impl SpaceReader {
         Self { data_dir, accounts }
     }
 
-    /// `getRecord` — fetch a single record by `(collection, rkey)`.
+    /// Fail with `SpaceNotFound` when the space is tombstoned. The tombstone
+    /// lives in the space-authority's (`space.space_did`) per-actor store; the
+    /// check is a no-op when that store is not local (cross-PDS spaces, where
+    /// the authority enforces deletion on its own side).
+    async fn ensure_space_live(&self, space: &SpaceUri) -> PdsResult<()> {
+        ensure_space_live(&self.data_dir, space).await?;
+        Ok(())
+    }
+
+    /// `getRecord` — fetch a single record by `(collection, rkey)` from the
+    /// per-actor store of `target_repo`.
+    ///
+    /// `target_repo` is the DID of the member whose records to read from.
+    /// For OAuth callers this is typically the caller's own DID (but may
+    /// differ if the caller passed `repo` to read another member's repo on
+    /// this PDS). For SpaceCredential callers this is the `repo` query
+    /// parameter; handler-level validation ensures it is always supplied.
     ///
     /// Returns `Ok(None)` when the record does not exist OR is taken-down
-    /// per §4.4 (`space_record_takedown`); returns [`PdsError::AuthDenied`]
+    /// (`space_record_takedown`); returns [`PdsError::AuthDenied`]
     /// for invalid SpaceCredentials.
     pub async fn get_record(
         &self,
         space: &SpaceUri,
         auth: SpaceReadAuth<'_>,
+        target_repo: &str,
         collection: &str,
         rkey: &str,
     ) -> PdsResult<Option<RecordRow>> {
-        let owner_did_for_read = self.resolve_read_target(space, &auth).await?;
-        let store = SqlActorStore::open(&self.data_dir, &owner_did_for_read).await?;
+        self.verify_auth(space, &auth).await?;
+        self.ensure_space_live(space).await?;
+        let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
 
-        // §4.4 takedown gate — admin moderation hides the record at read time.
+        // Takedown gate — admin moderation hides the record at read time.
         if is_record_taken_down(store.pool(), space, collection, rkey).await? {
             return Ok(None);
         }
@@ -90,90 +113,130 @@ impl SpaceReader {
             .map_err(PdsError::Space)
     }
 
-    /// `listRecords` — paginated listing within a collection.
+    /// `listRecords` — paginated listing within a collection, or across all
+    /// collections when `collection` is `None`.
+    ///
+    /// When `collection` is `Some`, the call is paginated via the supplied
+    /// `cursor`. When `collection` is `None`, the reader iterates every
+    /// collection in the space and concatenates the first `limit` records
+    /// from each; `cursor` is ignored in this mode (matching the TypeScript
+    /// PDS behavior).
+    ///
+    /// `target_repo` has the same meaning as in [`Self::get_record`].
     pub async fn list_records(
         &self,
         space: &SpaceUri,
         auth: SpaceReadAuth<'_>,
-        collection: &str,
+        target_repo: &str,
+        collection: Option<&str>,
         cursor: Option<&str>,
         limit: u32,
     ) -> PdsResult<RecordPage> {
-        let owner_did_for_read = self.resolve_read_target(space, &auth).await?;
-        let store = SqlActorStore::open(&self.data_dir, &owner_did_for_read).await?;
+        self.verify_auth(space, &auth).await?;
+        self.ensure_space_live(space).await?;
+        let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
             SpaceRepo::new(space.clone(), storage);
-        let mut page = repo
-            .list_records(collection, cursor, limit)
-            .await
-            .map_err(PdsError::Space)?;
 
-        // §4.4 takedown filter — drop taken-down rkeys from the page.
-        // We hit the takedown table once per page rather than per record.
-        let taken: std::collections::HashSet<String> =
-            taken_down_rkeys(store.pool(), space, collection).await?;
-        if !taken.is_empty() {
-            page.records.retain(|r| !taken.contains(&r.rkey));
-        }
-        Ok(page)
-    }
-
-    /// Verify the read auth and return the DID of the per-actor store to read.
-    ///
-    /// - `OwnPds { account_did }` → that account.
-    /// - `SpaceCredential { .. }` → the space owner (after JWT verification).
-    async fn resolve_read_target(
-        &self,
-        space: &SpaceUri,
-        auth: &SpaceReadAuth<'_>,
-    ) -> PdsResult<String> {
-        match auth {
-            SpaceReadAuth::OwnPds { account_did } => Ok((*account_did).to_string()),
-            SpaceReadAuth::SpaceCredential {
-                token,
-                expected_client_id,
-            } => {
-                // Verify with the owner's *public* signing key. The owner is
-                // an account managed by this PDS (otherwise we could not have
-                // minted the credential), so we look up the signing-key ref
-                // from `account` and convert to public form for verification.
-                let owner_did = &space.owner_did;
-                let owner_pub = self.owner_public_key(owner_did).await?;
-                let _payload: SpaceCredential =
-                    verify_space_credential(token, owner_did, space, &owner_pub).map_err(|e| {
-                        PdsError::AuthDenied {
-                            reason: format!("invalid SpaceCredential: {e}"),
-                        }
-                    })?;
-                // Re-verify the bound client_id matches the HTTP-layer
-                // expected value (the JWT carries this in payload.client_id;
-                // verify_space_credential already returns the payload).
-                let payload: SpaceCredential =
-                    verify_space_credential(token, owner_did, space, &owner_pub).map_err(|e| {
-                        PdsError::AuthDenied {
-                            reason: format!("invalid SpaceCredential: {e}"),
-                        }
-                    })?;
-                if &payload.client_id != expected_client_id {
-                    return Err(PdsError::AuthDenied {
-                        reason: format!(
-                            "SpaceCredential clientId mismatch: token={}, expected={}",
-                            payload.client_id, expected_client_id
-                        ),
-                    });
+        match collection {
+            Some(coll) => {
+                let mut page = repo
+                    .list_records(coll, cursor, limit)
+                    .await
+                    .map_err(PdsError::Space)?;
+                let taken: std::collections::HashSet<String> =
+                    taken_down_rkeys(store.pool(), space, coll).await?;
+                if !taken.is_empty() {
+                    page.records.retain(|r| !taken.contains(&r.rkey));
                 }
-                Ok(owner_did.clone())
+                Ok(page)
+            }
+            None => {
+                let collections = repo.list_collections().await.map_err(PdsError::Space)?;
+                let mut all_records = Vec::new();
+                for coll in collections {
+                    let mut page = repo
+                        .list_records(&coll, None, limit)
+                        .await
+                        .map_err(PdsError::Space)?;
+                    let taken: std::collections::HashSet<String> =
+                        taken_down_rkeys(store.pool(), space, &coll).await?;
+                    if !taken.is_empty() {
+                        page.records.retain(|r| !taken.contains(&r.rkey));
+                    }
+                    all_records.append(&mut page.records);
+                }
+                Ok(RecordPage {
+                    records: all_records,
+                    cursor: None,
+                })
             }
         }
     }
 
-    /// Resolve an account's atproto signing key in *public* form. Used to
-    /// verify SpaceCredentials minted by this PDS for one of its owners.
-    async fn owner_public_key(&self, owner_did: &str) -> PdsResult<KeyData> {
+    /// Public entry point to verify a record-read auth against `space` without
+    /// reading a record. Used by `com.atproto.space.getBlob`, which serves
+    /// blob bytes under the same auth gate as `getRecord` / `listRecords`
+    /// (space-credential-space-match OR OAuth/session) but does not go through
+    /// the record path.
+    pub async fn verify_read_auth(
+        &self,
+        space: &SpaceUri,
+        auth: &SpaceReadAuth<'_>,
+    ) -> PdsResult<()> {
+        self.verify_auth(space, auth).await
+    }
+
+    /// Verify a presented `SpaceCredential` JWT against `space` without reading
+    /// a record. Resolves the space authority's `#atproto_space` signing key and
+    /// runs the full credential check (signature + `iss`/`sub`/`exp` bound to
+    /// `space`), returning [`PdsError::AuthDenied`] on any failure.
+    ///
+    /// Used by the host/sync read methods (`getSpace`, `getRepoState`,
+    /// `listRepoOps`, `listRepos`) to verify a credential-`typ` bearer at the
+    /// HTTP layer, so a forged, unsigned, expired, or wrong-space credential is
+    /// rejected rather than admitted on its `typ` string alone.
+    pub async fn verify_space_credential_for(
+        &self,
+        space: &SpaceUri,
+        token: &str,
+    ) -> PdsResult<()> {
+        self.verify_auth(space, &SpaceReadAuth::SpaceCredential { token })
+            .await
+    }
+
+    /// Verify the read auth. For SpaceCredential, performs JWT signature
+    /// verification against the space authority's `#atproto_space` signing key
+    /// plus `iss`/`sub`/`exp` checks. The credential's `client_id` is advisory
+    /// and not enforced. For OwnPds, this is a no-op — the HTTP-layer
+    /// OAuth/session check already validated the bearer.
+    async fn verify_auth(&self, space: &SpaceUri, auth: &SpaceReadAuth<'_>) -> PdsResult<()> {
+        match auth {
+            SpaceReadAuth::OwnPds { .. } => Ok(()),
+            SpaceReadAuth::SpaceCredential { token } => {
+                let authority_did = &space.space_did;
+                let authority_pub = self.authority_public_key(authority_did).await?;
+                let _payload: SpaceCredential =
+                    verify_space_credential(token, authority_did, space, &authority_pub).map_err(
+                        |e| PdsError::AuthDenied {
+                            reason: format!("invalid SpaceCredential: {e}"),
+                        },
+                    )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve a local authority's space-credential verification key in
+    /// *public* form. Used to verify SpaceCredentials minted by this PDS for one
+    /// of its authorities. Per 0016 line 92 the authority's `#atproto_space`
+    /// verification method MAY coincide with `#atproto`; for accounts this PDS
+    /// manages it does, so this returns the account's atproto signing key.
+    async fn authority_public_key(&self, authority_did: &str) -> PdsResult<KeyData> {
         let key_ref: Option<(String,)> =
             sqlx::query_as("SELECT signing_key_ref FROM account WHERE did = ?")
-                .bind(owner_did)
+                .bind(authority_did)
                 .fetch_optional(self.accounts.pool())
                 .await
                 .map_err(|e| PdsError::Storage {
@@ -181,7 +244,7 @@ impl SpaceReader {
                 })?;
         let key_ref = key_ref
             .ok_or_else(|| PdsError::NotFound {
-                what: format!("account {owner_did} (signing_key_ref)"),
+                what: format!("account {authority_did} (signing_key_ref)"),
             })?
             .0;
         let private = self.accounts.key_store().get(&key_ref).await?;
@@ -192,7 +255,7 @@ impl SpaceReader {
 }
 
 /// Returns true when a row in `space_record_takedown` matches the
-/// `(space, collection, rkey)` triple. Per §4.4.
+/// `(space, collection, rkey)` triple.
 pub(crate) async fn is_record_taken_down(
     pool: &sqlx::SqlitePool,
     space: &SpaceUri,
@@ -311,6 +374,7 @@ mod tests {
                 SpaceReadAuth::OwnPds {
                     account_did: "did:plc:owner",
                 },
+                "did:plc:owner",
                 "app.bsky.group.message",
                 "abc",
             )
@@ -336,13 +400,61 @@ mod tests {
                 SpaceReadAuth::OwnPds {
                     account_did: "did:plc:owner",
                 },
-                "app.bsky.group.message",
+                "did:plc:owner",
+                Some("app.bsky.group.message"),
                 None,
                 10,
             )
             .await
             .unwrap();
         assert_eq!(page.records.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_records_across_collections_when_collection_none() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let manager = fresh_manager(&dir).await;
+        let uri = test_space();
+        let writer = crate::space::writer::SpaceWriter::new(manager.clone(), dir.clone());
+        for (collection, rkey) in [
+            ("app.bsky.group.message", "m1"),
+            ("app.bsky.group.like", "l1"),
+        ] {
+            writer
+                .apply_writes(
+                    "did:plc:owner",
+                    &uri,
+                    vec![SpaceWriteOp {
+                        action: SpaceWriteAction::Create,
+                        collection: collection.to_string(),
+                        rkey: rkey.to_string(),
+                        value: Some(serde_json::json!({})),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+
+        let reader = SpaceReader::new(manager, dir);
+        let page = reader
+            .list_records(
+                &uri,
+                SpaceReadAuth::OwnPds {
+                    account_did: "did:plc:owner",
+                },
+                "did:plc:owner",
+                None,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 2, "should aggregate across collections");
+        assert!(
+            page.cursor.is_none(),
+            "cross-collection listing has no cursor"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -365,7 +477,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &uri,
-            "https://app.example/client-metadata.json",
+            Some("https://app.example/client-metadata.json"),
             &signing_key,
             SPACE_CREDENTIAL_TTL_SECS,
         )
@@ -375,10 +487,8 @@ mod tests {
         let row = reader
             .get_record(
                 &uri,
-                SpaceReadAuth::SpaceCredential {
-                    token: &token,
-                    expected_client_id: "https://app.example/client-metadata.json",
-                },
+                SpaceReadAuth::SpaceCredential { token: &token },
+                "did:plc:owner",
                 "app.bsky.group.message",
                 "abc",
             )
@@ -389,7 +499,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn space_credential_wrong_client_rejected() {
+    async fn space_credential_wrong_space_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let manager = fresh_manager(&dir).await;
+        let uri = test_space();
+        seed_record(manager.clone(), dir.clone(), uri.clone()).await;
+
+        let key_ref: (String,) =
+            sqlx::query_as("SELECT signing_key_ref FROM account WHERE did = ?")
+                .bind("did:plc:owner")
+                .fetch_one(manager.pool())
+                .await
+                .unwrap();
+        let signing_key = manager.key_store().get(&key_ref.0).await.unwrap();
+        // Mint a credential bound to a *different* space; the reader must
+        // reject it against `uri` on the `sub` claim mismatch.
+        let other = SpaceUri::new(
+            "did:plc:owner".to_string(),
+            atproto_space::types::SpaceType::new("app.bsky.group").unwrap(),
+            atproto_space::types::SpaceKey::new("other").unwrap(),
+        );
+        let token = create_space_credential(
+            "did:plc:owner",
+            &other,
+            None,
+            &signing_key,
+            SPACE_CREDENTIAL_TTL_SECS,
+        )
+        .unwrap();
+
+        let reader = SpaceReader::new(manager, dir);
+        let result = reader
+            .get_record(
+                &uri,
+                SpaceReadAuth::SpaceCredential { token: &token },
+                "did:plc:owner",
+                "app.bsky.group.message",
+                "abc",
+            )
+            .await;
+        assert!(matches!(result, Err(PdsError::AuthDenied { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_space_credential_for_accepts_valid_and_rejects_forged() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let manager = fresh_manager(&dir).await;
@@ -406,24 +560,41 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &uri,
-            "client-A",
+            None,
             &signing_key,
             SPACE_CREDENTIAL_TTL_SECS,
         )
         .unwrap();
 
         let reader = SpaceReader::new(manager, dir);
-        let result = reader
-            .get_record(
-                &uri,
-                SpaceReadAuth::SpaceCredential {
-                    token: &token,
-                    expected_client_id: "client-B",
-                },
-                "app.bsky.group.message",
-                "abc",
-            )
-            .await;
+        // A genuinely authority-signed credential verifies.
+        reader
+            .verify_space_credential_for(&uri, &token)
+            .await
+            .unwrap();
+
+        // A token that merely *classifies* as a credential (correct typ/kid
+        // header) but carries a zero signature must be rejected.
+        let header = serde_json::json!({
+            "alg": "ES256",
+            "typ": "atproto-space-credential+jwt",
+            "kid": "#atproto_space"
+        });
+        let payload = serde_json::json!({
+            "iss": "did:plc:owner",
+            "sub": uri.to_string(),
+            "iat": 0,
+            "exp": 9_999_999_999u64,
+        });
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let forged = format!(
+            "{}.{}.{}",
+            b64.encode(serde_json::to_vec(&header).unwrap()),
+            b64.encode(serde_json::to_vec(&payload).unwrap()),
+            b64.encode([0u8; 64]),
+        );
+        let result = reader.verify_space_credential_for(&uri, &forged).await;
         assert!(matches!(result, Err(PdsError::AuthDenied { .. })));
     }
 
@@ -441,6 +612,7 @@ mod tests {
                 SpaceReadAuth::OwnPds {
                     account_did: "did:plc:owner",
                 },
+                "did:plc:owner",
                 "app.bsky.group.message",
                 "missing",
             )
@@ -449,7 +621,7 @@ mod tests {
         assert!(row.is_none());
     }
 
-    /// §4.4 takedown gate: a row in `space_record_takedown` hides the
+    /// Takedown gate: a row in `space_record_takedown` hides the
     /// record from `get_record` even when the underlying `space_record`
     /// row is intact. Re-inserting via `list_records` confirms the
     /// page-level filter is also wired.
@@ -486,6 +658,7 @@ mod tests {
                 SpaceReadAuth::OwnPds {
                     account_did: "did:plc:owner",
                 },
+                "did:plc:owner",
                 "app.bsky.group.message",
                 "abc",
             )
@@ -500,7 +673,8 @@ mod tests {
                 SpaceReadAuth::OwnPds {
                     account_did: "did:plc:owner",
                 },
-                "app.bsky.group.message",
+                "did:plc:owner",
+                Some("app.bsky.group.message"),
                 None,
                 10,
             )

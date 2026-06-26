@@ -1,82 +1,109 @@
-//! `MemberGrant` and `SpaceCredential` JWTs.
+//! `DelegationToken` and `SpaceCredential` JWTs (0016 Permissioned Data).
 //!
-//!  a syncing app obtains a
-//! `SpaceCredential` via a two-step flow:
+//! A syncing app obtains a `SpaceCredential` via a two-step flow, per the
+//! 0016 spec "Credential flow" (README lines 232-254):
 //!
-//! 1. App with OAuth on a member's PDS calls `getMemberGrant {space, clientId}`.
-//!    The member's PDS returns a `MemberGrant` JWT signed with the member's
-//!    atproto signing key, scoped to `clientId`, `aud=owner_did`,
-//!    `lxm=com.atproto.space.getSpaceCredential`. ~5 minute TTL.
-//! 2. App calls `getSpaceCredential {grant}` against the owner's PDS. Owner
-//!    verifies the grant (resolving member's DID doc, checking signature,
-//!    `lxm`, `clientId`, expiration), then mints a `SpaceCredential` JWT
-//!    signed with the owner's atproto signing key. 2–4h TTL (default 3h).
+//! 1. An app holding an OAuth session on a member's PDS calls
+//!    [`com.atproto.space.getDelegationToken`]. The member's PDS mints a
+//!    **delegation token** (spec "Delegation token", lines 147-176): a JWT with
+//!    header `typ=atproto-space-delegation+jwt`, `kid="#atproto"`, signed by
+//!    the member's atproto signing key. Claims: `iss` (member DID),
+//!    `aud=<spaceDid>#atproto_space_host`, `sub` (the space `ats://` URI),
+//!    `iat`, `exp=iat+60`, `jti`. It carries no `lxm` claim and says nothing
+//!    about the app. Single-use, default 60-second TTL.
+//! 2. The app presents that delegation token (in the `Authorization: Bearer`
+//!    header) plus an optional client attestation to the space authority at
+//!    [`com.atproto.space.getSpaceCredential`]. The authority verifies it and
+//!    mints a **space credential** (spec "Space credential", lines 200-230): a
+//!    JWT with header `typ=atproto-space-credential+jwt`,
+//!    `kid="#atproto_space"`, signed by the authority's space signing key.
+//!    Claims: `iss` (authority DID), `sub` (the space `ats://` URI),
+//!    `client_id` (the attested app, omitted when no attestation), `iat`,
+//!    `exp=iat+7200`, `jti`. It has no `aud`. Default 2-hour TTL.
 //!
-//! Both JWTs use the same compact-form encoding: `b64url(header).b64url(payload).b64url(sig)`,
-//! signed with ECDSA over the user's atproto signing key (P-256 → ES256, K-256 → ES256K).
+//! Both JWTs use the same compact-form encoding:
+//! `b64url(header).b64url(payload).b64url(sig)`, signed with ECDSA over an
+//! atproto signing key (P-256 → ES256, K-256 → ES256K).
+//!
+//! [`com.atproto.space.getDelegationToken`]: https://atproto.com
+//! [`com.atproto.space.getSpaceCredential`]: https://atproto.com
 
 use crate::errors::{SpaceError, SpaceResult};
 use crate::types::SpaceUri;
 use atproto_identity::key::{KeyData, sign as identity_sign, validate as identity_validate};
 use base64::{Engine as _, engine::general_purpose};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `typ` header value for MemberGrant.
-pub const TYP_MEMBER_GRANT: &str = "space_member_grant";
+/// `typ` header value for a delegation token (spec line 152).
+pub const TYP_DELEGATION_TOKEN: &str = "atproto-space-delegation+jwt";
 
-/// `typ` header value for SpaceCredential.
-pub const TYP_SPACE_CREDENTIAL: &str = "space_credential";
+/// `typ` header value for a space credential (spec line 206).
+pub const TYP_SPACE_CREDENTIAL: &str = "atproto-space-credential+jwt";
 
-/// `lxm` value required on MemberGrant for use at `getSpaceCredential`.
-pub const LXM_GET_SPACE_CREDENTIAL: &str = "com.atproto.space.getSpaceCredential";
+/// `kid` header value a delegation token MUST carry (spec line 162).
+pub const KID_DELEGATION_TOKEN: &str = "#atproto";
 
-/// MemberGrant default TTL: 5 minutes.
-pub const MEMBER_GRANT_TTL_SECS: u64 = 300;
+/// `kid` header value a space credential MUST carry (spec line 216).
+pub const KID_SPACE_CREDENTIAL: &str = "#atproto_space";
 
-/// SpaceCredential default TTL: 3 hours (within spec's 2–4h window).
-pub const SPACE_CREDENTIAL_TTL_SECS: u64 = 10800;
+/// Delegation-token default TTL: 60 seconds (spec lines 149, 169).
+pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60;
+
+/// SpaceCredential default TTL: 2 hours / 7200 seconds (spec line 223).
+pub const SPACE_CREDENTIAL_TTL_SECS: u64 = 7200;
+
+/// The `aud` of a delegation token: the space host service fragment of the
+/// authority DID (`<spaceDid>#atproto_space_host`, spec line 166).
+#[must_use]
+pub fn space_host_audience(space_did: &str) -> String {
+    format!("{space_did}#atproto_space_host")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JwtHeader {
     alg: String,
     typ: String,
+    kid: String,
 }
 
-/// Decoded MemberGrant payload.
+/// Decoded delegation-token payload (spec lines 164-171).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemberGrant {
-    /// Issuer DID — the member.
+pub struct DelegationToken {
+    /// Issuer DID — the member (user) delegating to the app.
     pub iss: String,
-    /// Audience DID — the space owner.
+    /// Audience — the space host service fragment
+    /// (`<spaceDid>#atproto_space_host`).
     pub aud: String,
-    /// Space URI.
-    pub space: String,
-    /// OAuth `client_id` of the requesting app.
-    #[serde(rename = "clientId")]
-    pub client_id: String,
-    /// Lexicon method this grant is good for.
-    pub lxm: String,
+    /// Subject — the space being requested, an `ats://` URI.
+    pub sub: String,
     /// Issued-at timestamp (seconds since epoch).
     pub iat: u64,
     /// Expiration timestamp (seconds since epoch).
     pub exp: u64,
+    /// Random nonce (UUIDv4) for single-use enforcement.
+    pub jti: String,
 }
 
-/// Decoded SpaceCredential payload.
+/// Decoded SpaceCredential payload (spec lines 218-225).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceCredential {
-    /// Issuer DID — the space owner.
+    /// Issuer DID — the space authority.
     pub iss: String,
-    /// Space URI.
-    pub space: String,
-    /// OAuth `client_id` the credential is bound to.
-    #[serde(rename = "clientId")]
-    pub client_id: String,
+    /// Subject — the space the credential reads, an `ats://` URI.
+    pub sub: String,
+    /// Attested application identity (the verified client attestation's
+    /// `iss`). Omitted on the wire when the request carried no attestation
+    /// (spec lines 221, 228).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_id: Option<String>,
     /// Issued-at timestamp.
     pub iat: u64,
     /// Expiration timestamp.
     pub exp: u64,
+    /// Random nonce (UUIDv4).
+    pub jti: String,
 }
 
 fn now_secs() -> u64 {
@@ -86,10 +113,47 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Re-export of the shared `jws_alg` helper. Keeps existing call sites
-/// inside this module unchanged when they delegate via the alias.
-fn jws_alg(key: &KeyData) -> &'static str {
-    atproto_identity::key::jws_alg(key)
+/// Generate a random UUIDv4-shaped nonce for the `jti` claim.
+///
+/// `jti` is an opaque nonce (it is never parsed), so we mint a v4-formatted
+/// string from the OS RNG without a dedicated UUID dependency.
+fn random_jti() -> String {
+    let mut b = [0u8; 16];
+    rand::rng().fill(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    )
+}
+
+/// Resolve the JWS `alg` header for `key`, restricted to the two algorithms
+/// the spec permits in space-token headers (ES256 / ES256K, spec lines 161,
+/// 215). Other key types (P-384, Ed25519) are rejected here so the minted
+/// header can never carry a non-conformant `alg`.
+fn space_jws_alg(key: &KeyData) -> SpaceResult<&'static str> {
+    match atproto_identity::key::jws_alg(key) {
+        alg @ ("ES256" | "ES256K") => Ok(alg),
+        other => Err(SpaceError::Signature {
+            reason: format!("space tokens require an ES256 or ES256K signing key; got alg {other}"),
+        }),
+    }
 }
 
 fn b64url_encode(bytes: &[u8]) -> String {
@@ -104,10 +168,16 @@ fn b64url_decode(s: &str) -> SpaceResult<Vec<u8>> {
         })
 }
 
-fn mint_jwt<P: Serialize>(typ: &str, payload: &P, signing_key: &KeyData) -> SpaceResult<String> {
+fn mint_jwt<P: Serialize>(
+    typ: &str,
+    kid: &str,
+    payload: &P,
+    signing_key: &KeyData,
+) -> SpaceResult<String> {
     let header = JwtHeader {
-        alg: jws_alg(signing_key).to_string(),
+        alg: space_jws_alg(signing_key)?.to_string(),
         typ: typ.to_string(),
+        kid: kid.to_string(),
     };
     let header_json = serde_json::to_vec(&header).map_err(|e| SpaceError::JwtEncoding {
         reason: e.to_string(),
@@ -131,6 +201,7 @@ fn mint_jwt<P: Serialize>(typ: &str, payload: &P, signing_key: &KeyData) -> Spac
 fn verify_jwt<P: for<'de> Deserialize<'de>>(
     token: &str,
     expected_typ: &str,
+    expected_kid: &str,
     verifying_key: &KeyData,
 ) -> SpaceResult<P> {
     let parts: Vec<&str> = token.split('.').collect();
@@ -152,7 +223,14 @@ fn verify_jwt<P: for<'de> Deserialize<'de>>(
             actual: header.typ,
         });
     }
-    let expected_alg = jws_alg(verifying_key);
+    if header.kid != expected_kid {
+        return Err(SpaceError::JwtClaimMismatch {
+            field: "kid".to_string(),
+            expected: expected_kid.to_string(),
+            actual: header.kid,
+        });
+    }
+    let expected_alg = space_jws_alg(verifying_key)?;
     if header.alg != expected_alg {
         return Err(SpaceError::JwtClaimMismatch {
             field: "alg".to_string(),
@@ -182,124 +260,154 @@ fn check_exp(exp: u64) -> SpaceResult<()> {
     Ok(())
 }
 
-/// Mint a MemberGrant signed by the member's atproto signing key.
+/// Mint a delegation token signed by the member's atproto signing key.
+///
+/// The token's `aud` is set to the space host service fragment
+/// (`<spaceDid>#atproto_space_host`) and `sub` to the space `ats://` URI, per
+/// spec lines 166-167. The header carries `kid="#atproto"`.
 ///
 /// # Errors
 ///
-/// Returns [`SpaceError::JwtEncoding`] / [`SpaceError::Signature`] on failure.
-pub fn create_member_grant(
+/// Returns [`SpaceError::JwtEncoding`] / [`SpaceError::Signature`] on failure,
+/// including when `member_signing_key` is not an ES256/ES256K key.
+pub fn create_delegation_token(
     member_did: &str,
-    owner_did: &str,
     space: &SpaceUri,
-    client_id: &str,
     member_signing_key: &KeyData,
     ttl_secs: u64,
 ) -> SpaceResult<String> {
     let iat = now_secs();
     let exp = iat + ttl_secs;
-    let payload = MemberGrant {
+    let payload = DelegationToken {
         iss: member_did.to_string(),
-        aud: owner_did.to_string(),
-        space: space.to_string(),
-        client_id: client_id.to_string(),
-        lxm: LXM_GET_SPACE_CREDENTIAL.to_string(),
+        aud: space_host_audience(&space.space_did),
+        sub: space.to_string(),
         iat,
         exp,
+        jti: random_jti(),
     };
-    mint_jwt(TYP_MEMBER_GRANT, &payload, member_signing_key)
+    mint_jwt(
+        TYP_DELEGATION_TOKEN,
+        KID_DELEGATION_TOKEN,
+        &payload,
+        member_signing_key,
+    )
 }
 
-/// Verify a MemberGrant against the member's verifying key and expected claims.
+/// Verify a delegation token against the member's verifying key and expected
+/// claims.
 ///
-/// Checks: signature, `typ`, `alg`, `aud=owner_did`, `space`, `lxm`, `clientId`, `exp`.
+/// Checks: signature, header `typ`/`kid`/`alg`, `aud` (the space host service
+/// fragment of the authority DID), `sub` (the space URI), and `exp`. The
+/// caller is responsible for enforcing single-use via `jti`.
 ///
 /// # Errors
 ///
 /// Returns the relevant `SpaceError` on any check failure.
-pub fn verify_member_grant(
+pub fn verify_delegation_token(
     token: &str,
-    expected_owner_did: &str,
+    expected_authority_did: &str,
     expected_space: &SpaceUri,
-    expected_client_id: &str,
     member_verifying_key: &KeyData,
-) -> SpaceResult<MemberGrant> {
-    let payload: MemberGrant = verify_jwt(token, TYP_MEMBER_GRANT, member_verifying_key)?;
+) -> SpaceResult<DelegationToken> {
+    let payload: DelegationToken = verify_jwt(
+        token,
+        TYP_DELEGATION_TOKEN,
+        KID_DELEGATION_TOKEN,
+        member_verifying_key,
+    )?;
 
-    if payload.aud != expected_owner_did {
+    let expected_aud = space_host_audience(expected_authority_did);
+    if payload.aud != expected_aud {
         return Err(SpaceError::JwtClaimMismatch {
             field: "aud".to_string(),
-            expected: expected_owner_did.to_string(),
+            expected: expected_aud,
             actual: payload.aud,
         });
     }
-    let expected_space_str = expected_space.to_string();
-    if payload.space != expected_space_str {
+    let expected_sub = expected_space.to_string();
+    if payload.sub != expected_sub {
         return Err(SpaceError::JwtClaimMismatch {
-            field: "space".to_string(),
-            expected: expected_space_str,
-            actual: payload.space,
-        });
-    }
-    if payload.lxm != LXM_GET_SPACE_CREDENTIAL {
-        return Err(SpaceError::JwtClaimMismatch {
-            field: "lxm".to_string(),
-            expected: LXM_GET_SPACE_CREDENTIAL.to_string(),
-            actual: payload.lxm,
-        });
-    }
-    if payload.client_id != expected_client_id {
-        return Err(SpaceError::JwtClaimMismatch {
-            field: "clientId".to_string(),
-            expected: expected_client_id.to_string(),
-            actual: payload.client_id,
+            field: "sub".to_string(),
+            expected: expected_sub,
+            actual: payload.sub,
         });
     }
     check_exp(payload.exp)?;
     Ok(payload)
 }
 
-/// Mint a SpaceCredential signed by the space owner's atproto signing key.
+/// Mint a space credential signed by the space authority's `#atproto_space`
+/// signing key.
+///
+/// `client_id` is the attested application identity (the verified client
+/// attestation's `iss`); pass `None` when the request carried no attestation,
+/// in which case the claim is omitted (spec lines 221, 228). The header
+/// carries `kid="#atproto_space"` and the payload has no `aud`.
+///
+/// # Errors
+///
+/// Returns [`SpaceError::JwtEncoding`] / [`SpaceError::Signature`] on failure.
 pub fn create_space_credential(
-    owner_did: &str,
+    authority_did: &str,
     space: &SpaceUri,
-    client_id: &str,
-    owner_signing_key: &KeyData,
+    client_id: Option<&str>,
+    authority_signing_key: &KeyData,
     ttl_secs: u64,
 ) -> SpaceResult<String> {
     let iat = now_secs();
     let exp = iat + ttl_secs;
     let payload = SpaceCredential {
-        iss: owner_did.to_string(),
-        space: space.to_string(),
-        client_id: client_id.to_string(),
+        iss: authority_did.to_string(),
+        sub: space.to_string(),
+        client_id: client_id.map(str::to_string),
         iat,
         exp,
+        jti: random_jti(),
     };
-    mint_jwt(TYP_SPACE_CREDENTIAL, &payload, owner_signing_key)
+    mint_jwt(
+        TYP_SPACE_CREDENTIAL,
+        KID_SPACE_CREDENTIAL,
+        &payload,
+        authority_signing_key,
+    )
 }
 
-/// Verify a SpaceCredential against the owner's verifying key and expected claims.
+/// Verify a space credential against the authority's verifying key and
+/// expected claims.
+///
+/// Checks: signature, header `typ`/`kid`/`alg`, `iss` (the authority DID),
+/// `sub` (the space URI), and `exp`.
+///
+/// # Errors
+///
+/// Returns the relevant `SpaceError` on any check failure.
 pub fn verify_space_credential(
     token: &str,
-    expected_owner_did: &str,
+    expected_authority_did: &str,
     expected_space: &SpaceUri,
-    owner_verifying_key: &KeyData,
+    authority_verifying_key: &KeyData,
 ) -> SpaceResult<SpaceCredential> {
-    let payload: SpaceCredential = verify_jwt(token, TYP_SPACE_CREDENTIAL, owner_verifying_key)?;
+    let payload: SpaceCredential = verify_jwt(
+        token,
+        TYP_SPACE_CREDENTIAL,
+        KID_SPACE_CREDENTIAL,
+        authority_verifying_key,
+    )?;
 
-    if payload.iss != expected_owner_did {
+    if payload.iss != expected_authority_did {
         return Err(SpaceError::JwtClaimMismatch {
             field: "iss".to_string(),
-            expected: expected_owner_did.to_string(),
+            expected: expected_authority_did.to_string(),
             actual: payload.iss,
         });
     }
-    let expected_space_str = expected_space.to_string();
-    if payload.space != expected_space_str {
+    let expected_sub = expected_space.to_string();
+    if payload.sub != expected_sub {
         return Err(SpaceError::JwtClaimMismatch {
-            field: "space".to_string(),
-            expected: expected_space_str,
-            actual: payload.space,
+            field: "sub".to_string(),
+            expected: expected_sub,
+            actual: payload.sub,
         });
     }
     check_exp(payload.exp)?;
@@ -327,120 +435,202 @@ mod tests {
     }
 
     #[test]
-    fn member_grant_round_trip() {
+    fn delegation_token_round_trip() {
         let (member_priv, member_pub) = keypair();
         let space = test_space();
-        let token = create_member_grant(
+        let token = create_delegation_token(
             "did:plc:alice",
-            "did:plc:owner",
             &space,
-            "https://app.example/client-metadata.json",
             &member_priv,
-            MEMBER_GRANT_TTL_SECS,
+            DELEGATION_TOKEN_TTL_SECS,
         )
         .unwrap();
 
-        let payload = verify_member_grant(
-            &token,
-            "did:plc:owner",
-            &space,
-            "https://app.example/client-metadata.json",
-            &member_pub,
-        )
-        .unwrap();
+        let payload =
+            verify_delegation_token(&token, "did:plc:owner", &space, &member_pub).unwrap();
         assert_eq!(payload.iss, "did:plc:alice");
-        assert_eq!(payload.aud, "did:plc:owner");
+        assert_eq!(payload.aud, "did:plc:owner#atproto_space_host");
+        assert_eq!(payload.sub, space.to_string());
     }
 
     #[test]
-    fn member_grant_wrong_aud_rejected() {
-        let (member_priv, member_pub) = keypair();
+    fn delegation_token_header_is_spec_exact() {
+        let (member_priv, _) = keypair();
         let space = test_space();
-        let token = create_member_grant(
+        let token = create_delegation_token(
             "did:plc:alice",
-            "did:plc:owner",
             &space,
-            "client",
             &member_priv,
-            MEMBER_GRANT_TTL_SECS,
+            DELEGATION_TOKEN_TTL_SECS,
         )
         .unwrap();
-        let result =
-            verify_member_grant(&token, "did:plc:other-owner", &space, "client", &member_pub);
+        let header_b64 = token.split('.').next().unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(header_b64).unwrap()).unwrap();
+        assert_eq!(header["typ"], "atproto-space-delegation+jwt");
+        assert_eq!(header["kid"], "#atproto");
+        assert_eq!(header["alg"], "ES256");
+    }
+
+    #[test]
+    fn delegation_token_has_no_lxm_or_client_id() {
+        let (member_priv, _) = keypair();
+        let space = test_space();
+        let token = create_delegation_token(
+            "did:plc:alice",
+            &space,
+            &member_priv,
+            DELEGATION_TOKEN_TTL_SECS,
+        )
+        .unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(payload_b64).unwrap()).unwrap();
+        assert!(payload.get("lxm").is_none());
+        assert!(payload.get("clientId").is_none());
+        assert!(payload.get("client_id").is_none());
+        assert!(payload.get("space").is_none());
+        assert!(payload.get("sub").is_some());
+    }
+
+    #[test]
+    fn delegation_token_default_ttl_is_60s() {
+        let (member_priv, _) = keypair();
+        let space = test_space();
+        let token = create_delegation_token(
+            "did:plc:alice",
+            &space,
+            &member_priv,
+            DELEGATION_TOKEN_TTL_SECS,
+        )
+        .unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload: DelegationToken =
+            serde_json::from_slice(&b64url_decode(payload_b64).unwrap()).unwrap();
+        assert_eq!(payload.exp - payload.iat, 60);
+    }
+
+    #[test]
+    fn delegation_token_wrong_authority_rejected() {
+        let (member_priv, member_pub) = keypair();
+        let space = test_space();
+        let token = create_delegation_token(
+            "did:plc:alice",
+            &space,
+            &member_priv,
+            DELEGATION_TOKEN_TTL_SECS,
+        )
+        .unwrap();
+        let result = verify_delegation_token(&token, "did:plc:other-owner", &space, &member_pub);
         assert!(matches!(result, Err(SpaceError::JwtClaimMismatch { .. })));
     }
 
     #[test]
-    fn member_grant_wrong_client_rejected() {
+    fn delegation_token_expired_rejected() {
         let (member_priv, member_pub) = keypair();
         let space = test_space();
-        let token = create_member_grant(
-            "did:plc:alice",
-            "did:plc:owner",
-            &space,
-            "client-A",
-            &member_priv,
-            MEMBER_GRANT_TTL_SECS,
-        )
-        .unwrap();
-        let result = verify_member_grant(&token, "did:plc:owner", &space, "client-B", &member_pub);
-        assert!(matches!(result, Err(SpaceError::JwtClaimMismatch { .. })));
-    }
-
-    #[test]
-    fn member_grant_expired_rejected() {
-        let (member_priv, member_pub) = keypair();
-        let space = test_space();
-        let token = create_member_grant(
-            "did:plc:alice",
-            "did:plc:owner",
-            &space,
-            "client",
-            &member_priv,
-            0,
-        )
-        .unwrap();
-        // Sleep one second to force expiration.
+        let token = create_delegation_token("did:plc:alice", &space, &member_priv, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let result = verify_member_grant(&token, "did:plc:owner", &space, "client", &member_pub);
+        let result = verify_delegation_token(&token, "did:plc:owner", &space, &member_pub);
         assert!(matches!(result, Err(SpaceError::JwtExpired { .. })));
     }
 
     #[test]
-    fn member_grant_tampered_payload_rejected() {
+    fn delegation_token_tampered_payload_rejected() {
         let (member_priv, member_pub) = keypair();
         let space = test_space();
-        let token = create_member_grant(
+        let token = create_delegation_token(
             "did:plc:alice",
-            "did:plc:owner",
             &space,
-            "client",
             &member_priv,
-            MEMBER_GRANT_TTL_SECS,
+            DELEGATION_TOKEN_TTL_SECS,
         )
         .unwrap();
-        // Flip a character in the payload portion.
         let mut parts: Vec<String> = token.split('.').map(String::from).collect();
         parts[1] = parts[1].chars().rev().collect::<String>();
         let tampered = parts.join(".");
-        let result = verify_member_grant(&tampered, "did:plc:owner", &space, "client", &member_pub);
+        let result = verify_delegation_token(&tampered, "did:plc:owner", &space, &member_pub);
         assert!(result.is_err());
     }
 
     #[test]
-    fn space_credential_round_trip() {
+    fn space_credential_round_trip_with_client_id() {
         let (owner_priv, owner_pub) = keypair();
         let space = test_space();
         let token = create_space_credential(
             "did:plc:owner",
             &space,
-            "client",
+            Some("https://app.example/client-metadata.json"),
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,
         )
         .unwrap();
         let payload = verify_space_credential(&token, "did:plc:owner", &space, &owner_pub).unwrap();
         assert_eq!(payload.iss, "did:plc:owner");
+        assert_eq!(payload.sub, space.to_string());
+        assert_eq!(
+            payload.client_id.as_deref(),
+            Some("https://app.example/client-metadata.json")
+        );
+    }
+
+    #[test]
+    fn space_credential_header_is_spec_exact() {
+        let (owner_priv, _) = keypair();
+        let space = test_space();
+        let token = create_space_credential(
+            "did:plc:owner",
+            &space,
+            None,
+            &owner_priv,
+            SPACE_CREDENTIAL_TTL_SECS,
+        )
+        .unwrap();
+        let header_b64 = token.split('.').next().unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(header_b64).unwrap()).unwrap();
+        assert_eq!(header["typ"], "atproto-space-credential+jwt");
+        assert_eq!(header["kid"], "#atproto_space");
+    }
+
+    #[test]
+    fn space_credential_omits_client_id_when_absent() {
+        let (owner_priv, _) = keypair();
+        let space = test_space();
+        let token = create_space_credential(
+            "did:plc:owner",
+            &space,
+            None,
+            &owner_priv,
+            SPACE_CREDENTIAL_TTL_SECS,
+        )
+        .unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(payload_b64).unwrap()).unwrap();
+        assert!(payload.get("client_id").is_none());
+        assert!(payload.get("clientId").is_none());
+        assert!(payload.get("aud").is_none());
+        assert_eq!(payload["sub"], space.to_string());
+    }
+
+    #[test]
+    fn space_credential_uses_snake_case_client_id() {
+        let (owner_priv, _) = keypair();
+        let space = test_space();
+        let token = create_space_credential(
+            "did:plc:owner",
+            &space,
+            Some("https://app.example/cm"),
+            &owner_priv,
+            SPACE_CREDENTIAL_TTL_SECS,
+        )
+        .unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(payload_b64).unwrap()).unwrap();
+        assert_eq!(payload["client_id"], "https://app.example/cm");
+        assert!(payload.get("clientId").is_none());
     }
 
     #[test]
@@ -455,7 +645,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &space,
-            "client",
+            None,
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,
         )

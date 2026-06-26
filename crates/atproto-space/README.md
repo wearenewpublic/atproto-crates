@@ -3,59 +3,39 @@
 AT Protocol permissioned-data spaces — protocol primitives.
 
 This crate implements the cryptographic and orchestration primitives from the
-[Spaces Design Spec](https://github.com/bluesky-social/atproto/blob/main/docs/superpowers/specs/2026-04-22-permissioned-data-pds-design.md):
-SetHash commitments, signed commits with HKDF-derived HMAC + ECDSA + per-commit
-random IKM (for deniability), domain-separated record vs member commitments,
-and the two-step `MemberGrant` → `SpaceCredential` JWT exchange.
+[0016 Permissioned Data draft](https://github.com/bluesky-social/proposals/tree/main/0016-permissioned-data),
+which is the authoritative alignment target for this crate: SetHash
+commitments, signed commits with HKDF-derived HMAC + ECDSA + per-commit random
+IKM (for deniability), and the two-step delegation-token → space-credential JWT
+exchange.
 
-> **Status: experimental**. The Spaces Design Spec is still settling; several
-> primitives (notably `SetHash`) are explicitly placeholder until upstream
-> picks ECMH or ltHash. The current default is `XorSha256SetHash`.
+> **Status: experimental**. The 0016 Permissioned Data draft is still settling.
+> The production `SetHash` is `LtHash`, the lattice hash the spec selects (spec
+> § "Commit digest").
 
 ## Modules
 
-- `set_hash` — `SetHash` trait + `XorSha256SetHash` placeholder.
-- `set_hash_ecmh` *(feature `ecmh`)* — `EcmhSetHash` over secp256k1: scalar-mul
-  multiset hash with property-tested homomorphic invariants. SEC1-compressed
-  digest. Pulls in k256.
-- `commit` — `SpaceContext`, `Commit`, `create_commit`, `verify_commit` with
-  HKDF + HMAC + ECDSA construction. Domain-separated `Records` vs `Members`
-  via `CommitScope`.
+- `set_hash` — `SetHash` trait + `LtHash` production primitive.
+- `commit` — `SpaceContext`, `Commit`, `create_commit`, `verify_commit`. A
+  commit signs only the per-commit context (`ctx`) and binds the set-hash
+  digest with an HKDF-keyed HMAC, so a leaked commit is deniable (spec
+  § "Commit signature", lines 285-316).
 - `space_repo` — `SpaceRepo<S, H>` orchestrator over the storage trait surface
   for per-(user, space) record CRUD.
-- `space_members` — `SpaceMembers<S, H>` orchestrator (owner-only).
-- `credential` — `MemberGrant` and `SpaceCredential` JWT mint/verify.
-- `recon` — `Reconciler` / `Sketch` traits + `oplog_catchup` baseline impl.
-  RIBLT impl is deferred; the trait surface preserves the call sites for the
-  eventual swap.
+- `space_members` — `SpaceMembers<S, H>` member-list orchestrator backing the
+  `simplespace` `member-list` mint policy (the spec carries no member commits).
+- `credential` — `DelegationToken` and `SpaceCredential` JWT mint/verify (spec
+  § "Access control", lines 136-251).
 - `storage` — `SpaceRepoStorage`, `SpaceMembersStorage` traits.
-- `types` — `SpaceUri`, `SpaceType`, `SpaceKey` newtypes.
+- `types` — `SpaceUri`, `RecordUri`, `SpaceType`, `SpaceKey` newtypes.
 - `errors` — `SpaceError` enum with `error-atproto-space-<domain>-<n>` IDs.
-
-## Cargo features
-
-| Feature | Default | Description |
-|---|---|---|
-| `ecmh` | | Build the `EcmhSetHash` impl over k256/secp256k1. |
-
-## Benchmarks
-
-Criterion-driven comparison of `XorSha256SetHash` vs `EcmhSetHash` is in
-`benches/set_hash.rs`. Run with:
-
-```bash
-cargo bench -p atproto-space --features ecmh
-```
-
-Three groups: `add_throughput` (1 / 100 / 1000 elements), `add_remove_round_trip`
-(single-element flush), and `digest_serialization` (digest + from_digest).
 
 ## Quick start
 
 ```rust,ignore
 use atproto_space::{
-    SpaceUri, SpaceType, SpaceKey, SpaceContext, CommitScope,
-    XorSha256SetHash, SetHash, create_commit, verify_commit,
+    SpaceUri, SpaceType, SpaceKey, SpaceContext,
+    LtHash, SetHash, create_commit, verify_commit,
 };
 use atproto_identity::key::{KeyType, generate_key, identify_key};
 
@@ -68,20 +48,19 @@ let space = SpaceUri::new(
     SpaceKey::new("default")?,
 );
 
-let mut hash = XorSha256SetHash::empty();
-hash.add(b"app.bsky.feed.post/3jui:bafy123");
+let mut hash = LtHash::empty();
+// Each record element is `{collection}/{rkey}/{record_cid}` (spec line 270).
+hash.add(b"app.bsky.feed.post/3jui/bafy123");
 
+// The signed context is the space URI + revision (spec lines 292-297); the
+// set-hash digest is bound by the commit's MAC, not signed directly.
 let context = SpaceContext {
-    space_did: "did:plc:owner".to_string(),
-    space_type: "app.bsky.group".to_string(),
-    space_key: "default".to_string(),
-    user_did: "did:plc:alice".to_string(),
-    scope: CommitScope::Records,
+    space: space.to_string(),
     rev: "3jui7kd2z2y2e".to_string(),
 };
 
 let commit = create_commit(&hash, &context, &private_key)?;
-// commit.set_hash, commit.rev, commit.ikm, commit.tag, commit.sig
+// commit.hash, commit.ikm, commit.sig, commit.mac, commit.rev
 
 # Ok::<(), anyhow::Error>(())
 ```

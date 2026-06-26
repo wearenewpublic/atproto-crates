@@ -111,6 +111,8 @@ CREATE TABLE notify_attempt (
     target_endpoint     TEXT NOT NULL,
     payload_cbor        BYTEA NOT NULL,
     nsid                TEXT NOT NULL,
+    content_type        TEXT NOT NULL DEFAULT 'application/cbor',
+    auth_token          TEXT,
     attempt_count       BIGINT NOT NULL DEFAULT 0,
     last_attempt_at     TEXT,
     next_attempt_at     TEXT NOT NULL,

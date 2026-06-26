@@ -60,11 +60,44 @@ impl AuthSubject {
         }
     }
 
+    /// OAuth `client_id` of the requesting app, when the token is an OAuth
+    /// access token. `None` for app-password sessions (which have no
+    /// associated OAuth client).
+    #[must_use]
+    pub fn client_id(&self) -> Option<&str> {
+        match self {
+            AuthSubject::AppPassword(_) => None,
+            AuthSubject::OAuth(c) => Some(&c.client_id),
+        }
+    }
+
     /// `true` when this is an OAuth token bound to a DPoP key (the
     /// `cnf.jkt` claim is present).
     #[must_use]
     pub fn is_dpop_bound(&self) -> bool {
         matches!(self, AuthSubject::OAuth(c) if c.cnf.is_some())
+    }
+
+    /// `true` when this is an OAuth access token (as opposed to an
+    /// app-password session). Space scope gating only applies to OAuth
+    /// tokens — app-password sessions carry no `space:` grants and so can
+    /// never satisfy [`assert_space`](atproto_oauth::scopes::ScopesSet::assert_space).
+    #[must_use]
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, AuthSubject::OAuth(_))
+    }
+
+    /// The granted OAuth scope set, parsed from the access token's `scope`
+    /// claim. Returns an empty set for app-password sessions (which have no
+    /// OAuth scope string), so callers can uniformly run
+    /// [`assert_space`](atproto_oauth::scopes::ScopesSet::assert_space)
+    /// against it — an empty set simply satisfies nothing.
+    #[must_use]
+    pub fn scopes(&self) -> atproto_oauth::scopes::ScopesSet {
+        match self {
+            AuthSubject::AppPassword(_) => atproto_oauth::scopes::ScopesSet::new(),
+            AuthSubject::OAuth(c) => atproto_oauth::scopes::ScopesSet::from_scope_string(&c.scope),
+        }
     }
 
     /// `true` if the token is allowed to perform privileged operations

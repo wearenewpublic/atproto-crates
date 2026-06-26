@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use atproto_space::SpaceError;
 use atproto_space::errors::SpaceResult;
 use atproto_space::storage::{
-    MemberChange, MemberPage, MemberRow, MemberState, OplogEntry, OplogPage, PreparedCommitMembers,
-    SpaceMembersStorage,
+    MemberChange, MemberPage, MemberRow, MemberState, PreparedCommitMembers, SpaceMembersStorage,
 };
 use atproto_space::types::SpaceUri;
 use sqlx::SqlitePool;
@@ -183,61 +182,13 @@ impl SpaceMembersStorage for SqlSpaceMembersStorage {
             .map_err(|e| sql_err(format!("apply_commit commit: {e}")))?;
         Ok(())
     }
-
-    async fn read_oplog(
-        &self,
-        space: &SpaceUri,
-        since: Option<&str>,
-        limit: u32,
-    ) -> SpaceResult<OplogPage> {
-        let limit = limit.clamp(1, 1000);
-        let rows: Vec<(String, i64, String, String)> = match since {
-            Some(s) => {
-                sqlx::query_as(
-                    "SELECT rev, idx, action, did FROM space_member_oplog
-                 WHERE space = ? AND rev > ? ORDER BY rev ASC, idx ASC LIMIT ?",
-                )
-                .bind(space.to_string())
-                .bind(s)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query_as(
-                    "SELECT rev, idx, action, did FROM space_member_oplog
-                 WHERE space = ? ORDER BY rev ASC, idx ASC LIMIT ?",
-                )
-                .bind(space.to_string())
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await
-            }
-        }
-        .map_err(|e| sql_err(format!("read_oplog: {e}")))?;
-        let ops = rows
-            .into_iter()
-            .map(|(rev, idx, action, did)| OplogEntry {
-                rev,
-                idx: idx as u32,
-                action,
-                collection: None,
-                rkey: None,
-                cid: None,
-                prev: None,
-                did: Some(did),
-            })
-            .collect();
-        let state = self.current_state(space).await?;
-        Ok(OplogPage { ops, state })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actor_store::sql::SqlActorStore;
-    use atproto_space::set_hash::XorSha256SetHash;
+    use atproto_space::set_hash::LtHash;
     use atproto_space::space_members::{MemberOp, MemberOpAction, SpaceMembers};
     use atproto_space::types::{SpaceKey, SpaceType};
 
@@ -254,7 +205,7 @@ mod tests {
         SqlSpaceMembersStorage::new(store.pool().clone())
     }
 
-    type TestMembers = SpaceMembers<SqlSpaceMembersStorage, XorSha256SetHash>;
+    type TestMembers = SpaceMembers<SqlSpaceMembersStorage, LtHash>;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn add_then_remove() {
@@ -286,7 +237,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn list_paginates_and_oplog_round_trips() {
+    async fn list_paginates() {
         let space = test_space();
         let m: TestMembers = SpaceMembers::new(space.clone(), fresh_storage().await);
         for did in ["did:plc:a", "did:plc:b", "did:plc:c"] {
@@ -304,9 +255,6 @@ mod tests {
         let page = m.list_members(None, 2).await.unwrap();
         assert_eq!(page.members.len(), 2);
         assert_eq!(page.members[0].did, "did:plc:a");
-
-        let oplog = m.read_oplog(None, 100).await.unwrap();
-        assert_eq!(oplog.ops.len(), 3);
-        assert!(oplog.ops.iter().all(|o| o.action == "add"));
+        assert_eq!(page.cursor.as_deref(), Some("did:plc:b"));
     }
 }

@@ -53,6 +53,23 @@ pub enum PdsError {
         what: String,
     },
 
+    /// error-atproto-pds-space-2: the referenced space does not exist or has
+    /// been tombstoned (`deleted_at IS NOT NULL`). Surfaced to clients as the
+    /// `SpaceNotFound` XRPC error.
+    #[error("error-atproto-pds-space-2 space not found: {uri}")]
+    SpaceNotFound {
+        /// URI of the missing or deleted space.
+        uri: String,
+    },
+
+    /// error-atproto-pds-space-3: the caller is not the owner of the space.
+    /// Surfaced to clients as the `NotSpaceOwner` XRPC error.
+    #[error("error-atproto-pds-space-3 not the space owner: {uri}")]
+    NotSpaceOwner {
+        /// URI of the space.
+        uri: String,
+    },
+
     /// error-atproto-pds-account-1: account state transition rejected.
     #[error("error-atproto-pds-account-1 invalid account state transition: {from} -> {to}")]
     InvalidAccountTransition {

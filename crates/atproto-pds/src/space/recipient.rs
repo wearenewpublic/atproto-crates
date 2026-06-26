@@ -1,7 +1,7 @@
 //! Consumer recipient discovery for `getSpaceCredential`.
 //!
-//! when a consumer service swaps a `MemberGrant`
-//! for a `SpaceCredential`, the owner's PDS must record the consumer's
+//! When a consumer service swaps a delegation token
+//! for a `SpaceCredential`, the authority's PDS must record the consumer's
 //! `(service_did, service_endpoint)` so the notifier knows where to fan
 //! out future commits.
 //!
@@ -26,8 +26,8 @@
 use crate::errors::{PdsError, PdsResult};
 use atproto_identity::resolve::resolve_handle_http;
 
-/// Resolved consumer identity, derivable from a MemberGrant + its
-/// bearing `client_id`.
+/// Resolved consumer identity, derivable from a delegation token's issuer +
+/// the attested `client_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRecipient {
     /// Consumer service DID (e.g. `did:web:appview.example`).
@@ -104,11 +104,23 @@ async fn fetch_atproto_pds_endpoint(
     did: &str,
     plc_directory_hostname: Option<&str>,
 ) -> PdsResult<Option<String>> {
+    let Some(document) = fetch_did_document(http, did, plc_directory_hostname).await? else {
+        return Ok(None);
+    };
+    Ok(document.pds_endpoints().first().map(|s| s.to_string()))
+}
+
+/// Fetch a DID document for `did:plc:`/`did:web:`, returning `None` for
+/// unsupported methods (e.g. `did:webvh`).
+async fn fetch_did_document(
+    http: &reqwest::Client,
+    did: &str,
+    plc_directory_hostname: Option<&str>,
+) -> PdsResult<Option<atproto_identity::model::Document>> {
     use atproto_identity::plc::query as plc_query;
     use atproto_identity::web::query as web_query;
-    let document = if let Some(stripped) = did.strip_prefix("did:plc:") {
+    let document = if did.starts_with("did:plc:") {
         let host = plc_directory_hostname.unwrap_or("plc.directory");
-        let _ = stripped;
         plc_query(http, host, did)
             .await
             .map_err(|e| PdsError::Storage {
@@ -119,12 +131,43 @@ async fn fetch_atproto_pds_endpoint(
             reason: format!("web query: {e}"),
         })?
     } else {
-        // did:webvh and other methods aren't yet covered by the
-        // recipient resolver — see. Surface a soft
-        // failure so the stub kicks in.
+        // did:webvh and other methods aren't yet covered.
         return Ok(None);
     };
-    Ok(document.pds_endpoints().first().map(|s| s.to_string()))
+    Ok(Some(document))
+}
+
+/// Resolve a service identifier of the form `<did>#<fragment>` (e.g.
+/// `did:web:example.com#forum`) to the service's base endpoint URL by fetching
+/// the DID document and matching the service entry by fragment.
+///
+/// Returns `Ok(None)` when the DID method is unsupported, the document has no
+/// matching service entry, or the identifier is malformed.
+///
+/// # Errors
+/// Returns [`PdsError::Storage`] on a DID-document fetch failure.
+pub async fn resolve_service_endpoint(
+    http: &reqwest::Client,
+    service_id: &str,
+    plc_directory_hostname: Option<&str>,
+) -> PdsResult<Option<String>> {
+    let (did, fragment) = match service_id.split_once('#') {
+        Some((did, frag)) => (did, Some(frag)),
+        None => (service_id, None),
+    };
+    let Some(document) = fetch_did_document(http, did, plc_directory_hostname).await? else {
+        return Ok(None);
+    };
+    // Match the service whose `id` ends with the requested fragment
+    // (DID documents render service ids as `<did>#frag` or `#frag`).
+    let endpoint = document.service.iter().find_map(|svc| match fragment {
+        Some(frag) => {
+            let svc_frag = svc.id.rsplit('#').next().unwrap_or(svc.id.as_str());
+            (svc_frag == frag).then(|| svc.service_endpoint.clone())
+        }
+        None => Some(svc.service_endpoint.clone()),
+    });
+    Ok(endpoint)
 }
 
 /// Build the fallback recipient — used both as the result on failure

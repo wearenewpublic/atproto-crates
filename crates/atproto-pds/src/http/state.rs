@@ -8,7 +8,7 @@ use crate::plc::PlcService;
 use crate::repo::{RepoReader, RepoWriter};
 use crate::security::{JtiReplayGuard, SlidingWindowLimiter};
 use crate::sequencer::EventBus;
-use crate::space::{SpaceReader, SpaceService, SpaceSync, SpaceWriter};
+use crate::space::{SpaceDeclarationResolver, SpaceReader, SpaceService, SpaceSync, SpaceWriter};
 use atproto_identity::key::KeyData;
 use atproto_identity::traits::DnsResolver;
 use std::sync::Arc;
@@ -43,6 +43,11 @@ pub struct HttpState {
     pub space_reader: Option<Arc<SpaceReader>>,
     /// Spaces sync (state + oplog) reader.
     pub space_sync: Option<Arc<SpaceSync>>,
+    /// Resolver for space-type declarations (NSID → declared `collections`),
+    /// used to expand a bare `space:` grant's omitted-`collection` default
+    /// (spec line 413). `None` disables the default (bare grants confer no
+    /// write targets); typically a TTL-cached network resolver.
+    pub space_declaration_resolver: Option<Arc<dyn SpaceDeclarationResolver>>,
     /// PLC genesis service (None disables PLC-managed DID creation).
     pub plc_service: Option<Arc<PlcService>>,
     /// JWT-jti replay guard (always populated; in-memory by default).
@@ -93,16 +98,13 @@ pub struct HttpState {
     /// `/oauth/jwks` so consumers verifying older tokens see them.
     pub pds_extra_signing_keys: Vec<Arc<KeyData>>,
     /// SpaceCredential TTL in seconds. Default
-    /// `atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS` (3h);
+    /// `atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS` (7200 / 2h);
     /// operators tighten/loosen via `PDS_SPACE_CREDENTIAL_TTL_SECONDS`.
     pub space_credential_ttl_secs: u64,
     /// Allowed handle suffix domains. Empty means
     /// any handle is accepted (back-compat). Set via
     /// `PDS_SERVICE_HANDLE_DOMAINS`.
     pub service_handle_domains: Vec<String>,
-    /// Whether to send a notification email on space membership changes
-    /// Set via `PDS_NOTIFY_MEMBERSHIP_EMAIL`.
-    pub notify_membership_email: bool,
     /// Crawler hostnames notified by `requestCrawl`.
     /// Comma-separated `PDS_CRAWLERS`.
     pub crawlers: Vec<String>,
@@ -131,6 +133,7 @@ impl HttpState {
             space_writer: None,
             space_reader: None,
             space_sync: None,
+            space_declaration_resolver: None,
             plc_service: None,
             jti_guard: JtiReplayGuard::new(100_000),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -146,7 +149,6 @@ impl HttpState {
             pds_extra_signing_keys: Vec::new(),
             space_credential_ttl_secs: atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
             service_handle_domains: Vec::new(),
-            notify_membership_email: false,
             crawlers: Vec::new(),
             bsky_app_view_did: None,
             bsky_app_view_url: None,
@@ -174,6 +176,7 @@ impl HttpState {
             space_writer: None,
             space_reader: None,
             space_sync: None,
+            space_declaration_resolver: None,
             plc_service: None,
             jti_guard: JtiReplayGuard::new(100_000),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -189,7 +192,6 @@ impl HttpState {
             pds_extra_signing_keys: Vec::new(),
             space_credential_ttl_secs: atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
             service_handle_domains: Vec::new(),
-            notify_membership_email: false,
             crawlers: Vec::new(),
             bsky_app_view_did: None,
             bsky_app_view_url: None,
@@ -268,6 +270,21 @@ impl HttpState {
         self
     }
 
+    /// Attach a space-type declaration resolver. When set, a bare `space:`
+    /// grant's omitted-`collection` default expands to the declaration's
+    /// `collections` (spec line 413). Typically a
+    /// [`CachingSpaceDeclarationResolver`](crate::space::CachingSpaceDeclarationResolver)
+    /// wrapping a
+    /// [`NetworkSpaceDeclarationResolver`](crate::space::NetworkSpaceDeclarationResolver).
+    #[must_use]
+    pub fn with_space_declaration_resolver(
+        mut self,
+        resolver: Arc<dyn SpaceDeclarationResolver>,
+    ) -> Self {
+        self.space_declaration_resolver = Some(resolver);
+        self
+    }
+
     /// Attach moderation-service forwarding configuration. When both `did` and `url` are set, `createReport` mints a
     /// service-auth token (`aud=did`, `lxm=com.atproto.moderation.createReport`)
     /// and POSTs the report payload to `<url>/xrpc/...`. Without these
@@ -330,13 +347,6 @@ impl HttpState {
     #[must_use]
     pub fn with_service_handle_domains(mut self, domains: Vec<String>) -> Self {
         self.service_handle_domains = domains;
-        self
-    }
-
-    /// Enable membership-change email notifications.
-    #[must_use]
-    pub fn with_notify_membership_email(mut self, enabled: bool) -> Self {
-        self.notify_membership_email = enabled;
         self
     }
 

@@ -195,7 +195,7 @@ struct Args {
     /// loop walks each per-actor store on each tick and prunes oplog
     /// rows whose TID sorts below the cutoff. `0` disables the sweep.
     /// Receivers that lag behind this window must re-sync via
-    /// `getRepoState` + `exportSpaces`.
+    /// `getRepoState`.
     #[arg(
         long,
         env = "PDS_SPACE_OPLOG_RETENTION_DAYS",
@@ -225,7 +225,7 @@ struct Args {
     space_notify_retry_max_attempts: u32,
 
     /// SpaceCredential TTL in seconds. Default
-    /// 10800 (3h, matching `atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS`).
+    /// 7200 (2h, matching `atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS`).
     #[arg(
         long,
         env = "PDS_SPACE_CREDENTIAL_TTL_SECONDS",
@@ -240,13 +240,6 @@ struct Args {
     /// accepted (back-compat for dev / test deployments).
     #[arg(long, env = "PDS_SERVICE_HANDLE_DOMAINS", value_delimiter = ',')]
     service_handle_domains: Vec<String>,
-
-    /// When set, `space.addMember` / `space.removeMember` send an
-    /// notification email to the affected member via `EmailService`
-    /// The flag is a sentinel — set to any
-    /// truthy value (`1`, `true`) to enable.
-    #[arg(long, env = "PDS_NOTIFY_MEMBERSHIP_EMAIL", default_value_t = false)]
-    notify_membership_email: bool,
 
     /// Comma-separated list of crawler hostnames to notify via
     /// `com.atproto.sync.requestCrawl`. Each
@@ -457,10 +450,10 @@ async fn main() -> anyhow::Result<()> {
         args.data_dir.clone(),
         account_manager.clone(),
     ));
-    let space_writer = Arc::new(SpaceWriter::new(
-        account_manager.clone(),
-        args.data_dir.clone(),
-    ));
+    let space_writer = Arc::new(
+        SpaceWriter::new(account_manager.clone(), args.data_dir.clone())
+            .with_plc_directory(args.plc_directory.clone()),
+    );
     let space_reader = Arc::new(SpaceReader::new(
         account_manager.clone(),
         args.data_dir.clone(),
@@ -599,7 +592,6 @@ async fn main() -> anyhow::Result<()> {
     .with_public_realm_backend(public_realm_backend.clone())
     .with_space_credential_ttl(args.space_credential_ttl_seconds)
     .with_service_handle_domains(args.service_handle_domains.clone())
-    .with_notify_membership_email(args.notify_membership_email)
     .with_crawlers(args.crawlers.clone())
     // Persist OAuth in-flight state (PAR / auth-codes / refresh handles)
     // to the accounts DB so the lifecycle survives PDS restart. See
@@ -620,6 +612,30 @@ async fn main() -> anyhow::Result<()> {
     }
     #[cfg(feature = "hickory-dns")]
     {
+        // Space-type declaration resolver (NSID → declared `collections`) for
+        // the bare `space:` grant default (spec line 413). Reuses the same
+        // DNS resolver + PLC hostname as handle resolution; results are
+        // TTL-cached to avoid resolving on every authorization check.
+        let plc_hostname = args
+            .plc_directory
+            .as_deref()
+            .and_then(|url| url.split("://").nth(1).map(|h| h.to_string()))
+            .unwrap_or_else(|| "plc.directory".to_string());
+        let decl_http = reqwest::Client::builder()
+            .user_agent(user_agent())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let network = atproto_pds::space::NetworkSpaceDeclarationResolver::new(
+            dns_resolver.clone(),
+            plc_hostname,
+            decl_http,
+        );
+        let cached = atproto_pds::space::CachingSpaceDeclarationResolver::new(
+            Arc::new(network),
+            std::time::Duration::from_secs(300),
+        );
+        state = state.with_space_declaration_resolver(Arc::new(cached));
         state = state.with_dns_resolver(dns_resolver);
     }
     if let (Some(did), Some(url)) = (

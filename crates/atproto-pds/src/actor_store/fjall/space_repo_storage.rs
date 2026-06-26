@@ -8,15 +8,14 @@
 //! Key layouts: see [`super::keyspace`].
 
 use super::keyspace::{
-    FjallActorStore, oplog_after_rev, oplog_key, oplog_prefix_by_space, record_key, record_prefix,
-    repo_state_key,
+    FjallActorStore, oplog_key, oplog_prefix_by_space, record_key, record_prefix, repo_state_key,
 };
 use async_trait::async_trait;
 use atproto_space::SpaceError;
 use atproto_space::errors::SpaceResult;
 use atproto_space::storage::{
-    OplogEntry, OplogPage, PreparedCommitRecords, RecordChange, RecordPage, RecordRow, RepoState,
-    SpaceRepoStorage,
+    OplogCursor, OplogEntry, OplogPage, PreparedCommitRecords, RecordChange, RecordPage, RecordRow,
+    RepoState, SpaceRepoStorage,
 };
 use atproto_space::types::SpaceUri;
 use serde::{Deserialize, Serialize};
@@ -259,14 +258,17 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
     async fn read_oplog(
         &self,
         space: &SpaceUri,
-        since: Option<&str>,
+        since: Option<&OplogCursor>,
         limit: u32,
     ) -> SpaceResult<OplogPage> {
         let space_uri = space.to_string();
         let limit = limit.clamp(1, 1000) as usize;
         let part = self.store.space_record_oplog();
 
-        let cursor = since.map(|s| oplog_after_rev(&space_uri, s));
+        // The oplog key encodes `(rev, idx)` with a zero-padded idx, so the
+        // exact key for the cursor's `(rev, idx)` is the highest key to skip;
+        // `k <= cursor` yields `(rev, idx) > (since.rev, since.idx)`.
+        let cursor = since.map(|c| oplog_key(&space_uri, &c.rev, c.idx));
         let prefix = oplog_prefix_by_space(&space_uri);
 
         let mut ops = Vec::with_capacity(limit);
@@ -317,7 +319,7 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atproto_space::set_hash::XorSha256SetHash;
+    use atproto_space::set_hash::LtHash;
     use atproto_space::space_repo::{Op, OpAction, SpaceRepo};
     use atproto_space::types::{SpaceKey, SpaceType};
     use tempfile::TempDir;
@@ -330,7 +332,7 @@ mod tests {
         )
     }
 
-    type TestRepo = SpaceRepo<FjallSpaceRepoStorage, XorSha256SetHash>;
+    type TestRepo = SpaceRepo<FjallSpaceRepoStorage, LtHash>;
 
     fn fresh_storage() -> (FjallSpaceRepoStorage, TempDir) {
         let tmp = TempDir::new().unwrap();
@@ -489,7 +491,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let oplog = repo.read_oplog(Some(&first_rev), 100).await.unwrap();
+        let cursor = OplogCursor::new(first_rev, 0);
+        let oplog = repo.read_oplog(Some(&cursor), 100).await.unwrap();
         assert_eq!(oplog.ops.len(), 1);
         assert_eq!(oplog.ops[0].rkey.as_deref(), Some("b"));
     }
