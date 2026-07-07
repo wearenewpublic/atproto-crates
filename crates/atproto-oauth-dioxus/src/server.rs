@@ -134,6 +134,14 @@ pub fn base_url() -> String {
     }
 }
 
+/// Returns the OAuth scope to request during authorization.
+///
+/// Defaults to `atproto transition:generic`. Override by setting the
+/// `OAUTH_SCOPE` environment variable.
+pub fn scope() -> String {
+    std::env::var("OAUTH_SCOPE").unwrap_or_else(|_| "atproto transition:generic".to_string())
+}
+
 /// Initiates the AT Protocol OAuth authorization flow.
 ///
 /// Resolves the user's handle to a DID, discovers their PDS OAuth endpoints,
@@ -177,7 +185,7 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
         format!(
             "http://localhost?redirect_uri={}&scope={}",
             urlencode(&redirect_uri),
-            urlencode("atproto transition:generic"),
+            urlencode(&scope()),
         )
     };
 
@@ -201,7 +209,7 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
         state: state.clone(),
         nonce: nonce.clone(),
         code_challenge,
-        scope: "atproto transition:generic".to_string(),
+        scope: scope(),
     };
 
     let par_response = oauth_init(

@@ -13,7 +13,9 @@ pub struct AtprotoOAuthConfig {
 
     /// The OAuth scope to request.
     ///
-    /// Defaults to `atproto transition:generic`.
+    /// Defaults to `atproto transition:generic`. On the server side,
+    /// the scope is controlled by the `OAUTH_SCOPE` environment variable,
+    /// which overrides this value.
     pub scope: String,
 }
 

@@ -57,7 +57,7 @@ pub async fn client_metadata() -> Result<ClientMetadata, ServerFnError> {
             "refresh_token".to_string(),
         ],
         response_types: vec!["code".to_string()],
-        scope: "atproto transition:generic".to_string(),
+        scope: crate::server::scope(),
         token_endpoint_auth_method: "private_key_jwt".to_string(),
         subject_type: "public".to_string(),
         token_endpoint_auth_signing_alg: "ES256".to_string(),
