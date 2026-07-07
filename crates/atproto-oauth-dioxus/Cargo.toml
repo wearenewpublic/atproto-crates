@@ -17,12 +17,15 @@ categories.workspace = true
 [dependencies]
 dioxus = { version = "0.7.1", features = ["router", "fullstack"] }
 
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 url = "2.5"
 web-sys = { version = "0.3", features = ["Window", "Location", "Storage"] }
+
+zeroize = { workspace = true, optional = true }
 
 atproto-identity = { workspace = true, optional = true }
 atproto-oauth = { workspace = true, optional = true }
@@ -51,6 +54,11 @@ server = [
 hickory-dns = [
     "atproto-identity?/hickory-dns",
     "atproto-oauth?/hickory-dns",
+]
+zeroize = [
+    "dep:zeroize",
+    "atproto-identity?/zeroize",
+    "atproto-oauth?/zeroize",
 ]
 
 [lints]

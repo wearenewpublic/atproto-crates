@@ -9,6 +9,9 @@ use atproto_oauth::workflow::{
 };
 use p256::SecretKey;
 
+#[cfg(feature = "zeroize")]
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 use crate::errors::DioxusOAuthError;
 use crate::types::SessionData;
 
@@ -41,6 +44,7 @@ struct StoredOAuthState {
 /// can retrieve this session to make DPoP-authenticated API calls to the
 /// user's PDS on their behalf.
 #[derive(Clone)]
+#[cfg_attr(feature = "zeroize", derive(Zeroize, ZeroizeOnDrop))]
 #[allow(dead_code)]
 pub struct ActiveSession {
     /// The user's decentralized identifier (DID).
@@ -73,13 +77,16 @@ fn get_or_generate_signing_key() -> Result<KeyData, DioxusOAuthError> {
         let trimmed = seed_hex.trim();
         if !trimmed.is_empty() {
             let seed = hex::decode(trimmed)
+                .inspect_err(|e| tracing::error!(error = ?e, "Invalid OAUTH_KEY_SEED hex"))
                 .map_err(|e| DioxusOAuthError::InvalidKeySeed(format!("Invalid hex: {}", e)))?;
             let seed: [u8; 32] = seed.try_into().map_err(|_| {
+                tracing::error!("OAUTH_KEY_SEED must be exactly 32 bytes (64 hex chars)");
                 DioxusOAuthError::InvalidKeySeed(
                     "OAUTH_KEY_SEED must be exactly 32 bytes (64 hex chars)".to_string(),
                 )
             })?;
             let sk = SecretKey::from_slice(&seed).map_err(|_| {
+                tracing::error!("OAUTH_KEY_SEED is not a valid P-256 private key");
                 DioxusOAuthError::InvalidKeySeed(
                     "OAUTH_KEY_SEED is not a valid P-256 private key".to_string(),
                 )
@@ -88,17 +95,22 @@ fn get_or_generate_signing_key() -> Result<KeyData, DioxusOAuthError> {
         }
     }
     generate_key(KeyType::P256Private)
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to generate OAuth signing key"))
         .map_err(|e| DioxusOAuthError::KeyInitializationFailed(e.to_string()))
 }
 
 /// Derives the public key JWKS for the signing key.
 pub fn signing_key_jwks() -> Result<serde_json::Value, DioxusOAuthError> {
     let public_key = to_public(&SIGNING_KEY)
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to derive public key from signing key"))
         .map_err(|e| DioxusOAuthError::PublicKeyDerivationFailed(e.to_string()))?;
     let jwk = atproto_oauth::jwk::generate(&public_key)
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to generate JWK"))
         .map_err(|e| DioxusOAuthError::JwkGenerationFailed(e.to_string()))?;
     let jwks = atproto_oauth::jwk::WrappedJsonWebKeySet { keys: vec![jwk] };
-    serde_json::to_value(jwks).map_err(|e| DioxusOAuthError::JwkGenerationFailed(e.to_string()))
+    serde_json::to_value(jwks)
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to serialize JWKS"))
+        .map_err(|e| DioxusOAuthError::JwkGenerationFailed(e.to_string()))
 }
 
 fn generate_random_hex(len: usize) -> String {
@@ -140,18 +152,21 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
     let doc = identity_resolver
         .resolve(&handle)
         .await
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to resolve handle: {}", &handle))
         .map_err(|e| DioxusOAuthError::HandleResolutionFailed(e.to_string()))?;
 
     let pds_url = doc
         .pds_endpoints()
         .first()
         .ok_or_else(|| {
+            tracing::error!("No PDS endpoints in DID document for handle: {}", &handle);
             DioxusOAuthError::PdsResolutionFailed("No PDS endpoints in DID document".to_string())
         })?
         .to_string();
 
     let (_protected, auth_server) = pds_resources(&http_client, &pds_url)
         .await
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to discover PDS resources at: {}", &pds_url))
         .map_err(|e| DioxusOAuthError::PdsResourceDiscoveryFailed(e.to_string()))?;
 
     let base = base_url();
@@ -173,6 +188,7 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
 
     let signing_key = get_signing_key().clone();
     let dpop_key = generate_key(KeyType::P256Private)
+        .inspect_err(|e| tracing::error!(error = ?e, "Failed to generate DPoP key"))
         .map_err(|e| DioxusOAuthError::KeyInitializationFailed(e.to_string()))?;
 
     let oauth_client = OAuthClient {
@@ -197,6 +213,7 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
         &oauth_request_state,
     )
     .await
+    .inspect_err(|e| tracing::error!(error = ?e, "OAuth authorization initiation failed for handle: {}", &handle))
     .map_err(|e| DioxusOAuthError::OAuthInitFailed(e.to_string()))?;
 
     let oauth_request = OAuthRequest {
@@ -245,7 +262,10 @@ pub async fn complete_oauth(code: String, state: String) -> Result<SessionData, 
         let mut states = OAUTH_STATES.lock().await;
         states
             .remove(&state)
-            .ok_or(DioxusOAuthError::InvalidOAuthState)?
+            .ok_or_else(|| {
+                tracing::error!("Invalid or expired OAuth state during callback");
+                DioxusOAuthError::InvalidOAuthState
+            })?
     };
 
     let http_client = reqwest::Client::new();
@@ -265,11 +285,16 @@ pub async fn complete_oauth(code: String, state: String) -> Result<SessionData, 
         &stored.auth_server,
     )
     .await
+    .inspect_err(|e| tracing::error!(error = ?e, "Token exchange failed"))
     .map_err(|e| DioxusOAuthError::TokenExchangeFailed(e.to_string()))?;
 
     let did = token_response
         .sub
-        .ok_or(DioxusOAuthError::MissingSubField)?;
+        .clone()
+        .ok_or_else(|| {
+            tracing::error!("Token response missing 'sub' (DID) field");
+            DioxusOAuthError::MissingSubField
+        })?;
 
     ACTIVE_SESSIONS.lock().await.insert(
         did.clone(),
@@ -286,6 +311,6 @@ pub async fn complete_oauth(code: String, state: String) -> Result<SessionData, 
         did,
         handle: stored.handle,
         pds_endpoint: stored.pds_url,
-        access_token: token_response.access_token,
+        access_token: token_response.access_token.clone(),
     })
 }

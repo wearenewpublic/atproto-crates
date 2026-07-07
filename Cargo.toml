@@ -46,6 +46,7 @@ atproto-lexicon = { version = "0.15.0-alpha.2", path = "crates/atproto-lexicon" 
 atproto-oauth = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth" }
 atproto-oauth-aip = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth-aip" }
 atproto-oauth-axum = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth-axum" }
+atproto-oauth-dioxus = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth-dioxus" }
 atproto-pds = { version = "0.15.0-alpha.2", path = "crates/atproto-pds" }
 atproto-record = { version = "0.15.0-alpha.2", path = "crates/atproto-record" }
 atproto-repo = { version = "0.15.0-alpha.2", path = "crates/atproto-repo" }
