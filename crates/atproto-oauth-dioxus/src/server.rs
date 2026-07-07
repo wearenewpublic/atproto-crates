@@ -134,7 +134,7 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
     let identity_resolver = InnerIdentityResolver {
         dns_resolver: Arc::new(dns_resolver),
         http_client: http_client.clone(),
-        plc_hostname: "https://plc.directory".to_string(),
+        plc_hostname: "plc.directory".to_string(),
     };
 
     let doc = identity_resolver
