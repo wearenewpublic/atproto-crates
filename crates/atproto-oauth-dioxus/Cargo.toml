@@ -1,0 +1,57 @@
+[package]
+name = "atproto-oauth-dioxus"
+version = "0.15.0-alpha.2"
+description = "Dioxus fullstack integration for AT Protocol OAuth authentication workflows"
+readme = "README.md"
+homepage = "https://tangled.org/ngerakines.me/atproto-crates"
+documentation = "https://docs.rs/atproto-oauth-dioxus"
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+dioxus = { version = "0.7.1", features = ["router", "fullstack"] }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+url = "2.5"
+web-sys = { version = "0.3", features = ["Window", "Location", "Storage"] }
+
+atproto-identity = { workspace = true, optional = true }
+atproto-oauth = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+p256 = { workspace = true, features = ["jwk", "serde"], optional = true }
+rand = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
+form_urlencoded = { version = "1.2", optional = true }
+
+[features]
+default = []
+server = [
+    "dioxus/server",
+    "dep:atproto-identity",
+    "dep:atproto-oauth",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:chrono",
+    "dep:p256",
+    "dep:rand",
+    "dep:hex",
+    "dep:form_urlencoded",
+]
+hickory-dns = [
+    "atproto-identity?/hickory-dns",
+    "atproto-oauth?/hickory-dns",
+]
+
+[lints]
+workspace = true

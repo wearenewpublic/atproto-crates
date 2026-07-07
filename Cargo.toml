@@ -9,6 +9,7 @@ members = [
     "crates/atproto-oauth-aip",
     "crates/atproto-oauth-axum",
     "crates/atproto-oauth",
+    "crates/atproto-oauth-dioxus",
     "crates/atproto-pds",
     "crates/atproto-record",
     "crates/atproto-repo",
