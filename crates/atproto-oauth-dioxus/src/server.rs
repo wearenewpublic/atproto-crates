@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use atproto_identity::key::{KeyData, KeyType, generate_key, to_public};
-use atproto_identity::resolve::{HickoryDnsResolver, resolve_subject};
+use atproto_identity::resolve::{HickoryDnsResolver, InnerIdentityResolver};
 use atproto_oauth::resources::{AuthorizationServer, pds_resources};
 use atproto_oauth::workflow::{
     OAuthClient, OAuthRequest, OAuthRequestState, oauth_complete, oauth_init,
@@ -129,13 +129,26 @@ pub fn base_url() -> String {
 /// should be redirected to for authentication.
 pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
     let http_client = reqwest::Client::new();
-    let dns_resolver = HickoryDnsResolver::create_resolver(&[]);
 
-    let did = resolve_subject(&http_client, &dns_resolver, &handle)
+    let dns_resolver = HickoryDnsResolver::create_resolver(&[]);
+    let identity_resolver = InnerIdentityResolver {
+        dns_resolver: Arc::new(dns_resolver),
+        http_client: http_client.clone(),
+        plc_hostname: "https://plc.directory".to_string(),
+    };
+
+    let doc = identity_resolver
+        .resolve(&handle)
         .await
         .map_err(|e| DioxusOAuthError::HandleResolutionFailed(e.to_string()))?;
 
-    let pds_url = resolve_did_to_pds(&did).await?;
+    let pds_url = doc
+        .pds_endpoints()
+        .first()
+        .ok_or_else(|| {
+            DioxusOAuthError::PdsResolutionFailed("No PDS endpoints in DID document".to_string())
+        })?
+        .to_string();
 
     let (_protected, auth_server) = pds_resources(&http_client, &pds_url)
         .await
@@ -275,39 +288,4 @@ pub async fn complete_oauth(code: String, state: String) -> Result<SessionData, 
         pds_endpoint: stored.pds_url,
         access_token: token_response.access_token,
     })
-}
-
-async fn resolve_did_to_pds(did: &str) -> Result<String, DioxusOAuthError> {
-    let http_client = reqwest::Client::new();
-    let did_doc_url = format!("https://plc.directory/{}", did);
-    let resp = http_client
-        .get(&did_doc_url)
-        .send()
-        .await
-        .map_err(|e| DioxusOAuthError::PdsResolutionFailed(e.to_string()))?;
-
-    let doc: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| DioxusOAuthError::PdsResolutionFailed(e.to_string()))?;
-
-    for svc in doc["service"]
-        .as_array()
-        .ok_or(DioxusOAuthError::PdsResolutionFailed(
-            "No services in DID document".to_string(),
-        ))?
-    {
-        if svc["id"].as_str() == Some("#atproto_pds") {
-            return svc["serviceEndpoint"]
-                .as_str()
-                .map(|s| s.to_string())
-                .ok_or(DioxusOAuthError::PdsResolutionFailed(
-                    "No serviceEndpoint for atproto_pds".to_string(),
-                ));
-        }
-    }
-
-    Err(DioxusOAuthError::PdsResolutionFailed(
-        "No atproto_pds service found".to_string(),
-    ))
 }
