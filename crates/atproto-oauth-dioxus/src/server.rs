@@ -3,7 +3,6 @@ use std::sync::{Arc, LazyLock};
 
 use atproto_identity::key::{KeyData, KeyType, generate_key, to_public};
 use atproto_identity::resolve::{HickoryDnsResolver, InnerIdentityResolver};
-use atproto_identity::url::build_url;
 use atproto_oauth::resources::{AuthorizationServer, pds_resources};
 use atproto_oauth::workflow::{
     OAuthClient, OAuthRequest, OAuthRequestState, oauth_complete, oauth_init,
@@ -251,17 +250,14 @@ pub async fn init_oauth(handle: String) -> Result<String, DioxusOAuthError> {
         },
     );
 
-    let authorization_url = build_url(
-        &auth_server.authorization_endpoint,
-        "",
-        [
-            ("client_id", &client_id),
-            ("request_uri", &par_response.request_uri),
-            ("state", &state),
-        ],
-    )
-    .map_err(|e| DioxusOAuthError::ConfigurationError(e.to_string()))?
-    .to_string();
+    let mut authorization_url = url::Url::parse(&auth_server.authorization_endpoint)
+        .map_err(|e| DioxusOAuthError::ConfigurationError(e.to_string()))?;
+    authorization_url
+        .query_pairs_mut()
+        .append_pair("client_id", &client_id)
+        .append_pair("request_uri", &par_response.request_uri)
+        .append_pair("state", &state);
+    let authorization_url = authorization_url.to_string();
 
     Ok(authorization_url)
 }
