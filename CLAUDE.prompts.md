@@ -24,11 +24,11 @@ In the `atproto-record` crate, update project documentation and README files to 
 
 Write high level module documentation in the `path/to/file.rs` source file. Documentation should brief and specific. Think very hard about how to do this.
 
-Write high level crate documentation in the `crates/atproto-oauth-axum/src/lib.rs` source file. Documentation should brief and specific. Think very hard about how to do this.
+Write high level crate documentation in the `crates/atproto-oauth-axum/src/lib.rs` and `crates/atproto-oauth-dioxus/src/lib.rs` source files. Documentation should brief and specific. Think very hard about how to do this.
 
 Update the high level module documentation in each of the source files in the `atproto-xrpcs` crates. Documentation should brief and specific. Think very hard about how to do this.
 
-Update the `README.md` files in the `atproto-identity`, `atproto-record`, `atproto-oauth`, `atproto-oauth-axum`, and `atproto-client` crates. Each `README.md` file should include a high level overview of what the crate provides and include a summary of each binary produced by the crate. Think very hard.
+Update the `README.md` files in the `atproto-identity`, `atproto-record`, `atproto-oauth`, `atproto-oauth-axum`, `atproto-oauth-dioxus`, and `atproto-client` crates. Each `README.md` file should include a high level overview of what the crate provides and include a summary of each binary produced by the crate. Think very hard.
 
 Write a project `README.md` file that describes the project as a library that supports ATProtocol identity record signing and verifying. Note that parts of this was extracted from the open sourced https://tangled.sh/@smokesignal.events/smokesignal project. This project is open source under the MIT license.
 

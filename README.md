@@ -6,7 +6,7 @@ A Rust workspace of crates for building AT Protocol applications. This collectio
 
 ## Components
 
-This workspace contains 17 crates that work together to provide complete AT Protocol application development capabilities:
+This workspace contains 18 crates that work together to provide complete AT Protocol application development capabilities:
 
 ### Data Foundations
 
@@ -28,6 +28,7 @@ This workspace contains 17 crates that work together to provide complete AT Prot
 - **[`atproto-oauth`](crates/atproto-oauth/)** - Complete OAuth 2.0 implementation with AT Protocol security extensions including DPoP (RFC 9449), PKCE (RFC 7636), JWT operations, and secure storage abstractions. *Includes 1 CLI tool.*
 - **[`atproto-oauth-aip`](crates/atproto-oauth-aip/)** - OAuth AIP (Identity Provider) implementation providing complete authorization code flow with PAR, token exchange, and AT Protocol session management.
 - **[`atproto-oauth-axum`](crates/atproto-oauth-axum/)** - Production-ready Axum web handlers for OAuth endpoints including authorization callbacks, JWKS endpoints, and client metadata. *Includes 1 CLI tool.*
+- **[`atproto-oauth-dioxus`](crates/atproto-oauth-dioxus/)** - Dioxus fullstack integration for AT Protocol OAuth authentication flow components, hooks, and server functions.
 
 ### Client & Service Development
 

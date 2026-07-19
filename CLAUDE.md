@@ -75,6 +75,7 @@ A comprehensive Rust workspace with multiple crates:
 - **atproto-oauth**: OAuth workflow implementation with DPoP, PKCE, JWT, and storage abstractions
 - **atproto-oauth-aip**: AT Protocol OAuth AIP (Identity Provider) implementation with PAR support
 - **atproto-oauth-axum**: Axum web framework integration for OAuth
+- **atproto-oauth-dioxus**: Dioxus fullstack integration for OAuth
 - **atproto-xrpcs**: XRPC service framework
 - **atproto-xrpcs-helloworld**: Complete example XRPC service
 
