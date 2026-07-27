@@ -243,8 +243,9 @@ pub trait OAuthRequestStorage: Send + Sync {
     /// let storage = MyOAuthStorage::new();
     /// let request = OAuthRequest {
     ///     oauth_state: "unique-random-state".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
-    ///     did: "did:plc:example123".to_string(),
+    ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "random-nonce".to_string(),
     ///     pkce_verifier: "code-verifier".to_string(),
     ///     signing_public_key: "public-key-data".to_string(),

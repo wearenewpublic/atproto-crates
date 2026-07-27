@@ -1,0 +1,101 @@
+:root {
+  --bg: #fafaf8;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #2f7d4f;
+  --border: #e2e2dc;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.nav .brand { font-weight: 700; text-decoration: none; color: var(--accent); }
+.nav nav a { margin-right: 1rem; text-decoration: none; color: var(--fg); }
+.nav-spacer { flex: 1; }
+.nav-identity { font-size: 0.85rem; color: var(--muted); }
+.link-button {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+}
+
+main { max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem; }
+
+h1 { font-size: 1.75rem; }
+.muted { color: var(--muted); }
+
+form { display: flex; flex-direction: column; gap: 0.5rem; max-width: 420px; }
+label { font-weight: 600; font-size: 0.9rem; }
+input, textarea {
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+}
+button {
+  align-self: flex-start;
+  padding: 0.5rem 1rem;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+article { padding: 1rem 0; border-bottom: 1px solid var(--border); }
+article h3 { margin: 0 0 0.25rem; }
+.byline { font-size: 0.8rem; margin: 0.25rem 0 0; }
+.byline code { word-break: break-all; }
+
+.button {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  text-decoration: none;
+}
+.button-secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+.actions { display: flex; gap: 0.75rem; }
+
+.compose-form { margin-bottom: 2rem; }
+.compose-status { min-height: 1.25rem; font-size: 0.9rem; }
+.compose-status.ok { color: var(--accent); }
+.compose-status.err { color: #b00020; }
+
+.feed-status { font-size: 0.8rem; }
+
+table.writers {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+}
+table.writers th,
+table.writers td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+table.writers code { word-break: break-all; }
+
+footer { padding: 2rem 1.5rem; color: var(--muted); }

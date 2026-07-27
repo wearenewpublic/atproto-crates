@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ title | default("Walking Club") }}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css?v={{ build_rev }}">
+</head>
+<body>
+  <header class="nav">
+    <a href="/" class="brand">Walking Club</a>
+    <nav>
+      <a href="/feed">Feed</a>
+      <a href="/compose">Compose</a>
+    </nav>
+    <span class="nav-spacer"></span>
+    <span class="nav-identity" id="nav-identity"></span>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <footer>
+    <small>build {{ build_rev }}</small>
+  </footer>
+  <script>
+    // Populate the navbar from the JS-readable `identity` cookie, and offer a
+    // logout control when signed in. No build step — plain inline vanilla JS.
+    (function () {
+      function cookie(name) {
+        return document.cookie.split(';').map(function (c) { return c.trim(); })
+          .filter(function (c) { return c.indexOf(name + '=') === 0; })
+          .map(function (c) { return c.slice(name.length + 1); })[0];
+      }
+      var el = document.getElementById('nav-identity');
+      if (!el) return;
+      var raw = cookie('identity');
+      if (!raw) return;
+      try {
+        var json = JSON.parse(atob(raw.replace(/-/g, '+').replace(/_/g, '/')));
+        var label = json.handle || json.did || 'signed in';
+        el.textContent = label + ' ';
+        var form = document.createElement('form');
+        form.method = 'post';
+        form.action = '/auth/logout';
+        form.style.display = 'inline';
+        var btn = document.createElement('button');
+        btn.type = 'submit';
+        btn.className = 'link-button';
+        btn.textContent = 'Sign out';
+        form.appendChild(btn);
+        el.appendChild(form);
+      } catch (e) { /* ignore malformed cookie */ }
+    })();
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -210,6 +210,41 @@ pub enum DecodeError {
         /// Maximum allowed size
         max: usize,
     },
+
+    /// Declared collection length cannot fit in the bytes that remain.
+    #[error(
+        "error-atproto-dasl-decode-26 Collection length exceeds input: {count} items need at least {needed} bytes, {remaining} remain"
+    )]
+    CollectionLengthExceedsInput {
+        /// Declared element or entry count from the wire.
+        count: usize,
+        /// Minimum bytes required to encode that many items.
+        needed: u64,
+        /// Bytes left in the input.
+        remaining: u64,
+    },
+
+    /// Declared byte- or text-string length exceeds the bytes that remain.
+    #[error(
+        "error-atproto-dasl-decode-27 String length exceeds input: {length} bytes declared, {remaining} remain"
+    )]
+    StringLengthExceedsInput {
+        /// Declared string length from the wire.
+        length: u64,
+        /// Bytes left in the input.
+        remaining: u64,
+    },
+
+    /// A buffer reservation failed (out of memory or capacity overflow).
+    #[error(
+        "error-atproto-dasl-decode-28 Allocation failed: {requested} bytes requested: {reason}"
+    )]
+    AllocationFailed {
+        /// Bytes that could not be reserved.
+        requested: usize,
+        /// Allocator failure description.
+        reason: String,
+    },
 }
 
 impl serde::de::Error for DecodeError {
@@ -306,6 +341,24 @@ pub enum CarError {
     /// Storage operation failed.
     #[error("error-atproto-dasl-car-12 Storage error: {0}")]
     Storage(#[from] StorageError),
+
+    /// Block frame or block data exceeds the configured block size limit.
+    #[error("error-atproto-dasl-car-13 Block too large: {size} bytes (max {max})")]
+    BlockTooLarge {
+        /// Declared or actual size in bytes.
+        size: u64,
+        /// Maximum allowed size in bytes.
+        max: u64,
+    },
+
+    /// Memory allocation for a block failed.
+    #[error("error-atproto-dasl-car-14 Allocation failed for {requested} bytes: {reason}")]
+    AllocationFailed {
+        /// Bytes the allocation attempted to reserve.
+        requested: usize,
+        /// Allocator failure description.
+        reason: String,
+    },
 }
 
 impl From<DecodeError> for CarError {

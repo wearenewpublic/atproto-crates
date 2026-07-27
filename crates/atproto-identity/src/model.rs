@@ -225,7 +225,19 @@ impl Document {
     }
 
     /// Extracts Personal Data Server endpoints from services.
-    /// Returns URLs of all AtprotoPersonalDataServer services.
+    ///
+    /// Returns URLs of all AtprotoPersonalDataServer services, verbatim.
+    ///
+    /// # Security
+    ///
+    /// **The returned strings are untrusted, attacker-controlled input.** A DID
+    /// document is fetched from a host the DID subject controls, so
+    /// `serviceEndpoint` is whatever that host chose to publish — including
+    /// `http://169.254.169.254`, `https://localhost:6379`, or a URL with embedded
+    /// credentials. Feeding these directly to an HTTP client is a server-side
+    /// request forgery sink. Use [`Document::pds_endpoints_validated`] unless you
+    /// have your own policy layer, and never treat the value as safe because it
+    /// came from a resolved DID document.
     pub fn pds_endpoints(&self) -> Vec<&str> {
         self.service
             .iter()
@@ -237,6 +249,48 @@ impl Document {
                 }
             })
             .collect()
+    }
+
+    /// Like [`Document::pds_endpoints`] but returns only endpoints that pass
+    /// [`crate::validation::validate_service_endpoint`].
+    ///
+    /// Endpoints that fail the policy are dropped and logged at `warn`. An empty
+    /// result means either no PDS service or no acceptable one — call
+    /// [`Document::pds_endpoints`] and validate individually if you need the reason.
+    ///
+    /// The policy requires `https`, a public DNS hostname that is not an address
+    /// literal, no embedded credentials, no non-default port, and no query or
+    /// fragment. It rejects `http://localhost:3000`-style development endpoints.
+    pub fn pds_endpoints_validated(&self) -> Vec<&str> {
+        self.pds_endpoints()
+            .into_iter()
+            .filter(|endpoint| self.accept_endpoint(endpoint))
+            .collect()
+    }
+
+    /// Like [`Document::service_endpoint`] but returns `None` when the endpoint
+    /// fails [`crate::validation::validate_service_endpoint`].
+    ///
+    /// See [`Document::pds_endpoints_validated`] for the policy applied.
+    pub fn service_endpoint_validated(&self, fragment: &str) -> Option<&str> {
+        self.service_endpoint(fragment)
+            .filter(|endpoint| self.accept_endpoint(endpoint))
+    }
+
+    /// Applies the service-endpoint policy, logging and rejecting on failure.
+    fn accept_endpoint(&self, endpoint: &str) -> bool {
+        match crate::validation::validate_service_endpoint(endpoint) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    document_id = %self.id,
+                    endpoint = %endpoint,
+                    error = %err,
+                    "rejected untrusted service endpoint"
+                );
+                false
+            }
+        }
     }
 
     /// Gets the primary handle from alsoKnownAs aliases.
@@ -275,6 +329,17 @@ impl Document {
     ///
     /// Service ids are rendered as either the absolute `did:plc:xxx#fragment`
     /// or the relative `#fragment`; both forms match.
+    ///
+    /// # Security
+    ///
+    /// **The returned string is untrusted, attacker-controlled input.** A DID
+    /// document is fetched from a host the DID subject controls, so
+    /// `serviceEndpoint` is whatever that host chose to publish — including
+    /// `http://169.254.169.254`, `https://localhost:6379`, or a URL with embedded
+    /// credentials. Feeding it directly to an HTTP client is a server-side request
+    /// forgery sink. Use [`Document::service_endpoint_validated`] unless you have
+    /// your own policy layer, and never treat the value as safe because it came
+    /// from a resolved DID document.
     pub fn service_endpoint(&self, fragment: &str) -> Option<&str> {
         let suffix = format!("#{fragment}");
         self.service
@@ -432,6 +497,52 @@ mod tests {
             Some("https://host.example.com")
         );
         assert_eq!(document.service_endpoint("missing"), None);
+    }
+
+    #[test]
+    fn test_pds_endpoints_validated_filters_untrusted() {
+        let document = serde_json::from_str::<Document>(
+            r##"{
+              "id":"did:web:attacker.example",
+              "service":[
+                {"id":"#a","type":"AtprotoPersonalDataServer","serviceEndpoint":"http://169.254.169.254"},
+                {"id":"#b","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://2852039166"},
+                {"id":"#c","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://user:pw@evil.example.com"},
+                {"id":"#d","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}
+              ]
+            }"##,
+        )
+        .expect("document parses");
+
+        // Unchanged semantics: the permissive accessor still returns everything.
+        assert_eq!(document.pds_endpoints().len(), 4);
+
+        assert_eq!(
+            document.pds_endpoints_validated(),
+            vec!["https://pds.example.com"]
+        );
+    }
+
+    #[test]
+    fn test_service_endpoint_validated_rejects_metadata_host() {
+        let document = serde_json::from_str::<Document>(
+            r##"{
+              "id":"did:web:attacker.example",
+              "service":[
+                {"id":"did:web:attacker.example#atproto_space_host","type":"AtprotoPersonalDataServer","serviceEndpoint":"http://169.254.169.254"}
+              ]
+            }"##,
+        )
+        .expect("document parses");
+
+        assert_eq!(
+            document.service_endpoint("atproto_space_host"),
+            Some("http://169.254.169.254")
+        );
+        assert_eq!(
+            document.service_endpoint_validated("atproto_space_host"),
+            None
+        );
     }
 
     #[test]

@@ -11,8 +11,12 @@
 //!
 //! ## Network Address Validation
 //! - [`is_valid_hostname`] - RFC 1035 compliant hostname validation
+//! - [`is_ip_literal`] - Detects every numeric address form a resolver accepts
 //! - [`is_ipv4`] - IPv4 address validation
 //! - [`is_ipv6`] - IPv6 address validation
+//!
+//! ## Endpoint Validation
+//! - [`validate_service_endpoint`] - Strict, SSRF-resistant service endpoint URL policy
 //!
 //! ## Utility Functions
 //! - [`is_valid_base58_btc`] - Base58-btc alphabet character validation
@@ -36,6 +40,8 @@
 //! assert!(is_ipv6("2001:db8::1"));
 //! ```
 
+use crate::errors::EndpointError;
+
 /// Maximum length for a valid hostname as defined in RFC 1035
 const MAX_HOSTNAME_LENGTH: usize = 253;
 
@@ -45,12 +51,97 @@ const MAX_LABEL_LENGTH: usize = 63;
 /// List of reserved top-level domains that are not valid for AT Protocol handles
 const RESERVED_TLDS: [&str; 4] = [".localhost", ".internal", ".arpa", ".local"];
 
+/// Returns `true` when the label is non-empty and composed entirely of ASCII digits.
+fn is_all_digits(label: &str) -> bool {
+    !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Returns `true` when the label is a `0x`/`0X`-prefixed hexadecimal integer literal.
+///
+/// A bare `0x` with no digits counts: `inet_aton` and the `url` crate both parse it as
+/// zero, so requiring a non-empty body would let `0x7f.0x.0x.0x1` through as a DNS name
+/// even though it resolves to `127.0.0.1`.
+fn is_hex_literal(label: &str) -> bool {
+    let rest = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"));
+    matches!(rest, Some(rest) if rest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Returns `true` when the `url` crate normalizes `hostname` into a network address.
+///
+/// The rules in [`is_ip_literal`] enumerate the address forms explicitly. This defers to
+/// the parser `reqwest` actually uses, so a host that normalizes into an address is
+/// caught even when its form is not enumerated above.
+///
+/// A host the parser rejects outright is not an address, and `reqwest` cannot issue a
+/// request for it either, so the verdict is left to the syntactic rules. Treating a parse
+/// failure as an address would newly reject malformed-but-harmless punycode such as
+/// `xn--example.com`.
+fn url_parses_as_address(hostname: &str) -> bool {
+    match url::Url::parse(&format!("https://{hostname}/")) {
+        Ok(parsed) => !matches!(parsed.host(), Some(url::Host::Domain(_))),
+        Err(_) => false,
+    }
+}
+
+/// Checks whether a host string denotes a numeric network address rather than a DNS name.
+///
+/// Covers dotted-quad IPv4, IPv6 (bracketed or bare), and the `inet_aton` integer
+/// forms that C resolvers, browsers, and most HTTP clients normalize back into an
+/// address: 32-bit decimal (`2852039166`), hexadecimal (`0xA9FEA9FE`), octal
+/// (`0250.0376.0250.0376`), and the short forms (`1.2.3`, `169.254.43518`).
+///
+/// # Arguments
+///
+/// * `host` - The host string to classify
+///
+/// # Returns
+///
+/// `true` if the host is a network address literal in any recognized form
+///
+/// # Examples
+///
+/// ```
+/// use atproto_identity::validation::is_ip_literal;
+///
+/// assert!(is_ip_literal("169.254.169.254"));
+/// assert!(is_ip_literal("2852039166")); // decimal form of 169.254.169.254
+/// assert!(is_ip_literal("0xA9FEA9FE")); // hexadecimal form
+/// assert!(is_ip_literal("[::1]"));
+///
+/// assert!(!is_ip_literal("example.com"));
+/// assert!(!is_ip_literal("123.example.com"));
+/// ```
+pub fn is_ip_literal(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+
+    if is_ipv4(host) || is_ipv6(host) {
+        return true;
+    }
+
+    // Every label being an integer literal (decimal, octal, or hexadecimal)
+    // means a resolver will treat the whole string as an address.
+    host.split('.')
+        .all(|label| is_all_digits(label) || is_hex_literal(label))
+}
+
 /// Validates if a string is a valid hostname according to RFC 1035.
+///
+/// Validation is case-insensitive: the name is ASCII-lowercased before any rule runs,
+/// because DNS and HTTP host matching are case-insensitive and an uppercased suffix
+/// would otherwise slip past the reserved-TLD and address-literal rules.
 ///
 /// A valid hostname must:
 /// - Be between 1 and 253 characters in length
-/// - Not use reserved top-level domains (.localhost, .internal, .arpa, .local)
-/// - Not be an IPv4 or IPv6 address
+/// - Not use reserved top-level domains (.localhost, .internal, .arpa, .local),
+///   in any letter case
+/// - Not be a network address literal in any form accepted by resolvers — dotted-quad
+///   IPv4, IPv6, or the `inet_aton` decimal/octal/hexadecimal integer forms (see
+///   [`is_ip_literal`])
+/// - Not have an entirely numeric rightmost label (RFC 1123 section 2.1)
 /// - Contain only valid hostname characters (letters, digits, hyphens, dots)
 /// - Have valid DNS labels (no leading/trailing hyphens, max 63 chars per label)
 ///
@@ -72,10 +163,15 @@ const RESERVED_TLDS: [&str; 4] = [".localhost", ".internal", ".arpa", ".local"];
 /// assert!(is_valid_hostname("sub.example.com"));
 /// assert!(is_valid_hostname("test-host.example.com"));
 /// assert!(is_valid_hostname("localhost"));
+/// assert!(is_valid_hostname("123.example.com"));
 ///
 /// // Invalid hostnames
 /// assert!(!is_valid_hostname("192.168.1.1")); // IPv4 address
+/// assert!(!is_valid_hostname("2852039166")); // Integer form of 169.254.169.254
+/// assert!(!is_valid_hostname("0xA9FEA9FE")); // Hexadecimal form of 169.254.169.254
 /// assert!(!is_valid_hostname("example.localhost")); // Reserved TLD
+/// assert!(!is_valid_hostname("example.LOCALHOST")); // Reserved TLD, uppercased
+/// assert!(!is_valid_hostname("metadata.google.INTERNAL")); // Reserved TLD, uppercased
 /// assert!(!is_valid_hostname("example..com")); // Double dot
 /// assert!(!is_valid_hostname("-example.com")); // Leading hyphen
 /// ```
@@ -85,18 +181,20 @@ pub fn is_valid_hostname(hostname: &str) -> bool {
         return false;
     }
 
+    // DNS lookups and HTTP host matching are case-insensitive, so every rule below has
+    // to run against a case-normalized name. Comparing the raw input would let
+    // `metadata.google.INTERNAL` through while blocking `metadata.google.internal`,
+    // even though both reach the identical target.
+    let normalized = hostname.to_ascii_lowercase();
+    let hostname = normalized.as_str();
+
     // Check if hostname uses any reserved TLDs
     if RESERVED_TLDS.iter().any(|tld| hostname.ends_with(tld)) {
         return false;
     }
 
-    // Reject IPv4 addresses
-    if is_ipv4(hostname) {
-        return false;
-    }
-
-    // Reject IPv6 addresses
-    if is_ipv6(hostname) {
+    // Reject IPv4, IPv6, and the inet_aton integer/octal/hexadecimal address forms
+    if is_ip_literal(hostname) {
         return false;
     }
 
@@ -107,6 +205,21 @@ pub fn is_valid_hostname(hostname: &str) -> bool {
 
     // Validate each DNS label in the hostname
     if hostname.split('.').any(|label| !is_valid_dns_label(label)) {
+        return false;
+    }
+
+    // RFC 1123 section 2.1: the rightmost label must not be entirely numeric,
+    // otherwise the name is ambiguous with an address literal.
+    if hostname.rsplit('.').next().is_some_and(is_all_digits) {
+        return false;
+    }
+
+    // Authoritative backstop. Everything above is a hand-rolled model of what a resolver
+    // does; this asks the parser that `reqwest` will actually use. Without it, any
+    // address form the model fails to anticipate becomes an SSRF vector, because a
+    // hostname that passes here is interpolated straight into a request URL by
+    // `resolve_handle_http`.
+    if url_parses_as_address(hostname) {
         return false;
     }
 
@@ -243,13 +356,18 @@ pub fn is_ipv6(s: &str) -> bool {
 ///
 /// The function automatically strips common prefixes (`at://` and `@`) before validation.
 ///
+/// The returned handle is ASCII-lowercased. AT Protocol handles are case-insensitive
+/// and canonically lowercase, and normalizing here means callers that interpolate the
+/// result into a DNS query name or an HTTPS URL cannot be handed a case variant that
+/// slipped past a case-sensitive rule.
+///
 /// # Arguments
 ///
 /// * `handle` - The handle string to validate and normalize
 ///
 /// # Returns
 ///
-/// `Some(String)` containing the normalized handle if valid, `None` if invalid
+/// `Some(String)` containing the lowercased handle if valid, `None` if invalid
 ///
 /// # Examples
 ///
@@ -261,10 +379,14 @@ pub fn is_ipv6(s: &str) -> bool {
 /// assert_eq!(is_valid_handle("@bob.example.com"), Some("bob.example.com".to_string()));
 /// assert_eq!(is_valid_handle("at://charlie.test.com"), Some("charlie.test.com".to_string()));
 ///
+/// // Normalized to lowercase
+/// assert_eq!(is_valid_handle("Alice.BSKY.social"), Some("alice.bsky.social".to_string()));
+///
 /// // Invalid handles
 /// assert_eq!(is_valid_handle("localhost"), None); // No period
 /// assert_eq!(is_valid_handle("192.168.1.1"), None); // IPv4 address
 /// assert_eq!(is_valid_handle("invalid..handle.com"), None); // Double dot
+/// assert_eq!(is_valid_handle("metadata.google.INTERNAL"), None); // Reserved TLD, uppercased
 /// ```
 pub fn is_valid_handle(handle: &str) -> Option<String> {
     // Strip optional prefixes to get the core handle
@@ -272,7 +394,7 @@ pub fn is_valid_handle(handle: &str) -> Option<String> {
 
     // A valid handle must be a valid hostname with at least one period
     if is_valid_hostname(trimmed) && trimmed.contains('.') {
-        Some(trimmed.to_string())
+        Some(trimmed.to_ascii_lowercase())
     } else {
         None
     }
@@ -567,6 +689,107 @@ pub fn is_valid_did_method_webvh(did: &str, strict: bool) -> bool {
 pub fn is_valid_base58_btc(s: &str) -> bool {
     const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     !s.is_empty() && s.chars().all(|c| BASE58_ALPHABET.contains(c))
+}
+
+/// Validates an AT Protocol service endpoint URL against a strict, SSRF-resistant
+/// syntactic policy.
+///
+/// Service endpoints come out of DID documents, which are published by the DID
+/// subject. They are attacker-controlled input whenever the subject is not you.
+/// This function is the syntactic gate to apply before handing such a URL to an
+/// HTTP client.
+///
+/// Accepts only:
+/// - the `https` scheme,
+/// - a host that parses as a DNS domain and is never an IPv4/IPv6/integer address
+///   literal (see [`is_ip_literal`]),
+/// - a hostname that passes [`is_valid_hostname`], which also excludes the reserved
+///   `.localhost`, `.internal`, `.arpa` and `.local` suffixes,
+/// - no embedded userinfo (`https://user:pw@host`),
+/// - no explicit port other than 443,
+/// - no query string and no fragment.
+///
+/// A path is permitted.
+///
+/// # Security
+///
+/// No DNS resolution is performed, so this does **not** defend against DNS
+/// rebinding, nor against a public name whose A record points at a private
+/// address. It is a syntactic layer of defense, not a complete SSRF control.
+///
+/// # Arguments
+///
+/// * `endpoint` - The service endpoint URL to validate
+///
+/// # Returns
+///
+/// `Ok(())` when the endpoint satisfies the policy, otherwise the [`EndpointError`]
+/// describing the first rule violated.
+///
+/// # Examples
+///
+/// ```
+/// use atproto_identity::validation::validate_service_endpoint;
+///
+/// assert!(validate_service_endpoint("https://pds.example.com").is_ok());
+/// assert!(validate_service_endpoint("https://pds.example.com:443/xrpc").is_ok());
+///
+/// assert!(validate_service_endpoint("http://169.254.169.254").is_err());
+/// assert!(validate_service_endpoint("https://2852039166").is_err());
+/// assert!(validate_service_endpoint("https://user:pw@evil.example.com").is_err());
+/// ```
+pub fn validate_service_endpoint(endpoint: &str) -> Result<(), EndpointError> {
+    let parsed = url::Url::parse(endpoint).map_err(|error| EndpointError::NotAbsoluteUrl {
+        endpoint: endpoint.to_string(),
+        details: error.to_string(),
+    })?;
+
+    if parsed.scheme() != "https" {
+        return Err(EndpointError::InvalidScheme {
+            scheme: parsed.scheme().to_string(),
+        });
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(EndpointError::EmbeddedCredentials {
+            endpoint: endpoint.to_string(),
+        });
+    }
+
+    let host = parsed.host().ok_or_else(|| EndpointError::MissingHost {
+        endpoint: endpoint.to_string(),
+    })?;
+
+    let domain = match host {
+        url::Host::Domain(domain) => domain.to_string(),
+        other => {
+            return Err(EndpointError::IpLiteralHost {
+                host: other.to_string(),
+            });
+        }
+    };
+
+    if is_ip_literal(&domain) {
+        return Err(EndpointError::IpLiteralHost { host: domain });
+    }
+
+    if !is_valid_hostname(&domain) {
+        return Err(EndpointError::InvalidHostname { host: domain });
+    }
+
+    if let Some(port) = parsed.port()
+        && port != 443
+    {
+        return Err(EndpointError::NonDefaultPort { port });
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(EndpointError::QueryOrFragment {
+            endpoint: endpoint.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1008,6 +1231,296 @@ mod tests {
             "did:webvh:HJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz:example.com",
             true
         )); // no excluded letters
+    }
+
+    #[test]
+    fn test_is_valid_hostname_rejects_integer_address_forms() {
+        // 2852039166 == 0xA9FEA9FE == 169.254.169.254, the cloud metadata endpoint.
+        for host in [
+            "2852039166",
+            "0xA9FEA9FE",
+            "0xa9fea9fe",
+            "0250.0376.0250.0376",
+            "1.2.3",
+            "169.254.43518",
+            "0x7f.1",
+            "017700000001",
+            "0xa9.0xfe.0xa9.0xfe",
+            "example.123",
+            "169.254.169.254",
+            // Case variants: DNS and HTTP host matching are case-insensitive, so an
+            // uppercased reserved suffix reaches the exact same target.
+            "metadata.google.INTERNAL",
+            "metadata.google.Internal",
+            "x.LOCALHOST",
+            "y.LOCAL",
+            "z.ARPA",
+            "EXAMPLE.LocalHost",
+            "0XA9FEA9FE",
+        ] {
+            assert!(
+                !is_valid_hostname(host),
+                "{host} must not be a valid hostname"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_valid_hostname_rejects_empty_hex_address_labels() {
+        // A bare `0x` label parses as zero, so these are address literals even though
+        // every label is not obviously numeric. `is_hex_literal` used to require a
+        // non-empty body, which let all of these through as DNS names while `url` and
+        // `reqwest` resolved them to loopback and RFC 1918 targets.
+        for (host, resolves_to) in [
+            ("0x7f.0x.0x.0x1", "127.0.0.1"),
+            ("0xa.0x.0x.0x1", "10.0.0.1"),
+            ("0xc0.0xa8.0x.0x1", "192.168.0.1"),
+            ("0x.0x.0x.0x", "0.0.0.0"),
+            ("0X7F.0X.0X.0X1", "127.0.0.1"),
+        ] {
+            assert!(
+                is_ip_literal(host),
+                "{host} is an address literal for {resolves_to}"
+            );
+            assert!(
+                !is_valid_hostname(host),
+                "{host} must not be a valid hostname; it reaches {resolves_to}"
+            );
+            assert!(
+                is_valid_handle(host).is_none(),
+                "{host} must not be a valid handle; it reaches {resolves_to}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_valid_hostname_defers_to_the_url_parser() {
+        // The backstop must agree with the parser reqwest uses: anything that parses as
+        // an address rather than a domain is rejected, and ordinary names still pass.
+        for host in [
+            "example.com",
+            "sub.example.com",
+            "localhost",
+            "3lab.example.com",
+        ] {
+            assert!(!url_parses_as_address(host), "{host} is a DNS name");
+            assert!(is_valid_hostname(host), "{host} must remain valid");
+        }
+        for host in ["0x7f.0x.0x.0x1", "127.0.0.1", "2852039166"] {
+            assert!(url_parses_as_address(host), "{host} parses as an address");
+        }
+        // A host the parser cannot handle is not an address, so the syntactic rules
+        // decide and malformed punycode keeps its previous verdict.
+        assert!(!url_parses_as_address("xn--example.com"));
+        assert!(is_valid_hostname("xn--example.com"));
+    }
+
+    #[test]
+    fn test_is_valid_hostname_reserved_tlds_are_case_insensitive() {
+        for host in [
+            "metadata.google.INTERNAL",
+            "metadata.google.Internal",
+            "metadata.google.internal",
+            "victim.LOCALHOST",
+            "printer.LOCAL",
+            "target.ARPA",
+        ] {
+            assert!(
+                !is_valid_hostname(host),
+                "{host} must be rejected regardless of letter case"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_valid_handle_rejects_uppercased_reserved_tlds() {
+        // Confirmed bypass payloads: the lowercase forms were blocked but the
+        // uppercased spellings reached _atproto.metadata.google.INTERNAL and
+        // https://metadata.google.INTERNAL/.well-known/atproto-did.
+        for handle in [
+            "metadata.google.INTERNAL",
+            "metadata.google.Internal",
+            "victim.LOCALHOST",
+            "printer.LOCAL",
+            "target.ARPA",
+            "x.LOCALHOST",
+            "y.LOCAL",
+            "z.ARPA",
+        ] {
+            assert_eq!(is_valid_handle(handle), None, "{handle} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_is_valid_handle_normalizes_case() {
+        assert_eq!(
+            is_valid_handle("Alice.BSKY.Social"),
+            Some("alice.bsky.social".to_string())
+        );
+        assert_eq!(
+            is_valid_handle("@BOB.EXAMPLE.COM"),
+            Some("bob.example.com".to_string())
+        );
+        assert_eq!(
+            is_valid_handle("at://Charlie.Test.Com"),
+            Some("charlie.test.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_valid_did_method_web_reserved_tlds_case_insensitive() {
+        for did in [
+            "did:web:metadata.google.INTERNAL",
+            "did:web:svc.LOCALHOST",
+            "did:web:printer.LOCAL",
+            "did:web:target.ARPA",
+        ] {
+            assert!(
+                !is_valid_did_method_web(did, true),
+                "{did} must be rejected"
+            );
+            assert!(
+                !is_valid_did_method_web(did, false),
+                "{did} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_valid_hostname_still_accepts_dns_names() {
+        for host in [
+            "example.com",
+            "sub.example.com",
+            "localhost",
+            "123.example.com",
+            "1.2.3.example.com",
+            "a.b.c.d.example.com",
+            "xn--example.com",
+            "test-host.example.com",
+            "pds.cauda.cloud",
+            // Case variants of ordinary names stay valid.
+            "EXAMPLE.COM",
+            "Pds.Example.Com",
+        ] {
+            assert!(
+                is_valid_hostname(host),
+                "{host} must remain a valid hostname"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_ip_literal() {
+        for host in [
+            "169.254.169.254",
+            "127.0.0.1",
+            "0.0.0.0",
+            "2001:db8::1",
+            "::1",
+            "[2001:db8::1]",
+            "[::1]",
+            "2852039166",
+            "0xA9FEA9FE",
+            "0250.0376.0250.0376",
+            "1.2.3",
+            "169.254.43518",
+            "0x7f.1",
+            "017700000001",
+        ] {
+            assert!(is_ip_literal(host), "{host} must be an address literal");
+        }
+
+        for host in [
+            "example.com",
+            "localhost",
+            "123.example.com",
+            "xn--example.com",
+            "",
+            "0xdead.com",
+        ] {
+            assert!(
+                !is_ip_literal(host),
+                "{host} must not be an address literal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_valid_handle_rejects_address_form_handles() {
+        // Confirmed handle-resolution SSRF payloads.
+        assert_eq!(is_valid_handle("169.254.43518"), None);
+        assert_eq!(is_valid_handle("1.2.3"), None);
+        assert_eq!(is_valid_handle("169.254.169.254"), None);
+        assert_eq!(is_valid_handle("0250.0376.0250.0376"), None);
+
+        assert_eq!(
+            is_valid_handle("alice.bsky.social"),
+            Some("alice.bsky.social".to_string())
+        );
+        assert_eq!(
+            is_valid_handle("@bob.example.com"),
+            Some("bob.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_service_endpoint_rejects_ssrf_payloads() {
+        for endpoint in [
+            "http://169.254.169.254",
+            "https://169.254.169.254",
+            "https://2852039166",
+            "https://0xA9FEA9FE",
+            "https://169.254.43518",
+            "https://0x7f.1",
+            "https://017700000001",
+            "https://[::1]",
+            "https://user:pw@evil.example.com",
+            "https://pds.example.com:6379",
+            "https://pds.example.com/?x=1",
+            "https://pds.example.com#frag",
+            "https://metadata.google.internal",
+            "https://exam_ple.com",
+            "file:///etc/passwd",
+            "not-a-url",
+            "/relative/path",
+        ] {
+            assert!(
+                validate_service_endpoint(endpoint).is_err(),
+                "{endpoint} must be rejected"
+            );
+        }
+
+        for endpoint in [
+            "https://pds.example.com",
+            "https://pds.example.com:443/xrpc",
+            "https://pds.cauda.cloud",
+            "https://pds.example.com/some/path",
+        ] {
+            assert!(
+                validate_service_endpoint(endpoint).is_ok(),
+                "{endpoint} must be accepted: {:?}",
+                validate_service_endpoint(endpoint).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_service_endpoint_error_message_format() {
+        let error = validate_service_endpoint("https://2852039166").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("error-atproto-identity-endpoint-4 "),
+            "unexpected message: {error}"
+        );
+
+        let error = validate_service_endpoint("http://pds.example.com").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("error-atproto-identity-endpoint-2 "),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]

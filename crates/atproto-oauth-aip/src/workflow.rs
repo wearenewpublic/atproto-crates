@@ -15,6 +15,9 @@
 //!   interception attacks
 //! - **DPoP (Demonstration of Proof-of-Possession)**: Cryptographic binding of tokens
 //!   to specific keys for enhanced security
+//! - **Subject binding**: `oauth_complete` requires the token endpoint's `sub`
+//!   claim to equal the DID the flow began for, so a hostile authorization server
+//!   cannot return a victim DID and have the caller mint a session for it
 //!
 //! ## Usage Example
 //!
@@ -72,6 +75,7 @@
 //! // 2. Complete OAuth flow
 //! # let oauth_request = OAuthRequest {
 //! #     oauth_state: "state".to_string(),
+//! #     subject: "did:plc:example123".to_string(),
 //! #     issuer: "https://auth.example.com".to_string(),
 //! #     authorization_server: "https://auth.example.com".to_string(),
 //! #     nonce: "nonce".to_string(),
@@ -114,8 +118,9 @@
 use anyhow::Result;
 use atproto_identity::url::build_url;
 use atproto_oauth::{
+    errors::OAuthClientError,
     jwk::WrappedJsonWebKey,
-    workflow::{OAuthRequest, OAuthRequestState, ParResponse, TokenResponse},
+    workflow::{OAuthRequest, OAuthRequestState, ParResponse, TokenResponse, bind_token_subject},
 };
 use serde::Deserialize;
 use std::iter;
@@ -329,6 +334,14 @@ pub async fn oauth_init(
 /// Returns a `TokenResponse` containing the access token and other token information,
 /// or an error if the token exchange fails.
 ///
+/// # Errors
+///
+/// Returns [`OAuthWorkflowError::TokenSubjectBindingFailed`] when
+/// `oauth_request.subject` is empty, when the token endpoint omitted the `sub`
+/// claim, or when `sub` is not byte-for-byte equal to `oauth_request.subject`.
+/// A mismatch means the authorization server tried to authenticate a different
+/// account than the one the flow began for.
+///
 /// # Example
 ///
 /// ```no_run
@@ -345,7 +358,6 @@ pub async fn oauth_init(
 ///     "auth_code_from_callback",
 ///     &oauth_request,
 /// ).await?;
-/// println!("Access token: {}", token_response.access_token);
 /// # Ok(())
 /// # }
 /// ```
@@ -356,6 +368,15 @@ pub async fn oauth_complete(
     callback_code: &str,
     oauth_request: &OAuthRequest,
 ) -> Result<TokenResponse> {
+    // Reject an unusable expected subject before any network work so the binding
+    // below can never silently pass.
+    if oauth_request.subject.is_empty() {
+        return Err(OAuthWorkflowError::TokenSubjectBindingFailed(
+            OAuthClientError::MissingExpectedSubject,
+        )
+        .into());
+    }
+
     let params = [
         ("client_id", oauth_client.client_id.as_str()),
         ("redirect_uri", oauth_client.redirect_uri.as_str()),
@@ -364,7 +385,7 @@ pub async fn oauth_complete(
         ("code_verifier", &oauth_request.pkce_verifier),
     ];
 
-    http_client
+    let token_response: TokenResponse = http_client
         .post(token_endpoint)
         .basic_auth(
             oauth_client.client_id.as_str(),
@@ -373,13 +394,26 @@ pub async fn oauth_complete(
         .form(&params)
         .send()
         .await
-        .inspect(|value| {
-            println!("{value:?}");
-        })
         .map_err(OAuthWorkflowError::TokenRequestFailed)?
         .json()
         .await
-        .map_err(|e| OAuthWorkflowError::TokenResponseParseFailed(e).into())
+        .map_err(OAuthWorkflowError::TokenResponseParseFailed)?;
+
+    bind_response_subject(&oauth_request.subject, &token_response)?;
+
+    Ok(token_response)
+}
+
+/// Binds a token endpoint response to the DID the authorization flow began for.
+///
+/// Delegates to [`atproto_oauth::workflow::bind_token_subject`] and maps its
+/// failure onto [`OAuthWorkflowError::TokenSubjectBindingFailed`].
+fn bind_response_subject(
+    expected_subject: &str,
+    token_response: &TokenResponse,
+) -> Result<(), OAuthWorkflowError> {
+    bind_token_subject(expected_subject, token_response)
+        .map_err(OAuthWorkflowError::TokenSubjectBindingFailed)
 }
 
 /// Exchanges an OAuth access token for an AT Protocol session.
@@ -654,4 +688,144 @@ pub async fn client_credentials_token(
         .json::<atproto_oauth::workflow::TokenResponse>()
         .await
         .map_err(|e| OAuthWorkflowError::TokenResponseParseFailed(e).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The confirmed attack payload: a hostile AIP authorization server returns a
+    /// victim DID as `sub` for a flow the attacker started for their own DID.
+    const ATTACK_TOKEN_RESPONSE: &str = r#"{"access_token":"attacker-minted","token_type":"DPoP","refresh_token":"r","scope":"atproto transition:generic","expires_in":3600,"sub":"did:plc:victim000000000000000000"}"#;
+
+    /// The downgrade variant: `sub` omitted entirely so a caller with a fallback
+    /// to the pending session DID authenticates the wrong account.
+    const ATTACK_TOKEN_RESPONSE_NO_SUB: &str = r#"{"access_token":"attacker-minted","token_type":"DPoP","refresh_token":"r","scope":"atproto transition:generic","expires_in":3600}"#;
+
+    fn token_response(json: &str) -> TokenResponse {
+        serde_json::from_str(json).expect("token response deserializes")
+    }
+
+    fn oauth_request(subject: &str) -> OAuthRequest {
+        OAuthRequest {
+            oauth_state: "state".to_string(),
+            subject: subject.to_string(),
+            issuer: "https://auth.example.com".to_string(),
+            authorization_server: "https://auth.example.com".to_string(),
+            nonce: "nonce".to_string(),
+            signing_public_key: "public-key".to_string(),
+            pkce_verifier: "verifier".to_string(),
+            dpop_private_key: "private-key".to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        }
+    }
+
+    #[test]
+    fn test_bind_response_subject_rejects_victim_impersonation() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE);
+
+        let err = bind_response_subject("did:plc:attacker00000000000000", &response)
+            .expect_err("victim subject must be rejected");
+
+        assert!(matches!(
+            err,
+            OAuthWorkflowError::TokenSubjectBindingFailed(
+                OAuthClientError::TokenSubjectMismatch { .. }
+            )
+        ));
+
+        let message = err.to_string();
+        assert!(
+            message.contains("error-atproto-oauth-aip-workflow-10"),
+            "{message}"
+        );
+        assert!(
+            message.contains("did:plc:victim000000000000000000"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_bind_response_subject_rejects_missing_sub() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE_NO_SUB);
+        assert!(response.sub.is_none());
+
+        let err = bind_response_subject("did:plc:attacker00000000000000", &response)
+            .expect_err("missing subject must be rejected");
+
+        assert!(matches!(
+            err,
+            OAuthWorkflowError::TokenSubjectBindingFailed(
+                OAuthClientError::TokenResponseMissingSubject
+            )
+        ));
+    }
+
+    #[test]
+    fn test_bind_response_subject_accepts_exact_match() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE);
+
+        bind_response_subject("did:plc:victim000000000000000000", &response)
+            .expect("an exactly matching subject is accepted");
+    }
+
+    #[test]
+    fn test_bind_response_subject_is_exact_comparison() {
+        let expected = "did:plc:victim000000000000000000";
+
+        for actual in [
+            "did:plc:VICTIM000000000000000000",
+            " did:plc:victim000000000000000000",
+            "did:plc:victim000000000000000000 ",
+        ] {
+            let json = format!(
+                r#"{{"access_token":"a","token_type":"DPoP","scope":"atproto","expires_in":3600,"sub":"{actual}"}}"#
+            );
+            let response = token_response(&json);
+
+            let err = bind_response_subject(expected, &response)
+                .expect_err("subjects are compared byte-for-byte");
+            assert!(matches!(
+                err,
+                OAuthWorkflowError::TokenSubjectBindingFailed(
+                    OAuthClientError::TokenSubjectMismatch { .. }
+                )
+            ));
+        }
+    }
+
+    /// An empty `OAuthRequest::subject` must fail before any request is sent, so
+    /// the binding can never degrade into a no-op. The token endpoint below is
+    /// unroutable: reaching it would surface as a request failure instead.
+    #[tokio::test]
+    async fn test_oauth_complete_rejects_empty_subject_before_network() {
+        let oauth_client = OAuthClient {
+            redirect_uri: "https://app.example.com/callback".to_string(),
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+        };
+
+        let result = oauth_complete(
+            &reqwest::Client::new(),
+            &oauth_client,
+            "http://127.0.0.1:1/token",
+            "auth-code",
+            &oauth_request(""),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("an empty expected subject must be rejected"),
+            Err(err) => err,
+        };
+
+        let workflow_error = err
+            .downcast_ref::<OAuthWorkflowError>()
+            .expect("error is an OAuthWorkflowError");
+        assert!(matches!(
+            workflow_error,
+            OAuthWorkflowError::TokenSubjectBindingFailed(OAuthClientError::MissingExpectedSubject)
+        ));
+    }
 }

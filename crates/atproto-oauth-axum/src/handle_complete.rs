@@ -100,16 +100,15 @@ pub async fn handle_oauth_callback(
         &oauth_client,
         &private_dpop_key_data,
         &callback_form.code,
+        &oauth_request.subject,
         &oauth_request,
         &authorization_server,
     )
     .await?;
 
-    // Now get the DID from the token response subject claim
-    let did = token_response
-        .sub
-        .clone()
-        .ok_or(OAuthCallbackError::NoDIDDocumentFound)?;
+    // `oauth_complete` has already bound the token response's `sub` claim to
+    // the DID the flow began for, so the stored subject is authoritative.
+    let did = oauth_request.subject.clone();
 
     let document = did_document_storage.get_document_by_did(&did).await?;
 

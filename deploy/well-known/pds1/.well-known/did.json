@@ -1,0 +1,8 @@
+{
+  "@context": ["https://www.w3.org/ns/did/v1"],
+  "id": "did:web:pds1.ngerakines.dev",
+  "service": [
+    { "id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://pds1.ngerakines.dev" },
+    { "id": "#atproto_space_host", "type": "AtprotoSpaceHost", "serviceEndpoint": "https://pds1.ngerakines.dev" }
+  ]
+}

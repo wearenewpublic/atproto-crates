@@ -9,7 +9,6 @@ members = [
     "crates/atproto-oauth-aip",
     "crates/atproto-oauth-axum",
     "crates/atproto-oauth",
-    "crates/atproto-oauth-dioxus",
     "crates/atproto-pds",
     "crates/atproto-record",
     "crates/atproto-repo",
@@ -36,25 +35,24 @@ keywords = ["atprotocol"]
 categories = ["command-line-utilities", "web-programming"]
 
 [workspace.dependencies]
-atproto-attestation = { version = "0.15.0-alpha.2", path = "crates/atproto-attestation" }
-atproto-client = { version = "0.15.0-alpha.2", path = "crates/atproto-client" }
-atproto-dasl = { version = "0.15.0-alpha.2", path = "crates/atproto-dasl" }
-atproto-extras = { version = "0.15.0-alpha.2", path = "crates/atproto-extras" }
-atproto-identity = { version = "0.15.0-alpha.2", path = "crates/atproto-identity" }
-atproto-jetstream = { version = "0.15.0-alpha.2", path = "crates/atproto-jetstream" }
-atproto-lexicon = { version = "0.15.0-alpha.2", path = "crates/atproto-lexicon" }
-atproto-oauth = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth" }
-atproto-oauth-aip = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth-aip" }
-atproto-oauth-axum = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth-axum" }
-atproto-oauth-dioxus = { version = "0.15.0-alpha.2", path = "crates/atproto-oauth-dioxus" }
-atproto-pds = { version = "0.15.0-alpha.2", path = "crates/atproto-pds" }
-atproto-record = { version = "0.15.0-alpha.2", path = "crates/atproto-record" }
-atproto-repo = { version = "0.15.0-alpha.2", path = "crates/atproto-repo" }
-atproto-space = { version = "0.15.0-alpha.2", path = "crates/atproto-space" }
-atproto-tap = { version = "0.15.0-alpha.2", path = "crates/atproto-tap" }
-atproto-xrpcs = { version = "0.15.0-alpha.2", path = "crates/atproto-xrpcs" }
+atproto-attestation = { version = "0.15.0-rc.1", path = "crates/atproto-attestation" }
+atproto-client = { version = "0.15.0-rc.1", path = "crates/atproto-client" }
+atproto-dasl = { version = "0.15.0-rc.1", path = "crates/atproto-dasl" }
+atproto-extras = { version = "0.15.0-rc.1", path = "crates/atproto-extras" }
+atproto-identity = { version = "0.15.0-rc.1", path = "crates/atproto-identity" }
+atproto-jetstream = { version = "0.15.0-rc.1", path = "crates/atproto-jetstream" }
+atproto-lexicon = { version = "0.15.0-rc.1", path = "crates/atproto-lexicon" }
+atproto-oauth = { version = "0.15.0-rc.1", path = "crates/atproto-oauth" }
+atproto-oauth-aip = { version = "0.15.0-rc.1", path = "crates/atproto-oauth-aip" }
+atproto-oauth-axum = { version = "0.15.0-rc.1", path = "crates/atproto-oauth-axum" }
+atproto-pds = { version = "0.15.0-rc.1", path = "crates/atproto-pds" }
+atproto-record = { version = "0.15.0-rc.1", path = "crates/atproto-record" }
+atproto-repo = { version = "0.15.0-rc.1", path = "crates/atproto-repo" }
+atproto-space = { version = "0.15.0-rc.1", path = "crates/atproto-space" }
+atproto-tap = { version = "0.15.0-rc.1", path = "crates/atproto-tap" }
+atproto-xrpcs = { version = "0.15.0-rc.1", path = "crates/atproto-xrpcs" }
 
-atpxrpc = { version = "0.15.0-alpha.2", path = "crates/atpxrpc" }
+atpxrpc = { version = "0.15.0-rc.1", path = "crates/atpxrpc" }
 
 bitflags = "2"
 anyhow = "1.0"

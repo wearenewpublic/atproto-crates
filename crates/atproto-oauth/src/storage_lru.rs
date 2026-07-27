@@ -68,6 +68,7 @@ use crate::workflow::OAuthRequest;
 /// // Create a sample OAuth request
 /// let request = OAuthRequest {
 ///     oauth_state: "unique-state-123".to_string(),
+///     subject: "did:plc:example123".to_string(),
 ///     issuer: "https://pds.example.com".to_string(),
 ///     authorization_server: "https://pds.example.com".to_string(),
 ///     nonce: "secure-nonce".to_string(),
@@ -180,6 +181,7 @@ impl LruOAuthRequestStorage {
     ///
     /// let request = OAuthRequest {
     ///     oauth_state: "state1".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "nonce1".to_string(),
@@ -257,6 +259,7 @@ impl LruOAuthRequestStorage {
     /// let storage = LruOAuthRequestStorage::new(NonZeroUsize::new(100).unwrap());
     /// let request = OAuthRequest {
     ///     oauth_state: "test-state".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "test-nonce".to_string(),
@@ -324,6 +327,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add request to cache
     /// let oauth_req = OAuthRequest {
     ///     oauth_state: "valid-state-123".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "secure-nonce".to_string(),
@@ -397,6 +401,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add an OAuth request
     /// let request = OAuthRequest {
     ///     oauth_state: "deletable-state".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "test-nonce".to_string(),
@@ -468,6 +473,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add first request
     /// let req1 = OAuthRequest {
     ///     oauth_state: "state1".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "nonce1".to_string(),
@@ -483,6 +489,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add second request
     /// let req2 = OAuthRequest {
     ///     oauth_state: "state2".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "nonce2".to_string(),
@@ -498,6 +505,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add third request - this will evict the least recently used entry (state1)
     /// let req3 = OAuthRequest {
     ///     oauth_state: "state3".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "nonce3".to_string(),
@@ -566,6 +574,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add a request that will expire soon
     /// let expired_request = OAuthRequest {
     ///     oauth_state: "soon-expired".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "nonce1".to_string(),
@@ -580,6 +589,7 @@ impl OAuthRequestStorage for LruOAuthRequestStorage {
     /// // Add a valid request
     /// let valid_request = OAuthRequest {
     ///     oauth_state: "still-valid".to_string(),
+    ///     subject: "did:plc:example123".to_string(),
     ///     issuer: "https://pds.example.com".to_string(),
     ///     authorization_server: "https://pds.example.com".to_string(),
     ///     nonce: "nonce2".to_string(),
@@ -641,9 +651,10 @@ mod tests {
     use chrono::{Duration, Utc};
     use std::num::NonZeroUsize;
 
-    fn create_test_oauth_request(state: &str, issuer: &str, _did: &str) -> OAuthRequest {
+    fn create_test_oauth_request(state: &str, issuer: &str, did: &str) -> OAuthRequest {
         OAuthRequest {
             oauth_state: state.to_string(),
+            subject: did.to_string(),
             issuer: issuer.to_string(),
             authorization_server: issuer.to_string(),
             nonce: format!("nonce-{}", state),
@@ -655,9 +666,10 @@ mod tests {
         }
     }
 
-    fn create_expired_oauth_request(state: &str, issuer: &str, _did: &str) -> OAuthRequest {
+    fn create_expired_oauth_request(state: &str, issuer: &str, did: &str) -> OAuthRequest {
         OAuthRequest {
             oauth_state: state.to_string(),
+            subject: did.to_string(),
             issuer: issuer.to_string(),
             authorization_server: issuer.to_string(),
             nonce: format!("nonce-{}", state),

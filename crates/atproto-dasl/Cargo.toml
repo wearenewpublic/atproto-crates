@@ -1,6 +1,6 @@
 [package]
 name = "atproto-dasl"
-version = "0.15.0-alpha.2"
+version = "0.15.0-rc.1"
 description = "DASL (Data-Addressed Structures & Links) implementation for AT Protocol"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

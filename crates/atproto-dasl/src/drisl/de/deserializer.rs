@@ -27,8 +27,21 @@ impl<R: Read> Deserializer<R> {
 
     /// Create a new deserializer with custom configuration
     pub fn with_config(reader: R, config: DecodeConfig) -> Self {
+        Self::with_config_and_input_len(reader, config, None)
+    }
+
+    /// Create a deserializer that knows its total input length.
+    ///
+    /// Supplying the length lets the decoder reject array and map headers that
+    /// declare more items than the remaining bytes can encode. Pass `None` for
+    /// an arbitrary stream.
+    pub fn with_config_and_input_len(
+        reader: R,
+        config: DecodeConfig,
+        input_len: Option<u64>,
+    ) -> Self {
         Self {
-            decoder: CborDecoder::with_config(reader, config.clone()),
+            decoder: CborDecoder::with_config_and_input_len(reader, config.clone(), input_len),
             depth: 0,
             config,
         }

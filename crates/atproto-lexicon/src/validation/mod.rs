@@ -9,6 +9,7 @@
 //! - [`data_types`]: AT Protocol data model types for validation
 //! - [`data_errors`]: Error types for data validation operations
 //! - [`flags`]: Configuration flags for validation behavior
+//! - [`limits`]: Resource limits bounding validation recursion and CPU
 //! - [`mimetype`]: MIME type matching utilities
 //! - [`parse`]: JSON to DataValue parsing
 //! - [`schema`]: Lexicon schema type definitions
@@ -21,6 +22,7 @@ mod nsid;
 pub mod data_errors;
 pub mod data_types;
 pub mod flags;
+pub mod limits;
 pub mod mimetype;
 pub mod parse;
 pub mod schema;
@@ -39,10 +41,17 @@ pub use nsid::{
 pub use data_errors::DataValidationError;
 pub use data_types::{Blob, Bytes, CIDLink, DataValue};
 pub use flags::ValidateFlags;
+pub use limits::{
+    DEFAULT_MAX_REF_DEPTH, DEFAULT_MAX_REF_STEPS, DEFAULT_MAX_REF_STEPS_PER_NODE, ValidationLimits,
+};
 pub use schema::SchemaDef;
 pub use schema_file::SchemaFile;
 pub use validate::{
-    BaseCatalog, Catalog, Schema, validate_procedure_input, validate_procedure_input_with_schema,
-    validate_procedure_params, validate_procedure_params_with_schema, validate_query_params,
-    validate_query_params_with_schema, validate_record, validate_record_with_schema,
+    BaseCatalog, Catalog, Schema, validate_procedure_input, validate_procedure_input_with_limits,
+    validate_procedure_input_with_schema, validate_procedure_input_with_schema_and_limits,
+    validate_procedure_params, validate_procedure_params_with_limits,
+    validate_procedure_params_with_schema, validate_procedure_params_with_schema_and_limits,
+    validate_query_params, validate_query_params_with_limits, validate_query_params_with_schema,
+    validate_query_params_with_schema_and_limits, validate_record, validate_record_with_limits,
+    validate_record_with_schema, validate_record_with_schema_and_limits,
 };

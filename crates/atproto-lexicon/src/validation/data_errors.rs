@@ -554,4 +554,39 @@ pub enum DataValidationError {
         "error-atproto-lexicon-data-validation-59 Space permission 'spaceType' must not be the '*' wildcard"
     )]
     SpacePermissionWildcardSpaceType,
+
+    /// The `ref`/`union` indirection depth exceeded the configured limit.
+    ///
+    /// Raised before the native stack can overflow. See
+    /// [`ValidationLimits::max_ref_depth`](crate::validation::limits::ValidationLimits::max_ref_depth).
+    #[error(
+        "error-atproto-lexicon-data-validation-60 Reference depth limit exceeded at {path}: maximum {max_depth} ref/union hops, at '{ref_path}'"
+    )]
+    RefDepthExceeded {
+        /// The JSON path at which the limit was reached.
+        path: String,
+        /// The configured maximum depth.
+        max_depth: usize,
+        /// The reference that would have exceeded the limit.
+        ref_path: String,
+    },
+
+    /// The total `ref`/`union` traversal budget for one validation was exhausted.
+    ///
+    /// Bounds the cost of unions that try every candidate against the same
+    /// value. The budget is the fixed
+    /// [`ValidationLimits::max_ref_steps`](crate::validation::limits::ValidationLimits::max_ref_steps)
+    /// allowance plus
+    /// [`ValidationLimits::max_ref_steps_per_node`](crate::validation::limits::ValidationLimits::max_ref_steps_per_node)
+    /// for every value in the input.
+    #[error(
+        "error-atproto-lexicon-data-validation-61 Reference traversal budget exhausted at {path}: maximum {max_steps} ref/union resolutions"
+    )]
+    RefStepBudgetExhausted {
+        /// The JSON path at which the budget ran out.
+        path: String,
+        /// The budget for this input: the fixed allowance plus the per-node
+        /// allowance for the document being validated.
+        max_steps: usize,
+    },
 }

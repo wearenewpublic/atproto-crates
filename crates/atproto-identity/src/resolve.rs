@@ -27,6 +27,7 @@ use std::time::Duration;
 use tracing::{Instrument, instrument};
 
 use crate::errors::ResolveError;
+use crate::host::did_host;
 use crate::model::Document;
 use crate::plc::query as plc_query;
 use crate::validation::{is_valid_did_method_plc, is_valid_did_method_webvh, is_valid_handle};
@@ -96,13 +97,32 @@ pub enum InputType {
     WebVH(String),
 }
 
+/// Validates and normalizes handle input at the point where it becomes a network target.
+///
+/// Trims surrounding whitespace, strips the `at://` and `@` prefixes, and requires the
+/// remainder to pass [`is_valid_handle`], which rejects every network address literal
+/// form — dotted-quad, IPv6, and the `inet_aton` decimal, octal, hexadecimal, and short
+/// forms — along with any string carrying URL metacharacters such as `:`, `/`, or `%`.
+fn validated_handle(handle: &str) -> Result<String, ResolveError> {
+    is_valid_handle(handle.trim()).ok_or(ResolveError::InvalidInput)
+}
+
 /// Resolves a handle to DID using DNS TXT records.
 /// Looks up _atproto.{handle} TXT record for DID value.
+///
+/// # Security
+///
+/// `lookup_dns` is validated with [`crate::validation::is_valid_handle`] before it is
+/// interpolated into the `_atproto.{handle}` query name. Address-shaped or
+/// metacharacter-bearing input is rejected with [`ResolveError::InvalidInput`] and no
+/// query is issued.
 #[instrument(skip(dns_resolver), err)]
 pub async fn resolve_handle_dns<R: DnsResolver + ?Sized>(
     dns_resolver: &R,
     lookup_dns: &str,
 ) -> Result<String, ResolveError> {
+    let lookup_dns = validated_handle(lookup_dns)?;
+
     let txt_records = dns_resolver
         .resolve_txt(&format!("_atproto.{}", lookup_dns))
         .await?;
@@ -121,11 +141,26 @@ pub async fn resolve_handle_dns<R: DnsResolver + ?Sized>(
 
 /// Resolves a handle to DID using HTTPS well-known endpoint.
 /// Fetches DID from https://{handle}/.well-known/atproto-did
+///
+/// # Security
+///
+/// This function is the validating sink for well-known handle resolution: `handle` is
+/// checked with [`crate::validation::is_valid_handle`] *before* it is interpolated into
+/// the lookup URL, so callers cannot reach an arbitrary network target by handing over
+/// unvalidated input. Address literals in every resolver-accepted form — `127.0.0.1`,
+/// the decimal `2130706433`, the hexadecimal `0x7f000001`, the octal `0177.0.0.1`, and
+/// the short `127.1` — are rejected with [`ResolveError::InvalidInput`] and no request
+/// is made. Input carrying `:`, `/`, `%`, or userinfo is rejected for the same reason.
+///
+/// Validation is purely syntactic. It does not defend against DNS rebinding, nor
+/// against a public hostname whose address record points into a private range.
 #[instrument(skip(http_client), err)]
 pub async fn resolve_handle_http(
     http_client: &reqwest::Client,
     handle: &str,
 ) -> Result<String, ResolveError> {
+    let handle = validated_handle(handle)?;
+
     let lookup_url = format!("https://{}/.well-known/atproto-did", handle);
 
     http_client
@@ -149,7 +184,15 @@ pub async fn resolve_handle_http(
 }
 
 /// Parses input string into appropriate identifier type.
+///
 /// Handles prefixes like "at://", "@", and DID formats.
+///
+/// # Security
+///
+/// Every accepted variant is validated before it is returned. `did:web` input must
+/// encode a safe HTTPS target per [`crate::host::did_host`], and handle input must
+/// pass [`crate::validation::is_valid_handle`], so an address-literal identifier
+/// never reaches an HTTP client through this entry point.
 pub fn parse_input(input: &str) -> Result<InputType, ResolveError> {
     let trimmed = {
         if let Some(value) = input.trim().strip_prefix("at://") {
@@ -165,7 +208,7 @@ pub fn parse_input(input: &str) -> Result<InputType, ResolveError> {
     }
     if trimmed.starts_with("did:webvh:") && is_valid_did_method_webvh(trimmed, false) {
         Ok(InputType::WebVH(trimmed.to_string()))
-    } else if trimmed.starts_with("did:web:") {
+    } else if trimmed.starts_with("did:web:") && did_host(trimmed).is_ok() {
         Ok(InputType::Web(trimmed.to_string()))
     } else if trimmed.starts_with("did:plc:") && is_valid_did_method_plc(trimmed) {
         Ok(InputType::Plc(trimmed.to_string()))
@@ -238,6 +281,246 @@ mod tests {
         let result = parse_input("did:web:example.com");
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), InputType::Web(_)));
+    }
+
+    #[test]
+    fn test_parse_input_rejects_address_form_did_web() {
+        for input in [
+            "did:web:169.254.169.254",
+            "did:web:2852039166",
+            "did:web:0xA9FEA9FE",
+            "did:web:169.254.43518",
+            "did:webvh:z6MkFakeScid:2852039166",
+            "did:web:metadata.google.internal",
+            "did:web:example.com:..:..:etc",
+        ] {
+            assert!(
+                matches!(parse_input(input), Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {input}"
+            );
+        }
+
+        // Legitimate did:web input still parses.
+        assert!(matches!(
+            parse_input("did:web:example.com"),
+            Ok(InputType::Web(_))
+        ));
+        assert!(matches!(
+            parse_input("did:web:example.com:path:sub"),
+            Ok(InputType::Web(_))
+        ));
+        assert!(matches!(
+            parse_input("did:web:localhost"),
+            Ok(InputType::Web(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_input_rejects_address_form_handle() {
+        for input in ["169.254.43518", "1.2.3", "2852039166", "0xA9FEA9FE"] {
+            assert!(
+                matches!(parse_input(input), Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {input}"
+            );
+        }
+
+        assert!(matches!(
+            parse_input("alice.bsky.social"),
+            Ok(InputType::Handle(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_rejects_address_form_handle() {
+        struct PanickingDnsResolver;
+
+        #[async_trait::async_trait]
+        impl DnsResolver for PanickingDnsResolver {
+            async fn resolve_txt(&self, _domain: &str) -> Result<Vec<String>, ResolveError> {
+                panic!("DNS resolution must not be attempted for invalid handles");
+            }
+        }
+
+        let client = reqwest::Client::new();
+        for handle in ["169.254.43518", "1.2.3", "localhost", "2852039166"] {
+            let result = resolve_handle(&client, &PanickingDnsResolver, handle).await;
+            assert!(
+                matches!(result, Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {handle}"
+            );
+        }
+    }
+
+    /// Confirmed SSRF payloads against the `resolve_handle_http` sink itself.
+    ///
+    /// Every one of these previously produced a real outbound connection to
+    /// 127.0.0.1:8099 because validation lived in `resolve_handle` rather than in the
+    /// function that builds the URL.
+    const LOOPBACK_HANDLE_PAYLOADS: [&str; 10] = [
+        "2130706433:8099",
+        "0x7f000001:8099",
+        "0177.0.0.1:8099",
+        "127.1:8099",
+        "127.0.0.1:8099",
+        "2130706433",
+        "0x7f000001",
+        "0177.0.0.1",
+        "127.1",
+        "127.0.0.1",
+    ];
+
+    #[tokio::test]
+    async fn test_resolve_handle_http_rejects_address_literal_payloads() {
+        let client = reqwest::Client::new();
+
+        for handle in LOOPBACK_HANDLE_PAYLOADS {
+            let result = resolve_handle_http(&client, handle).await;
+            assert!(
+                matches!(result, Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {handle}, got {result:?}"
+            );
+        }
+
+        // Metadata-endpoint forms confirmed in the original report.
+        for handle in [
+            "169.254.169.254",
+            "2852039166",
+            "0xA9FEA9FE",
+            "0250.0376.0250.0376",
+            "169.254.43518",
+            "017700000001",
+            "[::1]",
+            "metadata.google.internal",
+            "user@evil.example.com",
+            "example.com/../../x",
+            "example.com%2f..%2fx",
+            "example.com?x=1",
+        ] {
+            assert!(
+                matches!(
+                    resolve_handle_http(&client, handle).await,
+                    Err(ResolveError::InvalidInput)
+                ),
+                "expected InvalidInput for {handle}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_dns_rejects_address_literal_payloads() {
+        struct PanickingDnsResolver;
+
+        #[async_trait::async_trait]
+        impl DnsResolver for PanickingDnsResolver {
+            async fn resolve_txt(&self, domain: &str) -> Result<Vec<String>, ResolveError> {
+                panic!("DNS resolution must not be attempted: {domain}");
+            }
+        }
+
+        for handle in LOOPBACK_HANDLE_PAYLOADS {
+            let result = resolve_handle_dns(&PanickingDnsResolver, handle).await;
+            assert!(
+                matches!(result, Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {handle}, got {result:?}"
+            );
+        }
+    }
+
+    /// Reserved-TLD payloads whose lowercase spelling was already blocked, but whose
+    /// uppercased spelling reached the identical target because the reserved-TLD
+    /// comparison was case-sensitive. DNS and HTTP host matching are case-insensitive.
+    const UPPERCASE_RESERVED_TLD_PAYLOADS: [&str; 6] = [
+        "metadata.google.INTERNAL",
+        "metadata.google.Internal",
+        "victim.LOCALHOST",
+        "printer.LOCAL",
+        "target.ARPA",
+        "x.LOCALHOST",
+    ];
+
+    #[tokio::test]
+    async fn test_resolve_handle_dns_rejects_uppercased_reserved_tlds() {
+        struct PanickingDnsResolver;
+
+        #[async_trait::async_trait]
+        impl DnsResolver for PanickingDnsResolver {
+            async fn resolve_txt(&self, domain: &str) -> Result<Vec<String>, ResolveError> {
+                panic!("DNS resolution must not be attempted: {domain}");
+            }
+        }
+
+        for handle in UPPERCASE_RESERVED_TLD_PAYLOADS {
+            let result = resolve_handle_dns(&PanickingDnsResolver, handle).await;
+            assert!(
+                matches!(result, Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {handle}, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_http_rejects_uppercased_reserved_tlds() {
+        let client = reqwest::Client::new();
+
+        for handle in UPPERCASE_RESERVED_TLD_PAYLOADS {
+            let result = resolve_handle_http(&client, handle).await;
+            assert!(
+                matches!(result, Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {handle}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_input_rejects_uppercased_reserved_tlds() {
+        for input in UPPERCASE_RESERVED_TLD_PAYLOADS {
+            assert!(
+                matches!(parse_input(input), Err(ResolveError::InvalidInput)),
+                "expected InvalidInput for {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_dns_lowercases_the_query_name() {
+        struct AssertingDnsResolver;
+
+        #[async_trait::async_trait]
+        impl DnsResolver for AssertingDnsResolver {
+            async fn resolve_txt(&self, domain: &str) -> Result<Vec<String>, ResolveError> {
+                assert_eq!(domain, "_atproto.alice.bsky.social");
+                Ok(vec!["did=did:plc:z3f2222fa222f5c33c2f27ez".to_string()])
+            }
+        }
+
+        let did = resolve_handle_dns(&AssertingDnsResolver, "Alice.BSKY.Social")
+            .await
+            .unwrap();
+        assert_eq!(did, "did:plc:z3f2222fa222f5c33c2f27ez");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_dns_accepts_valid_handle() {
+        struct StubDnsResolver;
+
+        #[async_trait::async_trait]
+        impl DnsResolver for StubDnsResolver {
+            async fn resolve_txt(&self, domain: &str) -> Result<Vec<String>, ResolveError> {
+                assert_eq!(domain, "_atproto.alice.bsky.social");
+                Ok(vec!["did=did:plc:z3f2222fa222f5c33c2f27ez".to_string()])
+            }
+        }
+
+        // Prefixes and surrounding whitespace are normalized, not rejected.
+        for handle in [
+            "alice.bsky.social",
+            "@alice.bsky.social",
+            "at://alice.bsky.social",
+            "  alice.bsky.social  ",
+        ] {
+            let did = resolve_handle_dns(&StubDnsResolver, handle).await.unwrap();
+            assert_eq!(did, "did:plc:z3f2222fa222f5c33c2f27ez");
+        }
     }
 
     #[test]
@@ -318,22 +601,25 @@ mod tests {
 }
 
 /// Resolves a handle to DID using both DNS and HTTP methods.
+///
 /// Returns DID if both methods agree, or error if conflicting.
+///
+/// # Security
+///
+/// The handle is validated with [`crate::validation::is_valid_handle`] before it is
+/// interpolated into the `https://{handle}/.well-known/atproto-did` lookup URL.
+/// Address-shaped input such as `169.254.43518` is rejected with
+/// [`ResolveError::InvalidInput`] rather than fetched. The same check is enforced
+/// independently by [`resolve_handle_http`] and [`resolve_handle_dns`], so it cannot be
+/// bypassed by calling either of those directly.
 #[instrument(skip(http_client, dns_resolver), err)]
 pub async fn resolve_handle<R: DnsResolver + ?Sized>(
     http_client: &reqwest::Client,
     dns_resolver: &R,
     handle: &str,
 ) -> Result<String, ResolveError> {
-    let trimmed = {
-        if let Some(value) = handle.trim().strip_prefix("at://") {
-            value
-        } else if let Some(value) = handle.trim().strip_prefix('@') {
-            value
-        } else {
-            handle.trim()
-        }
-    };
+    let trimmed = validated_handle(handle)?;
+    let trimmed = trimmed.as_str();
 
     let (dns_lookup, http_lookup) = tokio::join!(
         resolve_handle_dns(dns_resolver, trimmed),

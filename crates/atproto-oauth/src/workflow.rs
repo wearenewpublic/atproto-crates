@@ -59,14 +59,16 @@
 //!     par_response.request_uri
 //! );
 //!
-//! // After user authorization and callback..
+//! // After user authorization and callback. The expected subject is the DID
+//! // the flow began for; the token endpoint's `sub` claim must match it.
 //! let token_response = oauth_complete(
 //!     &http_client,
 //!     &oauth_client,
 //!     &dpop_key,
 //!     "authorization_code_from_callback",
+//!     &oauth_request.subject,
 //!     &oauth_request,
-//!     &did_document,
+//!     &authorization_server,
 //! ).await?;
 //! ```
 
@@ -87,6 +89,74 @@ use crate::{
     jwt::{Claims, Header, JoseClaims, mint},
     resources::{AuthorizationServer, pds_resources},
 };
+
+/// Lifetime applied to minted client assertion JWTs, in seconds.
+///
+/// RFC 7523 section 3 requires an `exp` claim on client assertions. 60 seconds
+/// matches the service token lifetime used elsewhere in this crate and is well
+/// above the DPoP proof lifetime, so it tolerates a slow token endpoint.
+const CLIENT_ASSERTION_LIFETIME_SECONDS: i64 = 60;
+
+/// Builds the JOSE claims for a client assertion JWT.
+///
+/// The assertion is issued now and expires after
+/// [`CLIENT_ASSERTION_LIFETIME_SECONDS`], as required by RFC 7523 section 3.
+fn client_assertion_claims(client_id: &str, audience: &str, json_web_token_id: String) -> Claims {
+    let issued_at = chrono::Utc::now();
+    let expiration = issued_at + chrono::Duration::seconds(CLIENT_ASSERTION_LIFETIME_SECONDS);
+
+    Claims::new(JoseClaims {
+        issuer: Some(client_id.to_string()),
+        subject: Some(client_id.to_string()),
+        audience: Some(audience.to_string()),
+        json_web_token_id: Some(json_web_token_id),
+        issued_at: Some(issued_at.timestamp().cast_unsigned()),
+        expiration: Some(expiration.timestamp().cast_unsigned()),
+        ..Default::default()
+    })
+}
+
+/// Binds a token endpoint response to the DID the authorization flow began for.
+///
+/// Returns an error when `expected_subject` is empty, when the response has no
+/// `sub` claim, or when `sub` is not byte-for-byte equal to `expected_subject`.
+/// DIDs are compared exactly; no case folding or trimming is applied.
+///
+/// # Arguments
+/// * `expected_subject` - The AT Protocol DID the authorization flow began for
+/// * `token_response` - The parsed token endpoint response to check
+///
+/// # Errors
+/// Returns [`OAuthClientError::MissingExpectedSubject`],
+/// [`OAuthClientError::TokenResponseMissingSubject`], or
+/// [`OAuthClientError::TokenSubjectMismatch`].
+pub fn bind_token_subject(
+    expected_subject: &str,
+    token_response: &TokenResponse,
+) -> Result<(), OAuthClientError> {
+    if expected_subject.is_empty() {
+        return Err(OAuthClientError::MissingExpectedSubject);
+    }
+
+    let actual = token_response
+        .sub
+        .as_deref()
+        .ok_or(OAuthClientError::TokenResponseMissingSubject)?;
+
+    if actual != expected_subject {
+        tracing::warn!(
+            expected = %expected_subject,
+            actual = %actual,
+            "Token endpoint returned a subject other than the DID the flow began for"
+        );
+        return Err(OAuthClientError::TokenSubjectMismatch {
+            expected: expected_subject.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+
+    Ok(())
+}
 
 /// Response from a Pushed Authorization Request (PAR) endpoint.
 ///
@@ -148,6 +218,14 @@ pub struct OAuthRequest {
     #[cfg_attr(feature = "zeroize", zeroize(skip))]
     pub oauth_state: String,
 
+    /// The AT Protocol DID the authorization flow was initiated for.
+    ///
+    /// This must be a DID, not a handle: [`oauth_complete`] requires the token
+    /// endpoint's `sub` claim to equal this value exactly, and a mismatch means
+    /// the authorization server tried to authenticate a different account.
+    #[cfg_attr(feature = "zeroize", zeroize(skip))]
+    pub subject: String,
+
     /// The authorization server issuer identifier.
     #[cfg_attr(feature = "zeroize", zeroize(skip))]
     pub issuer: String,
@@ -184,6 +262,7 @@ impl std::fmt::Debug for OAuthRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthRequest")
             .field("oauth_state", &self.oauth_state)
+            .field("subject", &self.subject)
             .field("issuer", &self.issuer)
             .field("authorization_server", &self.authorization_server)
             .field("nonce", &self.nonce)
@@ -291,14 +370,11 @@ pub async fn oauth_init_with_prompt(
         .map_err(OAuthClientError::JWTHeaderCreationFailed)?;
 
     let client_assertion_jti = Alphanumeric.sample_string(&mut rand::rng(), 30);
-    let client_assertion_claims = Claims::new(JoseClaims {
-        issuer: Some(oauth_client.client_id.clone()),
-        subject: Some(oauth_client.client_id.clone()),
-        audience: Some(authorization_server.issuer.clone()),
-        json_web_token_id: Some(client_assertion_jti),
-        issued_at: Some(chrono::Utc::now().timestamp().cast_unsigned()),
-        ..Default::default()
-    });
+    let client_assertion_claims = client_assertion_claims(
+        &oauth_client.client_id,
+        &authorization_server.issuer,
+        client_assertion_jti,
+    );
 
     let client_assertion_token = mint(
         &oauth_client.private_signing_key_data,
@@ -363,41 +439,44 @@ pub async fn oauth_init_with_prompt(
 /// * `oauth_client` - The OAuth client configuration
 /// * `dpop_key_data` - The key data for creating DPoP proofs
 /// * `callback_code` - The authorization code received from the callback
+/// * `expected_subject` - The AT Protocol DID the flow began for, normally
+///   `oauth_request.subject`. The token endpoint's `sub` claim must equal it.
 /// * `oauth_request` - The original OAuth request state
-/// * `document` - The identity document containing PDS endpoints
+/// * `authorization_server` - The authorization server configuration
 ///
 /// # Returns
 /// A `TokenResponse` containing the access token, refresh token, and metadata on success.
 ///
 /// # Errors
-/// Returns `OAuthClientError` if the token exchange fails or response parsing fails.
+/// Returns `OAuthClientError` if the token exchange fails, the response cannot
+/// be parsed, or the returned `sub` claim is missing or does not match
+/// `expected_subject`. A mismatch means the authorization server tried to
+/// authenticate a different account than the one the flow began for.
 pub async fn oauth_complete(
     http_client: &reqwest::Client,
     oauth_client: &OAuthClient,
     dpop_key_data: &KeyData,
     callback_code: &str,
+    expected_subject: &str,
     oauth_request: &OAuthRequest,
     authorization_server: &AuthorizationServer,
 ) -> Result<TokenResponse, OAuthClientError> {
-    // let pds_endpoints = document.pds_endpoints();
-    // let pds_endpoint = pds_endpoints
-    //     .first()
-    //     .ok_or(OAuthClientError::InvalidOAuthProtectedResource)?;
-    // let (_, authorization_server) = pds_resources(http_client, pds_endpoint).await?;
+    // Reject an unusable expected subject before doing any network work so the
+    // binding below can never be a silent no-op.
+    if expected_subject.is_empty() {
+        return Err(OAuthClientError::MissingExpectedSubject);
+    }
 
     let client_assertion_header: Header = (oauth_client.private_signing_key_data.clone())
         .try_into()
         .map_err(OAuthClientError::JWTHeaderCreationFailed)?;
 
     let client_assertion_jti = Alphanumeric.sample_string(&mut rand::rng(), 30);
-    let client_assertion_claims = Claims::new(JoseClaims {
-        issuer: Some(oauth_client.client_id.clone()),
-        subject: Some(oauth_client.client_id.clone()),
-        audience: Some(authorization_server.issuer.clone()),
-        json_web_token_id: Some(client_assertion_jti),
-        issued_at: Some(chrono::Utc::now().timestamp().cast_unsigned()),
-        ..Default::default()
-    });
+    let client_assertion_claims = client_assertion_claims(
+        &oauth_client.client_id,
+        &authorization_server.issuer,
+        client_assertion_jti,
+    );
 
     let client_assertion_token = mint(
         &oauth_client.private_signing_key_data,
@@ -430,7 +509,7 @@ pub async fn oauth_complete(
         .with(ChainMiddleware::new(dpop_retry.clone()))
         .build();
 
-    dpop_retry_client
+    let token_response: TokenResponse = dpop_retry_client
         .post(token_endpoint)
         .header("DPoP", dpop_token.as_str())
         .form(&params)
@@ -439,7 +518,11 @@ pub async fn oauth_complete(
         .map_err(OAuthClientError::TokenHttpRequestFailed)?
         .json()
         .await
-        .map_err(OAuthClientError::TokenResponseJsonParsingFailed)
+        .map_err(OAuthClientError::TokenResponseJsonParsingFailed)?;
+
+    bind_token_subject(expected_subject, &token_response)?;
+
+    Ok(token_response)
 }
 
 /// Refreshes OAuth access tokens using a refresh token.
@@ -453,13 +536,16 @@ pub async fn oauth_complete(
 /// * `oauth_client` - The OAuth client configuration
 /// * `dpop_key_data` - The key data for creating DPoP proofs
 /// * `refresh_token` - The refresh token to exchange for new tokens
-/// * `document` - The identity document containing PDS endpoints
+/// * `document` - The identity document containing PDS endpoints. Its `id` is
+///   the expected subject: the refreshed token's `sub` claim must equal it.
 ///
 /// # Returns
 /// A `TokenResponse` containing the new access token, refresh token, and metadata on success.
 ///
 /// # Errors
-/// Returns `OAuthClientError` if the token refresh fails or response parsing fails.
+/// Returns `OAuthClientError` if the token refresh fails, the response cannot
+/// be parsed, or the returned `sub` claim is missing or does not match
+/// `document.id`.
 pub async fn oauth_refresh(
     http_client: &reqwest::Client,
     oauth_client: &OAuthClient,
@@ -467,6 +553,8 @@ pub async fn oauth_refresh(
     refresh_token: &str,
     document: &atproto_identity::model::Document,
 ) -> Result<TokenResponse, OAuthClientError> {
+    let expected_subject = document.id.clone();
+
     let pds_endpoints = document.pds_endpoints();
     let pds_endpoint = pds_endpoints
         .first()
@@ -478,14 +566,11 @@ pub async fn oauth_refresh(
         .map_err(OAuthClientError::JWTHeaderCreationFailed)?;
 
     let client_assertion_jti = Alphanumeric.sample_string(&mut rand::rng(), 30);
-    let client_assertion_claims = Claims::new(JoseClaims {
-        issuer: Some(oauth_client.client_id.clone()),
-        subject: Some(oauth_client.client_id.clone()),
-        audience: Some(authorization_server.issuer.clone()),
-        json_web_token_id: Some(client_assertion_jti),
-        issued_at: Some(chrono::Utc::now().timestamp().cast_unsigned()),
-        ..Default::default()
-    });
+    let client_assertion_claims = client_assertion_claims(
+        &oauth_client.client_id,
+        &authorization_server.issuer,
+        client_assertion_jti,
+    );
 
     let client_assertion_token = mint(
         &oauth_client.private_signing_key_data,
@@ -517,7 +602,7 @@ pub async fn oauth_refresh(
         .with(ChainMiddleware::new(dpop_retry.clone()))
         .build();
 
-    dpop_retry_client
+    let token_response: TokenResponse = dpop_retry_client
         .post(token_endpoint)
         .header("DPoP", dpop_token.as_str())
         .form(&params)
@@ -526,5 +611,128 @@ pub async fn oauth_refresh(
         .map_err(OAuthClientError::TokenHttpRequestFailed)?
         .json()
         .await
-        .map_err(OAuthClientError::TokenResponseJsonParsingFailed)
+        .map_err(OAuthClientError::TokenResponseJsonParsingFailed)?;
+
+    bind_token_subject(&expected_subject, &token_response)?;
+
+    Ok(token_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The confirmed attack payload: a hostile authorization server returns a
+    /// victim DID as `sub` for a flow the attacker started for their own DID.
+    const ATTACK_TOKEN_RESPONSE: &str = r#"{"access_token":"attacker-minted","token_type":"DPoP","refresh_token":"r","scope":"atproto transition:generic","expires_in":3600,"sub":"did:plc:victim000000000000000000"}"#;
+
+    /// The downgrade variant: `sub` omitted entirely so a caller with an
+    /// `unwrap_or(session_did)` fallback authenticates the wrong account.
+    const ATTACK_TOKEN_RESPONSE_NO_SUB: &str = r#"{"access_token":"attacker-minted","token_type":"DPoP","refresh_token":"r","scope":"atproto transition:generic","expires_in":3600}"#;
+
+    fn token_response(json: &str) -> TokenResponse {
+        serde_json::from_str(json).expect("token response deserializes")
+    }
+
+    #[test]
+    fn test_bind_token_subject_rejects_victim_impersonation() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE);
+
+        let err = bind_token_subject("did:plc:attacker00000000000000", &response)
+            .expect_err("victim subject must be rejected");
+
+        assert!(matches!(err, OAuthClientError::TokenSubjectMismatch { .. }));
+
+        let message = err.to_string();
+        assert!(
+            message.contains("error-atproto-oauth-client-16"),
+            "{message}"
+        );
+        assert!(
+            message.contains("did:plc:victim000000000000000000"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_bind_token_subject_rejects_missing_sub() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE_NO_SUB);
+        assert!(response.sub.is_none());
+
+        let err = bind_token_subject("did:plc:attacker00000000000000", &response)
+            .expect_err("missing subject must be rejected");
+
+        assert!(matches!(err, OAuthClientError::TokenResponseMissingSubject));
+        assert!(
+            err.to_string().contains("error-atproto-oauth-client-15"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_bind_token_subject_rejects_empty_expected_subject() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE);
+
+        let err =
+            bind_token_subject("", &response).expect_err("empty expected subject must be rejected");
+
+        assert!(matches!(err, OAuthClientError::MissingExpectedSubject));
+        assert!(
+            err.to_string().contains("error-atproto-oauth-client-17"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_bind_token_subject_accepts_exact_match() {
+        let response = token_response(ATTACK_TOKEN_RESPONSE);
+
+        bind_token_subject("did:plc:victim000000000000000000", &response)
+            .expect("an exactly matching subject is accepted");
+    }
+
+    #[test]
+    fn test_bind_token_subject_is_exact_comparison() {
+        let expected = "did:plc:victim000000000000000000";
+
+        for actual in [
+            "did:plc:VICTIM000000000000000000",
+            " did:plc:victim000000000000000000",
+            "did:plc:victim000000000000000000 ",
+        ] {
+            let json = format!(
+                r#"{{"access_token":"a","token_type":"DPoP","scope":"atproto","expires_in":3600,"sub":"{actual}"}}"#
+            );
+            let response = token_response(&json);
+
+            let err = bind_token_subject(expected, &response)
+                .expect_err("subjects are compared byte-for-byte");
+            assert!(matches!(err, OAuthClientError::TokenSubjectMismatch { .. }));
+        }
+    }
+
+    #[test]
+    fn test_client_assertion_claims_carry_expiration() {
+        let claims = client_assertion_claims(
+            "https://app.example.com/client-metadata.json",
+            "https://pds.example.com",
+            "jti-value".to_string(),
+        );
+
+        let issued_at = claims.jose.issued_at.expect("iat is set");
+        let expiration = claims.jose.expiration.expect("exp is set");
+
+        assert_eq!(
+            expiration,
+            issued_at + CLIENT_ASSERTION_LIFETIME_SECONDS.cast_unsigned()
+        );
+        assert_eq!(
+            claims.jose.issuer.as_deref(),
+            Some("https://app.example.com/client-metadata.json")
+        );
+        assert_eq!(
+            claims.jose.audience.as_deref(),
+            Some("https://pds.example.com")
+        );
+    }
 }

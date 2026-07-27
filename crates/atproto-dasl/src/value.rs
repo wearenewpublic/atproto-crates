@@ -398,6 +398,15 @@ impl<'de> Deserialize<'de> for Ipld {
     }
 }
 
+/// Upper bound in bytes on speculative pre-allocation driven by a
+/// wire-declared sequence length.
+///
+/// Mirrors `serde::de::size_hint::cautious`: a peer-supplied count is a hint,
+/// never an allocation instruction. Without this clamp a nine-byte CBOR array
+/// header declaring 2^63 elements reaches `Vec::reserve` and panics with
+/// "capacity overflow".
+const MAX_PREALLOC_BYTES: usize = 4096;
+
 struct IpldVisitor;
 
 impl<'de> Visitor<'de> for IpldVisitor {
@@ -576,7 +585,8 @@ impl<'de> Visitor<'de> for IpldVisitor {
     {
         let mut list = Vec::new();
         if let Some(size) = seq.size_hint() {
-            list.reserve(size);
+            let cap = MAX_PREALLOC_BYTES / std::mem::size_of::<Ipld>().max(1);
+            list.reserve(size.min(cap));
         }
         while let Some(elem) = seq.next_element()? {
             list.push(elem);

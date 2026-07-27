@@ -27,7 +27,8 @@ pub mod scid;
 
 use tracing::instrument;
 
-use crate::errors::WebVHDIDError;
+use crate::errors::{DidHostError, WebVHDIDError};
+use crate::host::did_host;
 use crate::model::Document;
 
 pub use model::{
@@ -47,76 +48,30 @@ pub use crate::errors::{ProblemDetails, ResolutionError, ResolutionErrorCode};
 ///
 /// International domain names are converted to ASCII-compatible encoding
 /// (Punycode) per RFC 9233.
-pub fn did_webvh_to_url(did: &str) -> Result<String, WebVHDIDError> {
-    let remainder = did
-        .strip_prefix("did:webvh:")
-        .ok_or(WebVHDIDError::InvalidDIDPrefix)?;
-
-    let parts: Vec<&str> = remainder.split(':').collect();
-    if parts.len() < 2 {
-        return Err(WebVHDIDError::MissingSCID);
-    }
-
-    // First part is SCID (skip for URL construction)
-    let _scid = parts[0];
-    if _scid.is_empty() {
-        return Err(WebVHDIDError::MissingSCID);
-    }
-
-    // Second part is hostname (may include percent-encoded port)
-    let hostname_raw = parts[1];
-    if hostname_raw.is_empty() {
-        return Err(WebVHDIDError::MissingHostname);
-    }
-
-    // Decode percent-encoded port (%3A → :)
-    let decoded = hostname_raw.replace("%3A", ":").replace("%3a", ":");
-
-    // Apply IDNA normalization to hostname portion only (item 10)
-    let hostname = normalize_hostname(&decoded)?;
-
-    // Remaining parts are path segments
-    let path_parts = &parts[2..];
-
-    let url = if path_parts.is_empty() {
-        format!("https://{}/.well-known/did.jsonl", hostname)
-    } else {
-        format!("https://{}/{}/did.jsonl", hostname, path_parts.join("/"))
-    };
-
-    Ok(url)
-}
-
-/// Normalizes a hostname using IDNA processing.
 ///
-/// Converts international domain names to ASCII-compatible encoding
-/// (Punycode) per RFC 9233. Preserves ports. Returns the hostname
-/// unchanged if it's already ASCII.
-fn normalize_hostname(hostname: &str) -> Result<String, WebVHDIDError> {
-    // Split hostname from port
-    let (host, port) = if let Some(colon_pos) = hostname.rfind(':') {
-        // Verify the part after : looks like a port number
-        let potential_port = &hostname[colon_pos + 1..];
-        if potential_port.chars().all(|c| c.is_ascii_digit()) {
-            (&hostname[..colon_pos], Some(potential_port))
-        } else {
-            (hostname, None)
-        }
-    } else {
-        (hostname, None)
-    };
-
-    // Apply IDNA processing to the host portion
-    let ascii_host =
-        idna::domain_to_ascii(host).map_err(|_| WebVHDIDError::HostnameNormalizationFailed {
-            details: format!("IDNA processing failed for hostname: {}", host),
-        })?;
-
-    // Reassemble with port
-    match port {
-        Some(p) => Ok(format!("{}:{}", ascii_host, p)),
-        None => Ok(ascii_host),
+/// # Security
+///
+/// The host is the **second** segment, after the SCID, and is validated by
+/// [`crate::host::did_host`]: it is a syntactic public DNS name and never a network
+/// address literal, so an attacker-published DID cannot direct a fetch at
+/// `169.254.169.254` or any of its decimal, octal, or hexadecimal spellings.
+/// DNS-level protection (rebinding, a public name resolving into a private range)
+/// is explicitly not provided.
+pub fn did_webvh_to_url(did: &str) -> Result<String, WebVHDIDError> {
+    if !did.starts_with("did:webvh:") {
+        return Err(WebVHDIDError::InvalidDIDPrefix);
     }
+
+    let target = did_host(did).map_err(|source| match source {
+        DidHostError::MissingScid { .. } => WebVHDIDError::MissingSCID,
+        DidHostError::MissingHostname { .. } => WebVHDIDError::MissingHostname,
+        DidHostError::IdnaFailed { host } => WebVHDIDError::HostnameNormalizationFailed {
+            details: format!("IDNA processing failed for hostname: {}", host),
+        },
+        other => WebVHDIDError::InvalidHost { source: other },
+    })?;
+
+    Ok(target.document_url("did.jsonl"))
 }
 
 /// Converts a did:webvh DID to its corresponding witness proof file URL.
@@ -327,6 +282,51 @@ mod tests {
     fn test_extract_scid_empty() {
         let result = extract_scid("did:webvh:");
         assert!(matches!(result, Err(WebVHDIDError::MissingSCID)));
+    }
+
+    #[test]
+    fn test_did_webvh_to_url_rejects_address_literal_host() {
+        // Previously returned Ok("https://2852039166/.well-known/did.jsonl").
+        for did in [
+            "did:webvh:z6MkFakeScid:2852039166",
+            "did:webvh:z6MkFakeScid:169.254.169.254",
+            "did:webvh:z6MkFakeScid:0xA9FEA9FE",
+            "did:webvh:z6MkFakeScid:169.254.43518",
+        ] {
+            let result = did_webvh_to_url(did);
+            assert!(
+                matches!(result, Err(WebVHDIDError::InvalidHost { .. })),
+                "expected InvalidHost for {did}, got {result:?}"
+            );
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.starts_with("error-atproto-identity-webvh-27 "),
+                "unexpected message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_did_webvh_to_witness_url_inherits_validation() {
+        let result = did_webvh_to_witness_url("did:webvh:z6MkFakeScid:2852039166");
+        assert!(matches!(result, Err(WebVHDIDError::InvalidHost { .. })));
+    }
+
+    #[test]
+    fn test_did_webvh_to_url_resolution_error_is_invalid_did() {
+        let error = did_webvh_to_url("did:webvh:z6MkFakeScid:2852039166").unwrap_err();
+        let resolution = error.to_resolution_error();
+        assert_eq!(resolution.error, ResolutionErrorCode::InvalidDid);
+        assert_eq!(
+            resolution.problem_details.unwrap().title,
+            "Invalid DID format"
+        );
+    }
+
+    #[test]
+    fn test_did_webvh_to_url_rejects_path_traversal() {
+        assert!(did_webvh_to_url("did:webvh:abc123:example.com:..:..:etc").is_err());
+        assert!(did_webvh_to_url("did:webvh:abc123:example.com%2f..%2fx").is_err());
     }
 
     #[test]

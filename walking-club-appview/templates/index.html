@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Walking Club{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>Walking Club</h1>
+  <p>A permissioned-data space for organizing walks.</p>
+  {% if space_uri %}
+  <p class="muted">Space: <code>{{ space_uri }}</code></p>
+  {% endif %}
+
+  {% if logged_in %}
+  <p>You are signed in{% if did %} as <code>{{ did }}</code>{% endif %}.</p>
+  <p class="actions">
+    <a class="button" href="/feed">Open the feed</a>
+    <a class="button button-secondary" href="/compose">Compose</a>
+  </p>
+  {% else %}
+  <form method="post" action="/login" class="login">
+    <label for="handle">Handle</label>
+    <input id="handle" name="handle" placeholder="alice.ngerakines.dev" required>
+    <button type="submit">Sign in</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

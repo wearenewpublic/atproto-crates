@@ -66,7 +66,7 @@ mod header;
 mod reader;
 mod writer;
 
-pub use block::CarBlock;
+pub use block::{CarBlock, DASL_CID_BYTE_LENGTH, MAX_CID_BYTE_LENGTH};
 pub use config::{CarConfig, LimitsConfig};
 pub use header::CarHeader;
 pub use reader::CarReader;

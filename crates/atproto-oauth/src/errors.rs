@@ -8,7 +8,7 @@
 //!
 //! - **`JWTError`** (jwt-1 to jwt-18): JSON Web Token validation, parsing, and verification errors
 //! - **`JWKError`** (jwk-1 to jwk-7): JSON Web Key conversion, processing, and thumbprint errors
-//! - **`OAuthClientError`** (client-1 to client-14): OAuth client operations and server communication errors
+//! - **`OAuthClientError`** (client-1 to client-17): OAuth client operations and server communication errors
 //! - **`ResourceValidationError`** (resource-1 to resource-2): OAuth protected resource configuration validation errors
 //! - **`AuthServerValidationError`** (auth-server-1 to auth-server-12): OAuth authorization server configuration validation errors
 //! - **`DpopError`** (dpop-1 to dpop-6): DPoP (Demonstration of Proof-of-Possession) operation errors
@@ -276,6 +276,40 @@ pub enum OAuthClientError {
     /// cannot be parsed as JSON.
     #[error("error-atproto-oauth-client-14 Token response JSON parsing failed: {0:?}")]
     TokenResponseJsonParsingFailed(reqwest::Error),
+
+    /// Error when the token endpoint response omits the `sub` claim.
+    ///
+    /// AT Protocol OAuth requires the token response to identify the account
+    /// DID. A missing subject cannot be bound to the DID the authorization flow
+    /// was initiated for, so the response is rejected rather than trusted.
+    #[error(
+        "error-atproto-oauth-client-15 Token response missing subject: authorization server returned no 'sub' claim"
+    )]
+    TokenResponseMissingSubject,
+
+    /// Error when the token endpoint returns a subject other than the DID the
+    /// authorization flow was initiated for.
+    ///
+    /// A mismatch means the authorization server is attempting to authenticate
+    /// the client as a different account than the one the flow began for.
+    #[error(
+        "error-atproto-oauth-client-16 Token subject mismatch: expected {expected}, got {actual}"
+    )]
+    TokenSubjectMismatch {
+        /// The DID the authorization flow was initiated for.
+        expected: String,
+        /// The subject returned by the authorization server.
+        actual: String,
+    },
+
+    /// Error when the caller supplies an empty expected subject.
+    ///
+    /// An empty expected subject would disable subject binding entirely, so it
+    /// is rejected rather than silently accepted.
+    #[error(
+        "error-atproto-oauth-client-17 Expected subject required: caller supplied an empty expected subject"
+    )]
+    MissingExpectedSubject,
 }
 
 /// Represents errors that can occur during OAuth resource validation.

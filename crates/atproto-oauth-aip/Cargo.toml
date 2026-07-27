@@ -1,6 +1,6 @@
 [package]
 name = "atproto-oauth-aip"
-version = "0.15.0-alpha.2"
+version = "0.15.0-rc.1"
 description = "ATProtocol AIP OAuth tools"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
@@ -26,6 +26,9 @@ serde.workspace = true
 thiserror.workspace = true
 
 zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
 
 [features]
 default = ["hickory-dns"]

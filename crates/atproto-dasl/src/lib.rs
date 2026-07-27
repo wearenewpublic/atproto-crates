@@ -59,9 +59,10 @@ pub use cid::{
     compute_cid_for, compute_raw_cid, compute_raw_cid_blake3, verify_cid_bytes, verify_cid_reader,
 };
 pub use drisl::{
-    DecodeConfig, EncodeConfig, TimeMode, from_reader, from_reader_non_strict,
-    from_reader_with_config, from_slice, from_slice_non_strict, from_slice_with_config, to_vec,
-    to_vec_with_config, to_writer, to_writer_with_config,
+    DEFAULT_MAX_ARRAY_ELEMENTS, DEFAULT_MAX_MAP_ENTRIES, DecodeConfig, EncodeConfig, TimeMode,
+    from_reader, from_reader_non_strict, from_reader_with_config, from_slice,
+    from_slice_non_strict, from_slice_with_config, to_vec, to_vec_with_config, to_writer,
+    to_writer_with_config,
 };
 pub use errors::{
     CarError, DaslCidError, DecodeError, EncodeError, MaslError, RaslError, StorageError,

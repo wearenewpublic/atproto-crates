@@ -452,6 +452,7 @@ async fn handle_login_command(
     let now = Utc::now();
     let oauth_request = OAuthRequest {
         oauth_state: state.clone(),
+        subject: document.id.clone(),
         issuer: authorization_server.issuer.clone(),
         authorization_server: authorization_server.issuer.clone(),
         nonce: nonce.clone(),

@@ -1,6 +1,6 @@
 [package]
 name = "atproto-pds"
-version = "0.15.0-alpha.2"
+version = "0.15.0-rc.1"
 description = "AT Protocol Personal Data Server — server library and `pds` binary"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

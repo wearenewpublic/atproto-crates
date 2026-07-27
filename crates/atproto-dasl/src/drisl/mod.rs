@@ -21,7 +21,9 @@ pub mod de;
 pub mod raw;
 pub mod ser;
 
-pub use config::{DecodeConfig, EncodeConfig, TimeMode};
+pub use config::{
+    DEFAULT_MAX_ARRAY_ELEMENTS, DEFAULT_MAX_MAP_ENTRIES, DecodeConfig, EncodeConfig, TimeMode,
+};
 
 use crate::errors::{DecodeError, EncodeError};
 use std::io::{Cursor, Read, Write};
@@ -144,6 +146,9 @@ pub fn from_reader_non_strict<R: Read, T: serde::de::DeserializeOwned>(
 
 /// Deserialize a value from a byte slice with custom configuration.
 ///
+/// A slice communicates its total length, which lets the decoder reject
+/// collection headers declaring more items than the remaining bytes can hold.
+///
 /// # Errors
 ///
 /// Returns `DecodeError` if deserialization fails.
@@ -151,11 +156,15 @@ pub fn from_slice_with_config<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     config: DecodeConfig,
 ) -> Result<T, DecodeError> {
-    let reader = Cursor::new(bytes);
-    from_reader_with_config(reader, config)
+    from_reader_with_input_len(Cursor::new(bytes), config, Some(bytes.len() as u64))
 }
 
 /// Deserialize a value from a reader with custom configuration.
+///
+/// The total input length is unknown for an arbitrary reader, so the
+/// remaining-input bound on collection lengths does not apply; the element
+/// count limits and bounded pre-allocation still do. Prefer
+/// [`from_slice_with_config`] when the input is already in memory.
 ///
 /// # Errors
 ///
@@ -164,8 +173,17 @@ pub fn from_reader_with_config<R: Read, T: serde::de::DeserializeOwned>(
     reader: R,
     config: DecodeConfig,
 ) -> Result<T, DecodeError> {
+    from_reader_with_input_len(reader, config, None)
+}
+
+/// Shared implementation for the slice and reader entry points.
+fn from_reader_with_input_len<R: Read, T: serde::de::DeserializeOwned>(
+    reader: R,
+    config: DecodeConfig,
+    input_len: Option<u64>,
+) -> Result<T, DecodeError> {
     let strict = config.strict;
-    let mut deserializer = de::Deserializer::with_config(reader, config);
+    let mut deserializer = de::Deserializer::with_config_and_input_len(reader, config, input_len);
     let value = serde::Deserialize::deserialize(&mut deserializer)?;
     if strict && deserializer.has_trailing_data()? {
         return Err(DecodeError::TrailingData);

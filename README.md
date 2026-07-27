@@ -6,7 +6,7 @@ A Rust workspace of crates for building AT Protocol applications. This collectio
 
 ## Components
 
-This workspace contains 18 crates that work together to provide complete AT Protocol application development capabilities:
+This workspace contains 17 crates that work together to provide complete AT Protocol application development capabilities:
 
 ### Data Foundations
 
@@ -56,17 +56,17 @@ Add the crates to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-atproto-dasl = "0.15.0-alpha.2"
-atproto-identity = "0.15.0-alpha.2"
-atproto-attestation = "0.15.0-alpha.2"
-atproto-record = "0.15.0-alpha.2"
-atproto-repo = "0.15.0-alpha.2"
-atproto-lexicon = "0.15.0-alpha.2"
-atproto-oauth = "0.15.0-alpha.2"
-atproto-oauth-aip = "0.15.0-alpha.2"
-atproto-client = "0.15.0-alpha.2"
-atproto-extras = "0.15.0-alpha.2"
-atproto-tap = "0.15.0-alpha.2"
+atproto-dasl = "0.15.0-rc.1"
+atproto-identity = "0.15.0-rc.1"
+atproto-attestation = "0.15.0-rc.1"
+atproto-record = "0.15.0-rc.1"
+atproto-repo = "0.15.0-rc.1"
+atproto-lexicon = "0.15.0-rc.1"
+atproto-oauth = "0.15.0-rc.1"
+atproto-oauth-aip = "0.15.0-rc.1"
+atproto-client = "0.15.0-rc.1"
+atproto-extras = "0.15.0-rc.1"
+atproto-tap = "0.15.0-rc.1"
 # Add others as needed
 ```
 

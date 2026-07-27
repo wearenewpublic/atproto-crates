@@ -2,6 +2,7 @@
 //!
 //! Each block in a CAR file consists of a CID and the block data.
 
+use crate::car::config::LimitsConfig;
 use crate::cid::{DAG_CBOR_CODEC, RAW_CODEC, SHA256_CODE, compute_cid};
 use crate::errors::CarError;
 use crate::varint;
@@ -13,6 +14,110 @@ use std::io::{Read, Write};
 /// A DASL-conformant CID is always exactly 36 bytes:
 /// 1 (version) + 1 (codec varint) + 1 (hash code) + 1 (digest length) + 32 (digest).
 pub const DASL_CID_BYTE_LENGTH: usize = 36;
+
+/// Largest CID prefix a CAR block frame can legitimately carry.
+///
+/// A worst-case CID prefix costs 1 byte of version varint, 9 bytes of codec
+/// varint, 9 bytes of multihash code varint, 2 bytes of digest length varint and
+/// a 64-byte digest (this crate uses `Multihash<64>`), for 85 bytes; rounded up
+/// to 96 for headroom.
+///
+/// DASL CIDs are 36 bytes, so this bound exists only to keep the pre-allocation
+/// check on the wire length from rejecting a legal frame. The exact
+/// `max_block_size` check runs after the CID is parsed, so the slack cannot
+/// loosen the real limit.
+pub const MAX_CID_BYTE_LENGTH: usize = 96;
+
+/// Chunk size for incremental block reads.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Read exactly `len` bytes without trusting `len` up front.
+///
+/// Commits at most `READ_CHUNK` bytes before the stream has proven it actually
+/// holds them, and grows with `Vec::try_reserve`, so a hostile length produces a
+/// recoverable error instead of a "capacity overflow" panic or an allocator
+/// abort.
+///
+/// # Errors
+///
+/// Returns `CarError::AllocationFailed` if the allocator cannot satisfy a chunk,
+/// and `CarError::Io` if the stream ends before `len` bytes are read.
+fn read_exact_incremental<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>, CarError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let initial = len.min(READ_CHUNK);
+    buf.try_reserve_exact(initial)
+        .map_err(|e| CarError::AllocationFailed {
+            requested: initial,
+            reason: e.to_string(),
+        })?;
+    while buf.len() < len {
+        let want = (len - buf.len()).min(READ_CHUNK);
+        let start = buf.len();
+        buf.try_reserve(want)
+            .map_err(|e| CarError::AllocationFailed {
+                requested: start + want,
+                reason: e.to_string(),
+            })?;
+        buf.resize(start + want, 0);
+        reader.read_exact(&mut buf[start..])?;
+    }
+    Ok(buf)
+}
+
+/// Convert a wire-declared frame length into a checked `usize`.
+///
+/// The frame budget is the data limit plus the largest CID that can precede the
+/// data, since the CAR wire length covers both.
+///
+/// # Errors
+///
+/// Returns `CarError::BlockTooLarge` if the declared length exceeds the budget
+/// or does not fit in `usize` (relevant on 32-bit targets, where a bare
+/// `as usize` would silently truncate).
+fn checked_frame_length(length: u64, limits: &LimitsConfig) -> Result<usize, CarError> {
+    let max_frame = limits.max_block_size.saturating_add(MAX_CID_BYTE_LENGTH);
+    let length_usize = usize::try_from(length).map_err(|_| CarError::BlockTooLarge {
+        size: length,
+        max: max_frame as u64,
+    })?;
+    if length_usize > max_frame {
+        return Err(CarError::BlockTooLarge {
+            size: length,
+            max: max_frame as u64,
+        });
+    }
+    Ok(length_usize)
+}
+
+/// Split a decoded frame into a CID and its data, enforcing the exact limit.
+///
+/// # Errors
+///
+/// Returns `CarError::InvalidCid` if the CID does not parse,
+/// `CarError::InvalidBlock` if no data follows the CID, and
+/// `CarError::BlockTooLarge` if the data exceeds `limits.max_block_size`.
+fn split_frame(block_bytes: &[u8], limits: &LimitsConfig) -> Result<CarBlock, CarError> {
+    let cid = Cid::try_from(block_bytes).map_err(|e| CarError::InvalidCid {
+        reason: e.to_string(),
+    })?;
+
+    let cid_len = cid.to_bytes().len();
+    if cid_len >= block_bytes.len() {
+        return Err(CarError::InvalidBlock {
+            reason: "block has no data after CID".to_string(),
+        });
+    }
+
+    let data = block_bytes[cid_len..].to_vec();
+    if data.len() > limits.max_block_size {
+        return Err(CarError::BlockTooLarge {
+            size: data.len() as u64,
+            max: limits.max_block_size as u64,
+        });
+    }
+
+    Ok(CarBlock { cid, data })
+}
 
 /// A single block in a CAR file.
 ///
@@ -150,14 +255,42 @@ impl CarBlock {
         Ok(bytes.len())
     }
 
-    /// Read a block from a reader.
+    /// Read a block from a reader using [`LimitsConfig::default`].
+    ///
+    /// Returns `None` at EOF. Blocks whose data exceeds the default
+    /// `max_block_size` (1 MB) are rejected; use [`Self::read_from_with_limits`]
+    /// for a different budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CarError::InvalidBlock` if the block is malformed, or
+    /// `CarError::BlockTooLarge` if it exceeds the default limits.
+    pub fn read_from<R: Read>(reader: &mut R) -> Result<Option<Self>, CarError> {
+        Self::read_from_with_limits(reader, &LimitsConfig::default())
+    }
+
+    /// Read a block from a reader, enforcing `limits` before allocating.
+    ///
+    /// The wire length is checked against `limits.max_block_size` plus
+    /// [`MAX_CID_BYTE_LENGTH`] before any buffer is created, and the block data
+    /// is checked exactly once the CID has been parsed. The buffer itself grows
+    /// incrementally with `Vec::try_reserve`, so even
+    /// [`LimitsConfig::unlimited`] cannot be turned into a panic or an
+    /// allocator abort by a hostile length prefix.
     ///
     /// Returns `None` at EOF.
     ///
     /// # Errors
     ///
-    /// Returns `CarError::InvalidBlock` if the block is malformed.
-    pub fn read_from<R: Read>(reader: &mut R) -> Result<Option<Self>, CarError> {
+    /// Returns `CarError::BlockTooLarge` if the declared frame or the decoded
+    /// data exceeds the limits, `CarError::AllocationFailed` if the allocator
+    /// refuses a chunk, `CarError::Io` if the stream is truncated, and
+    /// `CarError::InvalidBlock` or `CarError::InvalidCid` if the block is
+    /// malformed.
+    pub fn read_from_with_limits<R: Read>(
+        reader: &mut R,
+        limits: &LimitsConfig,
+    ) -> Result<Option<Self>, CarError> {
         // Try to read length prefix
         let length = match varint::read_varint(reader) {
             Ok(len) => len,
@@ -171,38 +304,39 @@ impl CarBlock {
             });
         }
 
-        // Read all bytes
-        let mut block_bytes = vec![0u8; length as usize];
-        reader.read_exact(&mut block_bytes)?;
+        let length = checked_frame_length(length, limits)?;
+        let block_bytes = read_exact_incremental(reader, length)?;
 
-        // Parse CID from beginning of block
-        let cid = Cid::try_from(&block_bytes[..]).map_err(|e| CarError::InvalidCid {
-            reason: e.to_string(),
-        })?;
-
-        let cid_len = cid.to_bytes().len();
-        if cid_len >= block_bytes.len() {
-            return Err(CarError::InvalidBlock {
-                reason: "block has no data after CID".to_string(),
-            });
-        }
-
-        // Remaining bytes are the data
-        let data = block_bytes[cid_len..].to_vec();
-
-        Ok(Some(Self { cid, data }))
+        Ok(Some(split_frame(&block_bytes, limits)?))
     }
 
-    /// Decode a block from bytes (with length prefix).
+    /// Decode a block from bytes (with length prefix) using
+    /// [`LimitsConfig::default`].
     ///
     /// Returns `(block, bytes_consumed)`.
     ///
     /// # Errors
     ///
-    /// Returns `CarError` if decoding fails.
+    /// Returns `CarError` if decoding fails, including
+    /// `CarError::BlockTooLarge` when the block exceeds the default limits.
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), CarError> {
+        Self::from_bytes_with_limits(bytes, &LimitsConfig::default())
+    }
+
+    /// Decode a block from bytes (with length prefix), enforcing `limits`.
+    ///
+    /// Returns `(block, bytes_consumed)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CarError` if decoding fails. See
+    /// [`Self::read_from_with_limits`] for the specific variants.
+    pub fn from_bytes_with_limits(
+        bytes: &[u8],
+        limits: &LimitsConfig,
+    ) -> Result<(Self, usize), CarError> {
         let mut cursor = std::io::Cursor::new(bytes);
-        match Self::read_from(&mut cursor)? {
+        match Self::read_from_with_limits(&mut cursor, limits)? {
             Some(block) => Ok((block, cursor.position() as usize)),
             None => Err(CarError::InvalidBlock {
                 reason: "unexpected end of input".to_string(),
@@ -237,11 +371,54 @@ pub mod async_io {
         Ok(prefix_len + total_len)
     }
 
-    /// Read a block from an async reader.
+    /// Async counterpart of [`super::read_exact_incremental`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `CarError::AllocationFailed` if the allocator cannot satisfy a
+    /// chunk, and `CarError::Io` if the stream ends early.
+    async fn read_exact_incremental<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        len: usize,
+    ) -> Result<Vec<u8>, CarError> {
+        let mut buf: Vec<u8> = Vec::new();
+        let initial = len.min(READ_CHUNK);
+        buf.try_reserve_exact(initial)
+            .map_err(|e| CarError::AllocationFailed {
+                requested: initial,
+                reason: e.to_string(),
+            })?;
+        while buf.len() < len {
+            let want = (len - buf.len()).min(READ_CHUNK);
+            let start = buf.len();
+            buf.try_reserve(want)
+                .map_err(|e| CarError::AllocationFailed {
+                    requested: start + want,
+                    reason: e.to_string(),
+                })?;
+            buf.resize(start + want, 0);
+            reader.read_exact(&mut buf[start..]).await?;
+        }
+        Ok(buf)
+    }
+
+    /// Read a block from an async reader, enforcing `limits` before allocating.
+    ///
+    /// Mirrors [`CarBlock::read_from_with_limits`]: the declared frame length is
+    /// checked against `limits.max_block_size` plus [`MAX_CID_BYTE_LENGTH`]
+    /// before any buffer exists, the buffer grows incrementally with
+    /// `Vec::try_reserve`, and the data is checked exactly once the CID has been
+    /// parsed.
     ///
     /// Returns `None` at EOF.
-    pub async fn read_block<R: AsyncRead + Unpin>(
+    ///
+    /// # Errors
+    ///
+    /// Returns `CarError::BlockTooLarge`, `CarError::AllocationFailed`,
+    /// `CarError::Io`, `CarError::InvalidBlock`, or `CarError::InvalidCid`.
+    pub async fn read_block_with_limits<R: AsyncRead + Unpin>(
         reader: &mut R,
+        limits: &LimitsConfig,
     ) -> Result<Option<CarBlock>, CarError> {
         // Try to read length prefix
         let length = match async_varint::read_varint(reader).await {
@@ -256,26 +433,10 @@ pub mod async_io {
             });
         }
 
-        // Read all bytes
-        let mut block_bytes = vec![0u8; length as usize];
-        reader.read_exact(&mut block_bytes).await?;
+        let length = checked_frame_length(length, limits)?;
+        let block_bytes = read_exact_incremental(reader, length).await?;
 
-        // Parse CID from beginning of block
-        let cid = Cid::try_from(&block_bytes[..]).map_err(|e| CarError::InvalidCid {
-            reason: e.to_string(),
-        })?;
-
-        let cid_len = cid.to_bytes().len();
-        if cid_len >= block_bytes.len() {
-            return Err(CarError::InvalidBlock {
-                reason: "block has no data after CID".to_string(),
-            });
-        }
-
-        // Remaining bytes are the data
-        let data = block_bytes[cid_len..].to_vec();
-
-        Ok(Some(CarBlock { cid, data }))
+        Ok(Some(split_frame(&block_bytes, limits)?))
     }
 }
 
@@ -373,7 +534,10 @@ mod tests {
         async_io::write_block(&mut buffer, &block).await.unwrap();
 
         let mut cursor = std::io::Cursor::new(&buffer);
-        let decoded = async_io::read_block(&mut cursor).await.unwrap().unwrap();
+        let decoded = async_io::read_block_with_limits(&mut cursor, &LimitsConfig::default())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(decoded.cid, block.cid);
         assert_eq!(decoded.data, block.data);
@@ -383,7 +547,9 @@ mod tests {
     async fn test_async_eof() {
         let empty: &[u8] = &[];
         let mut cursor = std::io::Cursor::new(empty);
-        let result = async_io::read_block(&mut cursor).await.unwrap();
+        let result = async_io::read_block_with_limits(&mut cursor, &LimitsConfig::default())
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 }

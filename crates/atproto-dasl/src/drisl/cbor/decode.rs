@@ -10,6 +10,13 @@ use crate::drisl::config::DecodeConfig;
 use crate::errors::DecodeError;
 use std::io::Read;
 
+/// Largest single buffer growth step when reading a byte or text string.
+///
+/// A declared length is never trusted enough to reserve in one shot: the buffer
+/// grows in chunks as bytes actually arrive, so a lying header costs at most
+/// this much memory before the read fails.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// Decoded CBOR data item
 #[derive(Debug, Clone, PartialEq)]
 pub enum CborItem {
@@ -61,6 +68,10 @@ pub struct CborDecoder<R: Read> {
     reader: R,
     config: DecodeConfig,
     peeked: Option<u8>,
+    /// Bytes consumed from the reader so far.
+    consumed: u64,
+    /// Total input length, when the input is a slice of known size.
+    input_len: Option<u64>,
 }
 
 impl<R: Read> CborDecoder<R> {
@@ -71,10 +82,25 @@ impl<R: Read> CborDecoder<R> {
 
     /// Create a new decoder with custom configuration
     pub fn with_config(reader: R, config: DecodeConfig) -> Self {
+        Self::with_config_and_input_len(reader, config, None)
+    }
+
+    /// Create a decoder that knows its total input length.
+    ///
+    /// Enables rejecting collection headers that declare more items than the
+    /// remaining bytes can possibly encode. Pass `None` when the total length
+    /// is unknown (an arbitrary stream).
+    pub fn with_config_and_input_len(
+        reader: R,
+        config: DecodeConfig,
+        input_len: Option<u64>,
+    ) -> Self {
         Self {
             reader,
             config,
             peeked: None,
+            consumed: 0,
+            input_len,
         }
     }
 
@@ -96,12 +122,21 @@ impl<R: Read> CborDecoder<R> {
 
         let mut buf = [0u8; 1];
         match self.reader.read_exact(&mut buf) {
-            Ok(()) => Ok(buf[0]),
+            Ok(()) => {
+                self.consumed = self.consumed.saturating_add(1);
+                Ok(buf[0])
+            }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 Err(DecodeError::UnexpectedEof)
             }
             Err(e) => Err(DecodeError::Io(e)),
         }
+    }
+
+    /// Bytes left in the input, when the total length is known.
+    fn remaining_input(&self) -> Option<u64> {
+        self.input_len
+            .map(|total| total.saturating_sub(self.consumed))
     }
 
     /// Peek at the next byte without consuming it
@@ -125,6 +160,7 @@ impl<R: Read> CborDecoder<R> {
         match self.reader.read(&mut buf) {
             Ok(0) => Ok(false),
             Ok(_) => {
+                self.consumed = self.consumed.saturating_add(1);
                 self.peeked = Some(buf[0]);
                 Ok(true)
             }
@@ -133,7 +169,19 @@ impl<R: Read> CborDecoder<R> {
         }
     }
 
-    /// Read exactly n bytes
+    /// Read exactly `n` bytes.
+    ///
+    /// The buffer grows incrementally as bytes arrive rather than being
+    /// pre-allocated from the wire-declared length, so a header that lies about
+    /// its size cannot commit a large allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecodeError::AllocationExceeded` when `n` exceeds
+    /// `max_alloc`, `DecodeError::StringLengthExceedsInput` when `n` exceeds
+    /// the bytes that remain in a known-length input,
+    /// `DecodeError::AllocationFailed` when the allocator refuses a chunk, and
+    /// `DecodeError::UnexpectedEof` when the input ends early.
     pub fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>, DecodeError> {
         if n > self.config.max_alloc {
             return Err(DecodeError::AllocationExceeded {
@@ -142,14 +190,45 @@ impl<R: Read> CborDecoder<R> {
             });
         }
 
-        let mut buf = vec![0u8; n];
-        match self.reader.read_exact(&mut buf) {
-            Ok(()) => Ok(buf),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Err(DecodeError::UnexpectedEof)
-            }
-            Err(e) => Err(DecodeError::Io(e)),
+        // A string of length n needs exactly n more bytes, so when the total
+        // input length is known this bound is exact and never false-rejects.
+        if let Some(remaining) = self.remaining_input()
+            && n as u64 > remaining
+        {
+            return Err(DecodeError::StringLengthExceedsInput {
+                length: n as u64,
+                remaining,
+            });
         }
+
+        let mut buf: Vec<u8> = Vec::new();
+        let initial = n.min(READ_CHUNK);
+        buf.try_reserve_exact(initial)
+            .map_err(|e| DecodeError::AllocationFailed {
+                requested: initial,
+                reason: e.to_string(),
+            })?;
+
+        while buf.len() < n {
+            let start = buf.len();
+            let want = (n - start).min(READ_CHUNK);
+            buf.try_reserve(want)
+                .map_err(|e| DecodeError::AllocationFailed {
+                    requested: start + want,
+                    reason: e.to_string(),
+                })?;
+            buf.resize(start + want, 0);
+            match self.reader.read_exact(&mut buf[start..]) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(DecodeError::UnexpectedEof);
+                }
+                Err(e) => return Err(DecodeError::Io(e)),
+            }
+        }
+
+        self.consumed = self.consumed.saturating_add(n as u64);
+        Ok(buf)
     }
 
     /// Read a u16 in big-endian format
@@ -266,6 +345,8 @@ impl<R: Read> CborDecoder<R> {
                         max: self.config.max_alloc,
                     });
                 }
+                // `read_bytes` applies the remaining-input bound and grows its
+                // buffer incrementally, so `len` is never pre-allocated.
                 let bytes = self.read_bytes(len)?;
                 Ok(CborItem::Bytes(bytes))
             }
@@ -277,6 +358,7 @@ impl<R: Read> CborDecoder<R> {
                         max: self.config.max_alloc,
                     });
                 }
+                // Same bounded read as the byte-string path above.
                 let bytes = self.read_bytes(len)?;
                 let text = String::from_utf8(bytes)?;
                 Ok(CborItem::Text(text))
@@ -289,6 +371,18 @@ impl<R: Read> CborDecoder<R> {
                         max: self.config.max_array_elements,
                     });
                 }
+                // Each element needs at least one byte, so a declared count
+                // larger than the bytes that remain cannot be honest.
+                if let Some(remaining) = self.remaining_input() {
+                    let needed = len as u64;
+                    if needed > remaining {
+                        return Err(DecodeError::CollectionLengthExceedsInput {
+                            count: len,
+                            needed,
+                            remaining,
+                        });
+                    }
+                }
                 Ok(CborItem::Array(len))
             }
             major_type::MAP => {
@@ -298,6 +392,17 @@ impl<R: Read> CborDecoder<R> {
                         count: len,
                         max: self.config.max_map_entries,
                     });
+                }
+                // Each entry needs at least a key byte and a value byte.
+                if let Some(remaining) = self.remaining_input() {
+                    let needed = (len as u64).saturating_mul(2);
+                    if needed > remaining {
+                        return Err(DecodeError::CollectionLengthExceedsInput {
+                            count: len,
+                            needed,
+                            remaining,
+                        });
+                    }
                 }
                 Ok(CborItem::Map(len))
             }
@@ -682,6 +787,107 @@ mod tests {
     fn test_rejects_undefined() {
         // Undefined -> 0xf7
         assert!(decode_bytes(&[0xf7]).is_err());
+    }
+
+    fn decode_slice(bytes: &[u8]) -> Result<CborItem, DecodeError> {
+        let mut decoder = CborDecoder::with_config_and_input_len(
+            Cursor::new(bytes),
+            DecodeConfig::default(),
+            Some(bytes.len() as u64),
+        );
+        decoder.decode_item()
+    }
+
+    #[test]
+    fn test_byte_string_bomb_rejected_before_allocation() {
+        // Major type 2, canonical 4-byte length 0x04000000 = 67_108_864, which
+        // is exactly DecodeConfig::default().max_alloc. Five bytes of input must
+        // not commit a 64 MiB allocation.
+        let payload = [0x5a, 0x04, 0x00, 0x00, 0x00];
+        match decode_slice(&payload) {
+            Err(DecodeError::StringLengthExceedsInput { length, remaining }) => {
+                assert_eq!(length, 67_108_864);
+                assert_eq!(remaining, 0);
+            }
+            other => panic!("expected StringLengthExceedsInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_text_string_bomb_rejected_before_allocation() {
+        // Text-string variant of the same bomb.
+        let payload = [0x7a, 0x04, 0x00, 0x00, 0x00];
+        match decode_slice(&payload) {
+            Err(DecodeError::StringLengthExceedsInput { length, remaining }) => {
+                assert_eq!(length, 67_108_864);
+                assert_eq!(remaining, 0);
+            }
+            other => panic!("expected StringLengthExceedsInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_string_bomb_over_reader_reads_incrementally() {
+        // Without a known input length the bound cannot apply, so the
+        // incremental read must surface EOF instead of pre-allocating.
+        let payload = [0x5a, 0x04, 0x00, 0x00, 0x00];
+        let mut decoder = CborDecoder::new(Cursor::new(&payload[..]));
+        assert!(matches!(
+            decoder.decode_item(),
+            Err(DecodeError::UnexpectedEof)
+        ));
+
+        let payload = [0x7a, 0x04, 0x00, 0x00, 0x00];
+        let mut decoder = CborDecoder::new(Cursor::new(&payload[..]));
+        assert!(matches!(
+            decoder.decode_item(),
+            Err(DecodeError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn test_string_bomb_rejected_with_unlimited_max_alloc() {
+        // max_alloc is no longer the only defence: a 2^63-byte declaration is
+        // rejected by the remaining-input bound even when max_alloc is huge.
+        let config = DecodeConfig {
+            max_alloc: usize::MAX,
+            ..DecodeConfig::default()
+        };
+        let payload = [0x5b, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut decoder = CborDecoder::with_config_and_input_len(
+            Cursor::new(&payload[..]),
+            config,
+            Some(payload.len() as u64),
+        );
+        assert!(matches!(
+            decoder.decode_item(),
+            Err(DecodeError::StringLengthExceedsInput { .. })
+        ));
+    }
+
+    #[test]
+    fn test_exact_length_strings_still_decode() {
+        // The bound is exact for strings, so a string that exactly fills the
+        // remaining input must still be accepted.
+        assert_eq!(
+            decode_slice(&[0x43, 0x01, 0x02, 0x03]).unwrap(),
+            CborItem::Bytes(vec![1, 2, 3])
+        );
+        assert_eq!(
+            decode_slice(&[0x65, b'h', b'e', b'l', b'l', b'o']).unwrap(),
+            CborItem::Text("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_large_legitimate_string_decodes() {
+        // Longer than READ_CHUNK, so the chunked read loop runs several times.
+        let data = vec![0x5au8; READ_CHUNK * 3 + 17];
+        let mut payload = Vec::new();
+        payload.push(0x5a);
+        payload.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&data);
+        assert_eq!(decode_slice(&payload).unwrap(), CborItem::Bytes(data));
     }
 
     #[test]

@@ -6,11 +6,14 @@
 //!
 //! ## Error Categories
 //!
-//! - **`WebDIDError`** (web-1 to web-4): Errors specific to `did:web` operations including URL conversion and document fetching
+//! - **`WebDIDError`** (web-1 to web-5): Errors specific to `did:web` operations including URL conversion and document fetching
 //! - **`ConfigError`** (config-1 to config-3): Configuration and environment variable related errors
 //! - **`ResolveError`** (resolve-1 to resolve-8): Handle and DID resolution errors including DNS/HTTP failures and conflicts
 //! - **`PLCDIDError`** (plc-1 to plc-2): PLC directory communication and document parsing errors
 //! - **`KeyError`** (key-1 to key-12): Cryptographic key operations including generation, parsing, signing, and validation
+//! - **`WebVHDIDError`** (webvh-1 to webvh-27): `did:webvh` log resolution, verification, and target validation errors
+//! - **`DidHostError`** (host-1 to host-8): Host extraction and validation for `did:web` and `did:webvh` targets
+//! - **`EndpointError`** (endpoint-1 to endpoint-8): Untrusted service endpoint URL policy violations
 //! - **`StorageError`** (storage-1 to storage-3): Storage operations including cache lock failures and data access errors
 //!
 //! ## Error Format
@@ -47,6 +50,145 @@ pub enum WebDIDError {
         url: String,
         /// The underlying parse error
         error: reqwest::Error,
+    },
+
+    /// Occurs when the did:web target host or path fails validation
+    #[error("error-atproto-identity-web-5 Rejected did:web target: {source}")]
+    InvalidHost {
+        /// The underlying host-extraction failure
+        #[from]
+        source: DidHostError,
+    },
+}
+
+/// Error types that can occur when extracting a network host from a DID.
+///
+/// Produced by [`crate::host::did_host`] when a `did:web` or `did:webvh` DID
+/// does not encode a safe, syntactically valid HTTPS target.
+#[derive(Debug, Error)]
+pub enum DidHostError {
+    /// Occurs when the DID method does not encode a network host
+    #[error("error-atproto-identity-host-1 Unsupported DID method for host extraction: {did}")]
+    UnsupportedMethod {
+        /// The DID that was supplied
+        did: String,
+    },
+
+    /// Occurs when the DID has no hostname component
+    #[error("error-atproto-identity-host-2 Invalid DID format: missing hostname component: {did}")]
+    MissingHostname {
+        /// The DID that was supplied
+        did: String,
+    },
+
+    /// Occurs when a `did:webvh` DID has no SCID component
+    #[error("error-atproto-identity-host-3 Invalid DID format: missing SCID component: {did}")]
+    MissingScid {
+        /// The DID that was supplied
+        did: String,
+    },
+
+    /// Occurs when the host is a network address literal rather than a DNS name
+    #[error("error-atproto-identity-host-4 Host is a network address literal: {host}")]
+    IpLiteralHost {
+        /// The rejected host
+        host: String,
+    },
+
+    /// Occurs when the host is not a syntactically valid DNS hostname
+    #[error("error-atproto-identity-host-5 Invalid hostname syntax: {host}")]
+    InvalidHostname {
+        /// The rejected host
+        host: String,
+    },
+
+    /// Occurs when the percent-decoded authority carries an unusable port
+    #[error("error-atproto-identity-host-6 Invalid port: {port}")]
+    InvalidPort {
+        /// The rejected port text
+        port: String,
+    },
+
+    /// Occurs when a colon-separated path segment contains unsafe characters
+    #[error("error-atproto-identity-host-7 Invalid path segment: {segment}")]
+    InvalidPathSegment {
+        /// The rejected path segment
+        segment: String,
+    },
+
+    /// Occurs when IDNA normalization of the host fails
+    #[error("error-atproto-identity-host-8 IDNA normalization failed: {host}")]
+    IdnaFailed {
+        /// The host that could not be normalized
+        host: String,
+    },
+}
+
+/// Error types produced when an untrusted service endpoint URL fails policy validation.
+///
+/// Produced by [`crate::validation::validate_service_endpoint`].
+#[derive(Debug, Error)]
+pub enum EndpointError {
+    /// Occurs when the endpoint cannot be parsed as an absolute URL
+    #[error(
+        "error-atproto-identity-endpoint-1 Endpoint is not an absolute URL: {endpoint} {details}"
+    )]
+    NotAbsoluteUrl {
+        /// The endpoint that was supplied
+        endpoint: String,
+        /// Details about the parse failure
+        details: String,
+    },
+
+    /// Occurs when the endpoint uses a scheme other than https
+    #[error("error-atproto-identity-endpoint-2 Endpoint scheme must be https: {scheme}")]
+    InvalidScheme {
+        /// The rejected scheme
+        scheme: String,
+    },
+
+    /// Occurs when the endpoint URL has no host component
+    #[error("error-atproto-identity-endpoint-3 Endpoint is missing a host: {endpoint}")]
+    MissingHost {
+        /// The endpoint that was supplied
+        endpoint: String,
+    },
+
+    /// Occurs when the endpoint host is a network address literal
+    #[error("error-atproto-identity-endpoint-4 Endpoint host is a network address literal: {host}")]
+    IpLiteralHost {
+        /// The rejected host
+        host: String,
+    },
+
+    /// Occurs when the endpoint hostname fails DNS name validation
+    #[error("error-atproto-identity-endpoint-5 Endpoint hostname is invalid: {host}")]
+    InvalidHostname {
+        /// The rejected host
+        host: String,
+    },
+
+    /// Occurs when the endpoint embeds userinfo credentials
+    #[error("error-atproto-identity-endpoint-6 Endpoint contains embedded credentials: {endpoint}")]
+    EmbeddedCredentials {
+        /// The endpoint that was supplied
+        endpoint: String,
+    },
+
+    /// Occurs when the endpoint specifies a port other than the https default
+    #[error("error-atproto-identity-endpoint-7 Endpoint uses a non-default port: {port}")]
+    NonDefaultPort {
+        /// The rejected port
+        port: u16,
+    },
+
+    /// Occurs when the endpoint carries a query string or fragment
+    #[error(
+        "error-atproto-identity-endpoint-8 Endpoint contains a query string or fragment: {endpoint}"
+    )]
+    QueryOrFragment {
+        /// The endpoint that was supplied
+        endpoint: String,
     },
 }
 
@@ -621,6 +763,14 @@ pub enum WebVHDIDError {
         /// Details about the signing failure
         details: String,
     },
+
+    /// Occurs when the did:webvh target host or path fails validation
+    #[error("error-atproto-identity-webvh-27 Rejected did:webvh target: {source}")]
+    InvalidHost {
+        /// The underlying host-extraction failure
+        #[from]
+        source: DidHostError,
+    },
 }
 
 /// Resolution error codes as defined by the did:webvh specification.
@@ -673,6 +823,7 @@ impl WebVHDIDError {
             WebVHDIDError::InvalidDIDPrefix
             | WebVHDIDError::MissingSCID
             | WebVHDIDError::MissingHostname
+            | WebVHDIDError::InvalidHost { .. }
             | WebVHDIDError::InvalidSCIDFormat { .. } => ResolutionError {
                 error: ResolutionErrorCode::InvalidDid,
                 problem_details: Some(ProblemDetails {

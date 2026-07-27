@@ -53,6 +53,7 @@
 //! // Complete OAuth flow with authorization code
 //! # let oauth_request = atproto_oauth::workflow::OAuthRequest {
 //! #     oauth_state: "state".to_string(),
+//! #     subject: "did:plc:example123".to_string(),
 //! #     issuer: "https://auth.example.com".to_string(),
 //! #     authorization_server: "https://auth.example.com".to_string(),
 //! #     nonce: "nonce".to_string(),

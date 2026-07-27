@@ -7,7 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- New `atproto-oauth-dioxus` crate providing Dioxus fullstack integration for AT Protocol OAuth authentication  flow components, hooks, and server functions by [@metru.dev](https://tangled.org/metru.dev).
+## [0.15.0-rc.1] - 2026-07-27
+### Security
+- `atproto-lexicon`: bounded `ref`/`union` traversal during data validation. A `union` def that
+  referenced itself, or an acyclic chain of ~2500 `union` defs (~105 KB of lexicon JSON), drove
+  unbounded recursion on the same `DataValue` and overflowed the stack. A stack overflow aborts the
+  whole process with `SIGABRT`, so a single unauthenticated request killed every in-flight request on
+  the server; `catch_unwind` cannot catch it. `validate_union` now honours `visited_refs` and
+  `ValidateFlags::STRICT_RECURSIVE_VALIDATION` the same way `validate_ref` always did, and
+  `ValidationLimits` adds a recursion depth cap (`max_ref_depth`, default 256) plus a total traversal
+  step budget (`max_ref_steps` + `max_ref_steps_per_node`). Reported by Lexicon Garden.
+- `atproto-lexicon`: bounded the `union` fan-out search. When a value carried no `$type`, every ref
+  was tried against the same value and each nested union retried all of its own refs, so a 978-byte
+  lexicon plus a 34-byte request body consumed ~25 s of CPU. The step budget above bounds it; the
+  same payload now fails in ~39 ms.
+- `atproto-dasl`: DRISL decoding no longer panics on a hostile collection header. A 9-byte input
+  declaring an array of 2^63 elements reached `Vec::reserve` with the wire-declared count and panicked
+  with `capacity overflow` under both `DecodeConfig::default()` and `non_strict()`. Pre-allocation is
+  now clamped, a declared count exceeding the remaining input is rejected
+  (`DecodeError::CollectionLengthExceedsInput`), and `max_array_elements` / `max_map_entries` default
+  to 2^24 instead of `0` (unlimited).
+- `atproto-dasl`: CAR block reads no longer allocate from an unvalidated wire length. A 10-byte input
+  declaring a 2^63-byte block panicked with `capacity overflow`. `CarBlock::read_from` /
+  `from_bytes` and the async block reader now enforce `LimitsConfig::max_block_size` *before*
+  allocating and read incrementally via `Vec::try_reserve`. `CarReader::next_block` was affected too:
+  it checked `max_block_size` only *after* `read_block` had already allocated, so the documented
+  limit provided no protection.
+- `atproto-identity`: hardened the SSRF surface around DID and handle hosts. `is_valid_hostname`
+  accepted integer, hexadecimal and octal IP forms (`2852039166`, `0xA9FEA9FE`,
+  `0250.0376.0250.0376`, and empty-hex labels such as `0x7f.0x.0x.0x1`), all of which resolvers and
+  `reqwest` normalize back into addresses like `169.254.169.254` and `127.0.0.1`. Neither
+  `did_web_to_url` nor `did_webvh_to_url` validated the host at all before building a URL. Hosts are
+  now rejected syntactically and cross-checked against the `url` parser, a shared method-aware
+  `did_host()` helper avoids consumers re-deriving host extraction (`did:webvh` places the SCID
+  first), and `Document::pds_endpoints()` documents that `serviceEndpoint` is attacker-controlled
+  alongside a new validating accessor.
+- `atproto-oauth`: `oauth_complete` now requires an expected subject and rejects a `TokenResponse`
+  whose `sub` does not match it. Previously `sub` was never bound to the DID the flow began for, so
+  an attacker running their own authorization server could return any victim's DID and have the
+  relying app mint a session as that victim. JWT verification now requires an `exp` claim, since a
+  token omitting it never expired.
+
+### Changed
+- **Breaking** `atproto-oauth`: `oauth_complete` takes an additional expected-subject argument.
+  Callers must pass the DID the authorization flow started for.
+- **Breaking** `atproto-oauth`: `oauth_refresh` keeps its signature, but now binds the returned `sub`
+  to the `document` it was called with and rejects a mismatch. A refresh whose authorization server
+  returns a different subject now fails where it previously succeeded. Because the signature is
+  unchanged, this one does not surface as a compile error.
+- **Breaking** `atproto-lexicon`: data validation now bounds `ref`/`union` traversal, so a document
+  needing more than `DEFAULT_MAX_REF_DEPTH` (256) nested ref/union hops — or more traversal steps
+  than `DEFAULT_MAX_REF_STEPS` (100,000) plus `DEFAULT_MAX_REF_STEPS_PER_NODE` (16) per value node
+  allows — is now rejected where it previously validated. Ordinary records, including legitimately
+  self-referential ones such as threaded replies, are unaffected. Tune the bounds with
+  `ValidationLimits` through the new `validate_record_with_limits` and matching
+  `validate_query_params_with_limits` / `validate_procedure_params_with_limits` /
+  `validate_procedure_input_with_limits` entry points (and their `_with_schema_and_limits` variants).
+- **Breaking** `atproto-identity`: `did_web_to_url` and `did_webvh_to_url` now return an error for
+  hosts that are address literals or fall under the reserved suffixes `.local`, `.internal`,
+  `.localhost` and `.arpa`. This blocks `metadata.google.internal`, but also rejects
+  cluster-internal names such as `pds.svc.cluster.local` and `host.docker.internal` that previously
+  produced a URL — deployments publishing a PDS under a cluster-internal name need a routable
+  hostname. Bare `localhost` (with or without a port) is unaffected. `did:web` path segments are
+  also restricted to `[A-Za-z0-9._-]`, which rejects the percent-encoded segments the DID Core
+  `idchar` grammar permits.
+- **Breaking** `atproto-dasl`: `CarBlock::read_from` and `CarBlock::from_bytes` are now bounded by
+  `LimitsConfig::default()` (1 MB) instead of being unlimited. Use `read_from_with_limits` /
+  `from_bytes_with_limits` to widen. Callers going through `CarReader` are unaffected.
+- **Breaking** `atproto-dasl`: `DecodeConfig::max_array_elements` and `max_map_entries` default to
+  2^24 rather than `0` (unlimited). Because `serde` encodes a plain `Vec<u8>` as a CBOR array, a
+  `Vec<u8>` larger than 16 MiB no longer round-trips under the defaults; use `serde_bytes` /
+  `Ipld::Bytes`, or `with_unlimited_array_elements()`.
 
 ## [0.15.0-alpha.2] - 2026-06-26
 ### Changed
@@ -252,6 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.15.0-rc.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.1
 [0.15.0-alpha.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.2
 [0.15.0-alpha.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.1
 [0.14.6]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.14.6

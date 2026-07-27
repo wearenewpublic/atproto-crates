@@ -117,7 +117,9 @@ impl<R: AsyncRead + Unpin> CarReader<R> {
     ///
     /// # Limits
     ///
-    /// - Enforces `config.limits.max_block_size` per block.
+    /// - Enforces `config.limits.max_block_size` per block. The declared wire
+    ///   length is checked **before** the block buffer is allocated, and the
+    ///   decoded data is checked again once the CID has been parsed.
     /// - Enforces `config.limits.max_block_count` total blocks.
     /// - Enforces `config.limits.max_car_size` total bytes.
     ///
@@ -135,20 +137,20 @@ impl<R: AsyncRead + Unpin> CarReader<R> {
             });
         }
 
-        // Read block
-        let block = match block_io::read_block(&mut self.reader).await? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
+        // Read block. The limits are enforced inside, before the block buffer
+        // is allocated, so a hostile length prefix cannot amplify a few bytes
+        // of input into a huge allocation.
+        let block =
+            match block_io::read_block_with_limits(&mut self.reader, &self.config.limits).await? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
 
-        // Check block size limit
+        // Re-check the block size as defense in depth.
         if block.data.len() > self.config.limits.max_block_size {
-            return Err(CarError::InvalidBlock {
-                reason: format!(
-                    "block too large: {} > {}",
-                    block.data.len(),
-                    self.config.limits.max_block_size
-                ),
+            return Err(CarError::BlockTooLarge {
+                size: block.data.len() as u64,
+                max: self.config.limits.max_block_size as u64,
             });
         }
 
@@ -295,6 +297,6 @@ mod tests {
             .unwrap();
 
         let result = reader.next_block().await;
-        assert!(matches!(result, Err(CarError::InvalidBlock { .. })));
+        assert!(matches!(result, Err(CarError::BlockTooLarge { .. })));
     }
 }

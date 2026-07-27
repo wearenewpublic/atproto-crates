@@ -594,7 +594,10 @@ async fn fetch_audit_log(
     let url = format!("{}/{}/log/audit", plc_url, did);
 
     let client = reqwest::Client::builder()
-        .user_agent("atproto-identity-plc-fork-viz/0.15.0-alpha.2")
+        .user_agent(concat!(
+            "atproto-identity-plc-fork-viz/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 

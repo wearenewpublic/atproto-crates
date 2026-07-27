@@ -79,6 +79,20 @@ impl EncodeConfig {
         self
     }
 }
+
+/// Default cap on elements in a single decoded array (2^24).
+///
+/// Reaching it requires at least 16 MB of input, five orders of magnitude
+/// above any AT Protocol collection (MST node entries, `applyWrites` batches,
+/// facets, firehose ops).
+pub const DEFAULT_MAX_ARRAY_ELEMENTS: usize = 16_777_216;
+
+/// Default cap on entries in a single decoded map (2^24).
+///
+/// Reaching it requires at least 32 MB of input, since each entry needs a
+/// key byte and a value byte.
+pub const DEFAULT_MAX_MAP_ENTRIES: usize = 16_777_216;
+
 /// Configuration for DAG-CBOR decoding
 #[derive(Debug, Clone)]
 pub struct DecodeConfig {
@@ -112,10 +126,18 @@ pub struct DecodeConfig {
     /// produce an error.
     pub int64_range_only: bool,
 
-    /// Maximum number of elements in a single array. Default: 0 (unlimited).
+    /// Maximum number of elements in a single array.
+    ///
+    /// Default: [`DEFAULT_MAX_ARRAY_ELEMENTS`]. Setting 0 disables this count
+    /// check only; the remaining-input bound and the bounded pre-allocation
+    /// still apply, so 0 is not a denial-of-service vector.
     pub max_array_elements: usize,
 
-    /// Maximum number of entries in a single map. Default: 0 (unlimited).
+    /// Maximum number of entries in a single map.
+    ///
+    /// Default: [`DEFAULT_MAX_MAP_ENTRIES`]. Setting 0 disables this count
+    /// check only; the remaining-input bound and the bounded pre-allocation
+    /// still apply, so 0 is not a denial-of-service vector.
     pub max_map_entries: usize,
 
     /// Decode CID tags as raw bytes without DASL validation.
@@ -143,8 +165,8 @@ impl Default for DecodeConfig {
             max_alloc: 64 * 1024 * 1024, // 64 MB
             no_floats: false,
             int64_range_only: false,
-            max_array_elements: 0,
-            max_map_entries: 0,
+            max_array_elements: DEFAULT_MAX_ARRAY_ELEMENTS,
+            max_map_entries: DEFAULT_MAX_MAP_ENTRIES,
             use_raw_cid: false,
             allow_undefined: false,
             disallow_unknown_fields: false,
@@ -204,15 +226,39 @@ impl DecodeConfig {
         self
     }
 
-    /// Set the maximum number of array elements (0 = unlimited)
+    /// Set the maximum number of array elements.
+    ///
+    /// Passing 0 disables this count check only; the remaining-input bound and
+    /// the bounded pre-allocation still apply.
     pub fn with_max_array_elements(mut self, max: usize) -> Self {
         self.max_array_elements = max;
         self
     }
 
-    /// Set the maximum number of map entries (0 = unlimited)
+    /// Set the maximum number of map entries.
+    ///
+    /// Passing 0 disables this count check only; the remaining-input bound and
+    /// the bounded pre-allocation still apply.
     pub fn with_max_map_entries(mut self, max: usize) -> Self {
         self.max_map_entries = max;
+        self
+    }
+
+    /// Disable the array element count check.
+    ///
+    /// The remaining-input bound and bounded pre-allocation still apply, so
+    /// this is not a denial-of-service vector.
+    pub fn with_unlimited_array_elements(mut self) -> Self {
+        self.max_array_elements = 0;
+        self
+    }
+
+    /// Disable the map entry count check.
+    ///
+    /// The remaining-input bound and bounded pre-allocation still apply, so
+    /// this is not a denial-of-service vector.
+    pub fn with_unlimited_map_entries(mut self) -> Self {
+        self.max_map_entries = 0;
         self
     }
 
@@ -232,5 +278,32 @@ impl DecodeConfig {
     pub fn with_disallow_unknown_fields(mut self, enabled: bool) -> Self {
         self.disallow_unknown_fields = enabled;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_collection_limits_are_non_zero() {
+        for config in [
+            DecodeConfig::default(),
+            DecodeConfig::strict(),
+            DecodeConfig::non_strict(),
+            DecodeConfig::dasl(),
+        ] {
+            assert_eq!(config.max_array_elements, DEFAULT_MAX_ARRAY_ELEMENTS);
+            assert_eq!(config.max_map_entries, DEFAULT_MAX_MAP_ENTRIES);
+        }
+    }
+
+    #[test]
+    fn unlimited_builders_use_the_zero_sentinel() {
+        let config = DecodeConfig::default()
+            .with_unlimited_array_elements()
+            .with_unlimited_map_entries();
+        assert_eq!(config.max_array_elements, 0);
+        assert_eq!(config.max_map_entries, 0);
     }
 }

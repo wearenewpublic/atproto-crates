@@ -1,0 +1,23 @@
+tunnel: ${TUNNEL_UUID}
+credentials-file: /etc/cloudflared/creds/${TUNNEL_UUID}.json
+
+originRequest:
+  connectTimeout: 30s
+  tcpKeepAlive: 30s
+  keepAliveTimeout: 90s
+  disableChunkedEncoding: false
+
+ingress:
+  - hostname: walking-club-appview.ngerakines.dev
+    service: http://appview:8080
+  - hostname: pds1.ngerakines.dev
+    service: http://pds1:3000
+    originRequest: { keepAliveTimeout: 600s }
+  - hostname: pds2.ngerakines.dev
+    service: http://pds2:3000
+    originRequest: { keepAliveTimeout: 600s }
+  - hostname: space-host.ngerakines.dev
+    service: http://space-host:3000
+    originRequest: { keepAliveTimeout: 600s }
+  # identity1/2/3 are NOT here — DNS TXT only (Option A).
+  - service: http_status:404

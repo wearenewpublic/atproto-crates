@@ -6,7 +6,7 @@
 //!
 //! ## Error Categories
 //!
-//! - **`OAuthWorkflowError`** (workflow-1 to workflow-9): OAuth workflow operations including PAR, token exchange, and session management
+//! - **`OAuthWorkflowError`** (workflow-1 to workflow-10): OAuth workflow operations including PAR, token exchange, subject binding, and session management
 //!
 //! ## Error Format
 //!
@@ -65,4 +65,12 @@ pub enum OAuthWorkflowError {
         /// Error message from the session response.
         message: String,
     },
+
+    /// The token response could not be bound to the DID the flow began for.
+    ///
+    /// Raised when the expected subject is empty, when the token endpoint
+    /// omitted the `sub` claim, or when `sub` names a different account than the
+    /// one the authorization flow was started for.
+    #[error("error-atproto-oauth-aip-workflow-10 Token subject binding failed: {0}")]
+    TokenSubjectBindingFailed(#[source] atproto_oauth::errors::OAuthClientError),
 }

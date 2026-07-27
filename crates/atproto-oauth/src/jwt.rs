@@ -2,6 +2,12 @@
 //!
 //! Create and verify JWTs with JOSE standard claims supporting
 //! ES256, ES384, and ES256K signature algorithms.
+//!
+//! [`crate::jwt::verify`] is strict by default: a token without an `exp` claim is
+//! rejected, because such a token would otherwise be valid forever. Issuers that bound
+//! token lifetime by some other mechanism can opt out with
+//! [`crate::jwt::verify_with_config`] and
+//! [`crate::jwt::JwtValidationConfig::allow_missing_expiration`].
 
 use anyhow::Result;
 use atproto_identity::key::{KeyData, KeyType, sign, to_public, validate};
@@ -139,6 +145,66 @@ pub struct JoseClaims {
     pub auth: Option<String>,
 }
 
+/// Policy applied by [`verify_with_config`] when validating JWT time claims.
+///
+/// [`JwtValidationConfig::default`] is the safe-by-default policy used by
+/// [`verify`]: an `exp` claim is required, no clock skew is tolerated on `exp`
+/// or `nbf`, and an `iat` more than 60 seconds in the future is rejected.
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Clone)]
+pub struct JwtValidationConfig {
+    /// Reject tokens with no `exp` claim. Defaults to `true`.
+    pub require_expiration: bool,
+
+    /// Reject tokens with no `iat` claim. Defaults to `false`.
+    pub require_issued_at: bool,
+
+    /// Skew allowance in seconds applied to `exp` and `nbf`. Defaults to `0`.
+    pub clock_skew_tolerance_seconds: SecondsSinceEpoch,
+
+    /// Skew allowance in seconds for an `iat` in the future. Defaults to `60`.
+    pub future_issued_at_tolerance_seconds: SecondsSinceEpoch,
+
+    /// Reject tokens whose `iat` is further ahead than the future tolerance.
+    /// Defaults to `true`.
+    pub reject_future_issued_at: bool,
+
+    /// Maximum age in seconds computed from `iat`. `None` disables the check.
+    /// Defaults to `None`.
+    pub max_age_seconds: Option<SecondsSinceEpoch>,
+
+    /// Current time in seconds since the Unix epoch. `None` uses the system
+    /// clock. Intended for deterministic tests.
+    pub now: Option<SecondsSinceEpoch>,
+}
+
+impl Default for JwtValidationConfig {
+    fn default() -> Self {
+        Self {
+            require_expiration: true,
+            require_issued_at: false,
+            clock_skew_tolerance_seconds: 0,
+            future_issued_at_tolerance_seconds: 60,
+            reject_future_issued_at: true,
+            max_age_seconds: None,
+            now: None,
+        }
+    }
+}
+
+impl JwtValidationConfig {
+    /// Policy that permits tokens with no `exp` claim.
+    ///
+    /// Only appropriate for issuers whose tokens are bounded by some other
+    /// mechanism; a token with no expiration is otherwise valid forever.
+    pub fn allow_missing_expiration() -> Self {
+        Self {
+            require_expiration: false,
+            ..Default::default()
+        }
+    }
+}
+
 /// Create and sign a new JWT token.
 pub fn mint(key_data: &KeyData, header: &Header, claims: &Claims) -> Result<String> {
     let header = header.to_base64()?;
@@ -155,7 +221,32 @@ pub fn mint(key_data: &KeyData, header: &Header, claims: &Claims) -> Result<Stri
 }
 
 /// Verify a JWT token and extract its claims.
+///
+/// Applies [`JwtValidationConfig::default`], which requires an `exp` claim: a
+/// token that omits `exp` is rejected with
+/// [`crate::errors::JWTError::MissingClaim`] rather than treated as never expiring.
 pub fn verify(token: &str, key_data: &KeyData) -> Result<Claims> {
+    verify_with_config(token, key_data, &JwtValidationConfig::default())
+}
+
+/// Verify a JWT token against an explicit validation policy.
+///
+/// The signature is always checked before any time claim, so an invalid
+/// signature can never be reported as a mere timestamp problem.
+///
+/// # Arguments
+/// * `token` - The encoded JWT to verify
+/// * `key_data` - The key to verify the signature against
+/// * `config` - The time-claim policy to apply
+///
+/// # Errors
+/// Returns a [`JWTError`] for malformed input, a failed signature check, or any
+/// time claim that violates `config`.
+pub fn verify_with_config(
+    token: &str,
+    key_data: &KeyData,
+    config: &JwtValidationConfig,
+) -> Result<Claims> {
     // Split token into its parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -209,23 +300,72 @@ pub fn verify(token: &str, key_data: &KeyData) -> Result<Claims> {
         .map_err(|_| JWTError::SignatureVerificationFailed)?;
 
     // Get current timestamp for validation
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| JWTError::SystemTimeError)?
-        .as_secs();
+    let now = match config.now {
+        Some(value) => value,
+        None => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| JWTError::SystemTimeError)?
+            .as_secs(),
+    };
 
-    // Validate expiration time if present
-    if let Some(exp) = claims.jose.expiration
-        && now >= exp
-    {
-        return Err(JWTError::TokenExpired.into());
+    // Validate expiration time. A token with no `exp` never expires, so it is
+    // rejected unless the caller explicitly opted out.
+    match claims.jose.expiration {
+        Some(exp) if now >= exp.saturating_add(config.clock_skew_tolerance_seconds) => {
+            return Err(JWTError::TokenExpired.into());
+        }
+        None if config.require_expiration => {
+            return Err(JWTError::MissingClaim {
+                claim: "exp".to_string(),
+            }
+            .into());
+        }
+        _ => {}
     }
 
     // Validate not-before time if present
     if let Some(nbf) = claims.jose.not_before
-        && now < nbf
+        && now.saturating_add(config.clock_skew_tolerance_seconds) < nbf
     {
         return Err(JWTError::TokenNotValidYet.into());
+    }
+
+    // Validate issued-at. All arithmetic saturates because these claims are
+    // attacker-controlled and would otherwise overflow near u64::MAX.
+    match claims.jose.issued_at {
+        Some(issued_at) => {
+            if config.reject_future_issued_at
+                && issued_at > now.saturating_add(config.future_issued_at_tolerance_seconds)
+            {
+                return Err(JWTError::InvalidTimestamp {
+                    reason: format!(
+                        "issued at {issued_at} is in the future; current time is {now}"
+                    ),
+                }
+                .into());
+            }
+
+            if let Some(max_age) = config.max_age_seconds
+                && now
+                    > issued_at
+                        .saturating_add(max_age)
+                        .saturating_add(config.clock_skew_tolerance_seconds)
+            {
+                return Err(JWTError::InvalidTimestamp {
+                    reason: format!(
+                        "token too old: issued at {issued_at}, max age is {max_age} seconds"
+                    ),
+                }
+                .into());
+            }
+        }
+        None if config.require_issued_at => {
+            return Err(JWTError::MissingClaim {
+                claim: "iat".to_string(),
+            }
+            .into());
+        }
+        None => {}
     }
 
     // Return validated claims
@@ -586,5 +726,242 @@ mod tests {
         assert_eq!(header.key_id, Some(expected_key_id));
 
         Ok(())
+    }
+
+    /// Fixed instant used so the time-claim tests never depend on the wall clock.
+    const FIXED_NOW: SecondsSinceEpoch = 1_700_000_000;
+
+    fn signing_key() -> KeyData {
+        generate_key(KeyType::P256Private).expect("P-256 key generation succeeds")
+    }
+
+    fn mint_with(key_data: &KeyData, jose: JoseClaims) -> String {
+        let header: Header = key_data.clone().try_into().expect("header from key");
+        mint(key_data, &header, &Claims::new(jose)).expect("token mints")
+    }
+
+    fn fixed_now_config() -> JwtValidationConfig {
+        JwtValidationConfig {
+            now: Some(FIXED_NOW),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_verify_rejects_token_without_expiration() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issuer: Some("did:plc:attacker".to_string()),
+                issued_at: Some(FIXED_NOW),
+                expiration: None,
+                ..Default::default()
+            },
+        );
+
+        let err = verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect_err("a token with no exp never expires and must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("error-atproto-oauth-jwt-12"), "{message}");
+        assert!(message.contains("exp"), "{message}");
+    }
+
+    #[test]
+    fn test_verify_accepts_token_with_future_expiration() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issuer: Some("did:plc:legitimate".to_string()),
+                issued_at: Some(FIXED_NOW),
+                expiration: Some(FIXED_NOW + 300),
+                ..Default::default()
+            },
+        );
+
+        let claims = verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect("an unexpired token verifies");
+
+        assert_eq!(claims.jose.issuer.as_deref(), Some("did:plc:legitimate"));
+        assert_eq!(claims.jose.expiration, Some(FIXED_NOW + 300));
+    }
+
+    #[test]
+    fn test_verify_rejects_expired_token() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issued_at: Some(FIXED_NOW - 600),
+                expiration: Some(FIXED_NOW - 1),
+                ..Default::default()
+            },
+        );
+
+        let err = verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect_err("an expired token is rejected");
+
+        assert!(
+            err.to_string().contains("error-atproto-oauth-jwt-7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_with_config_allows_missing_expiration_when_opted_out() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issuer: Some("did:plc:bounded-elsewhere".to_string()),
+                issued_at: Some(FIXED_NOW),
+                expiration: None,
+                ..Default::default()
+            },
+        );
+
+        let config = JwtValidationConfig {
+            now: Some(FIXED_NOW),
+            ..JwtValidationConfig::allow_missing_expiration()
+        };
+
+        let claims =
+            verify_with_config(&token, &key_data, &config).expect("the opt-out permits no exp");
+        assert_eq!(
+            claims.jose.issuer.as_deref(),
+            Some("did:plc:bounded-elsewhere")
+        );
+    }
+
+    #[test]
+    fn test_verify_rejects_future_issued_at() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issued_at: Some(FIXED_NOW + 3600),
+                expiration: Some(FIXED_NOW + 7200),
+                ..Default::default()
+            },
+        );
+
+        let err = verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect_err("an iat far in the future is rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("error-atproto-oauth-jwt-18"), "{message}");
+        assert!(message.contains("in the future"), "{message}");
+    }
+
+    #[test]
+    fn test_verify_with_config_max_age() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issued_at: Some(FIXED_NOW - 3600),
+                expiration: Some(FIXED_NOW + 3600),
+                ..Default::default()
+            },
+        );
+
+        let err = verify_with_config(
+            &token,
+            &key_data,
+            &JwtValidationConfig {
+                max_age_seconds: Some(60),
+                ..fixed_now_config()
+            },
+        )
+        .expect_err("a token older than max_age is rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("error-atproto-oauth-jwt-18"), "{message}");
+        assert!(message.contains("too old"), "{message}");
+
+        verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect("the same token passes when max_age is disabled");
+    }
+
+    #[test]
+    fn test_verify_rejects_not_yet_valid_token() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issued_at: Some(FIXED_NOW),
+                not_before: Some(FIXED_NOW + 300),
+                expiration: Some(FIXED_NOW + 600),
+                ..Default::default()
+            },
+        );
+
+        let err = verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect_err("a not-yet-valid token is rejected");
+
+        assert!(
+            err.to_string().contains("error-atproto-oauth-jwt-8"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_saturating_timestamp_arithmetic() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issued_at: Some(SecondsSinceEpoch::MAX),
+                not_before: Some(SecondsSinceEpoch::MAX),
+                expiration: Some(SecondsSinceEpoch::MAX),
+                ..Default::default()
+            },
+        );
+
+        let config = JwtValidationConfig {
+            clock_skew_tolerance_seconds: 30,
+            max_age_seconds: Some(60),
+            ..fixed_now_config()
+        };
+
+        // Must return a typed error rather than overflow-panic in a debug build.
+        let err = verify_with_config(&token, &key_data, &config)
+            .expect_err("u64::MAX timestamps are rejected, not panicked on");
+        assert!(
+            err.to_string().contains("error-atproto-oauth-jwt-8"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_with_config_deterministic_now() {
+        let key_data = signing_key();
+        let token = mint_with(
+            &key_data,
+            JoseClaims {
+                issued_at: Some(FIXED_NOW),
+                expiration: Some(FIXED_NOW + 100),
+                ..Default::default()
+            },
+        );
+
+        verify_with_config(&token, &key_data, &fixed_now_config())
+            .expect("valid at the fixed instant");
+
+        let err = verify_with_config(
+            &token,
+            &key_data,
+            &JwtValidationConfig {
+                now: Some(FIXED_NOW + 101),
+                ..Default::default()
+            },
+        )
+        .expect_err("expired once the fixed instant moves past exp");
+        assert!(
+            err.to_string().contains("error-atproto-oauth-jwt-7"),
+            "{err}"
+        );
     }
 }
