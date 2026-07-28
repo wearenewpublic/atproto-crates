@@ -171,7 +171,21 @@ docker build -t atproto-pds:dev -f crates/atproto-pds/Dockerfile .
 
 The image runs as non-root (`pds` UID 1000), exposes 3000, and includes a
 `HEALTHCHECK` against `/xrpc/_health`. Front it with a reverse proxy for
-TLS, large request bodies (>1 GiB for `importRepo`), and WS upgrades.
+TLS, large request bodies, and WS upgrades.
+
+## Request-body limits
+
+Two ceilings, both operator-tunable. The application enforces them itself and
+refuses over-sized requests as XRPC errors, so a client sees the same error
+shape it sees everywhere else rather than a bare `413 text/plain`.
+
+| Variable | Default | Bounds |
+| --- | --- | --- |
+| `PDS_BLOB_UPLOAD_LIMIT` | 16 MiB | one blob through `com.atproto.repo.uploadBlob` |
+| `PDS_IMPORT_LIMIT` | 1 GiB | one repository CAR through `com.atproto.repo.importRepo` |
+
+Size the reverse proxy's own body limit to whatever you set here, or it will
+reject first and the operator-facing error will be the proxy's, not the PDS's.
 
 ## Tests
 

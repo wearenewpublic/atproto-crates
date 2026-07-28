@@ -14,6 +14,13 @@ use atproto_identity::traits::DnsResolver;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Default ceiling for `importRepo`, in bytes (1 GiB).
+///
+/// Matches what `README.md` tells operators to size their reverse proxy for. It
+/// was previously bounded by axum's 2 MiB default instead, so inbound migration
+/// failed for any non-trivial repository.
+pub const DEFAULT_IMPORT_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Shared state for the HTTP layer.
 ///
 /// `Arc`-wrapped so axum can `Clone` the state cheaply across handlers.
@@ -89,6 +96,19 @@ pub struct HttpState {
     /// `Some(...)` selects the trait-dispatched code path; `None` keeps
     /// the legacy direct-sqlx path for back-compat.
     pub public_realm_backend: Option<PublicRealmBackend>,
+    /// Largest blob `uploadBlob` will accept, in bytes. Default
+    /// [`crate::blob::DEFAULT_BLOB_UPLOAD_LIMIT_BYTES`] (16 MiB). Set via
+    /// `PDS_BLOB_UPLOAD_LIMIT`.
+    ///
+    /// Enforced by the handler rather than by an axum body limit, so an
+    /// over-sized upload is refused as an XRPC error and not as a bare 413.
+    pub blob_upload_limit_bytes: usize,
+    /// Largest CAR `importRepo` will accept, in bytes. Default
+    /// [`DEFAULT_IMPORT_LIMIT_BYTES`] (1 GiB). Set via `PDS_IMPORT_LIMIT`.
+    ///
+    /// Separate from the blob ceiling because the two bound different things:
+    /// one media file against a whole repository.
+    pub import_limit_bytes: usize,
     /// OAuth access-token TTL. Default
     /// [`crate::oauth::state::DEFAULT_ACCESS_TTL_SECS`] (15 min). Set via
     /// `PDS_OAUTH_ACCESS_TOKEN_TTL_SECONDS`.
@@ -150,6 +170,8 @@ impl HttpState {
             report_service_did: None,
             report_service_url: None,
             public_realm_backend: None,
+            blob_upload_limit_bytes: crate::blob::DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+            import_limit_bytes: DEFAULT_IMPORT_LIMIT_BYTES,
             oauth_access_ttl_secs: crate::oauth::state::DEFAULT_ACCESS_TTL_SECS,
             oauth_refresh_ttl_secs: crate::oauth::state::DEFAULT_REFRESH_TTL_SECS,
             pds_extra_signing_keys: Vec::new(),
@@ -194,6 +216,8 @@ impl HttpState {
             report_service_did: None,
             report_service_url: None,
             public_realm_backend: None,
+            blob_upload_limit_bytes: crate::blob::DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+            import_limit_bytes: DEFAULT_IMPORT_LIMIT_BYTES,
             oauth_access_ttl_secs: crate::oauth::state::DEFAULT_ACCESS_TTL_SECS,
             oauth_refresh_ttl_secs: crate::oauth::state::DEFAULT_REFRESH_TTL_SECS,
             pds_extra_signing_keys: Vec::new(),
@@ -325,6 +349,20 @@ impl HttpState {
     #[must_use]
     pub fn with_public_realm_backend(mut self, backend: PublicRealmBackend) -> Self {
         self.public_realm_backend = Some(backend);
+        self
+    }
+
+    /// Override the `uploadBlob` ceiling.
+    #[must_use]
+    pub fn with_blob_upload_limit(mut self, bytes: usize) -> Self {
+        self.blob_upload_limit_bytes = bytes;
+        self
+    }
+
+    /// Override the `importRepo` ceiling.
+    #[must_use]
+    pub fn with_import_limit(mut self, bytes: usize) -> Self {
+        self.import_limit_bytes = bytes;
         self
     }
 

@@ -539,6 +539,47 @@ pub struct UploadBlobResponse {
     pub blob: crate::blob::BlobRef,
 }
 
+/// The XRPC refusal for an over-sized upload.
+///
+/// axum's own rejection is `text/plain` — `Failed to buffer the request body:
+/// length limit exceeded` — which is not the error shape every other failure on
+/// this surface uses, so a client's error handling never sees it. Reading the
+/// body ourselves keeps the refusal in the shape clients already parse.
+fn blob_too_large(actual: usize, limit: usize) -> XrpcError {
+    XrpcError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "BlobTooLarge",
+        format!("blob is {actual} bytes; this server accepts at most {limit}"),
+    )
+}
+
+/// The XRPC refusal for an over-sized CAR.
+fn car_too_large(limit: usize) -> XrpcError {
+    XrpcError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "RepoTooLarge",
+        format!("repository CAR exceeds this server's {limit}-byte import ceiling"),
+    )
+}
+
+/// Buffer a request body under an explicit ceiling.
+///
+/// The handlers take `Body` rather than `Bytes` so the limit is ours. Extracting
+/// `Bytes` applies axum's `DEFAULT_LIMIT` of 2 MiB unless a `DefaultBodyLimit`
+/// layer overrides it, which is what made the 16 MiB blob ceiling dead code —
+/// the real limit was eight times smaller and rejected a typical phone photo.
+async fn buffer_body(
+    body: axum::body::Body,
+    limit: usize,
+    too_large: impl FnOnce() -> XrpcError,
+) -> Result<axum::body::Bytes, XrpcError> {
+    axum::body::to_bytes(body, limit).await.map_err(|_| {
+        // `to_bytes` fails on an over-long body or a broken stream. Both are
+        // refusals the caller can only act on as "send less".
+        too_large()
+    })
+}
+
 /// Handler for `POST /xrpc/com.atproto.repo.uploadBlob`.
 ///
 /// Reads raw bytes from the request body (axum buffers); content-addresses
@@ -548,9 +589,11 @@ pub struct UploadBlobResponse {
 pub async fn upload_blob(
     State(state): State<HttpState>,
     parts: Parts,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Result<Json<UploadBlobResponse>, XrpcError> {
     let claims = require_session(&parts, &state).await?;
+    let limit = state.blob_upload_limit_bytes;
+    let body = buffer_body(body, limit, || blob_too_large(limit + 1, limit)).await?;
     let mime = parts
         .headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -560,14 +603,8 @@ pub async fn upload_blob(
     let did = claims.sub();
     if let Some(backend) = state.public_realm_backend.as_ref() {
         // Trait-dispatched path.
-        if body.len() > crate::blob::MAX_BLOB_BYTES {
-            return Err(XrpcError::from(crate::errors::PdsError::AuthDenied {
-                reason: format!(
-                    "blob too large: {} bytes (max {})",
-                    body.len(),
-                    crate::blob::MAX_BLOB_BYTES
-                ),
-            }));
+        if body.len() > state.blob_upload_limit_bytes {
+            return Err(blob_too_large(body.len(), state.blob_upload_limit_bytes));
         }
         let cid = atproto_dasl::cid::compute_raw_cid(&body).to_string();
         let row = crate::actor_store::BlobRow {
@@ -592,7 +629,7 @@ pub async fn upload_blob(
     let store = SqlActorStore::open(manager.data_dir(), did)
         .await
         .map_err(XrpcError::from)?;
-    let blob = crate::blob::put_blob(&store, &body, &mime)
+    let blob = crate::blob::put_blob(&store, &body, &mime, state.blob_upload_limit_bytes)
         .await
         .map_err(XrpcError::from)?;
     Ok(Json(UploadBlobResponse { blob }))
@@ -623,9 +660,11 @@ pub struct ImportRepoResponse {
 pub async fn import_repo(
     State(state): State<HttpState>,
     parts: Parts,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Result<Json<ImportRepoResponse>, XrpcError> {
     let claims = require_session(&parts, &state).await?;
+    let limit = state.import_limit_bytes;
+    let body = buffer_body(body, limit, || car_too_large(limit)).await?;
     if !claims.privileged() {
         return Err(XrpcError::new(
             StatusCode::FORBIDDEN,

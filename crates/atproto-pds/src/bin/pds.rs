@@ -169,6 +169,28 @@ struct Args {
     #[arg(long, env = "PDS_REPORT_SERVICE_URL")]
     report_service_url: Option<String>,
 
+    /// Largest blob `uploadBlob` accepts, in bytes. Default 16 MiB.
+    /// Raise it for video, lower it for abuse control. Previously a
+    /// compile-time constant that axum's 2 MiB body default pre-empted, so
+    /// neither the number nor the operator had any say.
+    #[arg(
+        long,
+        env = "PDS_BLOB_UPLOAD_LIMIT",
+        default_value_t = atproto_pds::blob::DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+        value_parser = clap::value_parser!(usize),
+    )]
+    blob_upload_limit: usize,
+
+    /// Largest repository CAR `importRepo` accepts, in bytes. Default 1 GiB,
+    /// matching what the README tells operators to size their proxy for.
+    #[arg(
+        long,
+        env = "PDS_IMPORT_LIMIT",
+        default_value_t = atproto_pds::http::state::DEFAULT_IMPORT_LIMIT_BYTES,
+        value_parser = clap::value_parser!(usize),
+    )]
+    import_limit: usize,
+
     /// OAuth access-token TTL in seconds. Default
     /// 900 (15 minutes); operators tighten for higher-security deployments.
     #[arg(
@@ -584,6 +606,8 @@ async fn main() -> anyhow::Result<()> {
     .with_admin_password(args.admin_password)
     .with_pds_signing_key(Arc::new(current_signing_key))
     .with_extra_signing_keys(extra_signing_keys)
+    .with_blob_upload_limit(args.blob_upload_limit)
+    .with_import_limit(args.import_limit)
     .with_oauth_access_ttl(args.oauth_access_token_ttl_seconds)
     .with_oauth_refresh_ttl(args.oauth_refresh_token_ttl_seconds)
     .with_email_service(email_service)

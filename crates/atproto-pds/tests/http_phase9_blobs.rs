@@ -196,3 +196,66 @@ async fn get_blob_refuses_to_render_as_a_document() {
         "the CSP must neuter a blob that is rendered anyway; was {csp:?}"
     );
 }
+
+/// A blob under the advertised ceiling must upload.
+///
+/// `MAX_BLOB_BYTES` is 16 MiB and `uploadBlob` checks it, but the handler
+/// extracts `axum::body::Bytes` and axum applies its own 2 MiB default to every
+/// route unless a `DefaultBodyLimit` layer says otherwise. So the documented
+/// ceiling was dead code: the real limit was eight times smaller, and a typical
+/// phone photo failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_under_the_ceiling_uploads() {
+    let (app, _tmp) = build_app().await;
+    let did = "did:plc:bigblob";
+    let token = create_account(&app, did, "big.test.example").await;
+
+    // 3 MiB — comfortably over axum's 2 MiB default, comfortably under 16 MiB.
+    let payload = vec![0x42u8; 3 * 1024 * 1024];
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.uploadBlob")
+        .method("POST")
+        .header("content-type", "image/jpeg")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(payload))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a 3 MiB upload is well under the 16 MiB ceiling this server advertises; body: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Over the ceiling, the refusal is an XRPC error and not a bare 413.
+///
+/// A client cannot act on `length limit exceeded` in text/plain — it is not the
+/// error shape every other failure on this surface uses, so a client's error
+/// handling does not see it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_over_the_ceiling_is_refused_as_xrpc() {
+    let (app, _tmp) = build_app().await;
+    let did = "did:plc:hugeblob";
+    let token = create_account(&app, did, "huge.test.example").await;
+
+    let payload = vec![0x42u8; 17 * 1024 * 1024];
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.uploadBlob")
+        .method("POST")
+        .header("content-type", "image/jpeg")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(payload))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    assert!(
+        parsed.get("error").is_some(),
+        "the refusal should be an XRPC error body, got {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}

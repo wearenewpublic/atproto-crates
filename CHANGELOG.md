@@ -83,6 +83,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: the 16 MiB blob ceiling was dead code — the real limit was axum's 2 MiB default, so
+  a typical phone photo failed to upload and inbound migration failed for any non-trivial
+  repository. `uploadBlob` and `importRepo` extracted `axum::body::Bytes`, which applies
+  `DEFAULT_LIMIT = 2_097_152` unless a body-limit layer says otherwise, and no layer existed. The
+  refusal was `text/plain` — `Failed to buffer the request body: length limit exceeded` — not the
+  XRPC error shape every other failure on that surface uses, so a client's error handling never saw
+  it. `README.md` meanwhile told operators to size their reverse proxy for bodies over 1 GiB while
+  the application rejected at 2 MiB.
+
+  Both handlers now take the body and buffer it under a ceiling of their own, so the limit is the
+  one the operator configured and an over-sized request is refused as `BlobTooLarge` or
+  `RepoTooLarge` with a JSON body. Two knobs, neither feature-gated so both work in the shipped
+  image: `PDS_BLOB_UPLOAD_LIMIT` (default 16 MiB) and `PDS_IMPORT_LIMIT` (default 1 GiB, matching
+  what the README asks of the proxy). `MAX_BLOB_BYTES` was a `const` no operator could change; it is
+  now `DEFAULT_BLOB_UPLOAD_LIMIT_BYTES`, a default, and `put_blob` takes the limit as an argument
+  rather than reading a global.
+
+  Per-account blob quotas remain unimplemented.
+
 - `atproto-pds`: the OAuth token binding is no longer optional in the type system. `issue_pair` took
   `Option<String>` and stored an absent thumbprint as an empty string, which came back as
   `cnf.jkt = ""` and matched no proof for the life of the session — a permanent `InvalidDpopProof`

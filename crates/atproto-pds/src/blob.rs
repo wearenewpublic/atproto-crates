@@ -17,8 +17,14 @@ use atproto_record::lexicon::{Blob, Link, TypedBlob};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-/// Maximum blob size accepted by the PDS (16 MiB, matching upstream defaults).
-pub const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+/// Default ceiling for `uploadBlob` (16 MiB, matching upstream defaults).
+///
+/// A default, not a constant: operators raise it for video and lower it for
+/// abuse control via `PDS_BLOB_UPLOAD_LIMIT`. It was previously a `const` that
+/// nothing could override — and, because no body limit was configured, one that
+/// axum's own 2 MiB default pre-empted, so the number here described nothing
+/// the server actually did.
+pub const DEFAULT_BLOB_UPLOAD_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// One ref-tracked blob row in `repo_blob_ref`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,14 +78,16 @@ pub fn blob_ref(cid: String, mime_type: String, size: u64) -> BlobRef {
 /// # Errors
 ///
 /// - [`PdsError::Storage`] for any underlying SQL error.
-/// - [`PdsError::AuthDenied`] if `bytes.len() > MAX_BLOB_BYTES`.
-pub async fn put_blob(store: &SqlActorStore, bytes: &[u8], mime_type: &str) -> PdsResult<BlobRef> {
-    if bytes.len() > MAX_BLOB_BYTES {
+/// - [`PdsError::AuthDenied`] if `bytes.len() > limit`.
+pub async fn put_blob(
+    store: &SqlActorStore,
+    bytes: &[u8],
+    mime_type: &str,
+    limit: usize,
+) -> PdsResult<BlobRef> {
+    if bytes.len() > limit {
         return Err(PdsError::AuthDenied {
-            reason: format!(
-                "blob too large: {} bytes (max {MAX_BLOB_BYTES})",
-                bytes.len()
-            ),
+            reason: format!("blob too large: {} bytes (max {limit})", bytes.len()),
         });
     }
     let cid = compute_raw_cid(bytes);
@@ -275,9 +283,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn put_get_round_trip() {
         let store = fresh_store().await;
-        let blob = put_blob(&store, b"hello world", "text/plain")
-            .await
-            .unwrap();
+        let blob = put_blob(
+            &store,
+            b"hello world",
+            "text/plain",
+            DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(
             blob.inner.ref_.link.starts_with("bafkrei") || blob.inner.ref_.link.starts_with("bafy")
         );
@@ -293,16 +306,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn put_blob_is_idempotent() {
         let store = fresh_store().await;
-        let a = put_blob(&store, b"abc", "text/plain").await.unwrap();
-        let b = put_blob(&store, b"abc", "text/plain").await.unwrap();
+        let a = put_blob(
+            &store,
+            b"abc",
+            "text/plain",
+            DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+        )
+        .await
+        .unwrap();
+        let b = put_blob(
+            &store,
+            b"abc",
+            "text/plain",
+            DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(a.inner.ref_.link, b.inner.ref_.link);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn oversize_blob_rejected() {
         let store = fresh_store().await;
-        let huge = vec![0u8; MAX_BLOB_BYTES + 1];
-        let result = put_blob(&store, &huge, "application/octet-stream").await;
+        // Cheap: the limit under test is the argument, not a 16 MiB constant.
+        let huge = vec![0u8; 65];
+        let result = put_blob(&store, &huge, "application/octet-stream", 64).await;
         assert!(matches!(result, Err(PdsError::AuthDenied { .. })));
     }
 
@@ -336,7 +364,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn drop_record_refs_gcs_orphan_blobs() {
         let store = fresh_store().await;
-        let blob = put_blob(&store, b"data", "text/plain").await.unwrap();
+        let blob = put_blob(
+            &store,
+            b"data",
+            "text/plain",
+            DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
+        )
+        .await
+        .unwrap();
         add_ref(&store, "at://x/c/k1", &blob).await.unwrap();
         // Second reference keeps the blob alive after dropping the first.
         add_ref(&store, "at://x/c/k2", &blob).await.unwrap();
