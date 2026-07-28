@@ -149,6 +149,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presence made `cargo clippy --workspace --all-targets` fail.
 
 ### Added
+- `atproto-pds`: four discovery endpoints that were never routed.
+  - `com.atproto.server.describeServer` — the first call a client makes, and the one account
+    migration reads the new PDS's `did` from to learn the `aud` for the service-auth token the old
+    PDS must mint. Migration failed at step two without it.
+  - `com.atproto.sync.listRepos` — how a relay discovers which accounts this server hosts, with
+    `{did, head, rev}` per repo plus `active`/`status`, `limit`/`cursor` pagination, and accounts
+    with no commits omitted rather than announced with a head a relay would fail to fetch.
+  - `/.well-known/atproto-did` — resolves a handle hosted on this server's own domain to its DID
+    from the request `Host`. Without it the PDS could not host handles on its own domain unless an
+    operator stood up a separate web server to synthesise the response, which was documented
+    nowhere.
+  - `/.well-known/did.json` — this server's own `did:web` document, synthesised from
+    `PDS_SERVICE_DID`. Peers resolving this PDS for spaces or service auth need it.
 - Continuous integration at `.tangled/workflows/ci.yml`, running `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on every push
   to `main` and every pull request, with a recursive submodule checkout so the DASL CBOR compliance
@@ -166,6 +179,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defect that explains them, and are required to keep failing until it is fixed.
 - `atproto_repo::mst::common_prefix_len` is now re-exported alongside `compare_keys` and
   `key_height`.
+
+### Removed
+- `deploy/well-known/` — three hand-maintained `did.json` files that were never mounted by
+  `docker-compose.yml` and are now redundant: each container already sets `PDS_SERVICE_DID` to the
+  DID those files described, and the server synthesises the identical document. A static file is a
+  second source of truth that can drift from the DID the server actually runs as.
 
 ## [0.15.0-rc.1] - 2026-07-27
 ### Security

@@ -3,6 +3,7 @@
 use crate::admin;
 use crate::http::auth_handlers;
 use crate::http::blob_handlers;
+use crate::http::discovery_handlers;
 use crate::http::handlers;
 use crate::http::identity_handlers;
 use crate::http::moderation_handlers;
@@ -73,6 +74,10 @@ pub fn build_router(state: HttpState) -> Router {
         )
         // com.atproto.sync.*
         .route(
+            "/xrpc/com.atproto.sync.listRepos",
+            get(discovery_handlers::list_repos),
+        )
+        .route(
             "/xrpc/com.atproto.sync.getLatestCommit",
             get(handlers::get_latest_commit),
         )
@@ -113,6 +118,10 @@ pub fn build_router(state: HttpState) -> Router {
                 .delete(proxy_handlers::proxy_app_bsky),
         )
         // com.atproto.server.*
+        .route(
+            "/xrpc/com.atproto.server.describeServer",
+            get(discovery_handlers::describe_server),
+        )
         .route(
             "/xrpc/com.atproto.server.createAccount",
             post(auth_handlers::create_account),
@@ -249,6 +258,17 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/oauth/token", post(oauth::token_handler))
         .route("/oauth/revoke", post(oauth::revoke_handler))
         .route("/oauth/jwks", get(oauth::jwks_handler))
+        // Identity discovery. `atproto-did` resolves a handle hosted on this
+        // server's own domain; `did.json` is this server's own did:web
+        // document, synthesised rather than served from a file.
+        .route(
+            "/.well-known/atproto-did",
+            get(discovery_handlers::well_known_atproto_did),
+        )
+        .route(
+            "/.well-known/did.json",
+            get(discovery_handlers::well_known_did_json),
+        )
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth::oauth_authorization_server),

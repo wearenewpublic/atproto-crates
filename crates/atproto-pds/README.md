@@ -46,9 +46,9 @@ XRPC endpoints (default features):
   `createRecord`, `putRecord`, `deleteRecord`, `applyWrites`, `importRepo`,
   `listMissingBlobs`.
 - **`com.atproto.sync.*`** — `getLatestCommit`, `getRepoStatus`, `getRepo`
-  (CAR streaming, `?since=<rev>` diff slice), `getBlocks`, `subscribeRepos`
-  (broadcast-channel WS with poll-fallback for catch-up).
-- **`com.atproto.server.*`** — `createAccount` (with optional PLC genesis),
+  (CAR streaming, `?since=<rev>` diff slice), `getBlocks`, `listRepos`,
+  `subscribeRepos` (broadcast-channel WS with poll-fallback for catch-up).
+- **`com.atproto.server.*`** — `describeServer`, `createAccount` (with optional PLC genesis),
   `createSession`, `getSession`, `refreshSession`, `deleteSession`,
   `createAppPassword`, `listAppPasswords`, `revokeAppPassword`,
   `createInviteCode`, `getServiceAuth`, `activateAccount`,
@@ -64,6 +64,10 @@ XRPC endpoints (default features):
   (RFC 7009), `/oauth/jwks`, `/.well-known/oauth-authorization-server`,
   `/.well-known/oauth-protected-resource`. Multi-key JWK rotation is
   supported via `PDS_OAUTH_KEYS_JWK_SET`.
+- **Identity discovery** — `/.well-known/atproto-did` resolves a handle hosted
+  on this server's own domain to its DID; `/.well-known/did.json` serves this
+  server's own `did:web` document, synthesised from `PDS_SERVICE_DID` rather
+  than read from a file.
 - **Spaces** — owner-side management under `com.atproto.simplespace.*`
   (`createSpace`, `updateSpace`, `deleteSpace`, `addMember`, `removeMember`,
   `listMembers`) and the permissioned realm under `com.atproto.space.*`
