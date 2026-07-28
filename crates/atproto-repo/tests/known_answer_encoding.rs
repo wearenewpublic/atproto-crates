@@ -166,7 +166,6 @@ fn unsigned_initial_commit_encodes_null_prev() {
         data: cid(VALUE_CID),
         rev: COMMIT_REV.to_string(),
         prev: None,
-        prev_data: None,
     };
     assert_encodes_to(
         "unsigned initial commit",
@@ -189,7 +188,6 @@ fn signed_initial_commit_encodes_null_prev() {
         data: cid(VALUE_CID),
         rev: COMMIT_REV.to_string(),
         prev: None,
-        prev_data: None,
         sig: commit_sig(),
     };
     assert_encodes_to(
@@ -238,5 +236,48 @@ fn legacy_node_without_l_or_t_still_decodes_and_re_encodes_canonically() {
         "re-encoding a legacy node must produce the canonical 82-byte form, got {} bytes: {}",
         re_encoded.len(),
         hex::encode(&re_encoded)
+    );
+}
+
+/// The signed body of a non-initial commit is five keys, with no `prevData`.
+///
+/// `prevData` — the prior MST root, used for Sync 1.1 inductive verification —
+/// belongs to the `com.atproto.sync.subscribeRepos` `#commit` event, not to the
+/// commit object. Carrying it inside the signed body added a sixth key, so the
+/// commit CID and the signature both differed from what a conformant peer
+/// computes even after the nullable-key fix.
+///
+/// The initial-commit vectors above cannot catch this: `prev_data` was `None`
+/// there, and the old attribute skipped it. Only a commit that would have
+/// carried a value shows the difference — 158 bytes and `a5` here, against 208
+/// bytes and `a6` before.
+///
+/// ```text
+/// a5                                          map(5)
+///   63 646964  78 20 "did:plc:ewvi…"          "did"     text(32)
+///   63 726576  6d "3jui7kd2z2y2e"             "rev"     text(13)
+///   64 64617461  d8 2a 58 25 00 <36 bytes>    "data"    tag(42)
+///   64 70726576  d8 2a 58 25 00 <36 bytes>    "prev"    tag(42)
+///   67 76657273696f6e  03                     "version" unsigned(3)
+/// ```
+#[test]
+fn unsigned_non_initial_commit_has_no_prev_data_key() {
+    let commit = UnsignedCommit {
+        did: COMMIT_DID.to_string(),
+        version: 3,
+        data: cid(VALUE_CID),
+        rev: COMMIT_REV.to_string(),
+        prev: Some(cid(SUBTREE_CID)),
+    };
+    assert_encodes_to(
+        "unsigned non-initial commit",
+        &commit,
+        "a56364696478206469643a706c633a65777669376e787a796f756e367a68787268733634\
+         6f697a637265766d336a7569376b64327a327932656464617461d82a5825000171122\
+         09d156bc3f3a520066252c708a9361fd3d089223842500e3713d404fdccb33cef64707265\
+         76d82a5825000171122065062a5a5a00fc16d73c6944237ccbc15b1c4a7234489336891d0\
+         91741a239d06776657273696f6e03"
+            .replace(['\n', ' '], "")
+            .as_str(),
     );
 }

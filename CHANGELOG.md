@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-repo`: `prevData` was carried inside the signed commit body, making the commit a six-key
+  object where the AT Protocol commit schema has five. `prevData` — the prior MST root CID used for
+  Sync 1.1 inductive verification — is a `com.atproto.sync.subscribeRepos#commit` **event** field.
+  It is per-delivery information, not repository state, and not something the account signs.
+  Carrying it in the commit meant the commit CID and the signature still differed from a conformant
+  peer's even after the nullable-key fix above: a non-initial commit encoded to 208 bytes and `a6`
+  against the canonical 158 and `a5`.
+
+  `Commit::new_unsigned_with_prev_data` and `UnsignedCommit::new_with_prev_data` are removed along
+  with the field; use `new_unsigned` / `new`. Subscribers are unaffected — the firehose payload
+  already carried `prevData` (`crates/atproto-pds/src/repo/writer.rs`), and the `commit_obj`
+  `prev_data_cid` column is unchanged, now populated by walking the commit chain rather than reading
+  a self-declared value off the commit.
+
+  **Operational note:** commits written before this change carry the extra key. They still decode —
+  the field is ignored — but their signatures no longer verify, because signature checking
+  reconstructs the signed bytes from the decoded struct and those bytes no longer include
+  `prevData`. In practice this means a CAR previously exported by this server will fail
+  signature-verified re-import. Those repositories were already unverifiable by any peer for the
+  same reason, so nothing that worked stops working.
+
 - `atproto-repo`: MST nodes and commits omitted map keys the AT Protocol data model requires to be
   present-and-null, so **every MST root CID and every commit CID this workspace produced was
   unrecomputable by any peer** — including for a single-record repository, where tree shape cannot

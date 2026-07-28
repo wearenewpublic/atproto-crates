@@ -338,20 +338,16 @@ impl RepoWriter {
             .map_err(|e: cid::Error| PdsError::Storage {
                 reason: format!("parse prev commit cid: {e}"),
             })?;
-        let prev_data_parsed: Option<atproto_dasl::Cid> = prev_data_cid
-            .as_deref()
-            .map(|s| s.parse::<cid::Cid>().map(atproto_dasl::Cid::from))
-            .transpose()
-            .map_err(|e: cid::Error| PdsError::Storage {
-                reason: format!("parse prev data cid: {e}"),
-            })?;
 
-        let unsigned = UnsignedCommit::new_with_prev_data(
+        // `prevData` is deliberately absent from the signed commit body: it is
+        // a `com.atproto.sync.subscribeRepos#commit` event field, not
+        // repository state, and it is not part of what the account signs.
+        // Subscribers still receive it, from the outbox payload built below.
+        let unsigned = UnsignedCommit::new(
             did.to_string(),
             atproto_dasl::Cid::from(new_root),
             rev.clone(),
             prev_cid_parsed,
-            prev_data_parsed,
         );
         let signing_bytes = atproto_dasl::to_vec(&unsigned).map_err(|e| PdsError::Storage {
             reason: format!("encode unsigned commit: {e}"),
@@ -654,19 +650,15 @@ impl RepoWriter {
             .map_err(|e: cid::Error| PdsError::Storage {
                 reason: format!("parse prev commit cid: {e}"),
             })?;
-        let prev_data_parsed: Option<atproto_dasl::Cid> = prev_data_cid
-            .as_deref()
-            .map(|s| s.parse::<cid::Cid>().map(atproto_dasl::Cid::from))
-            .transpose()
-            .map_err(|e: cid::Error| PdsError::Storage {
-                reason: format!("parse prev data cid: {e}"),
-            })?;
-        let unsigned = UnsignedCommit::new_with_prev_data(
+        // `prevData` is deliberately absent from the signed commit body: it is
+        // a `com.atproto.sync.subscribeRepos#commit` event field, not
+        // repository state, and it is not part of what the account signs.
+        // Subscribers still receive it, from the outbox payload built below.
+        let unsigned = UnsignedCommit::new(
             did.to_string(),
             atproto_dasl::Cid::from(new_root),
             rev.clone(),
             prev_cid_parsed,
-            prev_data_parsed,
         );
         let signing_bytes = atproto_dasl::to_vec(&unsigned).map_err(|e| PdsError::Storage {
             reason: format!("encode unsigned commit: {e}"),

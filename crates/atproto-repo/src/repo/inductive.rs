@@ -69,7 +69,10 @@ pub struct InductiveVerification {
 /// ```rust,ignore
 /// use atproto_repo::verify_inductive;
 ///
-/// let prev_data = commit.prev_data.clone();
+/// // `prevData` rides on the `subscribeRepos#commit` event, not on the
+/// // commit object — take it from the event, or from the prior commit's
+/// // `data` when walking a chain.
+/// let prev_data = event.prev_data.clone();
 /// let new_root = commit.data.clone();
 /// let blocks: Vec<CarBlock> = car_slice;
 ///

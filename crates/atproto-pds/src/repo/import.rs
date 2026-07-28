@@ -11,12 +11,14 @@
 //!
 //! # Verification model
 //!
-//! (Sync 1.1), each commit in the chain carries `prev` (the
-//! prior commit CID) and `prev_data` (the prior MST root CID). We walk the
+//! Each commit in the chain carries `prev`, the prior commit CID. We walk the
 //! chain from the CAR's root commit backward to genesis, then verify forward
-//! using [`atproto_repo::verify_inductive`]. Every block in the CAR must
-//! content-address correctly; every commit must be reachable through `prev`
-//! links.
+//! using [`atproto_repo::verify_inductive`], carrying the prior MST root
+//! (Sync 1.1 `prevData`) down the chain as we go — it is derived from the
+//! previous commit's `data`, not read off the commit, because `prevData` is a
+//! `subscribeRepos#commit` event field rather than repository state. Every
+//! block in the CAR must content-address correctly; every commit must be
+//! reachable through `prev` links.
 //!
 //! # Streaming
 //!
@@ -215,20 +217,17 @@ impl<'a> RepoImporter<'a> {
             ));
         }
 
-        // Verify forward (oldest -> newest) using verify_inductive. Each
-        // commit's `prev_data` must equal the previous commit's `data`.
+        // Verify forward (oldest -> newest) using verify_inductive, carrying
+        // the prior MST root down the chain.
+        //
+        // The prior root is derived from the chain itself rather than read off
+        // the commit: `prevData` is a `subscribeRepos#commit` event field, not
+        // a commit field, so there is nothing self-declared here to cross-check
+        // against. Walking `prev` gives the same value from the blocks that are
+        // actually present, which is the stronger source anyway.
         let mut prev_data: Option<atproto_dasl::Cid> = None;
         for commit in &chain {
             let new_root = commit.data.clone();
-            if let Some(expected_prev) = &commit.prev_data
-                && prev_data.as_ref() != Some(expected_prev)
-            {
-                return Err(PdsError::Repo(
-                    atproto_repo::errors::RepoError::InvalidCommit {
-                        reason: format!("commit chain prev_data mismatch at rev {}", commit.rev),
-                    },
-                ));
-            }
             verify_inductive(prev_data.clone(), new_root.clone(), &blocks)
                 .map_err(PdsError::Repo)?;
             prev_data = Some(new_root);
@@ -270,7 +269,13 @@ impl<'a> RepoImporter<'a> {
         }
 
         // Insert each commit row into commit_obj. Idempotent per the PRIMARY KEY.
+        //
+        // `prev_data_cid` is derived by walking the chain rather than read off
+        // the commit: `prevData` is a `subscribeRepos#commit` event field, not
+        // a commit field. The prior MST root is simply the previous commit's
+        // `data`, and `chain` is ordered oldest to newest.
         let now = chrono::Utc::now().to_rfc3339();
+        let mut prev_data_cid: Option<String> = None;
         for commit in &chain {
             let commit_cid = commit.cid().map_err(PdsError::Repo)?;
             let signature_blob = commit.sig.as_slice().to_vec();
@@ -280,7 +285,7 @@ impl<'a> RepoImporter<'a> {
                     rev: commit.rev.clone(),
                     data_cid: commit.data.to_string(),
                     prev_cid: commit.prev.as_ref().map(|c| c.to_string()),
-                    prev_data_cid: commit.prev_data.as_ref().map(|c| c.to_string()),
+                    prev_data_cid: prev_data_cid.clone(),
                     signature: signature_blob,
                     created_at: now.clone(),
                 };
@@ -304,7 +309,7 @@ impl<'a> RepoImporter<'a> {
                 .bind(&commit.rev)
                 .bind(commit.data.to_string())
                 .bind(commit.prev.as_ref().map(|c| c.to_string()))
-                .bind(commit.prev_data.as_ref().map(|c| c.to_string()))
+                .bind(prev_data_cid.clone())
                 .bind(&signature_blob)
                 .bind(&now)
                 .execute(store.pool())
@@ -313,6 +318,7 @@ impl<'a> RepoImporter<'a> {
                     reason: format!("insert commit_obj: {e}"),
                 })?;
             }
+            prev_data_cid = Some(commit.data.to_string());
         }
 
         let head = chain.last().expect("non-empty chain");

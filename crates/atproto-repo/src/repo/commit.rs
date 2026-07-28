@@ -22,18 +22,24 @@ use serde::{Deserialize, Serialize};
 ///   "version": 3,
 ///   "data": CID,         // MST root
 ///   "rev": "3jui7kd2z2y2e",
-///   "prev": CID,         // optional, deprecated by Sync 1.1
-///   "prevData": CID,     // optional, Sync 1.1 — prior MST root for inductive verification
+///   "prev": CID | null,  // prior commit CID, deprecated by Sync 1.1
 ///   "sig": bytes         // signature
 /// }
 /// ```
 ///
+/// The commit carries exactly these keys. Adding one — even an optional one —
+/// changes the encoded bytes, and so changes both the signature and the commit
+/// CID, which is why the set is fixed rather than extensible.
+///
 /// # Sync 1.1
 ///
-/// The `prev_data` field carries the **prior MST root CID** (not the prior commit CID).
-/// It enables inductive verification: a verifier with the prior `data` CID can verify
-/// the new commit's MST against the operations in the firehose `#commit` payload without
-/// retaining full repo state. See [`crate::repo::verify_inductive`].
+/// Inductive verification uses `prevData`, the **prior MST root CID** (not the
+/// prior commit CID), which lets a verifier holding the previous `data` check a
+/// new commit's MST against the operations in the event without retaining full
+/// repo state. That field belongs to the `com.atproto.sync.subscribeRepos`
+/// `#commit` event, **not** to the commit object: it is per-delivery
+/// information, not repository state, and it is not part of what the repository
+/// owner signs. See [`crate::repo::verify_inductive`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
     /// DID of the repository owner.
@@ -54,10 +60,6 @@ pub struct Commit {
     /// commit schema types this as nullable-and-required, so dropping the
     /// key changes the signed bytes and the commit CID.
     pub prev: Option<Cid>,
-
-    /// Prior MST root CID for Sync 1.1 inductive verification (None for initial commit).
-    #[serde(rename = "prevData", skip_serializing_if = "Option::is_none")]
-    pub prev_data: Option<Cid>,
 
     /// Signature bytes (raw ECDSA signature).
     #[serde(with = "serde_bytes")]
@@ -88,10 +90,6 @@ pub struct UnsignedCommit {
     /// commit schema types this as nullable-and-required, so dropping the
     /// key changes the signed bytes and the commit CID.
     pub prev: Option<Cid>,
-
-    /// Prior MST root CID for Sync 1.1 inductive verification (None for initial commit).
-    #[serde(rename = "prevData", skip_serializing_if = "Option::is_none")]
-    pub prev_data: Option<Cid>,
 }
 
 impl Commit {
@@ -104,26 +102,6 @@ impl Commit {
             data,
             rev,
             prev,
-            prev_data: None,
-        }
-    }
-
-    /// Create an unsigned commit including the Sync 1.1 `prevData` field.
-    #[must_use]
-    pub fn new_unsigned_with_prev_data(
-        did: String,
-        data: Cid,
-        rev: String,
-        prev: Option<Cid>,
-        prev_data: Option<Cid>,
-    ) -> UnsignedCommit {
-        UnsignedCommit {
-            did,
-            version: 3,
-            data,
-            rev,
-            prev,
-            prev_data,
         }
     }
 
@@ -139,7 +117,6 @@ impl Commit {
             data: self.data.clone(),
             rev: self.rev.clone(),
             prev: self.prev.clone(),
-            prev_data: self.prev_data.clone(),
         };
 
         atproto_dasl::to_vec(&unsigned).map_err(|e| RepoError::InvalidCommit {
@@ -235,26 +212,6 @@ impl UnsignedCommit {
             data,
             rev,
             prev,
-            prev_data: None,
-        }
-    }
-
-    /// Create a new unsigned commit including the Sync 1.1 `prevData` field.
-    #[must_use]
-    pub fn new_with_prev_data(
-        did: String,
-        data: Cid,
-        rev: String,
-        prev: Option<Cid>,
-        prev_data: Option<Cid>,
-    ) -> Self {
-        Self {
-            did,
-            version: 3,
-            data,
-            rev,
-            prev,
-            prev_data,
         }
     }
 
@@ -278,7 +235,6 @@ impl UnsignedCommit {
             data: self.data,
             rev: self.rev,
             prev: self.prev,
-            prev_data: self.prev_data,
             sig,
         }
     }
@@ -363,7 +319,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -385,7 +340,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: Some(prev_cid),
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -403,7 +357,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -418,7 +371,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -436,7 +388,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 
@@ -454,7 +405,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![],
         };
 
@@ -464,41 +414,45 @@ mod tests {
         ));
     }
 
+    /// A commit as this crate used to write it, carrying `prevData` in the
+    /// body. Used to prove such a commit still decodes.
+    #[derive(Serialize)]
+    struct LegacyCommitWithPrevData {
+        did: String,
+        version: u64,
+        data: Cid,
+        rev: String,
+        prev: Option<Cid>,
+        #[serde(rename = "prevData")]
+        prev_data: Option<Cid>,
+        #[serde(with = "serde_bytes")]
+        sig: Vec<u8>,
+    }
+
+    /// A commit encoded with a `prevData` key still decodes; the key is ignored.
+    ///
+    /// `prevData` moved to the `subscribeRepos` `#commit` event, so it is no
+    /// longer a field of [`Commit`]. Repositories written before that change
+    /// have it in the body, and reading them must not break. (Their signatures
+    /// no longer verify, because the signed bytes included the extra key — but
+    /// that is a property of those commits, not of the decoder.)
     #[test]
-    fn test_commit_with_prev_data() {
-        let prev_cid: Cid = compute_cid(b"prev").into();
-        let prev_data_cid: Cid = compute_cid(b"prev_data").into();
-        let commit = Commit {
+    fn test_commit_with_legacy_prev_data_key_still_decodes() {
+        let legacy = LegacyCommitWithPrevData {
             did: "did:plc:test".to_string(),
             version: 3,
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
-            prev: Some(prev_cid),
-            prev_data: Some(prev_data_cid.clone()),
+            prev: Some(compute_cid(b"prev").into()),
+            prev_data: Some(compute_cid(b"prev_data").into()),
             sig: vec![1, 2, 3, 4],
         };
+        let bytes = atproto_dasl::to_vec(&legacy).unwrap();
 
-        let bytes = commit.to_bytes().unwrap();
-        let decoded = Commit::from_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.prev_data, Some(prev_data_cid));
-    }
-
-    #[test]
-    fn test_unsigned_commit_with_prev_data() {
-        let prev_data_cid: Cid = compute_cid(b"prev_data").into();
-        let unsigned = UnsignedCommit::new_with_prev_data(
-            "did:plc:test".to_string(),
-            test_cid(),
-            "3jui7kd2z2y2e".to_string(),
-            None,
-            Some(prev_data_cid.clone()),
-        );
-
-        assert_eq!(unsigned.prev_data, Some(prev_data_cid.clone()));
-
-        let signed = unsigned.sign(vec![9, 9, 9]);
-        assert_eq!(signed.prev_data, Some(prev_data_cid));
+        let decoded = Commit::from_bytes(&bytes).expect("legacy commit should still decode");
+        assert_eq!(decoded.did, "did:plc:test");
+        assert_eq!(decoded.rev, "3jui7kd2z2y2e");
+        assert_eq!(decoded.sig, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -509,7 +463,6 @@ mod tests {
             data: test_cid(),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
 

@@ -600,7 +600,6 @@ mod tests {
             data: atproto_dasl::Cid::from(block_cid),
             rev: "3jui7kd2z2y2e".to_string(),
             prev: None,
-            prev_data: None,
             sig: vec![1, 2, 3, 4],
         };
         let commit_bytes = atproto_dasl::to_vec(&commit).unwrap();
