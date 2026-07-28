@@ -55,7 +55,7 @@ pub struct HttpState {
     /// Per-key sliding-window rate limiter (always populated).
     pub rate_limiter: SlidingWindowLimiter,
     /// In-process broadcast bus for `subscribeRepos` low-latency
-    /// fan-out. The durable per-actor outbox remains the source of truth;
+    /// fan-out. The durable firehose stream remains the source of truth;
     /// the bus is a wakeup-on-write optimization.
     pub event_bus: EventBus,
     /// PDS-level signing key (typically P-256 or K-256). When `Some`, its

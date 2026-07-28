@@ -21,7 +21,8 @@
 //! - **`realm`** — public/permissioned realm distinction.
 //! - **`repo`** — `RepoReader`, `RepoWriter`, CAR export, `RepoImporter`.
 //! - **`security`** — JTI replay guard + sliding-window rate limiter.
-//! - **`sequencer`** — durable per-actor outbox + in-process broadcast bus.
+//! - **`sequencer`** — the durable firehose stream (one ordered log for the
+//!   whole server) + in-process broadcast bus.
 //! - **`shutdown`** — graceful-shutdown controller.
 //! - **`space`** — `SpaceService`/`Writer`/`Reader`/`Sync` over `atproto-space`.
 //!

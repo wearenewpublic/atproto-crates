@@ -615,7 +615,7 @@ impl SqlAtomicCommitWriter {
 
 #[async_trait]
 impl AtomicCommitWriter for SqlAtomicCommitWriter {
-    async fn apply_atomic_commit(&self, did: &str, batch: CommitBatch<'_>) -> PdsResult<u64> {
+    async fn apply_atomic_commit(&self, did: &str, batch: CommitBatch<'_>) -> PdsResult<()> {
         let pool = open_pool(&self.data_dir, did).await?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut tx = pool.begin().await.map_err(|e| PdsError::Storage {
@@ -683,24 +683,11 @@ impl AtomicCommitWriter for SqlAtomicCommitWriter {
                 })?;
         }
 
-        // outbox event
-        let result =
-            sqlx::query("INSERT INTO outbox (event_type, payload, created_at) VALUES (?, ?, ?)")
-                .bind(batch.outbox_event_type)
-                .bind(&batch.outbox_payload)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| PdsError::Storage {
-                    reason: format!("atomic commit insert outbox: {e}"),
-                })?;
-        let seq = result.last_insert_rowid();
-
         tx.commit().await.map_err(|e| PdsError::Storage {
             reason: format!("atomic commit tx commit: {e}"),
         })?;
 
-        Ok(seq.max(0) as u64)
+        Ok(())
     }
 }
 

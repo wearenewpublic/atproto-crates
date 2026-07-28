@@ -395,19 +395,18 @@ impl AccountManager {
             }
         }
 
-        // Emit a `#account` firehose event into the per-actor outbox so
-        // subscribers see the state change. Best-effort: a failure here is
-        // logged but does not roll back the state transition.
+        // Emit a `#account` event onto the firehose stream so subscribers see
+        // the state change. Best-effort: a failure here is logged but does not
+        // roll back the state transition.
         if let Err(e) = self.emit_account_event(did, new_state).await {
             tracing::warn!(did, ?e, "failed to emit #account event");
         }
         Ok(())
     }
 
-    /// Append a `#account` outbox row reflecting the new state.
+    /// Append an `#account` event to the firehose stream reflecting the new
+    /// state.
     async fn emit_account_event(&self, did: &str, new_state: AccountState) -> PdsResult<()> {
-        let store = crate::actor_store::sql::SqlActorStore::open(&self.data_dir, did).await?;
-        let outbox = crate::sequencer::OutboxReader::new(store.pool().clone());
         // `status` is optional, not nullable: an active account carries none.
         // Emitting `status: "active"` alongside `active: true` says the same
         // thing twice and is not a value the lexicon lists.
@@ -417,8 +416,8 @@ impl AccountManager {
             active,
             status: (!active).then(|| new_state.as_str().to_string()),
         })?;
-        outbox
-            .append(crate::sequencer::EventType::Account, bytes)
+        self.sequencer()
+            .append(did, crate::sequencer::EventType::Account.as_str(), bytes)
             .await?;
         Ok(())
     }
@@ -449,6 +448,15 @@ impl AccountManager {
     #[must_use]
     pub fn account_pool(&self) -> AccountPool {
         self.accounts_pool.clone()
+    }
+
+    /// Handle on the firehose stream.
+    ///
+    /// The stream log lives in the accounts database, so every holder of the
+    /// accounts pool can append to it without extra plumbing.
+    #[must_use]
+    pub fn sequencer(&self) -> crate::sequencer::Sequencer {
+        crate::sequencer::Sequencer::new(self.accounts_pool.clone())
     }
 
     /// Get a borrow of the accounts pool — same as

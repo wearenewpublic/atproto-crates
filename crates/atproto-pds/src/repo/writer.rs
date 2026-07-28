@@ -12,8 +12,10 @@
 //!    delete from the MST, write to `repo_block` and `repo_record`.
 //! 5. Build a signed `Commit` via `atproto-repo::UnsignedCommit::sign` using
 //!    the account's KeyStore-resolved signing key.
-//! 6. Append the commit row to `commit_obj` and a Sync 1.1 `#commit` event to
-//!    the per-actor `outbox` (the OutboxReader::append helper).
+//! 6. Append the commit row to `commit_obj`, then — once that is durable —
+//!    record a Sync 1.1 `#commit` on the firehose stream. The stream is
+//!    server-global and so lives outside the per-actor transaction; see
+//!    [`crate::sequencer::stream`].
 //!
 //! `getRepo` CAR streaming and `subscribeRepos` live tail land alongside in
 //! sibling files; this module is the source of truth for "what changed" and
@@ -164,6 +166,28 @@ impl RepoWriter {
         match self.backend.as_ref() {
             Some(backend) => self.apply_writes_dispatch(did, ops, backend.clone()).await,
             None => self.apply_writes_legacy(did, ops).await,
+        }
+    }
+
+    /// Record a `#commit` on the firehose stream.
+    ///
+    /// Called after the repository write is durable, never inside it: the
+    /// stream log is server-global and lives in the accounts database, so it
+    /// cannot share the per-actor transaction. Best-effort in consequence — a
+    /// failure here leaves a commit that no event announced, which subscribers
+    /// repair by re-anchoring through `#sync` or `getRepo`. Returning an error
+    /// would report a write as failed that in fact succeeded.
+    async fn publish_commit(&self, did: &str, payload: Vec<u8>) {
+        let result = self
+            .accounts
+            .sequencer()
+            .append(did, EventType::Commit.as_str(), payload)
+            .await;
+        match result {
+            Ok(seq) => tracing::debug!(did, seq, "firehose: sequenced #commit"),
+            Err(error) => {
+                tracing::error!(error = ?error, did, "firehose: failed to sequence #commit");
+            }
         }
     }
 
@@ -445,9 +469,9 @@ impl RepoWriter {
                 })?;
         }
 
-        // Outbox: the `#commit` body, in the shape the subscription's union
-        // declares. `seq` and `time` belong to the delivery and are added when
-        // the frame is built.
+        // The `#commit` body, in the shape the subscription's union declares.
+        // `seq` and `time` belong to the delivery and are added when the frame
+        // is built.
         let repo_ops = ops_with_prev_cids(&diffs);
         let payload_bytes = crate::sequencer::payload::encode(&commit_body(
             did,
@@ -457,19 +481,17 @@ impl RepoWriter {
             prev_data_cid.as_deref(),
             repo_ops.clone(),
         )?)?;
-        sqlx::query("INSERT INTO outbox (event_type, payload, created_at) VALUES (?, ?, ?)")
-            .bind(EventType::Commit.as_str())
-            .bind(&payload_bytes)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| PdsError::Storage {
-                reason: format!("insert outbox: {e}"),
-            })?;
 
         tx.commit().await.map_err(|e| PdsError::Storage {
             reason: format!("commit tx: {e}"),
         })?;
+
+        // The stream log is server-global and so lives in a different database
+        // from this repository — the event cannot ride in the transaction
+        // above. It is published only after the commit is durable, so the
+        // ordering failure is a missed event rather than one announcing a
+        // commit that does not exist.
+        self.publish_commit(did, payload_bytes).await;
 
         // Compose the per-op WriteResult from the diffs + repo_ops aligned positions.
         let mut writes = Vec::with_capacity(ops.len());
@@ -736,10 +758,12 @@ impl RepoWriter {
             commit_block_bytes: &commit_bytes,
             record_upserts: &upserts,
             record_deletes: &delete_rkeys,
-            outbox_event_type: EventType::Commit.as_str(),
-            outbox_payload: payload_bytes,
         };
         backend.atomic.apply_atomic_commit(did, batch).await?;
+
+        // Published after the commit is durable — see the comment on the same
+        // call in `apply_writes_legacy`.
+        self.publish_commit(did, payload_bytes).await;
 
         let mut writes = Vec::with_capacity(ops.len());
         for (op, repo_op) in ops.iter().zip(repo_ops.iter()) {
@@ -813,6 +837,17 @@ mod tests {
     use crate::keys::MemoryKeyStore;
     use atproto_identity::key::KeyType;
     use tempfile::TempDir;
+
+    /// Open the firehose stream backing a test data directory.
+    ///
+    /// The stream log lives in the accounts DB, not in the actor store, which
+    /// is the whole point of the change these tests cover.
+    async fn stream_of(dir: &std::path::Path) -> crate::sequencer::Sequencer {
+        let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        crate::sequencer::Sequencer::new(accounts.account_pool())
+    }
 
     async fn fresh_writer() -> (RepoWriter, TempDir) {
         let tmp = TempDir::new().unwrap();
@@ -957,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn batch_atomic_commit_emits_one_outbox_event() {
+    async fn batch_atomic_commit_emits_one_stream_event() {
         let (writer, _tmp) = fresh_writer().await;
         let result = writer
             .apply_writes(
@@ -973,12 +1008,17 @@ mod tests {
         assert_eq!(result.writes.len(), 3);
         // All three writes share one rev and one commit.
         let rev = &result.rev;
-        let store = SqlActorStore::open(_tmp.path(), "did:plc:alice")
+        let events = stream_of(_tmp.path())
+            .await
+            .read_after(None, None, 100)
             .await
             .unwrap();
-        let outbox = OutboxReader::new(store.pool().clone());
-        let events = outbox.read_after(None, 100).await.unwrap();
         assert_eq!(events.len(), 1, "one batch → one #commit event");
+        assert_eq!(events[0].did, "did:plc:alice");
+        assert_eq!(
+            events[0].seq, 1,
+            "the stream numbers from 1 regardless of which repository wrote"
+        );
         // The stored body is DAG-CBOR in the lexicon's `#commit` shape.
         let atproto_dasl::Ipld::Map(payload) =
             atproto_dasl::from_slice(&events[0].payload).unwrap()
@@ -1160,8 +1200,8 @@ mod tests {
             .await
             .unwrap();
         assert!(rec.is_some(), "record should land via dispatch");
-        let outbox_seq = backend.outbox.latest_seq("did:plc:alice").await.unwrap();
-        assert!(outbox_seq.is_some(), "#commit outbox event should land");
+        let seq = stream_of(tmp_data.path()).await.latest_seq().await.unwrap();
+        assert!(seq.is_some(), "#commit should land on the firehose stream");
     }
 
     #[cfg(feature = "fjall")]
@@ -1237,19 +1277,17 @@ mod tests {
         assert_eq!(rec.collection, "app.bsky.feed.post");
         assert_eq!(rec.rkey, "k1");
 
-        let outbox_seq = backend
-            .outbox
-            .latest_seq("did:plc:alice")
+        // The event is on the firehose stream, not in the fjall keyspace: the
+        // stream is server-global and lives in the accounts DB under every
+        // storage profile.
+        let events = stream_of(tmp_data.path())
             .await
-            .unwrap()
-            .expect("fjall outbox should have one #commit event");
-        assert_eq!(outbox_seq, 1);
-        let events = backend
-            .outbox
-            .read_after("did:plc:alice", None, 10)
+            .read_after(None, None, 10)
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].did, "did:plc:alice");
         assert_eq!(events[0].event_type, "commit");
     }
 
@@ -1334,9 +1372,10 @@ mod tests {
             .unwrap();
         assert_eq!(page.len(), 2);
 
-        // Two outbox events (one per commit).
+        // Two stream events, one per commit — and numbered by the stream even
+        // though the repository lives in fjall.
         assert_eq!(
-            backend.outbox.latest_seq("did:plc:alice").await.unwrap(),
+            stream_of(tmp_data.path()).await.latest_seq().await.unwrap(),
             Some(2)
         );
     }

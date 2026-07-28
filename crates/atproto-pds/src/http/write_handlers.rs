@@ -6,7 +6,7 @@ use crate::http::auth::{AuthSubject, request_htm_htu, require_authn};
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
 use crate::repo::{RepoWriter, WriteAction, WriteOp};
-use crate::sequencer::{OutboxReader, SubscribeEvent};
+use crate::sequencer::SubscribeEvent;
 use atproto_record::tid::Tid;
 use atproto_repo::mst::RepoOpAction;
 use axum::Json;
@@ -15,41 +15,35 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 
-/// Publish the most-recently inserted outbox row(s) for `did` to the live
-/// event bus. Best-effort — a failure to read the outbox or send to the bus
-/// is logged but does not fail the write (subscribers self-heal via the
-/// durable outbox poll path).
-async fn publish_recent_outbox(state: &HttpState, did: &str) {
-    let reader = if let Some(backend) = state.public_realm_backend.as_ref() {
-        OutboxReader::dispatch(backend.outbox.clone(), did)
-    } else {
-        let data_dir = match state.account_manager.as_deref() {
-            Some(m) => m.data_dir().to_path_buf(),
-            None => return,
-        };
-        let store = match SqlActorStore::open(&data_dir, did).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(did, error = %e, "publish_recent_outbox: open store failed");
-                return;
-            }
-        };
-        OutboxReader::new(store.pool().clone())
+/// Wake live subscribers with the event this write just recorded.
+///
+/// The stream is the durable record; the bus only saves a subscriber from
+/// waiting out the poll interval. Best-effort in consequence — a failure to
+/// read the stream or send to the bus is logged and the write still succeeds,
+/// because the poll path delivers the same event moments later.
+async fn publish_recent_stream_event(state: &HttpState, did: &str) {
+    let sequencer = state.reader.sequencer();
+    let latest = match sequencer.latest_seq().await {
+        Ok(Some(seq)) => seq,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(did, error = %error, "firehose: stream high-water read failed");
+            return;
+        }
     };
-    let latest = match reader.latest_seq().await {
-        Ok(Some(s)) => s,
-        _ => return,
-    };
-    // Read the single newest row to broadcast the event payload directly.
-    let rows = match reader.read_after(Some(latest - 1), 1).await {
-        Ok(r) => r,
-        Err(_) => return,
+    // Read the single newest row so the broadcast carries the payload itself.
+    let rows = match sequencer.read_after(Some(latest - 1), Some(did), 1).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(did, error = %error, "firehose: stream tail read failed");
+            return;
+        }
     };
     for row in rows {
         let _ = state.event_bus.publish(SubscribeEvent {
-            did: did.to_string(),
+            did: row.did,
             seq: row.seq,
-            event_type: row.event_type.as_str().to_string(),
+            event_type: row.event_type,
             payload: row.payload,
             created_at: row.created_at,
         });
@@ -166,7 +160,7 @@ pub async fn create_record(
         )
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_outbox(&state, &repo_did).await;
+    publish_recent_stream_event(&state, &repo_did).await;
     let entry = &result.writes[0];
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
@@ -218,7 +212,7 @@ pub async fn put_record(
         )
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_outbox(&state, &repo_did).await;
+    publish_recent_stream_event(&state, &repo_did).await;
     let entry = &result.writes[0];
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
@@ -268,7 +262,7 @@ pub async fn delete_record(
         )
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_outbox(&state, &repo_did).await;
+    publish_recent_stream_event(&state, &repo_did).await;
     let entry = &result.writes[0];
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
@@ -425,7 +419,7 @@ pub async fn apply_writes(
         .apply_writes(&repo_did, ops)
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_outbox(&state, &repo_did).await;
+    publish_recent_stream_event(&state, &repo_did).await;
     let commit = WriteCommitInfo {
         cid: result.commit_cid.clone(),
         rev: result.rev.clone(),
@@ -649,7 +643,8 @@ pub async fn import_repo(
             ));
         }
     };
-    let mut importer = crate::repo::RepoImporter::new(&data_dir);
+    let sequencer = state.reader.sequencer();
+    let mut importer = crate::repo::RepoImporter::new(&data_dir).with_sequencer(&sequencer);
     if let Some(backend) = state.public_realm_backend.as_ref() {
         importer = importer.with_backend(backend);
     }

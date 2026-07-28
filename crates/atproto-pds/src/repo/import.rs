@@ -103,6 +103,10 @@ pub struct RepoImporter<'a> {
     /// `commit_obj.insert`); when `None`, the legacy SQLite-direct
     /// path runs.
     backend: Option<&'a crate::actor_store::PublicRealmBackend>,
+    /// Firehose stream handle. When `None`, the import runs but emits no
+    /// `#sync` — the legacy shape, kept so tests can construct an importer
+    /// without an accounts database.
+    sequencer: Option<&'a crate::sequencer::Sequencer>,
 }
 
 impl<'a> RepoImporter<'a> {
@@ -114,7 +118,15 @@ impl<'a> RepoImporter<'a> {
             max_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB safety ceiling
             plc_verifier: None,
             backend: None,
+            sequencer: None,
         }
+    }
+
+    /// Publish `#sync` to the firehose stream once the import completes.
+    #[must_use]
+    pub fn with_sequencer(mut self, sequencer: &'a crate::sequencer::Sequencer) -> Self {
+        self.sequencer = Some(sequencer);
+        self
     }
 
     /// Override the CAR-size ceiling.
@@ -324,7 +336,7 @@ impl<'a> RepoImporter<'a> {
         let head = chain.last().expect("non-empty chain");
         let head_cid = head.cid().map_err(PdsError::Repo)?;
 
-        // Emit a Sync 1.1 `#sync` event into the per-actor outbox. Per the
+        // Emit a Sync 1.1 `#sync` event onto the firehose stream. Per the
         // lexicon, `#sync` force-sets the head commit without a diff —
         // exactly the right semantics after a CAR import. Best-effort: the
         // import has already succeeded; a publish failure logs and continues.
@@ -335,13 +347,18 @@ impl<'a> RepoImporter<'a> {
             rev: &head.rev,
             blocks: blocks.len(),
         };
-        let publish = if let Some(backend) = self.backend {
-            crate::sequencer::publish_sync_via_backend(backend, &sync_event).await
-        } else {
-            crate::sequencer::publish_sync(self.data_dir, &sync_event).await
-        };
-        if let Err(e) = publish {
-            tracing::warn!(account_did, ?e, "import: failed to emit #sync event");
+        match self.sequencer {
+            Some(sequencer) => {
+                if let Err(e) = crate::sequencer::publish_sync(sequencer, &sync_event).await {
+                    tracing::warn!(account_did, ?e, "import: failed to emit #sync event");
+                }
+            }
+            // No sequencer wired — the import still succeeded, but nothing
+            // tailing the firehose learns about it.
+            None => tracing::warn!(
+                account_did,
+                "import: no sequencer configured, #sync not emitted"
+            ),
         }
 
         Ok(ImportOutcome {

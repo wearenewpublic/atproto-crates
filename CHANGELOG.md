@@ -52,6 +52,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: `seq` numbered a repository rather than the stream, so the firehose cursor meant
+  nothing. `outbox.seq` was an `AUTOINCREMENT` column inside each per-actor database, which made
+  every account's first event `seq = 1` — two repositories were handed the same number, a resuming
+  relay could not tell those events apart, and a repository created after a subscriber connected
+  restarted at 1 and had its entire history discarded as already-seen. The subscriber loop then
+  drained one account's outbox fully before touching the next, so frames left out of order even
+  where the numbers happened to differ.
+
+  There is now one ordered event log for the whole server, in the accounts database — which is
+  opened under every storage profile, so a single schema serves both the SQLite and fjall
+  deployments. `seq` is allocated by the INSERT into that log, which is what makes it monotonic:
+  allocation order *is* commit order. Handing out globally-unique numbers over per-actor storage
+  would not have been enough, because a subscriber merging those rows can still observe a later
+  number before an earlier one commits.
+
+  `subscribeRepos` accordingly tails one log with one cursor. Three limits disappear with the
+  per-account bookkeeping: a connection no longer covers at most 1000 accounts, an account created
+  after a subscriber connects now appears without reconnecting, and the per-account outbox is no
+  longer reopened on every poll tick. `?did=` remains as a filter over the stream and does not
+  renumber it, so a filtered subscriber's cursor stays valid against the unfiltered stream.
+
+  One trade is deliberate: a `#commit` is no longer written in the same transaction as the commit
+  it describes, because the repository lives in a per-actor store and the log is server-global. The
+  event is published only once the commit is durable, so a crash between the two loses an event
+  rather than announcing one that never happened — the case `#sync` and `getRepo` re-anchoring
+  exist to repair. The reference implementation splits them the same way.
+
+  The per-actor `outbox` table is left in place but is no longer written or read; dropping it is a
+  separate change.
+
 - `atproto-pds`: no relay could consume this server's firehose. `com.atproto.sync.subscribeRepos`
   publishes a closed union — a subscriber decodes each frame against `#commit`, `#sync`, `#identity`
   or `#account` and rejects anything matching none of them — and every frame this server emitted

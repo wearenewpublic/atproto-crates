@@ -742,35 +742,12 @@ impl FjallAtomicCommitWriter {
     pub fn new(store: FjallActorStore) -> Self {
         Self { store }
     }
-
-    fn decode_seq(slice: &[u8]) -> PdsResult<u64> {
-        if slice.len() != 8 {
-            return Err(PdsError::Storage {
-                reason: format!("outbox_meta value not 8 bytes: got {}", slice.len()),
-            });
-        }
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(slice);
-        Ok(u64::from_be_bytes(buf))
-    }
 }
 
 #[async_trait]
 impl AtomicCommitWriter for FjallAtomicCommitWriter {
-    async fn apply_atomic_commit(&self, did: &str, batch: CommitBatch<'_>) -> PdsResult<u64> {
+    async fn apply_atomic_commit(&self, did: &str, batch: CommitBatch<'_>) -> PdsResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
-
-        // Determine the next outbox seq before opening the batch. The
-        // per-DID write mutex held by the caller (RepoWriter) gates
-        // concurrent writers, so the read-then-write is race-free.
-        let outbox_meta = self.store.outbox_meta();
-        let prior = outbox_meta
-            .get(outbox_meta_key(did))
-            .map_err(fjall_err("outbox_meta get"))?;
-        let next_seq = match prior {
-            Some(slice) => Self::decode_seq(&slice)? + 1,
-            None => 1,
-        };
 
         // Encode the commit row payload.
         let commit_value = CommitValue {
@@ -782,14 +759,6 @@ impl AtomicCommitWriter for FjallAtomicCommitWriter {
             created_at: now.clone(),
         };
         let commit_bytes = atproto_dasl::to_vec(&commit_value).map_err(cbor_err("commit"))?;
-
-        // Encode the outbox payload.
-        let outbox_value = OutboxValue {
-            event_type: batch.outbox_event_type.to_string(),
-            payload: batch.outbox_payload,
-            created_at: now.clone(),
-        };
-        let outbox_bytes = atproto_dasl::to_vec(&outbox_value).map_err(cbor_err("outbox"))?;
 
         // Pre-encode all the record-row payloads so the batch step is
         // failure-free.
@@ -835,7 +804,6 @@ impl AtomicCommitWriter for FjallAtomicCommitWriter {
         let commit_obj = self.store.commit_obj();
         let by_rev = self.store.commit_by_rev();
         let repo_block = self.store.repo_block();
-        let outbox = self.store.outbox();
         let mut wb = self.store.db().batch();
 
         wb.insert(
@@ -861,15 +829,9 @@ impl AtomicCommitWriter for FjallAtomicCommitWriter {
             wb.remove(primary_record, primary_key);
             wb.remove(by_coll, by_coll_key);
         }
-        wb.insert(outbox, outbox_key(did, next_seq), outbox_bytes);
-        wb.insert(
-            outbox_meta,
-            outbox_meta_key(did),
-            next_seq.to_be_bytes().to_vec(),
-        );
         wb.commit().map_err(fjall_err("atomic commit batch"))?;
 
-        Ok(next_seq)
+        Ok(())
     }
 }
 

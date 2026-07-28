@@ -64,6 +64,16 @@ impl RepoReader {
         &self.accounts
     }
 
+    /// Handle on the firehose stream.
+    ///
+    /// Read-side callers reach the stream through the accounts directory the
+    /// reader already holds, which is what lets `subscribeRepos` tail one log
+    /// instead of every actor's outbox.
+    #[must_use]
+    pub fn sequencer(&self) -> crate::sequencer::Sequencer {
+        crate::sequencer::Sequencer::new(self.accounts.account_pool())
+    }
+
     /// Get the configured data directory (used by handlers that need to open
     /// per-actor stores directly).
     #[must_use]

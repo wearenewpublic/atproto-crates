@@ -559,7 +559,7 @@ pub struct RefreshIdentityResponse {
 /// Re-fetches the named account's PLC document via
 /// `atproto_identity::plc::query`, updates `account.handle` if the
 /// document's first `alsoKnownAs` entry differs, and emits an
-/// `#identity` event into the per-actor outbox so `subscribeRepos`
+/// `#identity` event onto the firehose stream so `subscribeRepos`
 /// consumers re-resolve. The PDS doesn't currently maintain a long-lived
 /// in-process PLC cache, so the refresh is a no-op for cache state — but
 /// the outbox event ensures fan-out, and the local-handle reconciliation
@@ -659,10 +659,10 @@ pub async fn refresh_identity(
         }
     }
 
-    // Emit an `#identity` event into the per-actor outbox. Best-effort:
+    // Emit an `#identity` event onto the firehose stream. Best-effort:
     // failures log and we still return Ok with `identityEventEmitted=false`.
     let event_emitted = match emit_identity_event(
-        manager.data_dir(),
+        &manager.sequencer(),
         &input.did,
         observed_handle.as_deref(),
     )
@@ -683,21 +683,19 @@ pub async fn refresh_identity(
     }))
 }
 
-/// Append an `#identity` event to the named DID's outbox so tailing
+/// Append an `#identity` event to the firehose stream so tailing
 /// `subscribeRepos` consumers re-resolve the document.
 async fn emit_identity_event(
-    data_dir: &std::path::Path,
+    sequencer: &crate::sequencer::Sequencer,
     did: &str,
     handle: Option<&str>,
 ) -> crate::errors::PdsResult<()> {
-    let store = crate::actor_store::sql::SqlActorStore::open(data_dir, did).await?;
     let bytes = crate::sequencer::payload::encode(&crate::sequencer::payload::IdentityBody {
         did: did.to_string(),
         handle: handle.map(str::to_string),
     })?;
-    let outbox = crate::sequencer::OutboxReader::new(store.pool().clone());
-    outbox
-        .append(crate::sequencer::EventType::Identity, bytes)
+    sequencer
+        .append(did, crate::sequencer::EventType::Identity.as_str(), bytes)
         .await?;
     Ok(())
 }

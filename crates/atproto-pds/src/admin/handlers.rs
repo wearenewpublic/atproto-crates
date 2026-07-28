@@ -1005,15 +1005,9 @@ pub async fn force_repo_sync(
         rev: &head_rev,
         blocks: blocks.max(0) as usize,
     };
-    let seq = if let Some(backend) = state.public_realm_backend.as_ref() {
-        crate::sequencer::publish_sync_via_backend(backend, &event)
-            .await
-            .map_err(XrpcError::from)?
-    } else {
-        crate::sequencer::publish_sync(manager.data_dir(), &event)
-            .await
-            .map_err(XrpcError::from)?
-    };
+    let seq = crate::sequencer::publish_sync(&manager.sequencer(), &event)
+        .await
+        .map_err(XrpcError::from)?;
     tracing::info!(did = %input.did, seq, head_cid = %head_cid, "admin: forceRepoSync emitted");
     Ok(Json(ForceRepoSyncResponse {
         did: input.did,

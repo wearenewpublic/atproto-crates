@@ -1,17 +1,14 @@
 //! Live event bus for `subscribeRepos` — broadcast-channel low-latency
 //! firehose path.
 //!
-//! under the SQLite
-//! profile we maintain per-actor outbox tables for durability + replay, but
-//! in addition we keep an in-process broadcast channel so subscribers wake
-//! immediately on each commit (instead of polling every 500ms). The
-//! durable outbox is the source of truth — the broadcast is a wakeup +
-//! payload-on-the-wire optimization for connected subscribers.
+//! [`crate::sequencer::stream`] is the durable record and the source of truth.
+//! This in-process broadcast channel exists only so a connected subscriber
+//! wakes on the write itself rather than waiting out the poll interval.
 //!
-//! When a subscriber receives a [`SubscribeEvent`], it advances its cursor
-//! and skips the corresponding outbox row on the next poll cycle — so even
-//! if the broadcast misses (lagged subscriber, restart), the poll fallback
-//! catches up via the outbox.
+//! When a subscriber receives a [`SubscribeEvent`] it advances its cursor and
+//! skips that `seq` on the next poll cycle — so a missed broadcast (lagged
+//! subscriber, restart, an event published by another process) costs latency
+//! and nothing else: the poll path delivers it from the stream.
 
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -21,11 +18,11 @@ use tokio::sync::broadcast;
 pub struct SubscribeEvent {
     /// DID of the actor that produced this event.
     pub did: String,
-    /// Outbox sequence number (matches the corresponding row).
+    /// Stream position (matches the corresponding `stream_event` row).
     pub seq: i64,
     /// `event_type` string (e.g. "#commit", "#account").
     pub event_type: String,
-    /// JSON payload bytes (the same bytes the poll path serializes).
+    /// DAG-CBOR body bytes — the same bytes the poll path sends.
     pub payload: Vec<u8>,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
@@ -40,8 +37,8 @@ pub struct EventBus {
 impl EventBus {
     /// Construct an event bus with the given subscriber-buffer capacity.
     /// Events delivered while a subscriber is behind by more than `capacity`
-    /// are dropped from the broadcast — the durable outbox path makes this
-    /// safe (consumers self-heal on the next poll).
+    /// are dropped from the broadcast — the durable stream makes this safe
+    /// (consumers self-heal on the next poll).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (sender, _rx) = broadcast::channel(capacity);
@@ -51,7 +48,7 @@ impl EventBus {
     }
 
     /// Publish an event. Returns the number of active subscribers that
-    /// received it (0 is fine — durable outbox covers them).
+    /// received it (0 is fine — the durable stream covers them).
     pub fn publish(&self, event: SubscribeEvent) -> usize {
         // `send` returns `Err(SendError)` when there are no receivers; that's
         // not actually an error from the publisher's perspective.

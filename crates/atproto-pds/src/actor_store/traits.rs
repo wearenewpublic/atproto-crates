@@ -160,16 +160,21 @@ pub trait RepoRecordStorage: Send + Sync {
 
 /// Atomic-commit batch — the lockstep payload that
 /// `RepoWriter::apply_writes` emits for one signed commit. Carries the
-/// commit row, the commit-block bytes, the indexed `repo_record`
-/// upserts + deletes, and the outbox event. Implementations of
+/// commit row, the commit-block bytes, and the indexed `repo_record`
+/// upserts + deletes. Implementations of
 /// [`AtomicCommitWriter`] persist all of these atomically using their
 /// native primitive (sqlx `Transaction` for SQL,
 /// `fjall::WriteBatch` for fjall) so a partial failure can't leave
 /// the repo in an inconsistent state.
 ///
+/// The firehose event is deliberately not part of this batch. `seq`
+/// numbers the whole stream, so the event log is server-global and
+/// lives in the accounts database — a per-actor transaction cannot
+/// reach it. [`crate::sequencer::Sequencer`] records the event once
+/// this batch is durable.
+///
 /// Field references are borrowed by the caller because it already
-/// owns them — no allocations beyond the outbox payload that the
-/// writer hands over by value.
+/// owns them.
 #[derive(Debug)]
 pub struct CommitBatch<'a> {
     /// Signed commit metadata to append to `commit_obj`.
@@ -184,33 +189,28 @@ pub struct CommitBatch<'a> {
     pub record_upserts: &'a [RecordRow],
     /// Records to delete by `(collection, rkey)` (`Delete` op outcomes).
     pub record_deletes: &'a [(String, String)],
-    /// Sync 1.1 firehose event-type discriminator (`commit`,
-    /// `account`, `identity`, `sync`, ...).
-    pub outbox_event_type: &'a str,
-    /// DAG-CBOR or JSON-encoded outbox payload bytes.
-    pub outbox_payload: Vec<u8>,
 }
 
 /// Atomic-commit dispatcher — implementations persist a [`CommitBatch`]
 /// atomically using their backend's native transaction primitive.
 ///
 /// SQL: opens a single sqlx `Transaction` covering `commit_obj`,
-/// `repo_block` (commit block), `repo_record` (upserts + deletes),
-/// and `outbox`. Fjall: builds a single `WriteBatch` against the
+/// `repo_block` (commit block) and `repo_record` (upserts +
+/// deletes). Fjall: builds a single `WriteBatch` against the
 /// matching keyspaces and commits it in one shot. Either way the
 /// caller sees an all-or-nothing semantic.
 #[async_trait]
 pub trait AtomicCommitWriter: Send + Sync {
-    /// Apply the batch atomically. Returns the assigned outbox seq so
-    /// the writer can emit the broadcast on the `EventBus`.
-    async fn apply_atomic_commit(&self, did: &str, batch: CommitBatch<'_>) -> PdsResult<u64>;
+    /// Apply the batch atomically.
+    async fn apply_atomic_commit(&self, did: &str, batch: CommitBatch<'_>) -> PdsResult<()>;
 }
 
 /// Per-DID firehose outbox storage.
 ///
-/// Mirrors the `outbox` SQLite table — `append` allocates the next per-DID
-/// seq atomically, `read_after` paginates by seq for subscribers, and
-/// `latest_seq` reports the current high-water mark.
+/// Mirrors the per-actor `outbox` table. **No longer the firehose source** —
+/// `seq` numbers the stream rather than a repository, so subscribers read
+/// [`crate::sequencer::Sequencer`] instead. Retained so that dropping the
+/// table is a separate change from redirecting the stream.
 #[async_trait]
 pub trait OutboxStorage: Send + Sync {
     /// Append a new event. Returns the assigned seq number.

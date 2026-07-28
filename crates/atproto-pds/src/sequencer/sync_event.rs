@@ -11,15 +11,13 @@
 //!    `#sync` so any tailing peer rebuilds their cache around the new head.
 //! 2. **`com.atproto.admin.forceRepoSync`** — operator-initiated drift fix.
 //!
-//! The helper is intentionally minimal — it just appends the canonical
-//! payload shape into the per-actor outbox via [`OutboxReader::append`].
-//! Best-effort: the caller logs and continues on storage failure.
+//! The helper appends the lexicon-shaped body to the firehose stream.
+//! Best-effort: the caller logs and continues on storage failure, because
+//! `#sync` is itself the recovery path — a subscriber that misses one falls
+//! back to `getRepo`.
 
-use crate::actor_store::PublicRealmBackend;
-use crate::actor_store::sql::SqlActorStore;
 use crate::errors::PdsResult;
-use crate::sequencer::{EventType, OutboxReader};
-use std::path::Path;
+use crate::sequencer::{EventType, Sequencer};
 
 /// Inputs a caller has on hand when it wants a `#sync` published.
 ///
@@ -39,56 +37,36 @@ pub struct SyncEvent<'a> {
     pub blocks: usize,
 }
 
-/// Append a `#sync` event into the per-actor outbox at `data_dir`.
+/// Append a `#sync` event to the firehose stream.
 ///
-/// Legacy SQLite-direct entry point. Returns the assigned outbox `seq`
-/// on success. On storage failure the caller is expected to
-/// `tracing::warn!` and continue — `#sync` is recoverable: subscribers
-/// fall back to `getRepo` for cold rebuild.
-pub async fn publish_sync(data_dir: &Path, event: &SyncEvent<'_>) -> PdsResult<i64> {
-    let store = SqlActorStore::open(data_dir, event.did).await?;
-    let bytes = encode_payload(event)?;
-    let outbox = OutboxReader::new(store.pool().clone());
-    outbox.append(EventType::Sync, bytes).await
-}
-
-/// Same as [`publish_sync`] but routes through the
-/// `PublicRealmBackend` dispatch surface. The fjall profile reaches the right keyspace via this
-/// path; the SQLite profile produces an identical row to the legacy
-/// `publish_sync` entry point.
-pub async fn publish_sync_via_backend(
-    backend: &PublicRealmBackend,
-    event: &SyncEvent<'_>,
-) -> PdsResult<i64> {
-    let bytes = encode_payload(event)?;
-    let outbox = OutboxReader::dispatch(backend.outbox.clone(), event.did);
-    outbox.append(EventType::Sync, bytes).await
-}
-
-fn encode_payload(event: &SyncEvent<'_>) -> PdsResult<Vec<u8>> {
+/// Returns the assigned stream `seq`.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::PdsError::Storage`] if the event cannot be
+/// encoded or recorded.
+pub async fn publish_sync(sequencer: &Sequencer, event: &SyncEvent<'_>) -> PdsResult<i64> {
     // `blocks` is a CARv1, not a count. It is empty until the commit path
     // builds one (F-FIRE-02); `head` is not a field of `#sync` at all.
-    crate::sequencer::payload::encode(&crate::sequencer::payload::SyncBody {
+    let bytes = crate::sequencer::payload::encode(&crate::sequencer::payload::SyncBody {
         did: event.did.to_string(),
         blocks: Vec::new(),
         rev: event.rev.to_string(),
-    })
+    })?;
+    sequencer
+        .append(event.did, EventType::Sync.as_str(), bytes)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::account::AccountDirectory;
-    use tempfile::TempDir;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn publish_sync_appends_outbox_row() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-        // Bootstrap the accounts DB so AccountDirectory exists.
-        let _ = AccountDirectory::open(&dir.join("accounts.sqlite"))
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn publish_sync_records_the_lexicon_shape() {
+        let accounts = AccountDirectory::open_memory().await.unwrap();
+        let sequencer = Sequencer::new(accounts.account_pool());
 
         let event = SyncEvent {
             did: "did:plc:alice",
@@ -96,22 +74,19 @@ mod tests {
             rev: "3kmev",
             blocks: 42,
         };
-        let seq = publish_sync(&dir, &event).await.unwrap();
+        let seq = publish_sync(&sequencer, &event).await.unwrap();
         assert!(seq > 0);
 
-        // Verify the row is in alice's outbox with type=sync.
-        let store = SqlActorStore::open(&dir, "did:plc:alice").await.unwrap();
-        let row: (String, Vec<u8>) =
-            sqlx::query_as("SELECT event_type, payload FROM outbox WHERE seq = ?")
-                .bind(seq)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(row.0, "sync");
+        let rows = sequencer.read_after(None, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "sync");
+        assert_eq!(rows[0].did, "did:plc:alice");
+
         // Stored as DAG-CBOR in the lexicon's `#sync` shape: `did`, `blocks`,
         // `rev` and nothing else. `head` and the source block count are the
         // caller's context, not fields of the event.
-        let atproto_dasl::Ipld::Map(payload) = atproto_dasl::from_slice(&row.1).unwrap() else {
+        let atproto_dasl::Ipld::Map(payload) = atproto_dasl::from_slice(&rows[0].payload).unwrap()
+        else {
             panic!("a #sync body is a map")
         };
         assert_eq!(
