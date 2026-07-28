@@ -359,54 +359,41 @@ impl<S: BlockStorage> Mst<S> {
             return Ok(Some(*cid));
         }
 
-        // Remove the entry
-        let mut new_entries = node.entries.clone();
-        new_entries.remove(delete_idx);
+        // Rebuild the entry list from full keys rather than patching the
+        // compression of the entry that follows the deleted one.
+        //
+        // Entries are prefix-compressed against the *full key of the preceding
+        // entry*, so removing one changes the base its successor was encoded
+        // against. Repairing that in place needs two steps in the right order —
+        // reconstruct the successor's key against the entry being deleted, then
+        // re-compress it against the entry before that — and getting the order
+        // wrong silently rewrites a neighbouring record's key rather than
+        // failing. Worse, every later entry reconstructs against the corrupted
+        // key, so the damage runs to the end of the node.
+        //
+        // Deriving all the keys first and re-compressing the whole list makes
+        // that class of error unrepresentable: there is no index arithmetic to
+        // get backwards. It is also what the reference and every port do, at
+        // serialization time.
+        let mut full_keys = Vec::with_capacity(node.entries.len());
+        let mut previous = String::new();
+        for entry in &node.entries {
+            let key = entry.reconstruct_key(&previous)?;
+            previous = key.clone();
+            full_keys.push(key);
+        }
 
-        // Fix prefix compression for the next entry
-        if delete_idx < new_entries.len() && delete_idx > 0 {
-            let mut prev_key = String::new();
-            for (i, entry) in new_entries.iter().enumerate() {
-                if i == delete_idx - 1 {
-                    prev_key = entry.reconstruct_key(&prev_key)?;
-                    break;
-                }
-                prev_key = entry.reconstruct_key(&prev_key)?;
-            }
+        let mut surviving = node.entries.clone();
+        surviving.remove(delete_idx);
+        full_keys.remove(delete_idx);
 
-            let next_entry = &new_entries[delete_idx];
-            // Reconstruct with old prefix logic then recompute
-            let old_prev = if delete_idx > 0 {
-                let mut k = String::new();
-                for (i, entry) in node.entries.iter().enumerate() {
-                    if i == delete_idx {
-                        break;
-                    }
-                    k = entry.reconstruct_key(&k)?;
-                }
-                k
-            } else {
-                String::new()
-            };
-
-            let next_key = node.entries[delete_idx + 1].reconstruct_key(&old_prev)?;
-            let new_prefix_len = super::key::common_prefix_len(&prev_key, &next_key) as u32;
-
-            new_entries[delete_idx] = TreeEntry {
-                prefix_len: new_prefix_len,
-                key_suffix: next_key.as_bytes()[new_prefix_len as usize..].to_vec(),
-                value: next_entry.value.clone(),
-                tree: next_entry.tree.clone(),
-            };
-        } else if delete_idx == 0 && !new_entries.is_empty() {
-            // First entry was deleted, next becomes first with no prefix
-            let old_first_key = node.entries[0].reconstruct_key("")?;
-            let next_key = node.entries[1].reconstruct_key(&old_first_key)?;
-            let next_value = new_entries[0].value.clone();
-            let next_tree = new_entries[0].tree.clone();
-
-            new_entries[0] = TreeEntry::first(&next_key, next_value);
-            new_entries[0].tree = next_tree;
+        let mut new_entries = Vec::with_capacity(surviving.len());
+        let mut previous = String::new();
+        for (entry, key) in surviving.iter().zip(full_keys.iter()) {
+            let mut rebuilt = TreeEntry::with_prefix(&previous, key, entry.value.clone());
+            rebuilt.tree = entry.tree.clone();
+            new_entries.push(rebuilt);
+            previous = key.clone();
         }
 
         if new_entries.is_empty() && node.left.is_none() {

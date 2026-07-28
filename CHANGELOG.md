@@ -52,6 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-repo`: `Mst::delete` silently corrupted neighbouring records. MST entries are
+  prefix-compressed against the full key of the preceding entry, so removing one changes the base
+  its successor was encoded against. Repairing that needs two steps in order — reconstruct the
+  successor's key against the entry being deleted, then re-compress against the entry before that —
+  and `delete_recursive` performed only the second, reconstructing against the wrong base. The
+  result was not an error: a neighbouring record's key was rewritten in place, and because every
+  later entry reconstructs against the rewritten one, the damage ran to the end of the node.
+
+  Measured on a 20-key, four-collection repository, deleting each key in turn from a fresh tree:
+  **3 of 20 deletes corrupted the tree**, one of them mangling nine records — `app.bsky.feed.like`
+  and `app.bsky.feed.post` entries reappearing as `app.bsky.actorpost/aaaa` and similar. An ordinary
+  user deleting one record moved unrelated records to keys that were never inserted, and the result
+  was committed and signed.
+
+  `delete_recursive` now derives every full key in the node, removes the deleted one, and rebuilds
+  the entry list's compression from the resulting key list. There is no index arithmetic left to get
+  backwards, which is how the reference and every port avoid this class entirely.
 - `atproto-pds`: `listRecords` emitted a `cursor` on every non-empty page, including the last, and
   serialized it as `null` when there genuinely was none. The lexicon types `cursor` as a plain
   string, so the final iteration of every pagination loop threw in a validating client. A cursor is
