@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suffixes. The guard is syntactic and does not defend against DNS rebinding.
 
 ### Fixed
+- `atproto-pds`: `com.atproto.repo.uploadBlob` returned `{"$link", "mimeType", "size"}`, an envelope
+  matching neither JSON form the AT Protocol data model accepts. The two accepted shapes are the
+  typed `{"$type": "blob", "ref": {"$link": …}, "mimeType", "size"}` and the legacy two-key
+  `{"cid", "mimeType"}`, both declared strict upstream — and the legacy form is rejected at write
+  time regardless. `$link` is a key in neither, and it belongs nested under `ref` as a cid-link
+  rather than spliced into the envelope. `@atproto/api` threw on the upload call itself, and a
+  client that embedded the returned object produced a record the reference validator rejected, so
+  media was broken against every real client.
+
+  The envelope is now `atproto_record::lexicon::TypedBlob`, the workspace's existing representation
+  of this shape, rather than a second local definition. Blob storage, ref-tracking rows and the
+  `listMissingBlobs` output are unchanged; only the returned envelope moves.
 - `atproto-pds`: `/oauth/par` and `/oauth/token` accepted `application/json` only, where RFC 9126 §2
   and RFC 6749 §4.1.3 specify `application/x-www-form-urlencoded` and every standard AT Protocol
   OAuth client sends it. `@atproto/oauth-client-node` and `-browser` received HTTP 415 and could not

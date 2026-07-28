@@ -13,6 +13,7 @@
 use crate::actor_store::sql::SqlActorStore;
 use crate::errors::{PdsError, PdsResult};
 use atproto_dasl::cid::compute_raw_cid;
+use atproto_record::lexicon::{Blob, Link, TypedBlob};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -34,18 +35,32 @@ pub struct BlobRefRow {
     pub record_uri: String,
 }
 
-/// The canonical "blob ref" envelope embedded in record values, per the
-/// upstream lexicon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlobRef {
-    /// Blob CID (`bafkreig...`).
-    #[serde(rename = "$link")]
-    pub link: String,
-    /// MIME type.
-    #[serde(rename = "mimeType")]
-    pub mime_type: String,
-    /// Size in bytes.
-    pub size: u64,
+/// The canonical blob-ref envelope embedded in record values.
+///
+/// Serializes as the typed lexicon form, which is one of only two shapes the
+/// AT Protocol data model accepts and the only one still valid at write time:
+///
+/// ```json
+/// { "$type": "blob",
+///   "ref": { "$link": "bafkrei…" },
+///   "mimeType": "image/jpeg",
+///   "size": 10000 }
+/// ```
+///
+/// Note that the CID is nested under `ref` as a cid-link, not spliced into the
+/// envelope as a top-level `$link`. Both schemas are declared strict upstream,
+/// so an envelope carrying an unexpected key is rejected outright rather than
+/// having the extra key ignored.
+pub type BlobRef = TypedBlob;
+
+/// Build the canonical blob-ref envelope for a stored blob.
+#[must_use]
+pub fn blob_ref(cid: String, mime_type: String, size: u64) -> BlobRef {
+    TypedBlob::new(Blob {
+        ref_: Link { link: cid },
+        mime_type,
+        size,
+    })
 }
 
 /// Persist blob bytes to the per-actor store.
@@ -86,11 +101,7 @@ pub async fn put_blob(store: &SqlActorStore, bytes: &[u8], mime_type: &str) -> P
         reason: format!("put_blob: {e}"),
     })?;
 
-    Ok(BlobRef {
-        link: cid_str,
-        mime_type: mime_type.to_string(),
-        size: bytes.len() as u64,
-    })
+    Ok(blob_ref(cid_str, mime_type.to_string(), bytes.len() as u64))
 }
 
 /// Retrieve raw blob bytes by CID.
@@ -118,9 +129,9 @@ pub async fn add_ref(store: &SqlActorStore, record_uri: &str, blob: &BlobRef) ->
          VALUES (?, ?, ?, ?)",
     )
     .bind(record_uri)
-    .bind(&blob.link)
-    .bind(&blob.mime_type)
-    .bind(blob.size as i64)
+    .bind(&blob.inner.ref_.link)
+    .bind(&blob.inner.mime_type)
+    .bind(blob.inner.size as i64)
     .execute(store.pool())
     .await
     .map_err(|e| PdsError::Storage {
@@ -267,9 +278,14 @@ mod tests {
         let blob = put_blob(&store, b"hello world", "text/plain")
             .await
             .unwrap();
-        assert!(blob.link.starts_with("bafkrei") || blob.link.starts_with("bafy"));
-        assert_eq!(blob.size, 11);
-        let (data, mime) = get_blob(&store, &blob.link).await.unwrap().unwrap();
+        assert!(
+            blob.inner.ref_.link.starts_with("bafkrei") || blob.inner.ref_.link.starts_with("bafy")
+        );
+        assert_eq!(blob.inner.size, 11);
+        let (data, mime) = get_blob(&store, &blob.inner.ref_.link)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(data, b"hello world");
         assert_eq!(mime, "text/plain");
     }
@@ -279,7 +295,7 @@ mod tests {
         let store = fresh_store().await;
         let a = put_blob(&store, b"abc", "text/plain").await.unwrap();
         let b = put_blob(&store, b"abc", "text/plain").await.unwrap();
-        assert_eq!(a.link, b.link);
+        assert_eq!(a.inner.ref_.link, b.inner.ref_.link);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -326,11 +342,60 @@ mod tests {
         add_ref(&store, "at://x/c/k2", &blob).await.unwrap();
         let orphans = drop_record_refs(&store, "at://x/c/k1").await.unwrap();
         assert_eq!(orphans, 0, "blob still referenced");
-        assert!(get_blob(&store, &blob.link).await.unwrap().is_some());
+        assert!(
+            get_blob(&store, &blob.inner.ref_.link)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Dropping the last ref garbage-collects.
         let orphans = drop_record_refs(&store, "at://x/c/k2").await.unwrap();
         assert_eq!(orphans, 1, "blob should be GCd");
-        assert!(get_blob(&store, &blob.link).await.unwrap().is_none());
+        assert!(
+            get_blob(&store, &blob.inner.ref_.link)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The blob-ref envelope must serialize to the typed lexicon shape.
+    ///
+    /// Byte-for-byte against the canonical form rather than a round trip: this
+    /// envelope is what `uploadBlob` hands a client to embed in a record, and
+    /// both upstream schemas are declared strict, so a wrong key set is not
+    /// leniently ignored — the record is rejected by the validator and
+    /// `@atproto/api` throws on the upload call itself.
+    ///
+    /// The shape here matches the `blob` value in the vendored interop corpus
+    /// at `tests/interop/data-model/data-model-fixtures.json`.
+    #[test]
+    fn blob_ref_serializes_as_the_typed_lexicon_envelope() {
+        let envelope = blob_ref(
+            "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity".to_string(),
+            "image/jpeg".to_string(),
+            10_000,
+        );
+        let actual = serde_json::to_value(&envelope).expect("blob ref should serialize");
+
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "$type": "blob",
+                "ref": { "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity" },
+                "mimeType": "image/jpeg",
+                "size": 10_000,
+            })
+        );
+
+        // The old shape spliced the CID into the envelope as a top-level
+        // `$link` and carried no `$type`. Neither key set is accepted.
+        let object = actual.as_object().unwrap();
+        assert!(
+            !object.contains_key("$link"),
+            "`$link` must be nested under `ref`, never a top-level key"
+        );
+        assert_eq!(object.len(), 4, "the typed envelope has exactly four keys");
     }
 }

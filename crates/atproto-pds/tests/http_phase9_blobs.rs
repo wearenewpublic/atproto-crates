@@ -78,11 +78,22 @@ async fn upload_blob_round_trip() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let link = body["blob"]["$link"].as_str().unwrap();
+    // The typed lexicon envelope: `$type`, a nested `ref` cid-link, `mimeType`
+    // and `size`. This is what a client embeds verbatim into a record value,
+    // so the shape returned here is the shape the reference validator sees.
+    let blob = &body["blob"];
+    assert_eq!(blob["$type"], "blob", "blob envelope: {blob}");
+    let link = blob["ref"]["$link"].as_str().unwrap_or_else(|| {
+        panic!("blob ref must nest the CID under `ref.$link`, got {blob}");
+    });
     assert!(link.starts_with("bafkrei") || link.starts_with("bafy"));
-    assert_eq!(body["blob"]["mimeType"], "image/png");
-    let actual_size = body["blob"]["size"].as_u64().unwrap();
-    assert!(actual_size > 0);
+    assert_eq!(blob["mimeType"], "image/png");
+    assert!(blob["size"].as_u64().unwrap() > 0);
+    assert!(
+        blob.get("$link").is_none(),
+        "`$link` must not appear at the top level of the envelope: {blob}"
+    );
+    assert_eq!(blob.as_object().unwrap().len(), 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]

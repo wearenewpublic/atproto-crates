@@ -547,11 +547,7 @@ pub async fn upload_blob(
         };
         backend.blob.put(did, &row).await.map_err(XrpcError::from)?;
         return Ok(Json(UploadBlobResponse {
-            blob: crate::blob::BlobRef {
-                link: cid,
-                mime_type: mime,
-                size: body.len() as u64,
-            },
+            blob: crate::blob::blob_ref(cid, mime, body.len() as u64),
         }));
     }
     let manager = state.account_manager.as_deref().ok_or_else(|| {
