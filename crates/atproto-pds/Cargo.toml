@@ -87,9 +87,13 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
+futures.workspace = true
+hex = "0.4"
+http.workspace = true
 http-body-util = "0.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-websockets.workspace = true
 tower = { version = "0.5", features = ["util"] }
 
 [features]

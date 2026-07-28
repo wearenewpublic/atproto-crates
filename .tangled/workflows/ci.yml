@@ -1,0 +1,40 @@
+when:
+  - event: ["push", "pull_request"]
+    branch: ["main"]
+
+engine: "nixery"
+
+dependencies:
+  nixpkgs:
+    - cargo
+    - rustc
+    - rustfmt
+    - clippy
+    - git
+    - pkg-config
+    - openssl
+    - cmake
+    - gcc
+
+steps:
+  # The `dasl-testing` submodule carries the DASL CBOR compliance fixtures.
+  # Without it `cargo test` fails 13 cases in `atproto-dasl` on a missing
+  # fixture file, so the checkout has to be recursive for the suite to mean
+  # anything. The AT Protocol interop vectors are vendored at `tests/interop/`
+  # rather than submoduled and need no setup.
+  - name: "submodules"
+    command: git submodule update --init --recursive
+
+  - name: "fmt"
+    command: cargo fmt --all -- --check
+
+  # `--all-targets` covers tests, benches and examples, not just the library
+  # and binary targets.
+  - name: "clippy"
+    command: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Plain `--workspace` rather than `--all-targets`, because `--all-targets`
+  # silently drops doctests and this workspace documents its public API with
+  # runnable examples.
+  - name: "test"
+    command: cargo test --workspace

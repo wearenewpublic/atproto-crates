@@ -27,9 +27,16 @@ also closed:
   Postgres deployments share a single code path.
 
 CI gates: `cargo fmt --all -- --check`, `cargo clippy --workspace
---all-targets --all-features -- -D warnings`, and `cargo test --workspace
---all-features` are enforced on every push to main and every PR (see
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)).
+--all-targets -- -D warnings`, and `cargo test --workspace` are enforced on
+every push to main and every pull request (see
+[`.tangled/workflows/ci.yml`](../../.tangled/workflows/ci.yml)).
+
+The test suite includes known-answer conformance vectors from
+[`bluesky-social/atproto-interop-tests`](https://github.com/bluesky-social/atproto-interop-tests),
+vendored at [`tests/interop/`](../../tests/interop/). Those are the only tests
+in the workspace that compare against an external oracle rather than against
+this codebase's own output; vectors that do not pass yet are listed in each
+harness's `KNOWN_FAILURES` table alongside the finding that explains them.
 
 ## Surface
 

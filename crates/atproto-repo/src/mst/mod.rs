@@ -54,4 +54,4 @@ pub use node::MstNode;
 pub use tree::Mst;
 
 // Re-export key utilities
-pub use key::{compare_keys, key_height};
+pub use key::{common_prefix_len, compare_keys, key_height};

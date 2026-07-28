@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `Cargo.lock` was corrupt and no crate in the workspace built from a clean checkout. A bad merge
+  concatenated two resolutions of the AWS SDK dependency subtree, leaving 35 duplicate `[[package]]`
+  entries and an inconsistent `data-encoding` selection, so `cargo` refused to parse the file at all
+  (`package 'aws-config' is specified twice in the lockfile`). Regenerated; 716 package entries
+  down to 577. This shipped in `0.15.0-rc.1` because nothing ran a build.
+- Removed `crates/atproto-space/benches/set_hash.rs`, which had not compiled since the set-hash
+  rewrite: it declares no `[[bench]]` target, has no `criterion` dev-dependency, and imports
+  `XorSha256SetHash` (renamed to `LtHash`) from `set_hash_ecmh` (never declared as a module). Its
+  presence made `cargo clippy --workspace --all-targets` fail.
+
+### Added
+- Continuous integration at `.tangled/workflows/ci.yml`, running `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on every push
+  to `main` and every pull request, with a recursive submodule checkout so the DASL CBOR compliance
+  fixtures are actually present. Previously no workflow ran the test suite, and 13 `atproto-dasl`
+  compliance cases failed on a missing fixture from a fresh clone.
+- Known-answer conformance vectors from `bluesky-social/atproto-interop-tests` (CC-0, pinned at
+  `056e574`), vendored at `tests/interop/`, with three harnesses:
+  `crates/atproto-repo/tests/interop_mst.rs` (MST key heights, common prefixes, and commit root
+  CIDs), `crates/atproto-dasl/tests/interop_data_model.rs` (canonical DAG-CBOR bytes and CIDs), and
+  `crates/atproto-pds/tests/interop_firehose.rs` (frame headers against hand-decoded CBOR, the
+  `#commit` body against the `subscribeRepos` lexicon, and the first end-to-end WebSocket test of
+  the firehose). Every prior encoding test in the workspace was a round trip, which passes just as
+  happily against a wrong encoding; these are the first that compare against an external oracle.
+  Vectors that do not pass yet are enumerated in each harness's `KNOWN_FAILURES` table with the
+  defect that explains them, and are required to keep failing until it is fixed.
+- `atproto_repo::mst::common_prefix_len` is now re-exported alongside `compare_keys` and
+  `key_height`.
 
 ## [0.15.0-rc.1] - 2026-07-27
 ### Security
