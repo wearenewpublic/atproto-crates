@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-repo`: MST nodes and commits omitted map keys the AT Protocol data model requires to be
+  present-and-null, so **every MST root CID and every commit CID this workspace produced was
+  unrecomputable by any peer** — including for a single-record repository, where tree shape cannot
+  differ. `MstNode.l`, `TreeEntry.t` and `Commit.prev`/`UnsignedCommit.prev` are nullable, not
+  optional; `skip_serializing_if = "Option::is_none"` dropped the key instead of writing `null`,
+  turning the node map from `a2` into `a1`, the entry map from `a4` into `a3`, and the signed commit
+  from a five-key object into a four-key one. A single-entry node encoded to 76 bytes against the
+  canonical 82. The attribute on `UnsignedCommit.prev` is the one on the signing path, so commit
+  signatures were computed over the wrong bytes as well.
+
+  **Operational note:** this changes the bytes every node and commit hashes to. Existing
+  repositories get a new MST root CID and a new commit CID on their next write, and the blocks
+  written under the old encoding become unreferenced. Reading is unaffected in both directions —
+  nodes stored without `l`/`t` still decode, and re-encoding one now yields the canonical form.
+
+  `prevData` inside the signed commit body is a separate divergence and is unchanged here.
+
+  Covered by byte-level known-answer vectors in
+  `crates/atproto-repo/tests/known_answer_encoding.rs`, asserted against DAG-CBOR written out from
+  the specification rather than against this crate's own output. The pre-existing round-trip tests
+  passed throughout.
+
 - `Cargo.lock` was corrupt and no crate in the workspace built from a clean checkout. A bad merge
   concatenated two resolutions of the AWS SDK dependency subtree, leaving 35 duplicate `[[package]]`
   entries and an inconsistent `data-encoding` selection, so `cargo` refused to parse the file at all

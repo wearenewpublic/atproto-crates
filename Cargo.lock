@@ -527,6 +527,7 @@ dependencies = [
  "atproto-dasl",
  "cid",
  "clap",
+ "hex",
  "multihash",
  "reqwest",
  "serde",

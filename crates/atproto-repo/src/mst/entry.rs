@@ -48,10 +48,14 @@ pub struct TreeEntry {
     #[serde(rename = "v")]
     pub value: Cid,
 
-    /// Optional CID of right subtree.
+    /// CID of the right subtree, or `None`.
     ///
     /// Contains keys > this key and < next key (if any).
-    #[serde(rename = "t", skip_serializing_if = "Option::is_none")]
+    ///
+    /// Serialized as an explicit `null` when absent, never omitted: the MST
+    /// schema types this as nullable-and-required, so dropping the key changes
+    /// the enclosing node's CID and with it every ancestor up to the repo root.
+    #[serde(rename = "t")]
     pub tree: Option<Cid>,
 }
 

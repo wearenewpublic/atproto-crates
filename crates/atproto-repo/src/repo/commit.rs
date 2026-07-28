@@ -48,8 +48,11 @@ pub struct Commit {
     /// Revision string (TID format).
     pub rev: String,
 
-    /// CID of previous commit (None for initial commit).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// CID of previous commit (`None` for the initial commit).
+    ///
+    /// Serialized as an explicit `null` when absent, never omitted: the
+    /// commit schema types this as nullable-and-required, so dropping the
+    /// key changes the signed bytes and the commit CID.
     pub prev: Option<Cid>,
 
     /// Prior MST root CID for Sync 1.1 inductive verification (None for initial commit).
@@ -79,8 +82,11 @@ pub struct UnsignedCommit {
     /// Revision string (TID format).
     pub rev: String,
 
-    /// CID of previous commit (None for initial commit).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// CID of previous commit (`None` for the initial commit).
+    ///
+    /// Serialized as an explicit `null` when absent, never omitted: the
+    /// commit schema types this as nullable-and-required, so dropping the
+    /// key changes the signed bytes and the commit CID.
     pub prev: Option<Cid>,
 
     /// Prior MST root CID for Sync 1.1 inductive verification (None for initial commit).

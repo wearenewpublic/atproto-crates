@@ -26,8 +26,12 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MstNode {
-    /// Optional CID of left subtree (contains keys < first entry's key).
-    #[serde(rename = "l", skip_serializing_if = "Option::is_none")]
+    /// CID of the left subtree (contains keys < first entry's key), or `None`.
+    ///
+    /// Serialized as an explicit `null` when absent, never omitted: the MST
+    /// schema types this as nullable-and-required, so dropping the key changes
+    /// the node's CID and with it every ancestor up to the repo root.
+    #[serde(rename = "l")]
     pub left: Option<Cid>,
 
     /// Array of tree entries at this node.
