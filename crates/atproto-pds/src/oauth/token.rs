@@ -224,7 +224,7 @@ async fn handle_code(
         &auth.did,
         &auth.request.client_id,
         &auth.request.scope,
-        Some(proof_jkt),
+        &proof_jkt,
     )
     .await
     .map(Json)
@@ -289,25 +289,33 @@ async fn handle_refresh(
         &handle.did,
         &handle.client_id,
         &handle.scope,
-        Some(handle.dpop_jkt),
+        &handle.dpop_jkt,
     )
     .await
     .map(Json)
 }
 
+/// Mint an access/refresh pair bound to `dpop_jkt`.
+///
+/// The thumbprint is not optional. Every grant proves possession at the token
+/// endpoint before reaching here, so an unbound token is not something this
+/// server can issue — and when the parameter was an `Option`, an absent value
+/// was stored as an empty string, came back as `cnf.jkt = ""`, and matched no
+/// proof for the life of the session (F-OAUTH-04). Taking `&str` means that
+/// failure cannot be expressed rather than merely not happening.
 async fn issue_pair(
     state: &HttpState,
     did: &str,
     client_id: &str,
     scope: &str,
-    dpop_jkt: Option<String>,
+    dpop_jkt: &str,
 ) -> Result<TokenResponse, XrpcError> {
     let now = chrono::Utc::now().timestamp() as u64;
     let access_jti = random_jti();
     let refresh_jti = random_jti();
-    let cnf = dpop_jkt
-        .as_ref()
-        .map(|jkt| DpopConfirmation { jkt: jkt.clone() });
+    let cnf = Some(DpopConfirmation {
+        jkt: dpop_jkt.to_string(),
+    });
 
     // §10.4 — TTLs come from runtime config; default to module constants
     // (15 min / 30d) when the operator hasn't overridden via env.
@@ -349,7 +357,7 @@ async fn issue_pair(
             RefreshHandle {
                 did: did.to_string(),
                 client_id: client_id.to_string(),
-                dpop_jkt: dpop_jkt.clone().unwrap_or_default(),
+                dpop_jkt: dpop_jkt.to_string(),
                 scope: scope.to_string(),
                 issued_at: Utc::now(),
             },
@@ -357,10 +365,10 @@ async fn issue_pair(
         .await
         .map_err(XrpcError::from)?;
 
-    let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
     Ok(TokenResponse {
         access_token: access_jwt,
-        token_type: token_type.to_string(),
+        // Always DPoP: there is no path here that does not carry a thumbprint.
+        token_type: "DPoP".to_string(),
         expires_in: access_ttl,
         refresh_token: refresh_jwt,
         scope: scope.to_string(),

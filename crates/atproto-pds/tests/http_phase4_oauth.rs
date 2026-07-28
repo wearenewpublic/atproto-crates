@@ -847,3 +847,64 @@ async fn par_and_token_accept_form_encoding() {
     );
     assert_eq!(body["token_type"], "DPoP");
 }
+
+/// A session survives repeated refreshes, and every token stays bound to the
+/// same key.
+///
+/// F-OAUTH-04 described a session that broke permanently after the first
+/// refresh: an absent `dpop_jkt` was stored as an empty string, came back as
+/// `cnf.jkt = ""`, and thereafter no proof could ever match it — an
+/// `InvalidDpopProof` with no way out. Requiring a DPoP proof at the token
+/// endpoint (F-OAUTH-02) closed that by removing the absent case, and the
+/// binding type now makes it unrepresentable.
+///
+/// This is a regression guard, not a reproduction: it passes before the type
+/// change as well. What it pins is the property the type change relies on —
+/// that a thumbprint is always present and always the real one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_survives_repeated_refreshes_bound_to_one_key() {
+    let (app, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (verifier, challenge) = pkce_pair();
+
+    let code = authorize_for_code(&app, &challenge).await;
+    let (status, tokens) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {tokens}");
+    assert_eq!(
+        tokens["token_type"], "DPoP",
+        "every token this server issues is DPoP-bound"
+    );
+
+    // Refresh three times. The finding's failure appeared on the second
+    // exchange — the first refresh minted the poisoned binding, the next use
+    // of it failed — so one round trip would not have caught it.
+    let mut refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    for round in 0..3 {
+        let (status, body) = post_token(
+            app.clone(),
+            json!({
+                "grant_type": "refresh_token", "client_id": CLIENT_ID,
+                "refresh_token": refresh,
+            }),
+            &key,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "refresh {round} should succeed, body: {body}"
+        );
+        assert_eq!(body["token_type"], "DPoP", "refresh {round}");
+        refresh = body["refresh_token"].as_str().unwrap().to_string();
+    }
+}

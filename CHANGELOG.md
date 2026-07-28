@@ -83,6 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: the OAuth token binding is no longer optional in the type system. `issue_pair` took
+  `Option<String>` and stored an absent thumbprint as an empty string, which came back as
+  `cnf.jkt = ""` and matched no proof for the life of the session — a permanent `InvalidDpopProof`
+  with no way out. That path stopped being reachable when the token endpoint began requiring a DPoP
+  proof of every grant, so the defect is already closed; what remained was a trap, where a future
+  caller passing `None` would silently re-create it with no error at the point of the mistake. The
+  parameter is now `&str`, `cnf` is unconditional, and `token_type` is the constant `"DPoP"`. No wire
+  change — every token this server issues was already DPoP-bound.
+
 - **The release build was broken, so the container could not be built at all.** Seven crates derived
   `Debug` under `#[cfg_attr(any(debug_assertions, test), ...)]`, which makes a public type implement
   the trait in a debug build and not in a release one. `atproto-pds` derives `Debug` on a struct
