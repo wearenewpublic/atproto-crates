@@ -225,8 +225,7 @@ mod tests {
         use chrono::{DateTime, Utc};
 
         // Define test record type with createdAt and text fields
-        #[derive(Serialize, Deserialize, PartialEq, Clone)]
-        #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+        #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
         struct TestRecord {
             #[serde(rename = "createdAt", with = "datetime_format")]
             created_at: DateTime<Utc>,
@@ -240,8 +239,7 @@ mod tests {
         }
 
         // Define test metadata type
-        #[derive(Serialize, Deserialize, PartialEq, Clone)]
-        #[cfg_attr(any(debug_assertions, test), derive(Debug))]
+        #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
         struct TestMetadata {
             #[serde(rename = "createdAt", with = "datetime_format")]
             created_at: DateTime<Utc>,

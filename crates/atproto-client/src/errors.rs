@@ -24,8 +24,7 @@ use thiserror::Error;
 /// This structure represents the standard error response format used by AT Protocol
 /// services, allowing for flexible error reporting with optional fields and
 /// extension points for additional error context.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleError {
     /// The error code identifier
     pub error: Option<String>,

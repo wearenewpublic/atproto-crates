@@ -34,8 +34,7 @@ pub const STRONG_REF_NSID: &str = "com.atproto.repo.strongRef";
 /// // Use TypedStrongRef for automatic $type field handling
 /// let typed_ref = TypedStrongRef::new(strong_ref);
 /// ```
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct StrongRef {
     /// AT URI pointing to a specific record
     /// Format: `at://[did]/[collection]/[rkey]`

@@ -12,9 +12,11 @@
 //! Two backends:
 //!
 //! - [`EmailService::Disabled`] — dev/test default. `send` returns `Ok(())`
-//!   after emitting an INFO log with the message body, so a developer
-//!   running the PDS locally can see what would have gone out without
-//!   needing an SMTP server.
+//!   after logging the recipient and subject. It does **not** log the body:
+//!   bodies carry password-reset and account-deletion tokens, and a log is a
+//!   lower-trust store than the one those tokens protect. Setting
+//!   `PDS_EMAIL_LOG_BODIES` restores the body at DEBUG for local development,
+//!   and warns loudly at startup that it has been asked for.
 //! - [`EmailService::Smtp`] (gated on `feature = "smtp"`) — wraps a
 //!   `lettre::AsyncSmtpTransport`. Reads the SMTP URL + sender address
 //!   from `PDS_EMAIL_SMTP_URL` + `PDS_EMAIL_FROM_ADDRESS`. Falls back to
@@ -24,18 +26,45 @@
 use crate::errors::PdsResult;
 
 /// Outbound email service. `Clone` so axum can pass it through `HttpState`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum EmailService {
-    /// No-op: logs the message body at INFO. Used in dev/test or when the
-    /// `smtp` feature is off.
-    #[default]
-    Disabled,
+    /// No-op delivery. Used in dev/test, or whenever SMTP is unconfigured.
+    Disabled {
+        /// Whether to log the rendered body — dev-only, and off unless
+        /// `PDS_EMAIL_LOG_BODIES` asked for it.
+        log_bodies: bool,
+    },
     /// Real SMTP delivery via `lettre`.
     #[cfg(feature = "smtp")]
     Smtp(Box<SmtpBackend>),
 }
 
+impl Default for EmailService {
+    /// Disabled, and not logging bodies. Reaching the opt-in requires
+    /// [`EmailService::disabled`], which reads the environment.
+    fn default() -> Self {
+        EmailService::Disabled { log_bodies: false }
+    }
+}
+
 impl EmailService {
+    /// A disabled service, reading the dev body-logging opt-in from the
+    /// environment.
+    #[must_use]
+    pub fn disabled() -> Self {
+        let log_bodies = std::env::var("PDS_EMAIL_LOG_BODIES")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if log_bodies {
+            tracing::warn!(
+                "PDS_EMAIL_LOG_BODIES is set: rendered email bodies will be written to the log at \
+                 DEBUG. Bodies carry password-reset and account-deletion tokens — anyone who can \
+                 read the log can take over any account. Never set this outside development."
+            );
+        }
+        EmailService::Disabled { log_bodies }
+    }
+
     /// Construct an SMTP-backed service. Without the `smtp` feature this
     /// always returns [`EmailService::Disabled`].
     ///
@@ -53,32 +82,48 @@ impl EmailService {
                 tracing::warn!(
                     "PDS_EMAIL_SMTP_URL set but `smtp` Cargo feature is disabled; email delivery is a no-op"
                 );
-                Ok(EmailService::Disabled)
+                Ok(EmailService::disabled())
             }
             _ => {
-                tracing::info!(
-                    "EmailService disabled (PDS_EMAIL_SMTP_URL or PDS_EMAIL_FROM_ADDRESS unset); messages will be logged only"
+                // Not a note in passing: with no mailer, requestPasswordReset
+                // and requestAccountDelete return success and deliver nothing,
+                // so the flows are broken in a way the caller cannot see.
+                tracing::warn!(
+                    "email delivery is disabled — PDS_EMAIL_SMTP_URL and PDS_EMAIL_FROM_ADDRESS \
+                     are not both set. Password reset, account deletion and email confirmation \
+                     will report success without sending anything."
                 );
-                Ok(EmailService::Disabled)
+                Ok(EmailService::disabled())
             }
         }
     }
 
     /// Send an email. Returns `Ok(())` on success.
     ///
-    /// The disabled backend logs `to`, `subject`, and `body` at INFO with a
-    /// `dev-only:` prefix so a developer running the PDS locally can see
-    /// the message body. The SMTP backend dispatches via lettre; transport
-    /// errors surface as `PdsError::Storage`.
+    /// The disabled backend logs `to` and `subject` at INFO, and the body
+    /// only when `PDS_EMAIL_LOG_BODIES` opted in — at DEBUG, never INFO. The
+    /// SMTP backend dispatches via lettre; transport errors surface as
+    /// `PdsError::Storage`.
     pub async fn send(&self, to: &str, subject: &str, body: &str) -> PdsResult<()> {
         match self {
-            EmailService::Disabled => {
+            EmailService::Disabled { log_bodies } => {
+                // Never the body. It carries the password-reset and
+                // account-deletion tokens, and logs are routinely lower-trust
+                // than the credential store — shipped to aggregators, mounted
+                // into sidecars, swept up by crash reporters. Anyone who could
+                // read one could complete a reset for any account.
                 tracing::info!(
                     to = to,
                     subject = subject,
-                    body = body,
-                    "dev-only: email-disabled stub would have sent message"
+                    "email delivery is disabled; message not sent"
                 );
+                if *log_bodies {
+                    tracing::debug!(
+                        to = to,
+                        body = body,
+                        "PDS_EMAIL_LOG_BODIES: rendered body follows"
+                    );
+                }
                 Ok(())
             }
             #[cfg(feature = "smtp")]
@@ -148,18 +193,137 @@ pub use smtp::SmtpBackend;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    /// One captured `tracing` event: its level and the names of its fields.
+    #[derive(Debug, Clone)]
+    struct Captured {
+        level: tracing::Level,
+        fields: Vec<String>,
+    }
+
+    #[derive(Default)]
+    struct FieldNames(Vec<String>);
+
+    impl Visit for FieldNames {
+        fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
+            self.0.push(field.name().to_string());
+        }
+        fn record_str(&mut self, field: &Field, _value: &str) {
+            self.0.push(field.name().to_string());
+        }
+    }
+
+    /// Collects every event emitted while it is the active subscriber.
+    #[derive(Clone, Default)]
+    struct Collector(Arc<Mutex<Vec<Captured>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Collector {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut names = FieldNames::default();
+            event.record(&mut names);
+            self.0.lock().unwrap().push(Captured {
+                level: *event.metadata().level(),
+                fields: names.0,
+            });
+        }
+    }
+
+    /// Run `f` with a capturing subscriber installed, returning what it emitted.
+    async fn capture<F, Fut>(f: F) -> Vec<Captured>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let collector = Collector::default();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        f().await;
+        drop(guard);
+        collector.0.lock().unwrap().clone()
+    }
+
+    /// The rendered body carries password-reset and account-deletion tokens.
+    /// Whoever can read the log must not thereby be able to complete either
+    /// flow, so the body is never a field of a log event by default.
+    #[tokio::test]
+    async fn a_disabled_send_never_logs_the_body() {
+        let events = capture(|| async {
+            let svc = EmailService::default();
+            svc.send(
+                "recipient@example.com",
+                "Reset your password",
+                "https://pds.example/reset?token=SECRET-RESET-TOKEN",
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        assert!(
+            !events.is_empty(),
+            "the disabled backend should say something"
+        );
+        for event in &events {
+            assert!(
+                !event.fields.iter().any(|f| f == "body"),
+                "an email body reached the log: {event:?}"
+            );
+        }
+        // It must still be visible that a send was attempted, and to whom.
+        let send = events
+            .iter()
+            .find(|e| e.fields.iter().any(|f| f == "to"))
+            .expect("the attempt should be logged with its recipient");
+        assert!(send.fields.iter().any(|f| f == "subject"));
+    }
+
+    /// The dev affordance survives, but only when asked for and never at INFO.
+    #[tokio::test]
+    async fn the_body_is_logged_at_debug_when_explicitly_opted_in() {
+        let events = capture(|| async {
+            let svc = EmailService::Disabled { log_bodies: true };
+            svc.send("recipient@example.com", "subject", "the body")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let body_event = events
+            .iter()
+            .find(|e| e.fields.iter().any(|f| f == "body"))
+            .expect("opting in should log the body");
+        assert_eq!(
+            body_event.level,
+            tracing::Level::DEBUG,
+            "a message body is never INFO-worthy"
+        );
+    }
 
     #[tokio::test]
-    async fn disabled_backend_logs_and_succeeds() {
+    async fn disabled_backend_succeeds() {
         let svc = EmailService::default();
         svc.send("recipient@example.com", "subject", "body")
             .await
             .unwrap();
     }
 
+    /// An unconfigured mailer is a broken password reset, so say so at WARN
+    /// rather than burying it in INFO.
     #[tokio::test]
-    async fn from_env_without_config_returns_disabled() {
-        let svc = EmailService::from_env(None, None).unwrap();
-        assert!(matches!(svc, EmailService::Disabled));
+    async fn an_unconfigured_mailer_warns() {
+        let events = capture(|| async {
+            let svc = EmailService::from_env(None, None).unwrap();
+            assert!(matches!(svc, EmailService::Disabled { .. }));
+        })
+        .await;
+
+        assert!(
+            events.iter().any(|e| e.level == tracing::Level::WARN),
+            "email being disabled should be a warning: {events:?}"
+        );
     }
 }

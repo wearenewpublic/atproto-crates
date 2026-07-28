@@ -29,8 +29,7 @@ use crate::{
 };
 
 /// Request to create a new authentication session.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateSessionRequest {
     /// Handle or other identifier supported by the server for the authenticating user
     pub identifier: String,
@@ -42,8 +41,7 @@ pub struct CreateSessionRequest {
 }
 
 /// App password session data returned from successful authentication.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AppPasswordSession {
     /// Distributed identifier for the authenticated account
     pub did: String,
@@ -60,8 +58,7 @@ pub struct AppPasswordSession {
 }
 
 /// Response from refreshing an authentication session.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RefreshSessionResponse {
     /// Distributed identifier for the authenticated account
     pub did: String,
@@ -82,8 +79,7 @@ pub struct RefreshSessionResponse {
 }
 
 /// Response from creating a new app password.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AppPasswordResponse {
     /// Name of the app password
     pub name: String,

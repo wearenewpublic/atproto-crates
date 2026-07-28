@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: password-reset and account-deletion tokens were written to the application log at
+  INFO, in the only build that shipped. `EmailService::Disabled::send` logged the full rendered body,
+  and that body carries the confirmation URL for password reset, account deletion and email change.
+  The stub is meant for development and says so — but the published image always selected it,
+  because `smtp` is not a default feature and the Dockerfile did not ask for it. Logs are routinely
+  lower-trust than the credential store they were protecting: shipped to aggregators, mounted into
+  sidecars, swept up by crash reporters. Anyone who could read one could complete a reset for any
+  account on the instance.
+
+  The body is no longer logged. The recipient and subject still are, so an operator can see that a
+  send was attempted and to whom. `PDS_EMAIL_LOG_BODIES=true` restores the body for local
+  development — at DEBUG, never INFO — and warns at startup, in as many words, that anyone who can
+  read the log can take over any account.
+
+  The image now builds with `smtp`, so it can deliver mail at all; `lettre` was already pinned to
+  rustls, so no OpenSSL enters the runtime image. When SMTP is unconfigured the service now warns at
+  startup rather than noting it at INFO, because an unconfigured mailer means `requestPasswordReset`
+  and `requestAccountDelete` return success and send nothing — a failure the caller cannot see.
+
 - `atproto-pds`: closed an authorization-code exfiltration chain ending in full account takeover.
   Three defects composed, and the compromise was invisible to the victim because the `client_id`
   shown on the consent screen was genuine:
@@ -52,6 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- **The release build was broken, so the container could not be built at all.** Seven crates derived
+  `Debug` under `#[cfg_attr(any(debug_assertions, test), ...)]`, which makes a public type implement
+  the trait in a debug build and not in a release one. `atproto-pds` derives `Debug` on a struct
+  holding a `BlobRef`, so `cargo build --release` failed on `atproto_record::lexicon::Blob doesn't
+  implement std::fmt::Debug` — the Dockerfile's exact command. Tests, clippy and CI all run the dev
+  profile, so nothing ever exercised it.
+
+  `Debug` is now unconditional across all 60 sites in the seven crates. A published type that
+  implements a trait only in debug builds is a latent break for every downstream consumer, not just
+  this workspace. CI gains a `cargo check --release` step using the Dockerfile's own feature set, so
+  an unbuildable image fails the build rather than the release.
+
 - `atproto-pds`: the firehose named records without shipping them. `#commit.blocks` is a required
   `bytes` field the lexicon describes as a CAR rooted at the commit block, and it was zero bytes —
   no CAR was ever built, because `car_export` was reachable only from `getRepo` and `getBlocks`.

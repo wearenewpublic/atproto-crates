@@ -39,8 +39,7 @@ use crate::{
 };
 
 /// Response from getting a record from an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum GetRecordResponse {
     /// Successfully retrieved record
@@ -133,8 +132,7 @@ pub async fn get_record(
 }
 
 /// A single record in a list records response.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ListRecord<T> {
     /// AT-URI of the record
     pub uri: String,
@@ -145,8 +143,7 @@ pub struct ListRecord<T> {
 }
 
 /// Response from listing records in an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ListRecordsResponse<T> {
     /// Pagination cursor for retrieving more records
     pub cursor: Option<String>,
@@ -251,8 +248,7 @@ pub async fn list_records<T: DeserializeOwned>(
 }
 
 /// Request to create a new record in an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound = "T: Serialize + DeserializeOwned")]
 pub struct CreateRecordRequest<T: DeserializeOwned> {
     /// Repository identifier (DID)
@@ -280,8 +276,7 @@ pub struct CreateRecordRequest<T: DeserializeOwned> {
 }
 
 /// Response from creating a record in an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum CreateRecordResponse {
     /// Successfully created record reference
@@ -340,8 +335,7 @@ pub async fn create_record<T: DeserializeOwned + Serialize>(
 }
 
 /// Request to update an existing record in an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound = "T: Serialize + DeserializeOwned")]
 pub struct PutRecordRequest<T: DeserializeOwned> {
     /// Repository identifier (DID)
@@ -377,8 +371,7 @@ pub struct PutRecordRequest<T: DeserializeOwned> {
 }
 
 /// Response from updating a record in an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum PutRecordResponse {
     /// Successfully updated record reference
@@ -437,8 +430,7 @@ pub async fn put_record<T: DeserializeOwned + Serialize>(
 }
 
 /// Request to delete a record from an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeleteRecordRequest {
     /// Repository identifier (DID)
     pub repo: String,
@@ -467,8 +459,7 @@ pub struct DeleteRecordRequest {
 }
 
 /// Response from deleting a record in an AT Protocol repository.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum DeleteRecordResponse {
     /// Successfully deleted record with commit information

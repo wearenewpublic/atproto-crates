@@ -46,8 +46,7 @@ use crate::errors::AturiError;
 ///
 /// This struct provides validated access to these components after successful parsing
 /// and implements `Display` for reconstructing the original URI format.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ATURI {
     /// The authority component as a DID (e.g., "did:plc:abc123")
     pub authority: String,

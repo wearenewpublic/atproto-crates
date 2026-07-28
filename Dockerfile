@@ -28,7 +28,11 @@ COPY . .
 # - atproto-xrpcs-helloworld: 1 binary (xrpcs-helloworld)
 # - atproto-lexicon: 1 binary (lexicon-resolve)
 # Note: atproto-identity-resolve and atproto-lexicon-resolve require hickory-dns feature
-RUN cargo build --release --bins -F clap,hickory-dns,zeroize,tokio
+# `smtp` is required for the image to deliver mail at all: without it the
+# binary always selects EmailService::Disabled, so password reset, account
+# deletion and email confirmation report success and send nothing. lettre is
+# pinned to rustls, so this adds no OpenSSL to the runtime image.
+RUN cargo build --release --bins -F clap,hickory-dns,zeroize,tokio,smtp
 
 # Runtime stage - use distroless for minimal attack surface
 FROM gcr.io/distroless/cc-debian12

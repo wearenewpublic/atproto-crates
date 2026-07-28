@@ -17,8 +17,7 @@ use crate::errors::JWKError;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A wrapped JSON Web Key with additional metadata.
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "zeroize", derive(Zeroize, ZeroizeOnDrop))]
 pub struct WrappedJsonWebKey {
     /// Key identifier (kid) for the JWK.

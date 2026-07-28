@@ -24,8 +24,7 @@ use crate::errors::JWTError;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// JWT header containing algorithm and key metadata.
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, Debug)]
 #[cfg_attr(feature = "zeroize", derive(Zeroize, ZeroizeOnDrop))]
 pub struct Header {
     /// Algorithm used for signing (e.g., "ES256", "ES384", "ES256K").
@@ -72,8 +71,7 @@ impl TryFrom<KeyData> for Header {
 }
 
 /// JWT claims combining standard JOSE claims with custom private claims.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Claims {
     /// Standard JOSE claims.
     #[serde(flatten)]
@@ -97,8 +95,7 @@ impl Claims {
 pub type SecondsSinceEpoch = u64;
 
 /// Standard JOSE claims for JWT tokens.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct JoseClaims {
     /// Issuer of the token.
     #[serde(rename = "iss", skip_serializing_if = "Option::is_none")]
@@ -150,8 +147,7 @@ pub struct JoseClaims {
 /// [`JwtValidationConfig::default`] is the safe-by-default policy used by
 /// [`verify`]: an `exp` claim is required, no clock skew is tolerated on `exp`
 /// or `nbf`, and an `iat` more than 60 seconds in the future is rejected.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct JwtValidationConfig {
     /// Reject tokens with no `exp` claim. Defaults to `true`.
     pub require_expiration: bool,

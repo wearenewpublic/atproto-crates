@@ -45,3 +45,12 @@ steps:
   # runnable examples.
   - name: "test"
     command: cargo test --workspace
+
+  # Everything above runs in the dev profile, which is why a release-only
+  # breakage survived: several crates derived `Debug` under
+  # `cfg_attr(any(debug_assertions, test), ...)`, so downstream `derive(Debug)`
+  # compiled in tests and failed in the shipped image — and nothing here ever
+  # built one. This step is the Dockerfile's own feature set, so a container
+  # that cannot build fails CI rather than the release.
+  - name: "release build"
+    command: cargo check --release --bins -F clap,hickory-dns,zeroize,tokio,smtp

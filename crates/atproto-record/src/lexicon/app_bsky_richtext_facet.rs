@@ -141,8 +141,7 @@ pub struct Tag {
 ///     tag: "rust".to_string(),
 /// });
 /// ```
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "$type")]
 pub enum FacetFeature {
     /// Account mention feature
@@ -194,8 +193,7 @@ pub enum FacetFeature {
 ///     ],
 /// };
 /// ```
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Facet {
     /// Byte range this facet applies to
     pub index: ByteSlice,

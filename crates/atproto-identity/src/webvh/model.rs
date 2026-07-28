@@ -141,8 +141,7 @@ pub struct QueryParams {
 }
 
 /// Result of processing a complete did:webvh log.
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ResolvedLog {
     /// The resolved DID Document from the final log entry.
     pub document: Document,

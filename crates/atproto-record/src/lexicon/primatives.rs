@@ -33,8 +33,7 @@ pub const BLOB_NSID: &str = "blob";
 /// // Use TypedBlob for automatic $type field handling
 /// let typed_blob = TypedBlob::new(blob);
 /// ```
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct Blob {
     /// Link to the blob content via CID
     #[serde(rename = "ref")]
@@ -62,8 +61,7 @@ pub type TypedBlob = TypedLexicon<Blob>;
 ///
 /// Represents a content-addressed link using a CID (Content Identifier).
 /// This is used to reference immutable content in the AT Protocol network.
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct Link {
     /// The CID (Content Identifier) as a string
     #[serde(rename = "$link")]
@@ -84,8 +82,7 @@ pub struct Link {
 /// };
 /// // Serializes to: {"$bytes": "c2lnbmF0dXJlIGRhdGE="}
 /// ```
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct Bytes {
     /// The raw bytes, serialized as base64 in JSON
     #[serde(rename = "$bytes", with = "bytes_format")]

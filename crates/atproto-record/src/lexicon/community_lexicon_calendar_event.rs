@@ -23,8 +23,7 @@ pub const NSID: &str = "community.lexicon.calendar.event";
 /// Event status enumeration.
 ///
 /// Represents the current status of a calendar event.
-#[derive(Serialize, Deserialize, PartialEq, Clone, Default)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Default, Debug)]
 pub enum Status {
     /// Event is scheduled and confirmed
     #[default]
@@ -51,8 +50,7 @@ pub enum Status {
 /// Event mode enumeration.
 ///
 /// Represents how attendees can participate in the event.
-#[derive(Serialize, Deserialize, PartialEq, Clone, Default)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Default, Debug)]
 pub enum Mode {
     /// In-person attendance only
     #[default]
@@ -77,8 +75,7 @@ pub const NAMED_URI_NSID: &str = "community.lexicon.calendar.event#uri";
 ///
 /// Represents a URI with an optional human-readable name.
 /// Used for linking to external resources related to an event.
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct NamedUri {
     /// The URI/URL
     pub uri: String,
@@ -110,8 +107,7 @@ pub const EVENT_LINK_NSID: &str = "community.lexicon.calendar.event#uri";
 ///
 /// Similar to NamedUri but kept as a separate type for semantic clarity
 /// and type safety when dealing with event-specific links.
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct EventLink {
     /// The URI/URL for the event link
     pub uri: String,
@@ -142,8 +138,7 @@ pub type EventLinks = Vec<TypedEventLink>;
 /// Aspect ratio for media content.
 ///
 /// Represents the width-to-height ratio of visual media.
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct AspectRatio {
     /// Width component of the ratio
     pub width: u64,
@@ -164,8 +159,7 @@ fn default_role() -> String {
 /// Media structure for event-related visual content.
 ///
 /// Represents images, videos, or other media associated with an event.
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct Media {
     /// The media content as a blob reference
     pub content: TypedBlob,
@@ -204,8 +198,7 @@ pub type MediaList = Vec<TypedMedia>;
 /// Enum that can hold a location, URI reference, or unknown type for calendar events.
 ///
 /// Extends `LocationOrRef` with URI location support specific to calendar events.
-#[derive(Deserialize, Serialize, Clone, PartialEq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
 #[serde(untagged)]
 pub enum EventLocation {
     /// An inline URI location
@@ -247,8 +240,7 @@ pub type EventLocations = Vec<EventLocation>;
 ///
 /// let typed_event = TypedEvent::new(event);
 /// ```
-#[derive(Serialize, Deserialize, PartialEq, Clone)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct Event {
     /// Name/title of the event
     pub name: String,
