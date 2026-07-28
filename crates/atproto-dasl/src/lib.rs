@@ -37,6 +37,7 @@
 #![warn(missing_docs)]
 
 // Core DASL modules
+pub mod atproto_json;
 pub mod cid;
 pub mod drisl;
 pub mod errors;
@@ -54,6 +55,7 @@ pub mod rasl;
 pub mod tiles;
 
 // Re-export primary types at crate root for ergonomics
+pub use atproto_json::{ipld_from_json, json_from_ipld};
 pub use cid::{
     Cid, CidCore, DAG_CBOR_CODEC, DaslCid, MULTIBASE_IDENTITY, RawCid, compute_cid_blake3,
     compute_cid_for, compute_raw_cid, compute_raw_cid_blake3, verify_cid_bytes, verify_cid_reader,

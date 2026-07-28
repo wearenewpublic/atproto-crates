@@ -290,3 +290,63 @@ fn repo_op_emits_null_cid_but_omits_absent_prev() {
         "a delete carries `prev`: {json}"
     );
 }
+
+/// A record carrying a blob ref must survive write and read unchanged, and get
+/// the CID the data model dictates.
+///
+/// The JSON representation spells a link as `{"$link": …}`; the data model has
+/// a link type, and DAG-CBOR encodes it as tag 42. Storing the JSON object
+/// verbatim produces a different CID from every other implementation and a body
+/// that fails `blob`-typed validation downstream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_with_a_blob_ref_round_trips_and_hashes_correctly() {
+    let (app, _tmp) = build_app().await;
+    let token = create_account(&app, "did:plc:alice", "alice.test").await;
+
+    let record = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "with an image",
+        "embed": {
+            "$type": "blob",
+            "ref": { "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity" },
+            "mimeType": "image/jpeg",
+            "size": 10000
+        }
+    });
+
+    let (status, created) = post(
+        app.clone(),
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "aaaaaaaaaaaaa",
+            "record": record,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {created}");
+
+    // Pinned rather than recomputed, so this cannot pass by agreeing with
+    // whatever the writer happens to do. The encoder that produces it is
+    // separately checked against upstream-supplied CIDs by the data-model
+    // fixtures in `atproto-dasl`.
+    assert_eq!(
+        created["cid"].as_str().unwrap(),
+        "bafyreidbmrjqco5tedmdigvwvdaonch4o4esflpgztmz7dqhl36z26hshq",
+        "the record's CID must be the data model's encoding of it, \
+         with `ref` stored as a link rather than a map with a `$link` key"
+    );
+
+    // And reading it back must give the same JSON that went in — the link
+    // stored as tag 42 renders as `$link` again.
+    let (status, fetched) = get(
+        app,
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice\
+         &collection=app.bsky.feed.post&rkey=aaaaaaaaaaaaa",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {fetched}");
+    assert_eq!(fetched["value"], record, "record did not round-trip");
+}

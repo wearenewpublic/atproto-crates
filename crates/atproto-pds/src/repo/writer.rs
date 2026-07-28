@@ -220,8 +220,14 @@ impl RepoWriter {
                     let value = op.value.clone().ok_or_else(|| PdsError::NotFound {
                         what: format!("write {} requires value", mst_key),
                     })?;
-                    let bytes = atproto_dasl::to_vec(&value).map_err(|e| PdsError::Storage {
-                        reason: format!("encode value: {e}"),
+                    // Read the JSON representation into the data model before
+                    // encoding: `$link` names a link and `$bytes` a byte
+                    // string, and encoding them as literal maps produces a
+                    // record no peer computes the same CID for.
+                    let bytes = atproto_dasl::atproto_json::to_vec(&value).map_err(|e| {
+                        PdsError::Storage {
+                            reason: format!("encode value: {e}"),
+                        }
                     })?;
                     let cid = compute_cid(&bytes);
 
@@ -538,8 +544,14 @@ impl RepoWriter {
                     let value = op.value.clone().ok_or_else(|| PdsError::NotFound {
                         what: format!("write {} requires value", mst_key),
                     })?;
-                    let bytes = atproto_dasl::to_vec(&value).map_err(|e| PdsError::Storage {
-                        reason: format!("encode value: {e}"),
+                    // Read the JSON representation into the data model before
+                    // encoding: `$link` names a link and `$bytes` a byte
+                    // string, and encoding them as literal maps produces a
+                    // record no peer computes the same CID for.
+                    let bytes = atproto_dasl::atproto_json::to_vec(&value).map_err(|e| {
+                        PdsError::Storage {
+                            reason: format!("encode value: {e}"),
+                        }
                     })?;
                     let cid = compute_cid(&bytes);
                     {

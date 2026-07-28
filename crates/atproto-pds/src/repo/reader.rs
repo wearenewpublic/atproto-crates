@@ -184,8 +184,11 @@ impl RepoReader {
         .ok_or_else(|| PdsError::NotFound {
             what: format!("block {cid_str} not present"),
         })?;
-        let value: serde_json::Value =
-            atproto_dasl::from_slice(&block).map_err(|e| PdsError::Storage {
+        // Render back into the JSON representation: links stored as tag 42
+        // become `$link` objects again, so a record reads out in the shape it
+        // was written in.
+        let value =
+            atproto_dasl::atproto_json::from_slice(&block).map_err(|e| PdsError::Storage {
                 reason: format!("decode record DAG-CBOR: {e}"),
             })?;
 
@@ -234,11 +237,13 @@ impl RepoReader {
                         reason: format!("list_records block fetch: {e}"),
                     })?
                     .unwrap_or_default();
-                let value: serde_json::Value = if block.is_empty() {
+                let value = if block.is_empty() {
                     serde_json::Value::Null
                 } else {
-                    atproto_dasl::from_slice(&block).map_err(|e| PdsError::Storage {
-                        reason: format!("decode list_records DAG-CBOR: {e}"),
+                    atproto_dasl::atproto_json::from_slice(&block).map_err(|e| {
+                        PdsError::Storage {
+                            reason: format!("decode list_records DAG-CBOR: {e}"),
+                        }
                     })?
                 };
                 records.push(ListRecordsItem {
@@ -315,10 +320,10 @@ impl RepoReader {
                     reason: format!("list_records block fetch: {e}"),
                 })?
                 .unwrap_or_default();
-            let value: serde_json::Value = if block.is_empty() {
+            let value = if block.is_empty() {
                 serde_json::Value::Null
             } else {
-                atproto_dasl::from_slice(&block).map_err(|e| PdsError::Storage {
+                atproto_dasl::atproto_json::from_slice(&block).map_err(|e| PdsError::Storage {
                     reason: format!("decode list_records DAG-CBOR: {e}"),
                 })?
             };

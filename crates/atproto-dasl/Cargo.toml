@@ -40,18 +40,17 @@ tracing.workspace = true
 serde_bytes.workspace = true
 blake3.workspace = true
 url.workspace = true
+serde_json.workspace = true
+base64.workspace = true
 
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json.workspace = true
-base64.workspace = true
 hex = "0.4"
 tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 criterion.workspace = true
@@ -59,7 +58,7 @@ proptest.workspace = true
 
 [features]
 default = []
-clap = ["dep:clap", "dep:serde_json", "dep:anyhow"]
+clap = ["dep:clap", "dep:anyhow"]
 reqwest = ["dep:reqwest"]
 axum = ["dep:axum", "dep:http", "dep:bytes"]
 

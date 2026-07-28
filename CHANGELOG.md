@@ -52,6 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds` / `atproto-dasl`: records were DAG-CBOR-encoded straight from JSON, so a record
+  containing a blob ref hashed to a CID no other implementation computes. The AT Protocol data model
+  has one shape and two encodings: DAG-CBOR expresses links and byte strings directly, while JSON
+  spells them `{"$link": …}` and `{"$bytes": …}`. Handing a `serde_json::Value` to the encoder stored
+  a literal map with a reserved key where a link belonged, and passed floats through even though the
+  data model has no floating-point type.
+
+  New `atproto_dasl::atproto_json` reads the JSON representation into the data model and renders it
+  back: `$link` becomes a link, `$bytes` a byte string, an integral number an integer whether it was
+  written `123` or `123.0`, and a fractional number is refused. Malformed sentinels — a non-string
+  value, a bogus CID, an extra key alongside the reserved one — are refused rather than guessed at.
+  The record read path renders the inverse, so a record comes back in the shape it went in.
+
+  All three `data-model` interop fixtures now match, up from one. The two vendored-but-unused
+  `data-model-valid` and `data-model-invalid` fixture files are now wired as harnesses too.
 - `atproto-repo`: the MST write path never built subtrees, so every repository was a single node
   and every root CID was wrong at any realistic size. A key's layer is fixed by its hash — `sha256`,
   leading zero bits, in pairs — and `key_height` computed it correctly and then discarded it

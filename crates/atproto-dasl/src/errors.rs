@@ -48,6 +48,13 @@ pub enum EncodeError {
         /// The maximum allowed output size in bytes.
         max: usize,
     },
+
+    /// A value has no representation in the AT Protocol data model.
+    #[error("error-atproto-dasl-encode-9 Value not representable: {reason}")]
+    InvalidValue {
+        /// Which rule the value broke.
+        reason: String,
+    },
 }
 
 impl serde::ser::Error for EncodeError {

@@ -6,6 +6,13 @@
 //! which only prove the encoder and decoder agree with each other, these can
 //! detect an encoding that is self-consistent and wrong.
 //!
+//! The entry point under test is `atproto_json::to_vec`, not the generic
+//! `to_vec`. AT Protocol's JSON representation spells links and byte strings as
+//! reserved single-key objects, so encoding a `serde_json::Value` correctly
+//! means reading it into the data model first. Teaching the generic serializer
+//! to recognise those keys would change encoding for any type that happens to
+//! have a `$link` field, which is action at a distance.
+//!
 //! Vectors are vendored at `tests/interop/`; see that directory's README for
 //! provenance, licence and the upstream pin.
 //!
@@ -27,16 +34,16 @@ use std::path::PathBuf;
 /// Keyed by the vector's index in `data-model-fixtures.json`, because the file
 /// carries no per-vector name. Every entry here is a statement that a known,
 /// filed defect is still open — never add one to silence a genuine regression.
-const KNOWN_FAILURES: &[(usize, &str)] = &[
-    // F-REPO-05 — the record encode path passes AT Protocol's JSON sentinel
-    // objects through as ordinary maps instead of translating them to their
-    // DAG-CBOR representations: `{"$link": "..."}` must become a CID under CBOR
-    // tag 42, and `{"$bytes": "..."}` must become a byte string. Encoding them
-    // as string-valued maps produces more bytes than the reference and a
-    // different CID. See gap-analysis roadmap item M1.11.
-    (1, "F-REPO-05"),
-    (2, "F-REPO-05"),
-];
+/// Vectors that do not pass yet, each mapped to the finding that explains it.
+///
+/// Keyed by the vector's index in `data-model-fixtures.json`, because the file
+/// carries no per-vector name. Every entry here is a statement that a known,
+/// filed defect is still open — never add one to silence a genuine regression.
+///
+/// Empty since the JSON representation is read into the data model before
+/// encoding: `$link` becomes a link and `$bytes` a byte string, rather than
+/// being encoded as literal maps with reserved keys.
+const KNOWN_FAILURES: &[(usize, &str)] = &[];
 
 /// Look up a vector in [`KNOWN_FAILURES`], returning the finding ID if listed.
 fn known_failure(index: usize) -> Option<&'static str> {
@@ -86,7 +93,7 @@ fn interop_data_model_fixtures() {
 
         let mut mismatches = Vec::new();
 
-        match atproto_dasl::to_vec(&vector.json) {
+        match atproto_dasl::atproto_json::to_vec(&vector.json) {
             Ok(actual_cbor) => {
                 if actual_cbor != expected_cbor {
                     mismatches.push(format!(
@@ -101,7 +108,7 @@ fn interop_data_model_fixtures() {
             Err(err) => mismatches.push(format!("DAG-CBOR: encode failed: {err}")),
         }
 
-        match atproto_dasl::compute_cid_for(&vector.json) {
+        match atproto_dasl::atproto_json::compute_cid(&vector.json) {
             Ok(actual_cid) => {
                 let actual_cid = actual_cid.to_string();
                 if actual_cid != vector.cid {
@@ -135,5 +142,80 @@ fn interop_data_model_fixtures() {
         "{} data-model vector(s) need attention:\n\n{}\n",
         failures.len(),
         failures.join("\n\n")
+    );
+}
+
+/// One entry of `data-model-valid.json` / `data-model-invalid.json`.
+///
+/// Both files describe whole records rather than bare values, and carry a
+/// `note` naming the case.
+#[derive(Deserialize)]
+struct DataModelCase {
+    note: String,
+    json: Value,
+}
+
+/// Every value the data model admits must translate and encode.
+#[test]
+fn interop_data_model_valid() {
+    let cases: Vec<DataModelCase> = load("data-model/data-model-valid.json");
+    assert!(!cases.is_empty(), "data-model-valid.json is empty");
+
+    let mut failures = Vec::new();
+    for case in &cases {
+        if let Err(err) = atproto_dasl::atproto_json::to_vec(&case.json) {
+            failures.push(format!("{:?} should encode: {err}", case.note));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} valid cases were rejected:\n  {}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// Values the data model cannot represent must be refused, not approximated.
+///
+/// Only the cases this layer is responsible for are asserted. The file also
+/// covers record structure — a missing `$type`, a blob with a string `size` —
+/// which is lexicon validation rather than encoding, and is not implemented
+/// yet. Those are listed here by name so the exclusion is visible rather than
+/// implied by a passing test.
+#[test]
+fn interop_data_model_invalid() {
+    /// Cases this test deliberately does not cover, with the reason.
+    const NOT_AN_ENCODING_CONCERN: &[&str] = &[
+        "top-level not an object",
+        "record with $type null",
+        "record with $type wrong type",
+        "record with empty $type string",
+        "blob with string size",
+        "blob with missing key",
+    ];
+
+    let cases: Vec<DataModelCase> = load("data-model/data-model-invalid.json");
+    assert!(!cases.is_empty(), "data-model-invalid.json is empty");
+
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for case in &cases {
+        if NOT_AN_ENCODING_CONCERN.contains(&case.note.as_str()) {
+            continue;
+        }
+        checked += 1;
+        if atproto_dasl::atproto_json::to_vec(&case.json).is_ok() {
+            failures.push(format!("{:?} should have been rejected", case.note));
+        }
+    }
+
+    assert!(checked > 0, "every case was excluded; the filter is wrong");
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} encoding cases were accepted:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
     );
 }
