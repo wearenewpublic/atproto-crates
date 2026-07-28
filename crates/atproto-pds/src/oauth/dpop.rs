@@ -108,6 +108,55 @@ pub async fn verify_dpop_proof(
     Ok(())
 }
 
+/// Verify a DPoP proof presented at the token endpoint and return its JWK
+/// thumbprint.
+///
+/// Distinct from [`verify_dpop_proof`] in two ways that matter. There is no
+/// access token yet, so the proof carries no `ath` claim (RFC 9449 §5) and the
+/// validator must not demand one. And there is no bound thumbprint to compare
+/// against — the thumbprint is the *output*, to be checked by the caller
+/// against whatever the authorization request pinned, and then written into the
+/// issued token's `cnf`.
+///
+/// Taking the thumbprint from a signed proof rather than from a request
+/// parameter is the point: a `dpop_jkt` in the request body is an assertion by
+/// whoever sent the request, which anyone holding a stolen code can make. A
+/// proof is a demonstration that the sender holds the private key.
+///
+/// # Errors
+///
+/// Returns a 400 `invalid_dpop_proof` when the header is missing, malformed,
+/// fails validation, or replays a previously seen `jti`. The token endpoint
+/// uses OAuth-style error codes rather than the XRPC-style names used on
+/// resource requests.
+pub async fn verify_token_endpoint_dpop(
+    headers: &HeaderMap,
+    htu: &str,
+    jti_guard: &JtiReplayGuard,
+) -> Result<String, XrpcError> {
+    let invalid =
+        |message: String| XrpcError::new(StatusCode::BAD_REQUEST, "invalid_dpop_proof", message);
+
+    let proof = headers
+        .get(DPOP_HEADER)
+        .ok_or_else(|| invalid("missing DPoP header".to_string()))?
+        .to_str()
+        .map_err(|_| invalid("DPoP header is not valid UTF-8".to_string()))?;
+
+    let mut config = DpopValidationConfig::for_authorization("POST", htu);
+    config.max_age_seconds = DPOP_MAX_AGE_SECS;
+    let jkt = validate_dpop_jwt(proof, &config)
+        .map_err(|e| invalid(format!("DPoP proof invalid: {e}")))?;
+
+    let jti = extract_jti(proof).ok_or_else(|| invalid("DPoP proof missing jti".to_string()))?;
+    jti_guard
+        .check_and_insert(&jti, Duration::from_secs(DPOP_MAX_AGE_SECS * 2))
+        .await
+        .map_err(|e| invalid(format!("DPoP proof replay: {e}")))?;
+
+    Ok(jkt)
+}
+
 /// Decode the `jti` claim from a DPoP proof's payload (no signature check —
 /// the caller has already done that via `validate_dpop_jwt`).
 fn extract_jti(proof: &str) -> Option<String> {

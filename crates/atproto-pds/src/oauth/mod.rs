@@ -17,8 +17,10 @@
 //! Askama-template refactor is documented in D-7.
 
 pub mod authorize;
+pub mod client_metadata;
 pub mod consent;
 pub mod dpop;
+pub mod extract;
 pub mod jwks;
 pub mod metadata;
 pub mod par;
@@ -27,8 +29,12 @@ pub mod state;
 pub mod token;
 
 pub use authorize::{AuthorizeInput, AuthorizeResponse, authorize_handler};
+pub use client_metadata::{
+    ClientMetadata, ClientMetadataError, assert_redirect_uri_registered, resolve_client_metadata,
+};
 pub use consent::consent_page;
 pub use dpop::{DPOP_HEADER, verify_dpop_proof};
+pub use extract::JsonOrForm;
 pub use jwks::jwks_handler;
 pub use metadata::{
     AuthorizationServerMetadata, ProtectedResourceMetadata, oauth_authorization_server,

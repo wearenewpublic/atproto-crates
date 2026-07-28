@@ -12,6 +12,8 @@
 
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
+use crate::oauth::client_metadata::{assert_redirect_uri_registered, resolve_client_metadata};
+use crate::oauth::extract::JsonOrForm;
 use crate::oauth::state::{OAuthRequest, OAuthState, PAR_TTL_SECS};
 use atproto_identity::key::{KeyData, KeyType, validate as validate_signature};
 use axum::Json;
@@ -131,7 +133,7 @@ pub struct ParResponse {
 /// Handler for `POST /oauth/par`.
 pub async fn par_handler(
     State(state): State<HttpState>,
-    Json(input): Json<ParInput>,
+    JsonOrForm(input): JsonOrForm<ParInput>,
 ) -> Result<Json<ParResponse>, XrpcError> {
     // §10.2 — when `request` is present, JWS-verify against the client
     // metadata's `jwks_uri` and use the embedded payload. Otherwise fall
@@ -172,6 +174,35 @@ pub async fn par_handler(
             "code_challenge required",
         ));
     }
+
+    // Resolve the client's metadata and confirm the requested redirect is one
+    // it published. Without this the authorization code for a legitimate,
+    // user-trusted `client_id` can be delivered to any destination the caller
+    // names — the consent screen shows the genuine client, and the code goes
+    // somewhere else. RFC 6749 §3.1.2.3.
+    let metadata = resolve_client_metadata(&resolved.client_id, &crate::user_agent())
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                client_id = %resolved.client_id,
+                error = %err,
+                "PAR rejected: could not resolve client metadata"
+            );
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("client metadata could not be resolved: {err}"),
+            )
+        })?;
+    assert_redirect_uri_registered(&resolved.client_id, &metadata, &resolved.redirect_uri)
+        .map_err(|err| {
+            tracing::warn!(
+                client_id = %resolved.client_id,
+                redirect_uri = %resolved.redirect_uri,
+                "PAR rejected: redirect_uri is not registered for this client"
+            );
+            XrpcError::new(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+        })?;
 
     // Generate the request_uri token.
     let token = random_token();

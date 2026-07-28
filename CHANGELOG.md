@@ -6,7 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security
+- `atproto-pds`: closed an authorization-code exfiltration chain ending in full account takeover.
+  Three defects composed, and the compromise was invisible to the victim because the `client_id`
+  shown on the consent screen was genuine:
+  - **`redirect_uri` was never validated.** PAR stored whatever the caller sent and the consent page
+    navigated to it, so an authorization code issued for a trusted client could be delivered to an
+    attacker's destination. PAR now resolves the client's metadata and requires the requested
+    redirect to be one the client published, compared for exact equality per RFC 6749 §3.1.2.3.
+  - **The token endpoint required no proof of possession.** A stolen code or a leaked refresh token
+    was redeemable by whoever held it. Both grants now require a DPoP proof bound to the token
+    endpoint (RFC 9449 §5 — no `ath`, since no access token exists yet), with the proof's `jti`
+    recorded against replay.
+  - **The caller chose its own `cnf.jkt`.** `token.rs` preferred a request-body `dpop_jkt` over the
+    thumbprint pinned at authorization, so an attacker redeeming a stolen code received a token
+    DPoP-bound to their own key — DPoP was decorative. The binding now comes from the signed proof
+    and nothing else; the `dpop_jkt` request field is gone. When authorization pinned a thumbprint
+    the proof must match it, and a refresh token is usable only by the key it is bound to.
+
+  This chain was unexploitable in practice only because of the encoding bug fixed below, which is
+  why the two ship together: fixing the encoding alone would have converted an unreachable defect
+  into a reachable one.
+
+  Client metadata is fetched from an unauthenticated caller's URL, so both that fetch and any
+  `jwks_uri` reached through it are gated by
+  `atproto_identity::validation::validate_service_endpoint`, which rejects non-HTTPS schemes,
+  address literals in every resolver-accepted form, embedded userinfo, non-443 ports and reserved
+  suffixes. The guard is syntactic and does not defend against DNS rebinding.
+
 ### Fixed
+- `atproto-pds`: `/oauth/par` and `/oauth/token` accepted `application/json` only, where RFC 9126 §2
+  and RFC 6749 §4.1.3 specify `application/x-www-form-urlencoded` and every standard AT Protocol
+  OAuth client sends it. `@atproto/oauth-client-node` and `-browser` received HTTP 415 and could not
+  complete a single flow, making an extensively implemented authorization server unreachable.
+  `/oauth/revoke` had always used `Form`, which is what showed the inconsistency was unintentional.
+  Both endpoints now accept either encoding.
+
+  Two consequences worth noting. Every issued token is now DPoP-bound and `token_type` is `DPoP`
+  rather than `Bearer`, which is what the server's own
+  `require_dpop_bound_access_tokens: true` metadata has always advertised. And a `client_id` must
+  now be resolvable: either an HTTPS URL serving a client metadata document, or a loopback
+  identifier of the form `http://localhost[/][?scope=…&redirect_uri=…]`, whose metadata is derived
+  from the identifier itself and defaults to `http://127.0.0.1/` and `http://[::1]/`.
+
 - `atproto-repo`: `prevData` was carried inside the signed commit body, making the commit a six-key
   object where the AT Protocol commit schema has five. `prevData` — the prior MST root CID used for
   Sync 1.1 inductive verification — is a `com.atproto.sync.subscribeRepos#commit` **event** field.

@@ -7,10 +7,13 @@
 
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
+use crate::oauth::dpop::verify_token_endpoint_dpop;
+use crate::oauth::extract::JsonOrForm;
 use crate::oauth::state::RefreshHandle;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
@@ -41,9 +44,11 @@ pub struct TokenInput {
     pub redirect_uri: Option<String>,
     /// PKCE verifier (for `authorization_code` grant).
     pub code_verifier: Option<String>,
-    /// DPoP key thumbprint provided alongside the request (DPoP-bound tokens).
-    pub dpop_jkt: Option<String>,
 }
+
+// Note: there is deliberately no `dpop_jkt` field. The DPoP binding is taken
+// from the signed proof in the `DPoP` header, never from a request parameter —
+// a parameter is an assertion anyone can make, a proof is a demonstration.
 
 /// Spec-shaped response.
 #[derive(Debug, Serialize)]
@@ -99,7 +104,8 @@ pub struct DpopConfirmation {
 /// refresh attempts.
 pub async fn token_handler(
     State(state): State<HttpState>,
-    Json(input): Json<TokenInput>,
+    headers: HeaderMap,
+    JsonOrForm(input): JsonOrForm<TokenInput>,
 ) -> Result<Json<TokenResponse>, XrpcError> {
     state
         .rate_limiter
@@ -112,9 +118,19 @@ pub async fn token_handler(
                 format!("oauth/token rate-limit hit: {e}"),
             )
         })?;
+
+    // Every grant must demonstrate possession of the DPoP key. The proof is
+    // the only client authentication a public AT Protocol OAuth client has:
+    // without it, a stolen authorization code or refresh token is redeemable
+    // by whoever holds it, which is exactly what DPoP exists to prevent. The
+    // server also advertises `require_dpop_bound_access_tokens: true`, so
+    // accepting an unproven request contradicts its own metadata.
+    let proof_jkt =
+        verify_token_endpoint_dpop(&headers, &token_endpoint_url(&state), &state.jti_guard).await?;
+
     match input.grant_type.as_str() {
-        "authorization_code" => handle_code(state, input).await,
-        "refresh_token" => handle_refresh(state, input).await,
+        "authorization_code" => handle_code(state, input, proof_jkt).await,
+        "refresh_token" => handle_refresh(state, input, proof_jkt).await,
         other => Err(XrpcError::new(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
@@ -123,9 +139,18 @@ pub async fn token_handler(
     }
 }
 
+/// The canonical `htu` a token-endpoint DPoP proof must be bound to.
+fn token_endpoint_url(state: &HttpState) -> String {
+    format!(
+        "https://{}/oauth/token",
+        state.service_did.replace("did:web:", "")
+    )
+}
+
 async fn handle_code(
     state: HttpState,
     input: TokenInput,
+    proof_jkt: String,
 ) -> Result<Json<TokenResponse>, XrpcError> {
     let code = input.code.as_deref().ok_or_else(|| {
         XrpcError::new(StatusCode::BAD_REQUEST, "invalid_request", "code required")
@@ -172,14 +197,34 @@ async fn handle_code(
         ));
     }
 
-    // DPoP binding: prefer the request-time jkt, fall back to PAR-time jkt.
-    let dpop_jkt = input.dpop_jkt.clone().or(auth.request.dpop_jkt.clone());
+    // DPoP binding comes from the proof, and from nothing else.
+    //
+    // `input.dpop_jkt` is deliberately ignored. Letting the request body name
+    // the thumbprint meant an attacker redeeming a stolen code could bind the
+    // issued token to their own key, so the resulting token was DPoP-bound —
+    // to the wrong party. When the authorization request pinned a thumbprint,
+    // the proof must match it; a mismatch means the code is being redeemed by
+    // a different key than the one that asked for it.
+    if let Some(pinned) = auth.request.dpop_jkt.as_deref()
+        && pinned != proof_jkt
+    {
+        tracing::warn!(
+            client_id = %auth.request.client_id,
+            "token exchange rejected: DPoP proof key differs from the key pinned at authorization"
+        );
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "DPoP proof key does not match the key bound at authorization",
+        ));
+    }
+
     issue_pair(
         &state,
         &auth.did,
         &auth.request.client_id,
         &auth.request.scope,
-        dpop_jkt,
+        Some(proof_jkt),
     )
     .await
     .map(Json)
@@ -188,6 +233,7 @@ async fn handle_code(
 async fn handle_refresh(
     state: HttpState,
     input: TokenInput,
+    proof_jkt: String,
 ) -> Result<Json<TokenResponse>, XrpcError> {
     let raw = input.refresh_token.as_deref().ok_or_else(|| {
         XrpcError::new(
@@ -221,6 +267,22 @@ async fn handle_refresh(
                 "refresh token already consumed or revoked",
             )
         })?;
+
+    // A refresh token carries the thumbprint it was bound to. Presenting it
+    // requires proving possession of that same key — otherwise a leaked
+    // refresh token is bearer-usable despite carrying `cnf`, and rotation
+    // hands the attacker a fresh pair indefinitely.
+    if handle.dpop_jkt != proof_jkt {
+        tracing::warn!(
+            client_id = %handle.client_id,
+            "refresh rejected: DPoP proof key differs from the key the refresh token is bound to"
+        );
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "DPoP proof key does not match the key this refresh token is bound to",
+        ));
+    }
 
     issue_pair(
         &state,

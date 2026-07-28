@@ -1,6 +1,7 @@
 //! Phase 4 OAuth integration tests — PAR → authorize → token end-to-end.
 
-use atproto_identity::key::KeyType;
+use atproto_identity::key::{KeyData, KeyType, generate_key};
+use atproto_oauth::dpop::auth_dpop;
 use atproto_pds::account::{AccountDirectory, AccountManager};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
@@ -90,6 +91,116 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
+/// A loopback `client_id`, whose metadata is derived from the identifier
+/// itself rather than fetched. Tests need a client the server will accept
+/// without reaching the network; the loopback shape is the specified way to
+/// have one, not a test-only shortcut.
+const CLIENT_ID: &str = "http://localhost";
+
+/// One of the two redirects a loopback client gets by default.
+const REDIRECT_URI: &str = "http://127.0.0.1/";
+
+/// The `htu` a token-endpoint DPoP proof must be bound to, given the
+/// `did:web:test.example` service DID these tests build.
+const TOKEN_ENDPOINT: &str = "https://test.example/oauth/token";
+
+fn dpop_key() -> KeyData {
+    generate_key(KeyType::P256Private).expect("generate DPoP key")
+}
+
+/// POST a form-encoded body, optionally attaching a DPoP proof.
+async fn post_form(
+    app: axum::Router,
+    path: &str,
+    fields: &[(&str, &str)],
+    dpop_proof: Option<&str>,
+) -> (StatusCode, Value) {
+    let body = fields
+        .iter()
+        .fold(
+            url::form_urlencoded::Serializer::new(String::new()),
+            |mut acc, (k, v)| {
+                acc.append_pair(k, v);
+                acc
+            },
+        )
+        .finish();
+    let mut builder = Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(proof) = dpop_proof {
+        builder = builder.header("DPoP", proof);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// Run PAR + authorize and return the issued authorization code.
+async fn authorize_for_code(app: &axum::Router, challenge: &str) -> String {
+    authorize_for_code_with_jkt(app, challenge, None).await
+}
+
+/// Run PAR + authorize, optionally pinning a DPoP thumbprint at PAR time.
+async fn authorize_for_code_with_jkt(
+    app: &axum::Router,
+    challenge: &str,
+    dpop_jkt: Option<&str>,
+) -> String {
+    let mut par = json!({
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": "atproto transition:generic",
+        "state": "abc",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    });
+    if let Some(jkt) = dpop_jkt {
+        par["dpop_jkt"] = json!(jkt);
+    }
+    let (status, body) = post_json(app.clone(), "/oauth/par", par).await;
+    assert_eq!(status, StatusCode::OK, "PAR setup failed: {body}");
+    let request_uri = body["request_uri"].as_str().unwrap().to_string();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri,
+            "identifier": "alice.example",
+            "password": "pw",
+            "approve": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "authorize setup failed: {body}");
+    body["code"].as_str().unwrap().to_string()
+}
+
+/// POST to the token endpoint carrying a DPoP proof signed by `key`.
+async fn post_token(app: axum::Router, body: Value, key: &KeyData) -> (StatusCode, Value) {
+    let (proof, _, _) = auth_dpop(key, "POST", TOKEN_ENDPOINT).expect("mint DPoP proof");
+    let request = Request::builder()
+        .uri("/oauth/token")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("DPoP", proof)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn metadata_documents_published() {
     let (app, _tmp) = build_app().await;
@@ -121,6 +232,7 @@ async fn jwks_returns_keys_array() {
 #[tokio::test(flavor = "multi_thread")]
 async fn par_then_authorize_then_token_flow() {
     let (app, _tmp) = build_app().await;
+    let key = dpop_key();
     create_account(&app, "did:plc:alice", "alice.example").await;
     let (verifier, challenge) = pkce_pair();
 
@@ -129,9 +241,9 @@ async fn par_then_authorize_then_token_flow() {
         app.clone(),
         "/oauth/par",
         json!({
-            "client_id": "https://app.example/cm.json",
+            "client_id": CLIENT_ID,
             "response_type": "code",
-            "redirect_uri": "https://app.example/cb",
+            "redirect_uri": REDIRECT_URI,
             "scope": "atproto transition:generic",
             "state": "abc",
             "code_challenge": challenge,
@@ -160,22 +272,25 @@ async fn par_then_authorize_then_token_flow() {
     assert_eq!(body["state"], "abc");
 
     // 3. token exchange.
-    let (status, body) = post_json(
+    let (status, body) = post_token(
         app,
-        "/oauth/token",
         json!({
             "grant_type": "authorization_code",
-            "client_id": "https://app.example/cm.json",
+            "client_id": CLIENT_ID,
             "code": code,
-            "redirect_uri": "https://app.example/cb",
+            "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
         }),
+        &key,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "token body: {body}");
     assert!(body["access_token"].as_str().unwrap().len() > 50);
     assert!(body["refresh_token"].as_str().unwrap().len() > 50);
-    assert_eq!(body["token_type"], "Bearer");
+    // Every issued token is DPoP-bound, because every grant now has to present
+    // a proof. That matches the `require_dpop_bound_access_tokens: true` the
+    // server advertises in its authorization-server metadata.
+    assert_eq!(body["token_type"], "DPoP");
     assert_eq!(body["sub"], "did:plc:alice");
 }
 
@@ -186,9 +301,9 @@ async fn par_rejects_non_s256_pkce() {
         app,
         "/oauth/par",
         json!({
-            "client_id": "https://app.example/cm.json",
+            "client_id": CLIENT_ID,
             "response_type": "code",
-            "redirect_uri": "https://app.example/cb",
+            "redirect_uri": REDIRECT_URI,
             "scope": "atproto",
             "state": "x",
             "code_challenge": "abc",
@@ -207,9 +322,9 @@ async fn par_rejects_missing_atproto_scope() {
         app,
         "/oauth/par",
         json!({
-            "client_id": "https://app.example/cm.json",
+            "client_id": CLIENT_ID,
             "response_type": "code",
-            "redirect_uri": "https://app.example/cb",
+            "redirect_uri": REDIRECT_URI,
             "scope": "transition:generic",
             "state": "x",
             "code_challenge": "ZGVhZGJlZWY",
@@ -224,6 +339,7 @@ async fn par_rejects_missing_atproto_scope() {
 #[tokio::test(flavor = "multi_thread")]
 async fn token_rejects_pkce_mismatch() {
     let (app, _tmp) = build_app().await;
+    let key = dpop_key();
     create_account(&app, "did:plc:alice", "alice.example").await;
     let (_verifier, challenge) = pkce_pair();
 
@@ -231,8 +347,8 @@ async fn token_rejects_pkce_mismatch() {
         app.clone(),
         "/oauth/par",
         json!({
-            "client_id": "https://c", "response_type": "code",
-            "redirect_uri": "https://c/cb",
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
             "scope": "atproto", "state": "s",
             "code_challenge": challenge, "code_challenge_method": "S256",
         }),
@@ -252,14 +368,14 @@ async fn token_rejects_pkce_mismatch() {
     let code = authz["code"].as_str().unwrap().to_string();
 
     // Wrong verifier.
-    let (status, body) = post_json(
+    let (status, body) = post_token(
         app,
-        "/oauth/token",
         json!({
-            "grant_type": "authorization_code", "client_id": "https://c",
-            "code": code, "redirect_uri": "https://c/cb",
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
             "code_verifier": "wrong-verifier",
         }),
+        &key,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
@@ -269,6 +385,7 @@ async fn token_rejects_pkce_mismatch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_token_rotates() {
     let (app, _tmp) = build_app().await;
+    let key = dpop_key();
     create_account(&app, "did:plc:alice", "alice.example").await;
     let (verifier, challenge) = pkce_pair();
 
@@ -276,8 +393,8 @@ async fn refresh_token_rotates() {
         app.clone(),
         "/oauth/par",
         json!({
-            "client_id": "https://c", "response_type": "code",
-            "redirect_uri": "https://c/cb",
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
             "scope": "atproto", "state": "s",
             "code_challenge": challenge, "code_challenge_method": "S256",
         }),
@@ -294,27 +411,27 @@ async fn refresh_token_rotates() {
     )
     .await;
     let code = authz["code"].as_str().unwrap().to_string();
-    let (_, tokens) = post_json(
+    let (_, tokens) = post_token(
         app.clone(),
-        "/oauth/token",
         json!({
-            "grant_type": "authorization_code", "client_id": "https://c",
-            "code": code, "redirect_uri": "https://c/cb",
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
         }),
+        &key,
     )
     .await;
     let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
     let original_access = tokens["access_token"].as_str().unwrap().to_string();
 
     // Refresh.
-    let (status, refreshed) = post_json(
+    let (status, refreshed) = post_token(
         app.clone(),
-        "/oauth/token",
         json!({
-            "grant_type": "refresh_token", "client_id": "https://c",
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
             "refresh_token": refresh,
         }),
+        &key,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {refreshed}");
@@ -324,13 +441,13 @@ async fn refresh_token_rotates() {
     assert_ne!(new_refresh, refresh);
 
     // Single-use: re-presenting the old refresh fails.
-    let (status, body) = post_json(
+    let (status, body) = post_token(
         app,
-        "/oauth/token",
         json!({
-            "grant_type": "refresh_token", "client_id": "https://c",
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
             "refresh_token": refresh,
         }),
+        &key,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -347,8 +464,8 @@ async fn authorize_decline_is_access_denied() {
         app.clone(),
         "/oauth/par",
         json!({
-            "client_id": "https://c", "response_type": "code",
-            "redirect_uri": "https://c/cb",
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
             "scope": "atproto", "state": "s",
             "code_challenge": challenge, "code_challenge_method": "S256",
         }),
@@ -371,10 +488,11 @@ async fn authorize_decline_is_access_denied() {
 #[tokio::test(flavor = "multi_thread")]
 async fn token_unsupported_grant_type_rejected() {
     let (app, _tmp) = build_app().await;
-    let (status, body) = post_json(
+    let key = dpop_key();
+    let (status, body) = post_token(
         app,
-        "/oauth/token",
         json!({"grant_type": "password", "client_id": "x"}),
+        &key,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -394,6 +512,7 @@ async fn oauth_state_persists_across_restart() {
     let dir = tmp.path().to_path_buf();
     let db_path = dir.join("accounts.sqlite");
     let (verifier, challenge) = pkce_pair();
+    let key = dpop_key();
 
     // ---- Phase A: boot, run PAR + authorize, get a code, drop the app. ----
     let code = {
@@ -425,9 +544,9 @@ async fn oauth_state_persists_across_restart() {
             app.clone(),
             "/oauth/par",
             json!({
-                "client_id": "https://app.example/cm.json",
+                "client_id": CLIENT_ID,
                 "response_type": "code",
-                "redirect_uri": "https://app.example/cb",
+                "redirect_uri": REDIRECT_URI,
                 "scope": "atproto transition:generic",
                 "state": "abc",
                 "code_challenge": challenge,
@@ -478,16 +597,16 @@ async fn oauth_state_persists_across_restart() {
     .with_oauth_state(oauth);
     let app = build_router(state);
 
-    let (status, body) = post_json(
+    let (status, body) = post_token(
         app,
-        "/oauth/token",
         json!({
             "grant_type": "authorization_code",
-            "client_id": "https://app.example/cm.json",
+            "client_id": CLIENT_ID,
             "code": code,
-            "redirect_uri": "https://app.example/cb",
+            "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
         }),
+        &key,
     )
     .await;
     assert_eq!(
@@ -496,4 +615,235 @@ async fn oauth_state_persists_across_restart() {
         "token exchange after restart: {body}"
     );
     assert!(body["access_token"].as_str().unwrap().len() > 50);
+}
+
+// ---------------------------------------------------------------------------
+// Security regressions: the authorization-code exfiltration chain.
+//
+// Three defects composed into full account takeover against any user who could
+// be phished onto a consent URL, and the compromise was invisible because the
+// `client_id` on the consent screen was genuine:
+//
+//   1. PAR accepted any `redirect_uri`, so the code for a trusted client could
+//      be delivered to an attacker (F-OAUTH-03).
+//   2. The token endpoint required no proof of possession, so a stolen code was
+//      redeemable by whoever held it (F-OAUTH-02).
+//   3. The caller chose its own `cnf.jkt`, so the resulting token was
+//      DPoP-bound to the attacker's key (F-OAUTH-02).
+//
+// Each test below closes one link. The wall that made the chain unexploitable
+// until now — JSON-only request bodies (F-OAUTH-01) — comes down in the same
+// change, which is why all of this ships together.
+// ---------------------------------------------------------------------------
+
+/// PAR must refuse a redirect the client never registered.
+///
+/// This is the first link. The `client_id` here is genuine and the user would
+/// see it on the consent screen; only the destination is the attacker's.
+#[tokio::test(flavor = "multi_thread")]
+async fn par_rejects_redirect_uri_not_registered_by_the_client() {
+    let (app, _tmp) = build_app().await;
+    let (_, challenge) = pkce_pair();
+
+    let (status, body) = post_json(
+        app,
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": "https://attacker.test/steal",
+            "scope": "atproto transition:generic",
+            "state": "abc",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unregistered redirect_uri must be refused: {body}"
+    );
+    assert_eq!(body["error"], "invalid_request");
+}
+
+/// The token endpoint must refuse a request carrying no DPoP proof.
+///
+/// This is the second link: without it, a code obtained by any means is
+/// redeemable by whoever holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn token_rejects_request_without_a_dpop_proof() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let (verifier, challenge) = pkce_pair();
+    let code = authorize_for_code(&app, &challenge).await;
+
+    // Deliberately uses `post_json`, which attaches no DPoP header.
+    let (status, body) = post_json(
+        app,
+        "/oauth/token",
+        json!({
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a token request without a DPoP proof must be refused: {body}"
+    );
+    assert_eq!(body["error"], "invalid_dpop_proof");
+    let _ = key;
+}
+
+/// A code pinned to one DPoP key must not be redeemable with another.
+///
+/// This is the third link, and the one that made DPoP decorative: the caller
+/// used to name its own thumbprint, so an attacker redeeming a stolen code
+/// received a token bound to the attacker's key.
+#[tokio::test(flavor = "multi_thread")]
+async fn token_rejects_a_dpop_key_other_than_the_one_pinned_at_authorization() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+    let victim_key = dpop_key();
+    let attacker_key = dpop_key();
+    let (verifier, challenge) = pkce_pair();
+
+    let victim_jkt = atproto_oauth::dpop::extract_jwk_thumbprint(
+        &auth_dpop(&victim_key, "POST", TOKEN_ENDPOINT).unwrap().0,
+    )
+    .unwrap();
+    let code = authorize_for_code_with_jkt(&app, &challenge, Some(&victim_jkt)).await;
+
+    let (status, body) = post_token(
+        app,
+        json!({
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        &attacker_key,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "redeeming with a different DPoP key must be refused: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// A refresh token must not be usable by a key other than the one it is bound to.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_rejects_a_dpop_key_other_than_the_bound_one() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let attacker_key = dpop_key();
+    let (verifier, challenge) = pkce_pair();
+    let code = authorize_for_code(&app, &challenge).await;
+
+    let (status, tokens) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "setup exchange failed: {tokens}");
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        app,
+        json!({
+            "grant_type": "refresh_token",
+            "client_id": CLIENT_ID,
+            "refresh_token": refresh,
+        }),
+        &attacker_key,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a leaked refresh token must not be bearer-usable: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
+}
+
+/// Form encoding is what every standard client sends, and it must work.
+#[tokio::test(flavor = "multi_thread")]
+async fn par_and_token_accept_form_encoding() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let (verifier, challenge) = pkce_pair();
+
+    let (status, body) = post_form(
+        app.clone(),
+        "/oauth/par",
+        &[
+            ("client_id", CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", REDIRECT_URI),
+            ("scope", "atproto transition:generic"),
+            ("state", "abc"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "form-encoded PAR must work: {body}");
+    let request_uri = body["request_uri"].as_str().unwrap().to_string();
+
+    let (_, authz) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri,
+            "identifier": "alice.example",
+            "password": "pw",
+            "approve": true,
+        }),
+    )
+    .await;
+    let code = authz["code"].as_str().unwrap().to_string();
+
+    let (proof, _, _) = auth_dpop(&key, "POST", TOKEN_ENDPOINT).unwrap();
+    let (status, body) = post_form(
+        app,
+        "/oauth/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("code_verifier", &verifier),
+        ],
+        Some(&proof),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "form-encoded token exchange must work: {body}"
+    );
+    assert_eq!(body["token_type"], "DPoP");
 }
