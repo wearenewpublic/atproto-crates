@@ -52,6 +52,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: `listRecords` emitted a `cursor` on every non-empty page, including the last, and
+  serialized it as `null` when there genuinely was none. The lexicon types `cursor` as a plain
+  string, so the final iteration of every pagination loop threw in a validating client. A cursor is
+  now emitted only when the page was full — a partial page cannot have more behind it — and the key
+  is omitted rather than nulled when absent.
+- `atproto-repo`: `#repoOp.cid` carried `skip_serializing_if`, dropping the key for deletions where
+  the lexicon requires it present-and-null. Now serialized as an explicit `null`. `prev` keeps its
+  `skip_serializing_if`, which is not symmetric and not an oversight: the lexicon declares `prev`
+  optional — "for creations, field should not be defined" — rather than nullable.
+- `atproto-pds`: `applyWrites` results matched no member of the closed output union. Each entry now
+  carries a `$type` of `#createResult`, `#updateResult` or `#deleteResult`. Two further corrections
+  fall out of the schema: neither create nor update results carry `commit` — that appears once at
+  the top level — and `#deleteResult` is an empty object, where results previously carried a `uri`
+  the schema does not define.
+- `atproto-pds`: `describeRepo` omitted `didDoc`, which the lexicon marks required, so the call
+  threw in a validating client and broke the migration handshake. The document is synthesised from
+  local state rather than resolved from PLC: `didDoc` being required means a resolver would turn a
+  directory outage into a hard failure, for a field whose useful contents — the handle, the signing
+  key, the PDS endpoint — this server is itself the authority for.
 - `atproto-pds`: service-auth JWTs carried `typ: "at+jwt"`. `@atproto/xrpc-server` throws
   `BadJwtType` for exactly that value, so every token this PDS minted was refused by the Bluesky
   AppView, by Ozone, and by any service built on that library — before the signature was checked.

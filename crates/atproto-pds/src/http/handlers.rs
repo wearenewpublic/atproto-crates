@@ -133,8 +133,81 @@ pub async fn describe_repo(
     State(state): State<HttpState>,
     Query(params): Query<DescribeRepoParams>,
 ) -> Result<Json<DescribeRepoResponse>, XrpcError> {
-    let response = state.reader.describe_repo(&params.repo).await?;
+    let mut response = state.reader.describe_repo(&params.repo).await?;
+    response.did_doc = Some(local_did_document(&state, &response.did, &response.handle).await?);
     Ok(Json(response))
+}
+
+/// Build the DID document for an account this server hosts.
+///
+/// Synthesised from local state rather than resolved from PLC. The lexicon
+/// marks `didDoc` required, so resolving would make `describeRepo` fail
+/// outright whenever the directory is unreachable — for a field whose useful
+/// contents (the handle, the signing key, the PDS endpoint) this server is
+/// itself the authority for.
+///
+/// The tradeoff: an account whose PLC document already points at another PDS
+/// mid-migration is described here as still living on this one. `describeRepo`
+/// is only meaningful for accounts this server holds, so that window is the
+/// migration itself.
+async fn local_did_document(
+    state: &HttpState,
+    did: &str,
+    handle: &str,
+) -> Result<serde_json::Value, XrpcError> {
+    use atproto_identity::key::to_public;
+    use atproto_identity::model::DocumentBuilder;
+
+    let mut builder = DocumentBuilder::new()
+        .add_context("https://www.w3.org/ns/did/v1")
+        .add_context("https://w3id.org/security/multikey/v1")
+        .id(did.to_string())
+        .add_also_known_as(format!("at://{handle}"));
+
+    if let Some(origin) = state
+        .service_did
+        .strip_prefix("did:web:")
+        .map(|host| format!("https://{}", host.replace("%3A", ":")))
+    {
+        builder = builder.add_pds_service(origin);
+    }
+
+    // The signing key is what a consumer needs in order to verify this
+    // account's commits, so a document without it is not much use.
+    if let Some(manager) = state.account_manager.as_deref() {
+        match crate::http::space_auth::local_signing_key(manager, did).await {
+            Ok(private) => match to_public(&private) {
+                Ok(public) => {
+                    builder = builder.add_multikey(
+                        format!("{did}#atproto"),
+                        did.to_string(),
+                        public.to_string(),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(did, error = %err, "describeRepo: could not derive public signing key");
+                }
+            },
+            Err(err) => {
+                tracing::warn!(did, error = ?err, "describeRepo: could not load signing key");
+            }
+        }
+    }
+
+    let document = builder.build().map_err(|reason| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("build DID document: {reason}"),
+        )
+    })?;
+    serde_json::to_value(document).map_err(|err| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("encode DID document: {err}"),
+        )
+    })
 }
 
 /// Query parameters carrying just a `did`.

@@ -8,6 +8,7 @@ use crate::http::state::HttpState;
 use crate::repo::{RepoWriter, WriteAction, WriteOp};
 use crate::sequencer::{OutboxReader, SubscribeEvent};
 use atproto_record::tid::Tid;
+use atproto_repo::mst::RepoOpAction;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -322,13 +323,47 @@ pub enum ApplyWritesEntry {
     },
 }
 
+/// One entry of the `applyWrites` result union.
+///
+/// The lexicon types `results` as a **closed** union of `#createResult`,
+/// `#updateResult` and `#deleteResult`, so each entry must carry a `$type`
+/// naming which one it is. Emitting an undiscriminated object makes batched
+/// writes unusable from any validating client.
+///
+/// Note what these do *not* carry. Neither create nor update results include
+/// `commit` — that appears once, at the top level of the response — and
+/// `#deleteResult` is an empty object, with no `uri` and no `cid`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "$type")]
+pub enum ApplyWritesResult {
+    /// A record was created.
+    #[serde(rename = "com.atproto.repo.applyWrites#createResult")]
+    Create {
+        /// AT-URI of the new record.
+        uri: String,
+        /// CID of the record value.
+        cid: String,
+    },
+    /// A record was updated.
+    #[serde(rename = "com.atproto.repo.applyWrites#updateResult")]
+    Update {
+        /// AT-URI of the record.
+        uri: String,
+        /// CID of the new record value.
+        cid: String,
+    },
+    /// A record was deleted. Carries nothing else.
+    #[serde(rename = "com.atproto.repo.applyWrites#deleteResult")]
+    Delete {},
+}
+
 /// Output for `com.atproto.repo.applyWrites`.
 #[derive(Debug, Serialize)]
 pub struct ApplyWritesResponse {
     /// New commit metadata.
     pub commit: WriteCommitInfo,
-    /// Per-op results.
-    pub results: Vec<WriteRecordResponse>,
+    /// Per-op results, in input order.
+    pub results: Vec<ApplyWritesResult>,
 }
 
 /// Handler for `com.atproto.repo.applyWrites`.
@@ -398,13 +433,16 @@ pub async fn apply_writes(
     let results = result
         .writes
         .into_iter()
-        .map(|w| WriteRecordResponse {
-            uri: w.uri,
-            cid: w.cid,
-            commit: WriteCommitInfo {
-                cid: result.commit_cid.clone(),
-                rev: result.rev.clone(),
+        .map(|w| match w.op.action {
+            RepoOpAction::Create => ApplyWritesResult::Create {
+                uri: w.uri,
+                cid: w.cid.unwrap_or_default(),
             },
+            RepoOpAction::Update => ApplyWritesResult::Update {
+                uri: w.uri,
+                cid: w.cid.unwrap_or_default(),
+            },
+            RepoOpAction::Delete => ApplyWritesResult::Delete {},
         })
         .collect();
     Ok(Json(ApplyWritesResponse { commit, results }))

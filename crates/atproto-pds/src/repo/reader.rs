@@ -247,7 +247,12 @@ impl RepoReader {
                     value,
                 });
             }
-            let next_cursor = rows.last().map(|r| r.rkey.clone());
+            // Only a full page can have more behind it. Emitting a cursor for
+            // a partial page costs the client an extra round trip and lands it
+            // on a response that used to carry `"cursor": null`.
+            let next_cursor = (rows.len() as u32 == limit)
+                .then(|| rows.last().map(|r| r.rkey.clone()))
+                .flatten();
             return Ok(ListRecordsResponse {
                 cursor: next_cursor,
                 records,
@@ -324,7 +329,9 @@ impl RepoReader {
             });
         }
 
-        let next_cursor = rows.last().map(|(_, _, rkey)| rkey.clone());
+        let next_cursor = (rows.len() as u32 == limit)
+            .then(|| rows.last().map(|(_, _, rkey)| rkey.clone()))
+            .flatten();
         Ok(ListRecordsResponse {
             cursor: next_cursor,
             records,
@@ -341,6 +348,7 @@ impl RepoReader {
                 handle: account.handle,
                 did: account.did,
                 handle_is_correct: true,
+                did_doc: None,
                 collections,
                 head_cid: latest.as_ref().map(|c| c.cid.clone()),
                 head_rev: latest.as_ref().map(|c| c.rev.clone()),
@@ -371,6 +379,7 @@ impl RepoReader {
             handle: account.handle,
             did: account.did,
             handle_is_correct: true,
+            did_doc: None,
             collections,
             head_cid: latest_commit.as_ref().map(|(c, _, _)| c.clone()),
             head_rev: latest_commit.as_ref().map(|(_, r, _)| r.clone()),
@@ -454,7 +463,12 @@ pub struct ListRecordsItem {
 /// Lexicon-shape of a `listRecords` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListRecordsResponse {
-    /// Next-page cursor (`None` if exhausted).
+    /// Next-page cursor, omitted when the listing is exhausted.
+    ///
+    /// Omitted rather than emitted as `null`: the lexicon types `cursor` as a
+    /// plain string, so a null makes the last page of every pagination loop
+    /// throw in a validating client.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     /// Records on this page.
     pub records: Vec<ListRecordsItem>,
@@ -470,6 +484,13 @@ pub struct DescribeRepoResponse {
     /// Whether the handle resolves correctly.
     #[serde(rename = "handleIsCorrect")]
     pub handle_is_correct: bool,
+    /// The account's DID document.
+    ///
+    /// Required by the lexicon. Populated by the HTTP layer, which holds the
+    /// service DID and key store needed to build it; `None` here means the
+    /// reader was used directly rather than through the route.
+    #[serde(rename = "didDoc", skip_serializing_if = "Option::is_none")]
+    pub did_doc: Option<serde_json::Value>,
     /// Collections present in the repo.
     pub collections: Vec<String>,
     /// Current head commit CID, if any.

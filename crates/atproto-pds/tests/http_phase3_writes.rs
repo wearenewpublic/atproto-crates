@@ -247,10 +247,19 @@ async fn apply_writes_atomic_batch() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["results"].as_array().unwrap().len(), 3);
-    let commit_rev = body["commit"]["rev"].as_str().unwrap().to_string();
-    // All three results share the same commit rev.
+    // One commit covers the whole batch, reported once at the top level.
+    // Per-result `commit` is not part of the `applyWrites` result union — the
+    // members are `#createResult`, `#updateResult` and `#deleteResult`, and
+    // each carries a `$type` naming which it is.
+    assert!(body["commit"]["rev"].as_str().is_some());
     for result in body["results"].as_array().unwrap() {
-        assert_eq!(result["commit"]["rev"], commit_rev);
+        assert!(
+            result["$type"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("com.atproto.repo.applyWrites#")),
+            "each result is a discriminated union member: {result}"
+        );
+        assert!(result.get("commit").is_none());
     }
 
     // Verify the records are listable.

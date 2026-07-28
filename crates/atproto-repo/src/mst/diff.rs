@@ -166,10 +166,16 @@ pub struct RepoOp {
     pub action: RepoOpAction,
     /// Repo path (`<collection>/<rkey>`).
     pub path: String,
-    /// New record CID. `None` only for delete.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// New record CID; `null` for a delete.
+    ///
+    /// Serialized as an explicit `null` when absent, never omitted:
+    /// `#repoOp.cid` is required-and-nullable, so dropping the key produces an
+    /// object no subscriber can decode against the lexicon.
     pub cid: Option<Cid>,
     /// Prior record CID. Required by Sync 1.1 for update and delete; `None` for create.
+    ///
+    /// Omitted when absent, unlike `cid`: the lexicon declares `prev` optional
+    /// — "for creations, field should not be defined" — rather than nullable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev: Option<Cid>,
 }
