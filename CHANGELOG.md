@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suffixes. The guard is syntactic and does not defend against DNS rebinding.
 
 ### Fixed
+- CI ran an unpinned toolchain, so `cargo clippy` locally and in the spindle were different
+  compilers that disagreed about lints. A `clippy::const_is_empty` failure reached `main` after
+  passing on a developer machine: `assert!(!BUILD_REV.is_empty())` calls `is_empty()` on a `const`
+  filled by `env!`, which the compiler decides, so the assertion can never do work at run time.
+  `rust-toolchain.toml` now pins 1.90 — matching the workspace `rust-version` and the Dockerfile's
+  builder stage — and the workflow installs it through `rustup` and prints the active version. The
+  assertion is replaced by one that reads the build rev back out of the formatted `user_agent()`
+  string, which keeps the property under test and cannot be const-folded.
 - `atproto-pds`: `com.atproto.repo.uploadBlob` returned `{"$link", "mimeType", "size"}`, an envelope
   matching neither JSON form the AT Protocol data model accepts. The two accepted shapes are the
   typed `{"$type": "blob", "ref": {"$link": …}, "mimeType", "size"}` and the legacy two-key

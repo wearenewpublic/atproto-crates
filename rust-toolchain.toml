@@ -1,0 +1,14 @@
+# Pins the toolchain for local development and CI to the same compiler.
+#
+# Without this, `cargo clippy` locally and `cargo clippy` in the spindle ran
+# whatever version each environment happened to supply, so "green locally" did
+# not imply "green in CI". A lint that fires on one and not the other is only
+# discovered after merge, which is exactly what happened with
+# `clippy::const_is_empty`.
+#
+# Keep this in step with two other declarations of the same fact:
+#   - `rust-version` in the workspace Cargo.toml (the MSRV crates publish)
+#   - the `FROM rust:<version>` builder stage in the Dockerfile
+[toolchain]
+channel = "1.90"
+components = ["rustfmt", "clippy"]

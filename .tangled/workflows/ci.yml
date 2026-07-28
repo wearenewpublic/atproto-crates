@@ -4,12 +4,14 @@ when:
 
 engine: "nixery"
 
+# `rustup` rather than nixpkgs `cargo`/`rustc`/`clippy`, so the toolchain comes
+# from `rust-toolchain.toml` instead of whatever version the nixpkgs channel
+# happens to carry. Unpinned, CI and local development ran different compilers
+# and disagreed about lints — a `clippy::const_is_empty` failure reached `main`
+# green from a developer machine.
 dependencies:
   nixpkgs:
-    - cargo
-    - rustc
-    - rustfmt
-    - clippy
+    - rustup
     - git
     - pkg-config
     - openssl
@@ -17,6 +19,11 @@ dependencies:
     - gcc
 
 steps:
+  # Installs the toolchain named in rust-toolchain.toml and prints it, so the
+  # version under test is visible in the log rather than inferred.
+  - name: "toolchain"
+    command: rustup show active-toolchain && cargo clippy --version
+
   # The `dasl-testing` submodule carries the DASL CBOR compliance fixtures.
   # Without it `cargo test` fails 13 cases in `atproto-dasl` on a missing
   # fixture file, so the checkout has to be recursive for the suite to mean

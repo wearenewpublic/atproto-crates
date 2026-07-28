@@ -85,15 +85,29 @@ pub fn user_agent() -> String {
 mod tests {
     use super::*;
 
+    /// The User-Agent is well formed and carries a non-empty build rev.
+    ///
+    /// Asserted through [`user_agent`] rather than against [`BUILD_REV`]
+    /// directly. `BUILD_REV` is a `const` filled by `env!`, so
+    /// `BUILD_REV.is_empty()` is decided by the compiler, and clippy's
+    /// `const_is_empty` rejects the check as one that can never do any work at
+    /// run time. Reading the rev back out of the formatted string keeps the
+    /// property under test — `build.rs` stamped something — while testing the
+    /// value that actually ships on outbound requests.
     #[test]
-    fn build_rev_is_populated() {
-        assert!(!BUILD_REV.is_empty());
-    }
-
-    #[test]
-    fn user_agent_format() {
+    fn user_agent_is_well_formed_and_carries_a_build_rev() {
         let ua = user_agent();
-        assert!(ua.starts_with("atproto-pds/"));
-        assert!(ua.contains('+'));
+        assert!(
+            ua.starts_with("atproto-pds/"),
+            "user agent should name the product: {ua}"
+        );
+        let (version, rev) = ua
+            .rsplit_once('+')
+            .unwrap_or_else(|| panic!("user agent should carry a `+<build-rev>` suffix: {ua}"));
+        assert_eq!(version, format!("atproto-pds/{CRATE_VERSION}"));
+        assert!(
+            !rev.is_empty(),
+            "build.rs should stamp a non-empty BUILD_REV: {ua}"
+        );
     }
 }
