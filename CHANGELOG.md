@@ -34,7 +34,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address literals in every resolver-accepted form, embedded userinfo, non-443 ports and reserved
   suffixes. The guard is syntactic and does not defend against DNS rebinding.
 
+- `atproto-pds`: service auth could mint an unrestricted cross-service credential. Any authenticated
+  account could call `getServiceAuth` with no `lxm` and receive a token scoped to nothing — which
+  satisfies every method a receiving service gates by one — for up to ten minutes, with no
+  protected-method, privileged-method or takedown gate, and no way to revoke it. The only thing
+  keeping that from working against real peers was a wrong `typ` header, which is fixed in the same
+  change; fixing the header alone would have made it live. Now:
+  - `PROTECTED_METHODS` (16 account-management NSIDs) can never be reached through service auth.
+  - `PRIVILEGED_METHODS` — `com.atproto.server.createAccount`, the migration credential, and the
+    `chat.bsky.*` namespace — require a privileged session.
+  - A taken-down account may mint only `com.atproto.server.createAccount`, so a takedown cannot
+    strand an account but cannot be worked around either.
+  - Inbound verification requires `lxm` to be present *and* match. Previously it compared only when
+    the claim happened to be there.
+  - `com.atproto.admin.revokeServiceAuth` now takes effect. It wrote a blacklist row that no
+    verifier read, so an operator revoking a leaked token got 200 OK and nothing happened — a
+    security control that reads as working is worse than an absent one.
+
 ### Fixed
+- `atproto-pds`: service-auth JWTs carried `typ: "at+jwt"`. `@atproto/xrpc-server` throws
+  `BadJwtType` for exactly that value, so every token this PDS minted was refused by the Bluesky
+  AppView, by Ozone, and by any service built on that library — before the signature was checked.
+  All five minters and both verifier constants now emit `"JWT"`, which is what seven of the
+  comparison implementations emit and none emits `at+jwt`.
+- `atproto-pds`: `getServiceAuth` read `exp` as a lifetime rather than an absolute epoch-seconds
+  instant. A client asking for 30 seconds received 600, and a client naming a real timestamp got a
+  token lasting until the clamp. `exp` is now absolute, with `BadExpiration` for an instant in the
+  past, beyond an hour, or beyond a minute for a token with no `lxm`.
 - CI ran an unpinned toolchain, so `cargo clippy` locally and in the spindle were different
   compilers that disagreed about lints. A `clippy::const_is_empty` failure reached `main` after
   passing on a developer machine: `assert!(!BUILD_REV.is_empty())` calls `is_empty()` on a `const`

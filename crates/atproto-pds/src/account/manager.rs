@@ -283,6 +283,45 @@ impl AccountManager {
         Ok(verify_password(password, &hash))
     }
 
+    /// Read an account's current state.
+    ///
+    /// `None` when no such account exists. An unrecognised state string in the
+    /// database also yields `None` rather than a guess, so a caller gating on
+    /// a specific state never mistakes an unknown value for a known one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if the query fails.
+    pub async fn account_state(&self, did: &str) -> PdsResult<Option<AccountState>> {
+        let row: Option<(String,)> = match self.accounts_pool.kind() {
+            #[cfg(feature = "sqlite")]
+            AccountPoolKind::Sqlite => sqlx::query_as("SELECT state FROM account WHERE did = ?")
+                .bind(did)
+                .fetch_optional(self.accounts_pool.as_sqlite())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("fetch state: {e}"),
+                })?,
+            #[cfg(feature = "postgres")]
+            AccountPoolKind::Postgres => sqlx::query_as("SELECT state FROM account WHERE did = $1")
+                .bind(did)
+                .fetch_optional(self.accounts_pool.as_postgres())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("fetch state: {e}"),
+                })?,
+            #[cfg(not(feature = "sqlite"))]
+            AccountPoolKind::Sqlite => {
+                unreachable!("AccountPool::Sqlite without `sqlite` feature")
+            }
+            #[cfg(not(feature = "postgres"))]
+            AccountPoolKind::Postgres => {
+                unreachable!("AccountPool::Postgres without `postgres` feature")
+            }
+        };
+        Ok(row.and_then(|(state,)| AccountState::parse(&state)))
+    }
+
     /// Transition an account's state. Validates the transition.
     pub async fn set_state(&self, did: &str, new_state: AccountState) -> PdsResult<()> {
         let row: Option<(String,)> = match self.accounts_pool.kind() {

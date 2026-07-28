@@ -283,7 +283,7 @@ fn _ensure_bearer_helper_imported(parts: &axum::http::request::Parts) -> Option<
     bearer_token(parts).ok()
 }
 
-/// Mint a 60-second `at+jwt` service-auth token bound to the proxy
+/// Mint a 60-second service-auth token bound to the proxy
 /// audience + lexicon method.
 fn mint_proxy_service_auth(
     caller_did: &str,
@@ -303,7 +303,7 @@ fn mint_proxy_service_auth(
     };
     let header = ProxyServiceAuthHeader {
         alg: jws_alg(signing_key).to_string(),
-        typ: "at+jwt",
+        typ: crate::http::service_auth_handlers::TYP_SERVICE_AUTH,
     };
     let payload = ProxyServiceAuthClaims {
         iss: caller_did,

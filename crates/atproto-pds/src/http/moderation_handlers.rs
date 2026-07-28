@@ -153,7 +153,7 @@ struct ServiceAuthClaims<'a> {
     jti: String,
 }
 
-/// Mint a 60-second `at+jwt` service-auth token signed by `signing_key`,
+/// Mint a 60-second service-auth token signed by `signing_key`,
 /// scoped to the moderation NSID.
 fn mint_service_auth(
     caller_did: &str,
@@ -172,7 +172,7 @@ fn mint_service_auth(
     };
     let header = ServiceAuthHeader {
         alg: jws_alg(signing_key).to_string(),
-        typ: "at+jwt",
+        typ: crate::http::service_auth_handlers::TYP_SERVICE_AUTH,
     };
     let payload = ServiceAuthClaims {
         iss: caller_did,

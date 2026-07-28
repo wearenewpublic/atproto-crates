@@ -2099,6 +2099,10 @@ pub async fn notify_write(
         plc_dir,
         &space.space_did,
         crate::space::notify::NOTIFY_WRITE_NSID,
+        state
+            .account_manager
+            .as_deref()
+            .map(AccountManager::account_pool_ref),
     )
     .await
     .map_err(XrpcError::from)?;
@@ -2573,6 +2577,10 @@ pub async fn notify_space_deleted(
         plc_dir,
         &recipient_did,
         "com.atproto.space.notifySpaceDeleted",
+        state
+            .account_manager
+            .as_deref()
+            .map(AccountManager::account_pool_ref),
     )
     .await
     .map_err(XrpcError::from)?;

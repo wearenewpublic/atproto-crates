@@ -82,6 +82,27 @@ async fn account_signing_pubkey(manager: &AccountManager, did: &str) -> KeyData 
     to_public(&private).unwrap()
 }
 
+/// Epoch seconds, `secs` from now. `exp` is an absolute instant, not a
+/// lifetime, so every test that names one has to compute it.
+fn epoch_in(secs: i64) -> u64 {
+    (chrono::Utc::now().timestamp() + secs).max(0) as u64
+}
+
+/// Decode a compact JWT's header and payload without verifying the signature.
+fn jwt_parts(jwt: &str) -> (Value, Value) {
+    let parts: Vec<&str> = jwt.split('.').collect();
+    assert_eq!(parts.len(), 3, "JWT must have header.payload.sig");
+    let decode = |p: &str| -> Value {
+        serde_json::from_slice(
+            &general_purpose::URL_SAFE_NO_PAD
+                .decode(p.as_bytes())
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    (decode(parts[0]), decode(parts[1]))
+}
+
 async fn get_token(app: axum::Router, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
     let mut req = Request::builder().uri(path);
     if let Some(t) = bearer {
@@ -102,7 +123,7 @@ async fn service_auth_round_trip_signature_verifies() {
 
     let (status, body) = get_token(
         app,
-        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:appview.example&exp=120&lxm=app.bsky.feed.getPosts",
+        &format!("/xrpc/com.atproto.server.getServiceAuth?aud=did:web:appview.example&exp={}&lxm=app.bsky.feed.getPosts", epoch_in(120)),
         Some(&token),
     )
     .await;
@@ -131,7 +152,11 @@ async fn service_auth_round_trip_signature_verifies() {
     assert!(payload["jti"].as_str().unwrap().len() >= 10);
     let iat = payload["iat"].as_u64().unwrap();
     let exp = payload["exp"].as_u64().unwrap();
-    assert_eq!(exp - iat, 120);
+    assert!(
+        (118..=122).contains(&(exp - iat)),
+        "requested expiry should be honoured as an absolute instant, got {}s",
+        exp - iat
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,27 +185,20 @@ async fn service_auth_rejects_non_did_aud() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn service_auth_clamps_max_ttl() {
+async fn service_auth_rejects_expiry_beyond_one_hour() {
     let (app, _, _tmp) = build_app().await;
     let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
-        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&exp=99999",
+        &format!(
+            "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts&exp={}",
+            epoch_in(7200)
+        ),
         Some(&token),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let jwt = body["token"].as_str().unwrap();
-    let parts: Vec<&str> = jwt.split('.').collect();
-    let payload: Value = serde_json::from_slice(
-        &general_purpose::URL_SAFE_NO_PAD
-            .decode(parts[1].as_bytes())
-            .unwrap(),
-    )
-    .unwrap();
-    let iat = payload["iat"].as_u64().unwrap();
-    let exp = payload["exp"].as_u64().unwrap();
-    assert_eq!(exp - iat, 600, "ttl should clamp to 600s");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "BadExpiration");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -203,4 +221,197 @@ async fn service_auth_omits_lxm_when_not_provided() {
     )
     .unwrap();
     assert!(payload.get("lxm").is_none() || payload["lxm"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// Service-auth is a credential handed to another service to act for this
+// account. What it authorises, for how long, and whether it is honoured at all
+// are the whole security surface — and until these gates existed the `typ`
+// header was the only thing keeping the tokens from working at real peers.
+// ---------------------------------------------------------------------------
+
+/// The JWS header must be typed `JWT`.
+///
+/// `@atproto/xrpc-server` throws `BadJwtType` for anything else, so a token
+/// typed `at+jwt` is refused by the Bluesky AppView, by Ozone and by every
+/// service built on that library before the signature is even checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_header_is_typed_jwt() {
+    let (app, _, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (status, body) = get_token(
+        app,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (header, _) = jwt_parts(body["token"].as_str().unwrap());
+    assert_eq!(header["typ"], "JWT", "header: {header}");
+}
+
+/// Omitting `exp` yields the one-minute default.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_defaults_to_sixty_seconds() {
+    let (app, _, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (status, body) = get_token(
+        app,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, payload) = jwt_parts(body["token"].as_str().unwrap());
+    assert_eq!(
+        payload["exp"].as_u64().unwrap() - payload["iat"].as_u64().unwrap(),
+        60
+    );
+}
+
+/// An `exp` already in the past is refused rather than silently honoured.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_rejects_expiry_in_the_past() {
+    let (app, _, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (status, body) = get_token(
+        app,
+        &format!(
+            "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts&exp={}",
+            epoch_in(-60)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "BadExpiration");
+}
+
+/// A token with no `lxm` satisfies every method the receiver scopes by one, so
+/// it is a general-purpose credential and is capped at a minute.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_caps_method_less_tokens_at_one_minute() {
+    let (app, _, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (status, body) = get_token(
+        app,
+        &format!(
+            "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&exp={}",
+            epoch_in(600)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "BadExpiration");
+}
+
+/// Account-management methods must never be reachable through service auth.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_refuses_protected_methods() {
+    let (app, _, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    for lxm in [
+        "com.atproto.identity.updateHandle",
+        "com.atproto.server.createAppPassword",
+        "com.atproto.server.getSession",
+        "com.atproto.identity.signPlcOperation",
+    ] {
+        let (status, body) = get_token(
+            app.clone(),
+            &format!("/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm={lxm}"),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{lxm} must be refused: {body}"
+        );
+    }
+}
+
+/// A taken-down account keeps only its ability to migrate away.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_restricts_takendown_accounts_to_migration() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    manager
+        .set_state(
+            "did:plc:alice",
+            atproto_pds::account::AccountState::Takendown,
+        )
+        .await
+        .expect("takedown should apply");
+
+    let (status, body) = get_token(
+        app.clone(),
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a taken-down account should not mint general service auth: {body}"
+    );
+
+    // Migration remains possible, so a takedown cannot strand an account.
+    let (status, body) = get_token(
+        app,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=com.atproto.server.createAccount",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "migration credential must remain available: {body}"
+    );
+}
+
+/// `createAccount` is the migration credential: a token bearing it lets the
+/// holder create an account elsewhere in the issuer's name. A non-privileged
+/// session — an app password without the privileged flag — must not mint one.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_refuses_privileged_methods_to_unprivileged_sessions() {
+    let (app, _, _tmp) = build_app().await;
+    create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+
+    let unprivileged = atproto_pds::account::session::issue_pair(
+        "did:web:test.example",
+        "did:plc:alice",
+        "app-password-1",
+        false,
+        b"test-secret-do-not-use-in-prod-32!",
+        600,
+        3600,
+    )
+    .expect("issue an unprivileged session")
+    .access_jwt;
+
+    let (status, body) = get_token(
+        app.clone(),
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=com.atproto.server.createAccount",
+        Some(&unprivileged),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unprivileged session must not mint the migration credential: {body}"
+    );
+
+    // The same session may still mint an ordinary read-scoped token.
+    let (status, body) = get_token(
+        app,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts",
+        Some(&unprivileged),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ordinary methods stay available: {body}"
+    );
 }

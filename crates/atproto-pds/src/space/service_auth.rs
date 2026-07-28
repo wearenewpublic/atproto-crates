@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `typ` header value for service-auth JWTs.
-pub const TYP_SERVICE_AUTH: &str = "at+jwt";
+pub const TYP_SERVICE_AUTH: &str = crate::http::service_auth_handlers::TYP_SERVICE_AUTH;
 
 /// Default TTL for a minted notify service-auth token (60s).
 pub const NOTIFY_SERVICE_AUTH_TTL_SECS: u64 = 60;
@@ -128,6 +128,7 @@ pub async fn verify_service_auth(
     plc_directory_hostname: Option<&str>,
     expected_aud: &str,
     expected_lxm: &str,
+    revocations: Option<&crate::account::AccountPool>,
 ) -> PdsResult<ServiceAuthClaims> {
     let mut parts = token.split('.');
     let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
@@ -148,15 +149,40 @@ pub async fn verify_service_auth(
             claims.aud, expected_aud
         )));
     }
-    if let Some(lxm) = claims.lxm.as_deref()
-        && lxm != expected_lxm
-    {
-        return Err(deny(&format!(
-            "service-auth lxm mismatch: token={lxm}, expected={expected_lxm}"
-        )));
+    // A token with no `lxm` is scoped to nothing, which means it satisfies
+    // every method the receiving service gates by one. Accepting it here made
+    // any service-auth token a wildcard credential at this endpoint, so an
+    // absent claim is a failure rather than a pass.
+    match claims.lxm.as_deref() {
+        Some(lxm) if lxm == expected_lxm => {}
+        Some(lxm) => {
+            return Err(deny(&format!(
+                "service-auth lxm mismatch: token={lxm}, expected={expected_lxm}"
+            )));
+        }
+        None => {
+            return Err(deny(&format!(
+                "service-auth token has no lxm; must match: {expected_lxm}"
+            )));
+        }
     }
     if claims.exp <= now_secs() {
         return Err(deny("service-auth token expired"));
+    }
+
+    // `com.atproto.admin.revokeServiceAuth` writes the jti here. Until this
+    // check existed the endpoint returned 200 OK and did nothing, so an
+    // operator revoking a leaked token was told it had worked and it had not —
+    // a security control that reads as working is worse than an absent one.
+    if let Some(pool) = revocations
+        && crate::service_auth_blacklist::contains(pool, &claims.jti).await?
+    {
+        tracing::warn!(
+            jti = %claims.jti,
+            iss = %claims.iss,
+            "rejected a revoked service-auth token"
+        );
+        return Err(deny("service-auth token has been revoked"));
     }
 
     let key = atproto_signing_key(http, &claims.iss, plc_directory_hostname)
@@ -240,5 +266,71 @@ mod tests {
         assert_eq!(claims.aud, "did:plc:owner");
         assert_eq!(claims.lxm.as_deref(), Some("com.atproto.space.notifyWrite"));
         assert!(claims.exp > claims.iat);
+    }
+
+    /// Build a compact token carrying `claims` with a placeholder signature.
+    ///
+    /// The claim checks below all run before the issuer's key is resolved, so
+    /// no network and no valid signature are needed to exercise them.
+    fn unsigned_token(claims: &ServiceAuthClaims) -> String {
+        let header = general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256K","typ":"JWT"}"#);
+        let payload = general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        format!("{header}.{payload}.c2ln")
+    }
+
+    fn claims_with_lxm(lxm: Option<&str>) -> ServiceAuthClaims {
+        ServiceAuthClaims {
+            iss: "did:plc:writer".to_string(),
+            aud: "did:plc:owner".to_string(),
+            lxm: lxm.map(str::to_string),
+            iat: now_secs(),
+            exp: now_secs() + 60,
+            jti: "test-jti".to_string(),
+        }
+    }
+
+    /// A token with no `lxm` must be refused, not treated as satisfying
+    /// whatever method it is presented against.
+    ///
+    /// This is the whole point of the claim: an unscoped token satisfies every
+    /// `lxm`-gated method at every peer that only compares when the claim is
+    /// present, which makes it a wildcard cross-service bearer.
+    #[tokio::test]
+    async fn verify_rejects_a_token_with_no_lxm() {
+        let token = unsigned_token(&claims_with_lxm(None));
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("a token with no lxm must be refused");
+        assert!(
+            err.to_string().contains("no lxm"),
+            "expected an lxm-specific denial, got: {err}"
+        );
+    }
+
+    /// A token scoped to a different method is refused.
+    #[tokio::test]
+    async fn verify_rejects_a_token_scoped_to_another_method() {
+        let token = unsigned_token(&claims_with_lxm(Some("com.atproto.repo.createRecord")));
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("a mismatched lxm must be refused");
+        assert!(
+            err.to_string().contains("lxm mismatch"),
+            "expected an lxm mismatch denial, got: {err}"
+        );
     }
 }

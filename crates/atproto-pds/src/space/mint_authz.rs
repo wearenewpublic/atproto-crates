@@ -470,7 +470,7 @@ struct ServiceAuthClaims<'a> {
     jti: String,
 }
 
-/// Mint a 60-second `at+jwt` service-auth token signed by the owner's signing
+/// Mint a 60-second service-auth token signed by the owner's signing
 /// key, scoped to `com.atproto.simplespace.checkUserAccess`.
 fn mint_check_user_access_service_auth(
     owner_did: &str,
@@ -487,7 +487,7 @@ fn mint_check_user_access_service_auth(
     };
     let header = ServiceAuthHeader {
         alg: atproto_identity::key::jws_alg(signing_key).to_string(),
-        typ: "at+jwt",
+        typ: crate::http::service_auth_handlers::TYP_SERVICE_AUTH,
     };
     let payload = ServiceAuthClaims {
         iss: owner_did,

@@ -324,7 +324,7 @@ pub async fn request_plc_operation_signature(
     });
     let header = serde_json::json!({
         "alg": jws_alg(&signing_key),
-        "typ": "at+jwt",
+        "typ": crate::http::service_auth_handlers::TYP_SERVICE_AUTH,
     });
     let header_b64 = B64URL.encode(serde_json::to_vec(&header).unwrap());
     let claims_b64 = B64URL.encode(serde_json::to_vec(&claims).unwrap());
