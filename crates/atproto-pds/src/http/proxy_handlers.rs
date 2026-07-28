@@ -30,11 +30,12 @@
 
 use crate::http::auth::{bearer_token, request_htm_htu, require_authn_sub};
 use crate::http::errors::XrpcError;
+use crate::http::proxy_target::ProxyTarget;
 use crate::http::space_auth::local_signing_key;
 use crate::http::state::HttpState;
 use atproto_identity::key::{jws_alg, sign as identity_sign};
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use base64::Engine as _;
@@ -42,15 +43,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use rand::RngExt;
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Inbound `Atproto-Proxy: <did>#<service-id>` header form.
-#[derive(Debug, Clone)]
-struct ProxyTarget {
-    /// Audience DID for the service-auth token.
-    did: String,
-    /// Base URL the request gets forwarded to.
-    url: String,
-}
 
 /// Resolve the proxy target for an inbound request.
 ///
@@ -60,7 +52,7 @@ struct ProxyTarget {
 ///
 /// Returns `Ok(None)` when there is no proxy target (the request should
 /// be served locally). `Err` is reserved for malformed proxy headers.
-fn resolve_target(
+async fn resolve_target(
     headers: &HeaderMap,
     state: &HttpState,
     nsid: &str,
@@ -83,8 +75,8 @@ fn resolve_target(
                 "Atproto-Proxy must be `<did>#<service-id>`",
             ));
         }
-        // Per-request override: only the configured AppView DID is
-        // recognized today. Arbitrary DID-doc resolution is.
+        // The operator's own AppView is a fast path — it needs no network and
+        // is by far the most requested target.
         if let Some(app_view_did) = state.bsky_app_view_did.as_deref()
             && did == app_view_did
             && let Some(url) = state.bsky_app_view_url.as_deref()
@@ -94,14 +86,23 @@ fn resolve_target(
                 url: url.to_string(),
             }));
         }
+        // Anything else is resolved from its DID document. This is what makes
+        // labelers, feed generators, chat and third-party AppViews reachable
+        // at all, rather than only the one endpoint the operator pinned.
+        if let Some(resolver) = state.proxy_resolver.as_ref()
+            && let Some(target) = resolver.resolve(did, service_id).await
+        {
+            return Ok(Some(target));
+        }
         return Err(XrpcError::new(
             StatusCode::BAD_GATEWAY,
             "ProxyDidUnknown",
-            format!("Atproto-Proxy DID {did} is not in the operator-configured proxy registry"),
+            format!("could not resolve Atproto-Proxy target {did}#{service_id}"),
         ));
     }
-    // Default pin: app.bsky.* → configured AppView when set.
-    if nsid.starts_with("app.bsky.")
+    // Default pin: the configured AppView, when one is set. Only namespaces
+    // this PDS does not serve locally reach here at all.
+    if PROXIED_NAMESPACES.iter().any(|ns| nsid.starts_with(ns))
         && let (Some(did), Some(url)) = (
             state.bsky_app_view_did.as_deref(),
             state.bsky_app_view_url.as_deref(),
@@ -115,16 +116,45 @@ fn resolve_target(
     Ok(None)
 }
 
-/// Catch-all proxy handler mounted at `/xrpc/app.bsky.*`. Forwards to
-/// the configured AppView (or the per-request `Atproto-Proxy` target).
+/// Namespaces this PDS forwards rather than serves.
+///
+/// `com.atproto.label.*` is listed rather than `com.atproto.*` because almost
+/// every other `com.atproto` method is served locally; a broader prefix would
+/// shadow them.
+pub const PROXIED_NAMESPACES: &[&str] = &[
+    "app.bsky.",
+    "chat.bsky.",
+    "tools.ozone.",
+    "com.atproto.label.",
+];
+
+/// Catch-all proxy handler. Forwards to the configured AppView, or to the
+/// service named by a per-request `Atproto-Proxy` header.
+///
+/// The NSID and query string are read from [`OriginalUri`] rather than from the
+/// route capture. A catch-all after a literal prefix captures only the
+/// remainder — `/xrpc/app.bsky.{*nsid}` yields `feed.getTimeline`, not
+/// `app.bsky.feed.getTimeline` — so re-prefixing by hand would tie this handler
+/// to the exact route literals it happens to be mounted at.
 pub async fn proxy_app_bsky(
     State(state): State<HttpState>,
-    Path(nsid): Path<String>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, XrpcError> {
-    proxy_call(&state, &nsid, method, headers, body).await
+    let nsid = uri
+        .path()
+        .strip_prefix("/xrpc/")
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                "proxy route reached without an /xrpc/ path",
+            )
+        })?
+        .to_string();
+    proxy_call(&state, &nsid, uri.query(), method, headers, body).await
 }
 
 /// Core proxy logic. Resolves the target, mints a service-auth bearer
@@ -132,11 +162,12 @@ pub async fn proxy_app_bsky(
 async fn proxy_call(
     state: &HttpState,
     nsid: &str,
+    query: Option<&str>,
     method: Method,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, XrpcError> {
-    let target = match resolve_target(&headers, state, nsid)? {
+    let target = match resolve_target(&headers, state, nsid).await? {
         Some(t) => t,
         None => {
             // No proxy configured — return a structured 502 so the
@@ -166,11 +197,19 @@ async fn proxy_call(
     let signing_key = local_signing_key(manager, &caller).await?;
     let token = mint_proxy_service_auth(&caller, &target.did, nsid, &signing_key)?;
 
-    // Forward.
-    let endpoint = format!(
-        "{base}/xrpc/{nsid}",
-        base = target.url.trim_end_matches('/')
-    );
+    // Forward, carrying the query string. Dropping it turns every
+    // parameterised call — every cursor, every limit — into its unfiltered
+    // form, which is worse than failing.
+    let endpoint = match query {
+        Some(query) if !query.is_empty() => format!(
+            "{base}/xrpc/{nsid}?{query}",
+            base = target.url.trim_end_matches('/')
+        ),
+        _ => format!(
+            "{base}/xrpc/{nsid}",
+            base = target.url.trim_end_matches('/')
+        ),
+    };
     let http = reqwest::Client::builder()
         .user_agent(crate::user_agent())
         .timeout(Duration::from_secs(20))
@@ -363,6 +402,7 @@ mod tests {
         state.bsky_app_view_url = Some("https://app.example".to_string());
         let headers = HeaderMap::new();
         let target = resolve_target(&headers, &state, "app.bsky.feed.getTimeline")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(target.did, "did:web:appview");
@@ -380,6 +420,7 @@ mod tests {
             HeaderValue::from_static("did:web:appview#bsky_appview"),
         );
         let target = resolve_target(&headers, &state, "app.bsky.feed.getTimeline")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(target.did, "did:web:appview");
@@ -395,7 +436,9 @@ mod tests {
             "atproto-proxy",
             HeaderValue::from_static("did:web:other#svc"),
         );
-        let err = resolve_target(&headers, &state, "app.bsky.actor.getProfile").unwrap_err();
+        let err = resolve_target(&headers, &state, "app.bsky.actor.getProfile")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_GATEWAY);
         assert_eq!(err.name, "ProxyDidUnknown");
     }
@@ -403,8 +446,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_no_appview_no_proxy_returns_none() {
         let state = empty_state().await;
-        let target =
-            resolve_target(&HeaderMap::new(), &state, "app.bsky.feed.getTimeline").unwrap();
+        let target = resolve_target(&HeaderMap::new(), &state, "app.bsky.feed.getTimeline")
+            .await
+            .unwrap();
         assert!(target.is_none());
     }
 
@@ -414,8 +458,9 @@ mod tests {
         state.bsky_app_view_did = Some("did:web:appview".to_string());
         state.bsky_app_view_url = Some("https://app.example".to_string());
         // com.atproto.* is locally served — no proxy target by default.
-        let target =
-            resolve_target(&HeaderMap::new(), &state, "com.atproto.repo.getRecord").unwrap();
+        let target = resolve_target(&HeaderMap::new(), &state, "com.atproto.repo.getRecord")
+            .await
+            .unwrap();
         assert!(target.is_none());
     }
 
@@ -425,7 +470,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         // Missing `#service-id` half.
         headers.insert("atproto-proxy", HeaderValue::from_static("did:web:appview"));
-        let err = resolve_target(&headers, &state, "app.bsky.actor.getProfile").unwrap_err();
+        let err = resolve_target(&headers, &state, "app.bsky.actor.getProfile")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 }

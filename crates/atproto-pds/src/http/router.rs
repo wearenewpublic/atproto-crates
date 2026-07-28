@@ -14,7 +14,7 @@ use crate::http::state::HttpState;
 use crate::http::write_handlers;
 use crate::oauth;
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 
 /// Build the full router (read-only + auth flows).
 ///
@@ -108,14 +108,28 @@ pub fn build_router(state: HttpState) -> Router {
             "/xrpc/com.atproto.sync.requestCrawl",
             post(handlers::request_crawl),
         )
-        // §11a — Atproto-Proxy default pin: app.bsky.* → configured AppView.
-        // Per-request `Atproto-Proxy: <did>#<service-id>` overrides at runtime.
+        // Namespaces this server forwards rather than serves. The default
+        // target is the configured AppView; a per-request
+        // `Atproto-Proxy: <did>#<service-id>` names any other service, which
+        // is what makes labelers, feed generators, chat and Ozone reachable.
+        //
+        // `com.atproto.label.` rather than `com.atproto.` — the rest of that
+        // namespace is served locally and a broader prefix would shadow it.
         .route(
             "/xrpc/app.bsky.{*nsid}",
-            get(proxy_handlers::proxy_app_bsky)
-                .post(proxy_handlers::proxy_app_bsky)
-                .put(proxy_handlers::proxy_app_bsky)
-                .delete(proxy_handlers::proxy_app_bsky),
+            any(proxy_handlers::proxy_app_bsky),
+        )
+        .route(
+            "/xrpc/chat.bsky.{*nsid}",
+            any(proxy_handlers::proxy_app_bsky),
+        )
+        .route(
+            "/xrpc/tools.ozone.{*nsid}",
+            any(proxy_handlers::proxy_app_bsky),
+        )
+        .route(
+            "/xrpc/com.atproto.label.{*nsid}",
+            any(proxy_handlers::proxy_app_bsky),
         )
         // com.atproto.server.*
         .route(

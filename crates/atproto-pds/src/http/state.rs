@@ -67,6 +67,11 @@ pub struct HttpState {
     /// `PDS_EMAIL_SMTP_URL` + `PDS_EMAIL_FROM_ADDRESS` are set; otherwise a
     /// disabled stub that logs the would-be confirmation URL.
     pub email: EmailService,
+    /// Resolves an `Atproto-Proxy` DID to a forwarding target, with a TTL
+    /// cache. `None` disables per-request proxy targets, leaving only the
+    /// operator-pinned AppView reachable.
+    pub proxy_resolver: Option<Arc<crate::http::proxy_target::CachingProxyResolver>>,
+
     /// DNS resolver for handle-to-DID resolution via TXT records
     /// When `Some`, `resolveHandle` performs the
     /// dual DNS+HTTP resolution per `atproto_identity::resolve::resolve_handle`;
@@ -140,6 +145,7 @@ impl HttpState {
             event_bus: EventBus::default(),
             pds_signing_key: None,
             email: EmailService::default(),
+            proxy_resolver: None,
             dns_resolver: None,
             report_service_did: None,
             report_service_url: None,
@@ -183,6 +189,7 @@ impl HttpState {
             event_bus: EventBus::default(),
             pds_signing_key: None,
             email: EmailService::default(),
+            proxy_resolver: None,
             dns_resolver: None,
             report_service_did: None,
             report_service_url: None,
@@ -257,6 +264,19 @@ impl HttpState {
     #[must_use]
     pub fn with_email_service(mut self, email: EmailService) -> Self {
         self.email = email;
+        self
+    }
+
+    /// Attach a resolver for per-request `Atproto-Proxy` targets.
+    ///
+    /// Without one, only the operator-configured AppView is reachable and any
+    /// other DID in the header is refused.
+    #[must_use]
+    pub fn with_proxy_resolver(
+        mut self,
+        resolver: Arc<crate::http::proxy_target::CachingProxyResolver>,
+    ) -> Self {
+        self.proxy_resolver = Some(resolver);
         self
     }
 

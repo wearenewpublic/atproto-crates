@@ -610,6 +610,36 @@ async fn main() -> anyhow::Result<()> {
     if let Some(plc) = plc_service {
         state = state.with_plc_service(plc);
     }
+
+    // Per-request `Atproto-Proxy` targets. Without this only the pinned
+    // AppView above is reachable, which is what keeps labelers, feed
+    // generators, chat and Ozone out of reach.
+    {
+        let http = reqwest::Client::builder()
+            .user_agent(atproto_pds::user_agent())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let plc_hostname = args
+            .plc_directory
+            .clone()
+            .unwrap_or_else(|| "plc.directory".to_string());
+        let resolver = atproto_pds::http::proxy_target::NetworkDidDocumentResolver::new(
+            http,
+            plc_hostname.clone(),
+        );
+        info!(
+            plc_hostname,
+            ttl_secs = atproto_pds::http::proxy_target::DEFAULT_PROXY_CACHE_TTL.as_secs(),
+            "Atproto-Proxy targets resolve from DID documents"
+        );
+        state = state.with_proxy_resolver(std::sync::Arc::new(
+            atproto_pds::http::proxy_target::CachingProxyResolver::new(
+                std::sync::Arc::new(resolver),
+                atproto_pds::http::proxy_target::DEFAULT_PROXY_CACHE_TTL,
+            ),
+        ));
+    }
     #[cfg(feature = "hickory-dns")]
     {
         // Space-type declaration resolver (NSID → declared `collections`) for

@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod identity_handlers;
 pub mod moderation_handlers;
 pub mod proxy_handlers;
+pub mod proxy_target;
 pub mod router;
 pub mod service_auth_handlers;
 pub mod space_auth;

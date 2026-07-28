@@ -52,6 +52,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: AppView proxying was non-functional as routed, so no Bluesky client worked against
+  this server. The route `/xrpc/app.bsky.{*nsid}` captures only what follows the literal prefix, so
+  `app.bsky.feed.getTimeline` arrived as `feed.getTimeline`. The default-pin test
+  `nsid.starts_with("app.bsky.")` could therefore never match — every unheadered call returned 503 —
+  and a headered one forwarded to `{appview}/xrpc/feed.getTimeline` with the query string dropped
+  entirely. The NSID and query now come from the original request URI.
+
+  The unit tests passed throughout because they called `resolve_target` with a hand-written full
+  NSID rather than routing a request. The new tests go through the real router and assert what a
+  stand-in upstream actually receives.
+
+### Added
+- `atproto-pds`: `Atproto-Proxy: <did>#<service-id>` now resolves the named DID's document and
+  forwards to the service carrying that fragment, instead of refusing every DID except the
+  operator-pinned AppView. This is what makes labelers, feed generators, chat and Ozone reachable.
+  Endpoints are read through `Document::service_endpoint_validated`, so an attacker-supplied DID
+  cannot direct the server at an internal address; resolutions are cached with a five-minute TTL,
+  negative results included, so a bad header cannot drive one outbound request per inbound one.
+- `atproto-pds`: routes for `chat.bsky.*`, `tools.ozone.*` and `com.atproto.label.*`.
+  `com.atproto.label.` specifically rather than `com.atproto.`, which would shadow the many methods
+  served locally.
 - `atproto-pds` / `atproto-dasl`: records were DAG-CBOR-encoded straight from JSON, so a record
   containing a blob ref hashed to a CID no other implementation computes. The AT Protocol data model
   has one shape and two encodings: DAG-CBOR expresses links and byte strings directly, while JSON
