@@ -978,32 +978,58 @@ pub async fn force_repo_sync(
     let store = crate::actor_store::sql::SqlActorStore::open(manager.data_dir(), &input.did)
         .await
         .map_err(XrpcError::from)?;
-    let head: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT cid, rev,
-            (SELECT COUNT(*) FROM repo_block) AS blocks
-         FROM commit_obj ORDER BY rev DESC LIMIT 1",
-    )
-    .fetch_optional(store.pool())
-    .await
-    .map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("forceRepoSync head lookup: {e}"),
-        )
-    })?;
-    let (head_cid, head_rev, blocks) = head.ok_or_else(|| {
+    let head: Option<(String, String)> =
+        sqlx::query_as("SELECT cid, rev FROM commit_obj ORDER BY rev DESC LIMIT 1")
+            .fetch_optional(store.pool())
+            .await
+            .map_err(|e| {
+                XrpcError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    format!("forceRepoSync head lookup: {e}"),
+                )
+            })?;
+    let (head_cid, head_rev) = head.ok_or_else(|| {
         XrpcError::new(
             StatusCode::NOT_FOUND,
             "RepoNotFound",
             format!("account {} has no commits", input.did),
         )
     })?;
+    // `#sync` carries the commit block, so read it back out of the repo.
+    let commit_cid: cid::Cid = head_cid.parse().map_err(|e: cid::Error| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("forceRepoSync parse head CID: {e}"),
+        )
+    })?;
+    let commit_block: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM repo_block WHERE cid = ?")
+            .bind(&head_cid)
+            .fetch_optional(store.pool())
+            .await
+            .map_err(|e| {
+                XrpcError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    format!("forceRepoSync head block lookup: {e}"),
+                )
+            })?;
+    let commit_block = commit_block
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::NOT_FOUND,
+                "RepoNotFound",
+                format!("head commit block {head_cid} is missing from the repo"),
+            )
+        })?
+        .0;
     let event = crate::sequencer::sync_event::SyncEvent {
         did: &input.did,
-        head: &head_cid,
         rev: &head_rev,
-        blocks: blocks.max(0) as usize,
+        commit_cid: &commit_cid,
+        commit_block: &commit_block,
     };
     let seq = crate::sequencer::publish_sync(&manager.sequencer(), &event)
         .await

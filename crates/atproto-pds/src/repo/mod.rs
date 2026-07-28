@@ -13,6 +13,9 @@
 #[cfg(feature = "sqlite")]
 pub mod car_export;
 
+/// CARv1 slices for the firehose `blocks` field.
+pub mod commit_car;
+
 #[cfg(feature = "sqlite")]
 pub mod import;
 
@@ -24,6 +27,7 @@ pub mod writer;
 
 #[cfg(feature = "sqlite")]
 pub use car_export::{export_blocks_car, export_repo_car};
+pub use commit_car::{RecordingBlockStorage, build_commit_car, build_sync_car};
 
 #[cfg(feature = "sqlite")]
 pub use import::{ImportOutcome, RepoImporter};

@@ -28,6 +28,7 @@ use crate::actor_store::{
     CommitRow as ActorCommitRow, PublicRealmBackend, RecordRow as ActorRecordRow,
 };
 use crate::errors::{PdsError, PdsResult};
+use crate::repo::commit_car::{RecordingBlockStorage, build_commit_car};
 use crate::sequencer::{EventType, OutboxReader};
 use atproto_dasl::cid::compute_cid;
 use atproto_dasl::storage::BlockStorage;
@@ -226,9 +227,9 @@ impl RepoWriter {
                         .map_err(|e: cid::Error| PdsError::Storage {
                             reason: format!("parse prior data CID: {e}"),
                         })?;
-                Mst::from_root(root, block_storage, config)
+                Mst::from_root(root, RecordingBlockStorage::new(block_storage), config)
             }
-            None => Mst::new(block_storage, config),
+            None => Mst::new(RecordingBlockStorage::new(block_storage), config),
         };
 
         // Apply ops to the MST + persist record bytes to repo_block.
@@ -409,6 +410,10 @@ impl RepoWriter {
             reason: format!("encode signed commit: {e}"),
         })?;
         let commit_cid = compute_cid(&commit_bytes);
+        // The CARv1 slice this event carries. `mst` is finished with by now, so
+        // the recorder can be unwrapped for the blocks the commit wrote.
+        let (_, written_blocks) = mst.into_storage().into_parts();
+        let blocks_car = build_commit_car(&commit_cid, &commit_bytes, &written_blocks).await?;
 
         // Persist commit + record-rows + outbox event in one tx.
         let mut tx = pool.begin().await.map_err(|e| PdsError::Storage {
@@ -480,6 +485,7 @@ impl RepoWriter {
             prior.as_ref().map(|(_, rev, _)| rev.clone()),
             prev_data_cid.as_deref(),
             repo_ops.clone(),
+            blocks_car,
         )?)?;
 
         tx.commit().await.map_err(|e| PdsError::Storage {
@@ -547,9 +553,9 @@ impl RepoWriter {
                         .map_err(|e: cid::Error| PdsError::Storage {
                             reason: format!("parse prior data CID: {e}"),
                         })?;
-                Mst::from_root(root, block_storage, config)
+                Mst::from_root(root, RecordingBlockStorage::new(block_storage), config)
             }
-            None => Mst::new(block_storage, config),
+            None => Mst::new(RecordingBlockStorage::new(block_storage), config),
         };
 
         // Apply ops to the MST + persist record bytes.
@@ -720,6 +726,10 @@ impl RepoWriter {
             reason: format!("encode signed commit: {e}"),
         })?;
         let commit_cid = compute_cid(&commit_bytes);
+        // The CARv1 slice this event carries. `mst` is finished with by now, so
+        // the recorder can be unwrapped for the blocks the commit wrote.
+        let (_, written_blocks) = mst.into_storage().into_parts();
+        let blocks_car = build_commit_car(&commit_cid, &commit_bytes, &written_blocks).await?;
 
         // Build the atomic-commit batch.
         let commit_row = ActorCommitRow {
@@ -750,6 +760,7 @@ impl RepoWriter {
             prior.as_ref().map(|row| row.rev.clone()),
             commit_row.prev_data_cid.as_deref(),
             repo_ops.clone(),
+            blocks_car,
         )?)?;
         let commit_cid_str = commit_cid.to_string();
         let batch = CommitBatch {
@@ -797,8 +808,9 @@ pub async fn outbox_latest_seq(store: &SqlActorStore) -> PdsResult<Option<i64>> 
 ///
 /// `since` is the revision of the previous commit from this repo — the point a
 /// subscriber would be resuming from — and is null for a repository's first
-/// commit. `blocks` and `blobs` are present and empty: both are required
-/// fields, and filling them is F-FIRE-02 and F-BLOB-02 respectively.
+/// commit. `blocks` is the CARv1 slice carrying what this commit wrote.
+/// `blobs` remains empty pending F-BLOB-02.
+#[allow(clippy::too_many_arguments)]
 fn commit_body(
     did: &str,
     commit_cid: &cid::Cid,
@@ -806,6 +818,7 @@ fn commit_body(
     since: Option<String>,
     prev_data_cid: Option<&str>,
     ops: Vec<atproto_repo::mst::RepoOp>,
+    blocks: Vec<u8>,
 ) -> PdsResult<crate::sequencer::payload::CommitBody> {
     let prev_data = prev_data_cid
         .map(|text| {
@@ -823,7 +836,7 @@ fn commit_body(
         commit: atproto_dasl::Cid::from(*commit_cid),
         rev: rev.to_string(),
         since,
-        blocks: Vec::new(),
+        blocks,
         ops,
         blobs: Vec::new(),
         prev_data,

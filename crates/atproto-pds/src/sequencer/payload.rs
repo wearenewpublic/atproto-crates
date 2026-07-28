@@ -49,10 +49,10 @@ pub struct CommitBody {
     pub rev: String,
     /// Revision of the previous commit from this repo, or null for the first.
     pub since: Option<String>,
-    /// CARv1 slice carrying the blocks this commit touched.
+    /// CARv1 slice carrying the blocks this commit wrote, rooted at `commit`.
     ///
-    /// Empty until the commit path builds one (F-FIRE-02): the field is
-    /// required, so it is present and well-typed, but it carries nothing yet.
+    /// Not yet the Sync 1.1 covering proof (F-FIRE-06) — an inductive consumer
+    /// needs the prior state of each touched key as well.
     #[serde(with = "serde_bytes")]
     pub blocks: Vec<u8>,
     /// The record operations this commit performed.
@@ -70,7 +70,7 @@ pub struct CommitBody {
 pub struct SyncBody {
     /// DID of the repository.
     pub did: String,
-    /// CARv1 slice carrying the commit. Empty until F-FIRE-02.
+    /// CARv1 rooted at the head commit and carrying that commit block.
     #[serde(with = "serde_bytes")]
     pub blocks: Vec<u8>,
     /// Revision of the commit being asserted.

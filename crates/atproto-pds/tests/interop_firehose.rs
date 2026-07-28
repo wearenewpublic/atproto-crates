@@ -49,11 +49,11 @@ use tower::ServiceExt;
 /// Every entry here is a statement that a known, filed defect is still open —
 /// never add one to silence a genuine regression.
 ///
-/// Empty since bodies became flat and lexicon-shaped, and stopped
-/// round-tripping through JSON. Note what that does *not* mean: `blocks` is
-/// well-typed and empty, not populated. Carrying a real CARv1 is F-FIRE-02, and
-/// `blocks_is_present_but_empty` below pins the current state so the gap stays
-/// visible rather than being implied by a green tick.
+/// Empty since bodies became flat and lexicon-shaped, stopped round-tripping
+/// through JSON, and began carrying a real CARv1 in `blocks`. What that does
+/// *not* mean is that the frames satisfy an inductive consumer: the CAR holds
+/// the blocks the commit wrote, not the Sync 1.1 covering proof (F-FIRE-06),
+/// and `blobs` is still empty (F-BLOB-02).
 const KNOWN_FAILURES: &[(&str, &str)] = &[];
 
 /// Look up a check in [`KNOWN_FAILURES`], returning the finding ID if listed.
@@ -123,7 +123,7 @@ const COMMIT_REQUIRED_FIELDS: &[&str] = &[
 /// of what changed: bodies are DAG-CBOR now, not JSON. The assertions below
 /// stay derived from the lexicon rather than from this helper — what is
 /// constructed here is only the input.
-fn stored_commit_body() -> Vec<u8> {
+fn stored_commit_body(blocks: Vec<u8>) -> Vec<u8> {
     use atproto_pds::sequencer::payload::{CommitBody, encode};
     encode(&CommitBody {
         rebase: false,
@@ -136,7 +136,7 @@ fn stored_commit_body() -> Vec<u8> {
         ),
         rev: "3kmev".to_string(),
         since: None,
-        blocks: Vec::new(),
+        blocks,
         ops: Vec::new(),
         blobs: Vec::new(),
         prev_data: None,
@@ -155,7 +155,7 @@ fn split_frame<'a>(frame: &'a [u8], expected_header: &[u8]) -> &'a [u8] {
 
 #[test]
 fn interop_cbor_header_bytes() {
-    let payload = stored_commit_body();
+    let payload = stored_commit_body(Vec::new());
     let (frame, is_text) = encode_event(
         Encoding::Cbor,
         "commit",
@@ -204,7 +204,7 @@ fn interop_info_header_bytes() {
 /// exact bytes would only record how far off it is.
 #[test]
 fn interop_commit_body_matches_lexicon() {
-    let payload = stored_commit_body();
+    let payload = stored_commit_body(Vec::new());
     let (frame, _) = encode_event(
         Encoding::Cbor,
         "commit",
@@ -383,20 +383,22 @@ async fn subscribe_repos_end_to_end() {
     );
 }
 
-/// `blocks` is well-typed but carries nothing yet.
+/// A `blocks` slice that is present but empty is no longer acceptable.
 ///
-/// The firehose is a notification stream, not a data feed, until the commit
-/// path builds a CARv1 slice (F-FIRE-02). Asserted rather than left implicit so
-/// that a passing conformance harness is not mistaken for a working feed — and
-/// so this test fails, loudly, the moment the gap is closed.
+/// This replaces `blocks_is_present_but_empty_pending_car_slices`, which pinned
+/// the gap while F-FIRE-02 was open and instructed its own replacement. The
+/// write path now builds a real CARv1; `tests/firehose_car.rs` asserts what it
+/// contains. What is checked here is the encoder's half of the contract — that
+/// a slice handed to it survives the frame intact, byte for byte.
 #[test]
-fn blocks_is_present_but_empty_pending_car_slices() {
+fn the_encoder_passes_a_car_slice_through_unchanged() {
+    let car = vec![0x3a, 0xa2, 0x65, 0x72, 0x6f, 0x6f, 0x74, 0x73];
     let (frame, _) = encode_event(
         Encoding::Cbor,
         "commit",
         1,
         "did:plc:a",
-        &stored_commit_body(),
+        &stored_commit_body(car.clone()),
         "2026-07-28T00:00:00.000Z",
     )
     .expect("commit frame should encode");
@@ -408,7 +410,7 @@ fn blocks_is_present_but_empty_pending_car_slices() {
     };
     assert_eq!(
         map.get("blocks"),
-        Some(&atproto_dasl::Ipld::Bytes(Vec::new())),
-        "when F-FIRE-02 lands this should carry a CARv1 and this test should be replaced"
+        Some(&atproto_dasl::Ipld::Bytes(car)),
+        "the frame encoder must not touch the CAR the write path built"
     );
 }

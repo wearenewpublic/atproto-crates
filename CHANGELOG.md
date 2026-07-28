@@ -52,6 +52,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: the firehose named records without shipping them. `#commit.blocks` is a required
+  `bytes` field the lexicon describes as a CAR rooted at the commit block, and it was zero bytes —
+  no CAR was ever built, because `car_export` was reachable only from `getRepo` and `getBlocks`.
+  A consumer learned that a record had changed and had to come back over XRPC to learn what it
+  said, which makes the stream a notification feed rather than the thing federation runs on.
+  `#sync.blocks` had the matching gap: it once carried a block *count*, and since the previous
+  release a well-typed empty byte string.
+
+  Both now carry a real CARv1. `RecordingBlockStorage` wraps the storage the MST writes through and
+  keeps every block written during the commit, so the diff is captured by construction — the writer
+  puts exactly the record blocks and MST nodes the commit creates — rather than re-derived
+  afterwards by comparing two trees. Recording alone over-collects, because a multi-operation batch
+  rewrites intermediate MST nodes the final root never references, so the recorded set is filtered
+  to what the new commit can reach. Blocks the commit did not write are left out even when
+  reachable: the consumer already has them, and that is what makes this a diff rather than a
+  snapshot. `#sync` carries the commit block alone, which is what a consumer needs to re-anchor.
+
+  **This is not the Sync 1.1 covering proof.** A proof also carries the blocks needed to verify the
+  prior state of each touched key, so a consumer can check the operation inductively without
+  holding the repository; that is a separate piece of work, and the vendored
+  `firehose/commit-proof-fixtures.json` describes that larger block set. Until it lands, consumers
+  that verify inductively will still reject these frames. Consumers that trust the PDS can now read
+  the records off the stream. `blobs` also remains empty.
+
 - `atproto-pds`: `seq` numbered a repository rather than the stream, so the firehose cursor meant
   nothing. `outbox.seq` was an `AUTOINCREMENT` column inside each per-actor database, which made
   every account's first event `seq = 1` — two repositories were handed the same number, a resuming

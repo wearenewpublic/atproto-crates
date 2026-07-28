@@ -340,12 +340,16 @@ impl<'a> RepoImporter<'a> {
         // lexicon, `#sync` force-sets the head commit without a diff —
         // exactly the right semantics after a CAR import. Best-effort: the
         // import has already succeeded; a publish failure logs and continues.
-        let head_cid_str = head_cid.to_string();
+        // Re-encode the head commit: `#sync` ships the block itself so a
+        // consumer can re-anchor without a follow-up fetch.
+        let head_block = atproto_dasl::to_vec(head).map_err(|e| PdsError::Storage {
+            reason: format!("encode head commit for #sync: {e}"),
+        })?;
         let sync_event = crate::sequencer::sync_event::SyncEvent {
             did: account_did,
-            head: &head_cid_str,
             rev: &head.rev,
-            blocks: blocks.len(),
+            commit_cid: &head_cid,
+            commit_block: &head_block,
         };
         match self.sequencer {
             Some(sequencer) => {
