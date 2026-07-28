@@ -124,3 +124,75 @@ async fn list_missing_blobs_starts_empty() {
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["blobs"].as_array().unwrap().len(), 0);
 }
+
+/// An uploaded blob must never render as a document on this origin.
+///
+/// The MIME type comes from the client's `content-type` header and is not
+/// validated, so a caller can declare `text/html`. This origin also serves the
+/// OAuth consent screen and session cookies, so a blob that renders is stored
+/// XSS against the authorization server — a victim who opens the blob URL runs
+/// the uploader's script with this origin's cookies in scope.
+///
+/// Three headers together prevent it: `nosniff` stops a browser second-guessing
+/// a benign declared type, `content-disposition: attachment` makes the response
+/// a download rather than a document, and the CSP neuters it if it is rendered
+/// anyway.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_blob_refuses_to_render_as_a_document() {
+    let (app, _tmp) = build_app().await;
+    let did = "did:plc:blobxss";
+    let token = create_account(&app, did, "xss.test.example").await;
+
+    // Upload something a browser would happily execute, declared as such.
+    let payload = b"<script>alert(document.domain)</script>".to_vec();
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.uploadBlob")
+        .method("POST")
+        .header("content-type", "text/html")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(payload))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let cid = body["blob"]["ref"]["$link"]
+        .as_str()
+        .or_else(|| body["blob"]["$link"].as_str())
+        .expect("uploadBlob should return the blob ref")
+        .to_string();
+
+    let request = Request::builder()
+        .uri(format!(
+            "/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff"),
+        "without nosniff a browser may execute a blob whose declared type is benign"
+    );
+    let disposition = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        disposition.starts_with("attachment"),
+        "a blob must download, not render; content-disposition was {disposition:?}"
+    );
+    let csp = headers
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        csp.contains("default-src 'none'") && csp.contains("sandbox"),
+        "the CSP must neuter a blob that is rendered anyway; was {csp:?}"
+    );
+}

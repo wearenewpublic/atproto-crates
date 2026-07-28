@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: an uploaded blob could render as a document on this origin — stored XSS against the
+  authorization server. `com.atproto.sync.getBlob` set only `Content-Type`, echoing the MIME the
+  uploader declared in its request header, which is neither validated nor sniffed. Upload
+  `text/html`, get someone to open the blob URL, and the script runs on the origin that also serves
+  the OAuth consent screen and its session cookies — which chains straight into account takeover.
+
+  `getBlob` now sends the same three headers `space.getBlob` has always sent: `nosniff`, so a
+  browser does not second-guess a benign declared type; `content-disposition: attachment`, so the
+  response downloads rather than renders; and `default-src 'none'; sandbox`, so anything rendered
+  regardless can do nothing. The MIME is still unvalidated — sniffing it is a separate change — but
+  it can no longer be turned into script on this origin.
+
 - `atproto-pds`: password-reset and account-deletion tokens were written to the application log at
   INFO, in the only build that shipped. `EmailService::Disabled::send` logged the full rendered body,
   and that body carries the confirmation URL for password reset, account deletion and email change.

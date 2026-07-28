@@ -4,6 +4,12 @@
 //! when they know which DID hosts it. (Privacy is handled at the record
 //! layer; if a record references a blob, the blob is reachable.)
 //! `listBlobs` is also public.
+//!
+//! Because it is public and serves attacker-supplied bytes under an
+//! attacker-declared MIME type, `getBlob` responds with `nosniff`,
+//! `content-disposition: attachment` and a `default-src 'none'; sandbox` CSP.
+//! Without them an uploaded `text/html` blob renders as a document on the
+//! origin that also serves the OAuth consent screen and its session cookies.
 
 use crate::actor_store::sql::SqlActorStore;
 use crate::http::errors::XrpcError;
@@ -24,6 +30,9 @@ pub struct GetBlobQuery {
 }
 
 /// `GET /xrpc/com.atproto.sync.getBlob`.
+///
+/// Responds with the blob bytes under the stored MIME type, plus the three
+/// headers that keep a blob from rendering as a document on this origin.
 ///
 /// When a `PublicRealmBackend` is wired into `HttpState` (per
 /// ), the blob lookup dispatches through the
@@ -63,10 +72,38 @@ pub async fn get_blob(
         )
     })?;
     let mut resp = Response::new(Body::from(data));
-    resp.headers_mut().insert(
+    // The MIME comes from the uploader's `content-type` header and is not
+    // validated (F-BLOB-08), so a caller can declare `text/html`. This origin
+    // also serves the OAuth consent screen and its session cookies, which makes
+    // a blob that renders stored XSS against the authorization server. Three
+    // headers close that: `nosniff` stops a browser second-guessing a benign
+    // declared type, `attachment` makes the response a download rather than a
+    // document, and the CSP neuters anything that is rendered regardless.
+    //
+    // `space.getBlob` has set these since it shipped; this is the same set.
+    let headers = resp.headers_mut();
+    headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&mime)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // The filename is the CID, which reached here only by matching a stored
+    // blob, so it is server-generated base32 rather than caller text. Built
+    // through `HeaderValue::from_str` anyway, so a value that could not be a
+    // well-formed header degrades to a bare `attachment` instead of being
+    // interpolated.
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", q.cid))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
     );
     Ok(resp)
 }
