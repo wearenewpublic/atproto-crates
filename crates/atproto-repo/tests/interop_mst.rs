@@ -28,38 +28,17 @@ use std::path::PathBuf;
 /// Keyed by the vector's `comment` field in `commit-proof-fixtures.json`. Every
 /// entry here is a statement that a known, filed defect is still open — never
 /// add one to silence a genuine regression.
-const KNOWN_FAILURES: &[(&str, &str)] = &[
-    // The MST root CID depends on the DAG-CBOR encoding of every node on the
-    // path to the root. Two independent defects change those bytes:
-    //
-    //   F-REPO-01 — `MstNode.l` and `TreeEntry.t` carry
-    //               `skip_serializing_if = "Option::is_none"`, so a null left
-    //               pointer is omitted from the map where the data model
-    //               requires it present-and-null. Every node hashes
-    //               differently from what a peer computes.
-    //   F-REPO-04 — `Mst::insert` is not height-aware and never splits or
-    //               merges nodes, so the tree *shape* also differs once a key
-    //               lands at a height above its neighbours. Each of these
-    //               vectors was chosen upstream to exercise exactly that.
-    //
-    // Both must land before any of these can pass; F-REPO-01 alone will not
-    // flip them. See gap-analysis roadmap items M1.2 and M1.10.
-    ("two deep split", "F-REPO-01 + F-REPO-04"),
-    ("two deep leafless split", "F-REPO-01 + F-REPO-04"),
-    (
-        "add on edge with neighbor two layers down",
-        "F-REPO-01 + F-REPO-04",
-    ),
-    (
-        "merge and split in multi-op commit",
-        "F-REPO-01 + F-REPO-04",
-    ),
-    ("complex multi-op commit", "F-REPO-01 + F-REPO-04"),
-    (
-        "split with earlier leaves on same layer",
-        "F-REPO-01 + F-REPO-04",
-    ),
-];
+/// Vectors that do not pass yet, each mapped to the finding that explains it.
+///
+/// Keyed by the vector's `comment` field in `commit-proof-fixtures.json`. Every
+/// entry here is a statement that a known, filed defect is still open — never
+/// add one to silence a genuine regression.
+///
+/// Empty since height-aware insert with splitting and merging landed: all six
+/// upstream commit-proof vectors match, before and after commit. F-REPO-01
+/// corrected the node encoding and F-REPO-04 the tree shape; both were needed,
+/// and neither alone moved a single vector.
+const KNOWN_FAILURES: &[(&str, &str)] = &[];
 
 /// Look up a vector in [`KNOWN_FAILURES`], returning the finding ID if listed.
 fn known_failure(name: &str) -> Option<&'static str> {

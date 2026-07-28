@@ -42,6 +42,7 @@
 //! See [AT Protocol Repository](https://atproto.com/specs/repository)
 
 mod diff;
+mod entries;
 mod entry;
 mod key;
 mod node;
@@ -49,6 +50,7 @@ mod serialize;
 mod tree;
 
 pub use diff::{DiffStats, MstDiff, RepoOp, RepoOpAction, diff_entries, ops_with_prev_cids};
+pub use entries::{NodeEntry, find_leaf_index, layer_for_entries};
 pub use entry::TreeEntry;
 pub use node::MstNode;
 pub use tree::Mst;

@@ -3,7 +3,7 @@
 //! The main `Mst` struct provides CRUD operations on the Merkle Search Tree.
 
 use super::MstNode;
-use super::entry::TreeEntry;
+use super::entries::{self, NodeEntry};
 use super::key::key_height;
 use crate::config::RepoConfig;
 use crate::errors::MstError;
@@ -128,90 +128,61 @@ impl<S: BlockStorage> Mst<S> {
     ///
     /// Returns `MstError` if the key is invalid or node loading fails.
     pub async fn get(&self, key: &str) -> Result<Option<Cid>, MstError> {
-        let root_cid = match &self.root {
-            Some(cid) => cid,
-            None => return Ok(None),
+        let Some(root) = self.root else {
+            return Ok(None);
         };
-
-        self.get_recursive(root_cid, key, 0).await
+        self.get_at(&root, key, 0).await
     }
 
-    async fn get_recursive(
+    /// Look for `key` in the node at `cid`, descending as needed.
+    ///
+    /// Descent is structural rather than heuristic: the first leaf at or after
+    /// `key` bounds the search, and anything smaller lives in the child
+    /// immediately before that position — `l` when the position is the front of
+    /// the node, otherwise the preceding leaf's `t`.
+    async fn get_at(
         &self,
         cid: &cid::Cid,
         key: &str,
         depth: usize,
     ) -> Result<Option<Cid>, MstError> {
-        // Check depth limit
-        if depth > self.config.limits.max_depth {
-            return Err(MstError::StructureViolation {
-                reason: format!("max depth {} exceeded", self.config.limits.max_depth),
-            });
+        self.check_depth(depth)?;
+        let entries = entries::from_node(&self.load_node(cid).await?)?;
+        let index = entries::find_leaf_index(&entries, key);
+
+        if let Some(NodeEntry::Leaf { key: found, value }) = entries.get(index)
+            && found == key
+        {
+            return Ok(Some(value.clone()));
         }
 
-        let node = self.load_node(cid).await?;
-        let target_height = key_height(key);
-
-        // Find the entry or subtree
-        let mut prev_key = String::new();
-
-        for entry in &node.entries {
-            let entry_key = entry.reconstruct_key(&prev_key)?;
-
-            if entry_key == key {
-                return Ok(Some(entry.value.clone()));
-            }
-
-            if entry_key.as_str() > key {
-                // Key would be before this entry - check left or entry's tree
-                // First check if we should go into a subtree
-                break;
-            }
-
-            // Check if we should descend into this entry's subtree
-            if let Some(ref tree_cid) = entry.tree {
-                let entry_height = key_height(&entry_key);
-                if target_height <= entry_height && key > entry_key.as_str() {
-                    // Key might be in this subtree
-                    if let result @ Some(_) =
-                        Box::pin(self.get_recursive(tree_cid, key, depth + 1)).await?
-                    {
-                        return Ok(result);
-                    }
-                }
-            }
-
-            prev_key = entry_key;
+        match index.checked_sub(1).and_then(|i| entries.get(i)) {
+            Some(NodeEntry::Tree(child)) => Box::pin(self.get_at(child, key, depth + 1)).await,
+            _ => Ok(None),
         }
-
-        // Check left subtree
-        if let Some(ref left_cid) = node.left {
-            return Box::pin(self.get_recursive(left_cid, key, depth + 1)).await;
-        }
-
-        Ok(None)
     }
 
     /// Insert a key-value pair. Returns the new root CID.
-    ///
-    /// Creates new nodes in storage for the modified path.
     ///
     /// # Errors
     ///
     /// Returns `MstError` if the key is invalid or storage fails.
     pub async fn insert(&mut self, key: &str, value: Cid) -> Result<cid::Cid, MstError> {
         super::key::validate_key(key).map_err(|reason| MstError::InvalidNode { reason })?;
+        let height = key_height(key);
 
-        let new_root = match &self.root {
-            Some(root_cid) => {
-                let root_cid = *root_cid;
-                self.insert_recursive(&root_cid, key, value, 0).await?
+        let new_root = match self.root {
+            Some(root) => {
+                let layer = self.layer_of(&root, 0).await?;
+                self.insert_at(&root, layer, key, value, height, 0).await?
             }
             None => {
-                // Empty tree - create root node with single entry
-                let entry = TreeEntry::first(key, value);
-                let node = MstNode::new(vec![entry]);
-                self.store_node(&node).await?
+                // The first key placed defines the tree's layer.
+                self.store_entries(&[NodeEntry::Leaf {
+                    key: key.to_string(),
+                    value,
+                }])
+                .await?
             }
         };
 
@@ -219,98 +190,145 @@ impl<S: BlockStorage> Mst<S> {
         Ok(new_root)
     }
 
-    async fn insert_recursive(
+    /// Insert into the node at `cid`, which sits at `layer`.
+    ///
+    /// A key's layer is fixed by its hash, so there are exactly three cases:
+    /// the key belongs at this layer, below it, or above it. Placing a key
+    /// anywhere else produces a tree that is internally consistent and hashes
+    /// differently from every other implementation's.
+    async fn insert_at(
+        &mut self,
+        cid: &cid::Cid,
+        layer: u32,
+        key: &str,
+        value: Cid,
+        height: u32,
+        depth: usize,
+    ) -> Result<cid::Cid, MstError> {
+        self.check_depth(depth)?;
+        let mut entries = entries::from_node(&self.load_node(cid).await?)?;
+        let index = entries::find_leaf_index(&entries, key);
+
+        if height == layer {
+            if let Some(NodeEntry::Leaf { key: found, .. }) = entries.get(index)
+                && found == key
+            {
+                entries[index] = NodeEntry::Leaf {
+                    key: key.to_string(),
+                    value,
+                };
+                return self.store_entries(&entries).await;
+            }
+
+            let leaf = NodeEntry::Leaf {
+                key: key.to_string(),
+                value,
+            };
+            match index.checked_sub(1).and_then(|i| entries.get(i)).cloned() {
+                // A subtree occupies the gap the key falls into, so it spans
+                // the key and has to be cut in two around it.
+                Some(NodeEntry::Tree(child)) => {
+                    let (left, right) = Box::pin(self.split_around(&child, key, depth + 1)).await?;
+                    let mut replacement = Vec::new();
+                    replacement.extend(left.map(NodeEntry::Tree));
+                    replacement.push(leaf);
+                    replacement.extend(right.map(NodeEntry::Tree));
+                    entries.splice(index - 1..index, replacement);
+                }
+                // Otherwise the key slots straight in.
+                _ => entries.insert(index, leaf),
+            }
+            return self.store_entries(&entries).await;
+        }
+
+        if height < layer {
+            // Belongs further down: descend into the child before this
+            // position, creating it when that gap is empty.
+            match index.checked_sub(1).and_then(|i| entries.get(i)).cloned() {
+                Some(NodeEntry::Tree(child)) => {
+                    let updated =
+                        Box::pin(self.insert_at(&child, layer - 1, key, value, height, depth + 1))
+                            .await?;
+                    entries[index - 1] = NodeEntry::Tree(updated);
+                }
+                _ => {
+                    let mut child = self
+                        .store_entries(&[NodeEntry::Leaf {
+                            key: key.to_string(),
+                            value,
+                        }])
+                        .await?;
+                    // The leaf may belong several layers down; wrap it until it
+                    // reaches the layer directly below this node.
+                    for _ in (height + 1)..layer {
+                        child = self.store_entries(&[NodeEntry::Tree(child)]).await?;
+                    }
+                    entries.insert(index, NodeEntry::Tree(child));
+                }
+            }
+            return self.store_entries(&entries).await;
+        }
+
+        // Belongs above the current root. Split what is there around the key
+        // and hang both halves off a new node, inserting bare structural
+        // layers between when the jump is more than one.
+        let (mut left, mut right) = Box::pin(self.split_around(cid, key, depth + 1)).await?;
+        for _ in 1..(height - layer) {
+            if let Some(cid) = left {
+                left = Some(self.store_entries(&[NodeEntry::Tree(cid)]).await?);
+            }
+            if let Some(cid) = right {
+                right = Some(self.store_entries(&[NodeEntry::Tree(cid)]).await?);
+            }
+        }
+        let mut top = Vec::new();
+        top.extend(left.map(NodeEntry::Tree));
+        top.push(NodeEntry::Leaf {
+            key: key.to_string(),
+            value,
+        });
+        top.extend(right.map(NodeEntry::Tree));
+        self.store_entries(&top).await
+    }
+
+    /// Cut the subtree at `cid` into the parts below and above `key`.
+    ///
+    /// Either side is `None` when it would be empty. A subtree straddling the
+    /// boundary is itself split, recursively, so both halves stay well-formed
+    /// all the way down.
+    async fn split_around(
         &mut self,
         cid: &cid::Cid,
         key: &str,
-        value: Cid,
         depth: usize,
-    ) -> Result<cid::Cid, MstError> {
-        if depth > self.config.limits.max_depth {
-            return Err(MstError::StructureViolation {
-                reason: format!("max depth {} exceeded", self.config.limits.max_depth),
-            });
+    ) -> Result<(Option<cid::Cid>, Option<cid::Cid>), MstError> {
+        self.check_depth(depth)?;
+        let entries = entries::from_node(&self.load_node(cid).await?)?;
+        let index = entries::find_leaf_index(&entries, key);
+        let mut left: Vec<NodeEntry> = entries[..index].to_vec();
+        let mut right: Vec<NodeEntry> = entries[index..].to_vec();
+
+        if let Some(NodeEntry::Tree(child)) = left.last().cloned() {
+            left.pop();
+            let (inner_left, inner_right) =
+                Box::pin(self.split_around(&child, key, depth + 1)).await?;
+            left.extend(inner_left.map(NodeEntry::Tree));
+            if let Some(cid) = inner_right {
+                right.insert(0, NodeEntry::Tree(cid));
+            }
         }
 
-        let node = self.load_node(cid).await?;
-        let _target_height = key_height(key);
-
-        // Simple case: insert into entries
-        let (insert_idx, exists) = node.find_insertion_point(key)?;
-
-        if exists {
-            // Update existing entry
-            let mut new_entries = node.entries.clone();
-            let mut prev_key = String::new();
-            for (i, entry) in new_entries.iter().enumerate() {
-                if i == insert_idx {
-                    break;
-                }
-                prev_key = entry.reconstruct_key(&prev_key)?;
-            }
-
-            let entry_key = new_entries[insert_idx].reconstruct_key(&prev_key)?;
-            let prefix_len = if insert_idx > 0 {
-                super::key::common_prefix_len(&prev_key, &entry_key) as u32
-            } else {
-                0
-            };
-
-            new_entries[insert_idx] = TreeEntry {
-                prefix_len,
-                key_suffix: entry_key.as_bytes()[prefix_len as usize..].to_vec(),
-                value,
-                tree: new_entries[insert_idx].tree.clone(),
-            };
-
-            let new_node = MstNode {
-                left: node.left.clone(),
-                entries: new_entries,
-            };
-            return self.store_node(&new_node).await;
-        }
-
-        // Insert new entry
-        let mut new_entries = node.entries.clone();
-
-        // Calculate the new entry with proper prefix compression
-        let prev_key = if insert_idx > 0 {
-            let mut k = String::new();
-            for (i, entry) in node.entries.iter().enumerate() {
-                k = entry.reconstruct_key(&k)?;
-                if i == insert_idx - 1 {
-                    break;
-                }
-            }
-            k
+        let left = if left.is_empty() {
+            None
         } else {
-            String::new()
+            Some(self.store_entries(&left).await?)
         };
-
-        let new_entry = TreeEntry::with_prefix(&prev_key, key, value);
-        new_entries.insert(insert_idx, new_entry);
-
-        // Fix prefix compression for the next entry if it exists
-        if insert_idx + 1 < new_entries.len() {
-            let next_entry = &new_entries[insert_idx + 1];
-            let next_key = next_entry.reconstruct_key(&prev_key)?;
-
-            // Recompute with new previous key
-            let new_prefix_len = super::key::common_prefix_len(key, &next_key) as u32;
-            new_entries[insert_idx + 1] = TreeEntry {
-                prefix_len: new_prefix_len,
-                key_suffix: next_key.as_bytes()[new_prefix_len as usize..].to_vec(),
-                value: next_entry.value.clone(),
-                tree: next_entry.tree.clone(),
-            };
-        }
-
-        let new_node = MstNode {
-            left: node.left.clone(),
-            entries: new_entries,
+        let right = if right.is_empty() {
+            None
+        } else {
+            Some(self.store_entries(&right).await?)
         };
-
-        self.store_node(&new_node).await
+        Ok((left, right))
     }
 
     /// Delete a key. Returns the new root CID (or None if tree is now empty).
@@ -319,94 +337,153 @@ impl<S: BlockStorage> Mst<S> {
     ///
     /// Returns `MstError` if the key is invalid or storage fails.
     pub async fn delete(&mut self, key: &str) -> Result<Option<cid::Cid>, MstError> {
-        let root_cid = match &self.root {
-            Some(cid) => *cid,
-            None => return Ok(None),
+        let Some(root) = self.root else {
+            return Ok(None);
         };
-
-        let new_root = self.delete_recursive(&root_cid, key, 0).await?;
-
-        // Check if root is now empty
-        if let Some(ref cid) = new_root {
-            let node = self.load_node(cid).await?;
-            if node.is_empty() {
-                self.root = None;
-                return Ok(None);
-            }
-        }
-
-        self.root = new_root;
+        self.root = match self.delete_at(&root, key, 0).await? {
+            Some(cid) => Some(self.trim_top(cid, 0).await?),
+            None => None,
+        };
         Ok(self.root)
     }
 
-    async fn delete_recursive(
+    /// Remove `key` from the node at `cid`, descending the way `get` does.
+    ///
+    /// Returns `None` when the node is left with no children at all.
+    async fn delete_at(
         &mut self,
         cid: &cid::Cid,
         key: &str,
         depth: usize,
     ) -> Result<Option<cid::Cid>, MstError> {
+        self.check_depth(depth)?;
+        let mut entries = entries::from_node(&self.load_node(cid).await?)?;
+        let index = entries::find_leaf_index(&entries, key);
+
+        let found_here = matches!(
+            entries.get(index),
+            Some(NodeEntry::Leaf { key: found, .. }) if found == key
+        );
+
+        if found_here {
+            entries.remove(index);
+            // Removing a leaf can leave the subtrees that flanked it side by
+            // side. Nothing separates them any more, so they are one subtree
+            // and have to be joined — every key in the left is below every key
+            // in the right, which is what makes the join a simple append.
+            if index > 0
+                && let (Some(NodeEntry::Tree(left)), Some(NodeEntry::Tree(right))) =
+                    (entries.get(index - 1).cloned(), entries.get(index).cloned())
+            {
+                let merged = Box::pin(self.append_merge(&left, &right, depth + 1)).await?;
+                entries.splice(index - 1..=index, [NodeEntry::Tree(merged)]);
+            }
+        } else {
+            match index.checked_sub(1).and_then(|i| entries.get(i)).cloned() {
+                Some(NodeEntry::Tree(child)) => {
+                    match Box::pin(self.delete_at(&child, key, depth + 1)).await? {
+                        Some(updated) => entries[index - 1] = NodeEntry::Tree(updated),
+                        None => {
+                            entries.remove(index - 1);
+                        }
+                    }
+                }
+                // Not in this tree; leave it untouched.
+                _ => return Ok(Some(*cid)),
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.store_entries(&entries).await?))
+    }
+
+    /// Join two adjacent subtrees of the same layer into one.
+    ///
+    /// Only valid when every key in `left` sorts below every key in `right`,
+    /// which is exactly the situation a deletion creates. When the seam itself
+    /// is two subtrees — the last child of `left` and the first of `right` —
+    /// they meet the same condition one layer down, so the join recurses.
+    async fn append_merge(
+        &mut self,
+        left: &cid::Cid,
+        right: &cid::Cid,
+        depth: usize,
+    ) -> Result<cid::Cid, MstError> {
+        self.check_depth(depth)?;
+        let left_entries = entries::from_node(&self.load_node(left).await?)?;
+        let right_entries = entries::from_node(&self.load_node(right).await?)?;
+
+        let joined = match (left_entries.last().cloned(), right_entries.first().cloned()) {
+            (Some(NodeEntry::Tree(inner_left)), Some(NodeEntry::Tree(inner_right))) => {
+                let merged =
+                    Box::pin(self.append_merge(&inner_left, &inner_right, depth + 1)).await?;
+                let mut joined = left_entries[..left_entries.len() - 1].to_vec();
+                joined.push(NodeEntry::Tree(merged));
+                joined.extend_from_slice(&right_entries[1..]);
+                joined
+            }
+            _ => {
+                let mut joined = left_entries;
+                joined.extend(right_entries);
+                joined
+            }
+        };
+
+        self.store_entries(&joined).await
+    }
+
+    /// Drop layers above the highest one that still holds a key.
+    ///
+    /// A deletion can leave the root as a chain of nodes that carry nothing but
+    /// a pointer to the next one down. Those layers are real structure to a
+    /// hash, so leaving them in place gives a different root CID than the same
+    /// content built from scratch.
+    async fn trim_top(&self, mut cid: cid::Cid, depth: usize) -> Result<cid::Cid, MstError> {
+        for step in 0.. {
+            self.check_depth(depth + step)?;
+            let entries = entries::from_node(&self.load_node(&cid).await?)?;
+            match entries.as_slice() {
+                [NodeEntry::Tree(child)] => cid = *child,
+                _ => break,
+            }
+        }
+        Ok(cid)
+    }
+
+    /// The layer a node sits at, descending until a leaf reveals it.
+    ///
+    /// A node of pure structure carries no key to derive a layer from, so its
+    /// layer is one above whatever its child resolves to.
+    async fn layer_of(&self, cid: &cid::Cid, depth: usize) -> Result<u32, MstError> {
+        self.check_depth(depth)?;
+        let entries = entries::from_node(&self.load_node(cid).await?)?;
+        if let Some(layer) = entries::layer_for_entries(&entries) {
+            return Ok(layer);
+        }
+        match entries.first() {
+            Some(NodeEntry::Tree(child)) => {
+                Ok(Box::pin(self.layer_of(child, depth + 1)).await? + 1)
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Serialize an interleaved child list and persist it.
+    async fn store_entries(&mut self, entries: &[NodeEntry]) -> Result<cid::Cid, MstError> {
+        let node = entries::to_node(entries)?;
+        self.store_node(&node).await
+    }
+
+    /// Guard against a cycle or a pathologically deep tree.
+    fn check_depth(&self, depth: usize) -> Result<(), MstError> {
         if depth > self.config.limits.max_depth {
             return Err(MstError::StructureViolation {
                 reason: format!("max depth {} exceeded", self.config.limits.max_depth),
             });
         }
-
-        let node = self.load_node(cid).await?;
-        let (delete_idx, exists) = node.find_insertion_point(key)?;
-
-        if !exists {
-            // Key not found, return unchanged
-            return Ok(Some(*cid));
-        }
-
-        // Rebuild the entry list from full keys rather than patching the
-        // compression of the entry that follows the deleted one.
-        //
-        // Entries are prefix-compressed against the *full key of the preceding
-        // entry*, so removing one changes the base its successor was encoded
-        // against. Repairing that in place needs two steps in the right order —
-        // reconstruct the successor's key against the entry being deleted, then
-        // re-compress it against the entry before that — and getting the order
-        // wrong silently rewrites a neighbouring record's key rather than
-        // failing. Worse, every later entry reconstructs against the corrupted
-        // key, so the damage runs to the end of the node.
-        //
-        // Deriving all the keys first and re-compressing the whole list makes
-        // that class of error unrepresentable: there is no index arithmetic to
-        // get backwards. It is also what the reference and every port do, at
-        // serialization time.
-        let mut full_keys = Vec::with_capacity(node.entries.len());
-        let mut previous = String::new();
-        for entry in &node.entries {
-            let key = entry.reconstruct_key(&previous)?;
-            previous = key.clone();
-            full_keys.push(key);
-        }
-
-        let mut surviving = node.entries.clone();
-        surviving.remove(delete_idx);
-        full_keys.remove(delete_idx);
-
-        let mut new_entries = Vec::with_capacity(surviving.len());
-        let mut previous = String::new();
-        for (entry, key) in surviving.iter().zip(full_keys.iter()) {
-            let mut rebuilt = TreeEntry::with_prefix(&previous, key, entry.value.clone());
-            rebuilt.tree = entry.tree.clone();
-            new_entries.push(rebuilt);
-            previous = key.clone();
-        }
-
-        if new_entries.is_empty() && node.left.is_none() {
-            return Ok(None);
-        }
-
-        let new_node = MstNode {
-            left: node.left.clone(),
-            entries: new_entries,
-        };
-
-        let new_cid = self.store_node(&new_node).await?;
-        Ok(Some(new_cid))
+        Ok(())
     }
 
     /// Iterate over all key-value pairs in sorted order.

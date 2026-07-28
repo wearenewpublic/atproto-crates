@@ -52,6 +52,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-repo`: the MST write path never built subtrees, so every repository was a single node
+  and every root CID was wrong at any realistic size. A key's layer is fixed by its hash — `sha256`,
+  leading zero bits, in pairs — and `key_height` computed it correctly and then discarded it
+  (`let _target_height = …`). `insert_recursive` never called itself and never set `l` or `t`.
+  Keys reach layer ≥ 1 with probability 1/4, so a repository of a dozen records already diverged.
+
+  Insert is now height-aware: a key at the node's layer slots in, splitting any subtree that spans
+  its position; a key below descends, creating intermediate layers as needed; a key above splits the
+  existing tree and becomes a new root over both halves. Delete recurses, merges the subtrees a
+  removed leaf leaves adjacent, and trims layers that no longer hold a key.
+
+  **All six upstream commit-proof vectors now pass, before and after commit** — the first time this
+  workspace has produced MST roots a peer can recompute. They were red through the encoding fix in
+  0.15.0-rc.2 and stayed red: F-REPO-01 corrected the node bytes and F-REPO-04 the tree shape, and
+  neither alone moved a single vector.
+
+  Two read paths changed with it. `get` descended on a height heuristic that only worked when no
+  subtree existed; it now follows the structural position. `delete` recurses, where it previously
+  ignored `l` and `t` entirely — harmless while nothing built them, silent data loss the moment
+  anything did.
 - `atproto-repo`: `Mst::delete` silently corrupted neighbouring records. MST entries are
   prefix-compressed against the full key of the preceding entry, so removing one changes the base
   its successor was encoded against. Repairing that needs two steps in order — reconstruct the
