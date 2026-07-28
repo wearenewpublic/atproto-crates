@@ -408,19 +408,14 @@ impl AccountManager {
     async fn emit_account_event(&self, did: &str, new_state: AccountState) -> PdsResult<()> {
         let store = crate::actor_store::sql::SqlActorStore::open(&self.data_dir, did).await?;
         let outbox = crate::sequencer::OutboxReader::new(store.pool().clone());
-        let payload = serde_json::json!({
-            "did": did,
-            "active": matches!(new_state, AccountState::Active),
-            "status": match new_state {
-                AccountState::Active => "active",
-                AccountState::Deactivated => "deactivated",
-                AccountState::Takendown => "takendown",
-                AccountState::Suspended => "suspended",
-                AccountState::Deleted => "deleted",
-            },
-        });
-        let bytes = serde_json::to_vec(&payload).map_err(|e| PdsError::Storage {
-            reason: format!("encode account event: {e}"),
+        // `status` is optional, not nullable: an active account carries none.
+        // Emitting `status: "active"` alongside `active: true` says the same
+        // thing twice and is not a value the lexicon lists.
+        let active = matches!(new_state, AccountState::Active);
+        let bytes = crate::sequencer::payload::encode(&crate::sequencer::payload::AccountBody {
+            did: did.to_string(),
+            active,
+            status: (!active).then(|| new_state.as_str().to_string()),
         })?;
         outbox
             .append(crate::sequencer::EventType::Account, bytes)

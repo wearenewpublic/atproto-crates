@@ -52,6 +52,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: no relay could consume this server's firehose. `com.atproto.sync.subscribeRepos`
+  publishes a closed union — a subscriber decodes each frame against `#commit`, `#sync`, `#identity`
+  or `#account` and rejects anything matching none of them — and every frame this server emitted
+  matched none. Two defects, which is why they ship together:
+  - **The body was an envelope, not the event.** Frames carried
+    `{seq, repo, time, payload: {…}}`, wrapping the event inside a `payload` field the lexicon does
+    not declare, while none of the eight required `#commit` fields (`rebase`, `tooBig`, `commit`,
+    `rev`, `since`, `blocks`, `ops`, `blobs`) appeared at the level a decoder reads them. Bodies are
+    now the lexicon shape itself, with only `seq` and `time` — which belong to the delivery, not the
+    event — spliced in when the frame is built.
+  - **Bodies round-tripped through JSON.** JSON has no link type and no byte-string type, so the two
+    types this union depends on could not survive storage: `commit` and each `ops[].cid` arrived as
+    text where a decoder expects a CBOR tag-42 link, and `blocks` could not be represented at all.
+    Bodies are now stored and spliced as DAG-CBOR throughout, so a link stays a link.
+
+  `blocks` is present, well-typed and empty pending the commit path building a CARv1 slice; a test
+  pins that so the remaining gap stays visible rather than reading as complete. Also corrected along
+  the way: `#sync` was emitting `head` (not a field of the event) and a block *count* where the
+  lexicon specifies a CARv1; `#account` emitted `status: "active"` where the field is optional and
+  must be omitted for an active account; `#commit` emitted `data` (not a field) and omitted `since`,
+  which is required-and-nullable and tells a resuming subscriber where the gap starts.
+
+  The existing unit tests passed throughout because they asserted the envelope they were given —
+  `body["payload"]["rev"]` — rather than the lexicon. The new conformance harness checks bodies
+  against the published `subscribeRepos` schema.
+
 - `atproto-pds`: AppView proxying was non-functional as routed, so no Bluesky client worked against
   this server. The route `/xrpc/app.bsky.{*nsid}` captures only what follows the literal prefix, so
   `app.bsky.feed.getTimeline` arrived as `feed.getTimeline`. The default-pin test

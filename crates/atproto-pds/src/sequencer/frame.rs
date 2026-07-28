@@ -14,7 +14,6 @@
 //! Spec defaults to CBOR — production peers (relays, app-views) require it.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Frame encoding selection for a subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,51 +77,29 @@ pub fn encode_event(
     encoding: Encoding,
     event_type: &str,
     seq: i64,
-    did: &str,
-    payload_json: &[u8],
+    _did: &str,
+    payload: &[u8],
     time: &str,
 ) -> Option<(Vec<u8>, bool)> {
     let t = type_tag(event_type);
+    // The stored body is already the lexicon's event shape in DAG-CBOR; only
+    // `seq` and `time` belong to the delivery rather than the event, so those
+    // are spliced in here. Nothing is re-encoded through JSON, which is what
+    // used to turn a `cid-link` into text and made `blocks` unrepresentable.
+    let body_bytes = crate::sequencer::payload::splice_envelope(payload, seq, time).ok()?;
+
     match encoding {
         Encoding::Json => {
-            let payload: Value = serde_json::from_slice(payload_json).unwrap_or(Value::Null);
-            let frame = serde_json::json!({
-                "t": t,
-                "seq": seq,
-                "did": did,
-                "payload": payload,
-                "time": time,
-            });
+            // Browser-dev only, and not the wire format: JSON has no link or
+            // byte-string type, so this rendering spells them with the
+            // `$link` / `$bytes` sentinels.
+            let body = atproto_dasl::atproto_json::from_slice(&body_bytes).ok()?;
+            let frame = serde_json::json!({ "t": t, "seq": seq, "body": body });
             Some((frame.to_string().into_bytes(), true))
         }
         Encoding::Cbor => {
-            // Header CBOR object.
             let header = FrameHeader { op: 1, t };
-            let mut out = match atproto_dasl::to_vec(&header) {
-                Ok(b) => b,
-                Err(_) => return None,
-            };
-            // Body CBOR object — re-encode the JSON payload + envelope
-            // fields into one DAG-CBOR map.
-            //
-            // Decoding the JSON to a `serde_json::Value` then re-encoding
-            // to DAG-CBOR is lossy for byte-array fields (DAG-CBOR has a
-            // distinct bytes type that JSON encodes as base64). Spec-shape
-            // commit/sync payloads use CIDs (strings) and CARv1 bytes; for
-            // now we wrap the JSON-decoded payload as-is. A follow-up that
-            // teaches the writer side to store DAG-CBOR payloads directly
-            // skips this round-trip.
-            let payload_value: Value = serde_json::from_slice(payload_json).unwrap_or(Value::Null);
-            let body = serde_json::json!({
-                "seq": seq,
-                "repo": did,
-                "time": time,
-                "payload": payload_value,
-            });
-            let body_bytes = match atproto_dasl::to_vec(&body) {
-                Ok(b) => b,
-                Err(_) => return None,
-            };
+            let mut out = atproto_dasl::to_vec(&header).ok()?;
             out.extend_from_slice(&body_bytes);
             Some((out, false))
         }
@@ -193,25 +170,66 @@ mod tests {
         assert_eq!(type_tag("#commit"), "#commit");
     }
 
+    /// A stored `#commit` body, as the write path produces one.
+    fn commit_payload() -> Vec<u8> {
+        crate::sequencer::payload::encode(&crate::sequencer::payload::CommitBody {
+            rebase: false,
+            too_big: false,
+            repo: "did:plc:a".to_string(),
+            commit: atproto_dasl::Cid(
+                "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"
+                    .parse()
+                    .unwrap(),
+            ),
+            rev: "3kmev".to_string(),
+            since: None,
+            blocks: Vec::new(),
+            ops: Vec::new(),
+            blobs: Vec::new(),
+            prev_data: None,
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn json_frame_carries_envelope_and_payload() {
-        let payload = serde_json::to_vec(&serde_json::json!({"rev": "3kmev"})).unwrap();
-        let (bytes, is_text) =
-            encode_event(Encoding::Json, "commit", 42, "did:plc:a", &payload, "now").unwrap();
+    fn json_frame_body_is_the_event_not_an_envelope() {
+        let (bytes, is_text) = encode_event(
+            Encoding::Json,
+            "commit",
+            42,
+            "did:plc:a",
+            &commit_payload(),
+            "now",
+        )
+        .unwrap();
         assert!(is_text);
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["t"], "#commit");
         assert_eq!(v["seq"], 42);
-        assert_eq!(v["did"], "did:plc:a");
-        assert_eq!(v["time"], "now");
-        assert_eq!(v["payload"]["rev"], "3kmev");
+
+        let body = &v["body"];
+        assert_eq!(body["repo"], "did:plc:a");
+        assert_eq!(body["rev"], "3kmev");
+        assert_eq!(body["seq"], 42);
+        assert_eq!(body["time"], "now");
+        // JSON has no link or byte-string type, so this rendering spells them.
+        assert!(body["commit"]["$link"].is_string(), "{body}");
+        assert!(body["blocks"]["$bytes"].is_string(), "{body}");
+        assert!(body["payload"].is_null(), "the body is not an envelope");
+        assert!(body["did"].is_null(), "#commit names the repository `repo`");
     }
 
     #[test]
     fn cbor_frame_carries_header_then_body() {
-        let payload = serde_json::to_vec(&serde_json::json!({"rev": "3kmev"})).unwrap();
-        let (bytes, is_text) =
-            encode_event(Encoding::Cbor, "commit", 42, "did:plc:a", &payload, "now").unwrap();
+        let (bytes, is_text) = encode_event(
+            Encoding::Cbor,
+            "commit",
+            42,
+            "did:plc:a",
+            &commit_payload(),
+            "now",
+        )
+        .unwrap();
         assert!(!is_text);
         // The frame is the concatenation of two DAG-CBOR objects:
         //   header_bytes || body_bytes
@@ -230,11 +248,20 @@ mod tests {
         assert_eq!(header.op, 1);
         assert_eq!(header.t, "#commit");
         let body_bytes = &bytes[header_bytes.len()..];
-        let body: Value = atproto_dasl::from_slice(body_bytes).unwrap();
-        assert_eq!(body["seq"], 42);
-        assert_eq!(body["repo"], "did:plc:a");
-        assert_eq!(body["time"], "now");
-        assert_eq!(body["payload"]["rev"], "3kmev");
+        let atproto_dasl::Ipld::Map(body) = atproto_dasl::from_slice(body_bytes).unwrap() else {
+            panic!("a #commit body is a map")
+        };
+        assert_eq!(body["seq"], atproto_dasl::Ipld::Integer(42));
+        assert_eq!(
+            body["repo"],
+            atproto_dasl::Ipld::String("did:plc:a".to_string())
+        );
+        assert_eq!(body["rev"], atproto_dasl::Ipld::String("3kmev".to_string()));
+        assert_eq!(body["time"], atproto_dasl::Ipld::String("now".to_string()));
+        // The wire body must carry links and bytes as links and bytes.
+        assert!(matches!(body["commit"], atproto_dasl::Ipld::Link(_)));
+        assert!(matches!(body["blocks"], atproto_dasl::Ipld::Bytes(_)));
+        assert!(!body.contains_key("payload"), "{body:?}");
     }
 
     #[test]
@@ -248,7 +275,7 @@ mod tests {
         let header_bytes = atproto_dasl::to_vec(&expected_header).unwrap();
         assert!(bytes.starts_with(&header_bytes));
         let body_bytes = &bytes[header_bytes.len()..];
-        let body: Value = atproto_dasl::from_slice(body_bytes).unwrap();
+        let body: serde_json::Value = atproto_dasl::from_slice(body_bytes).unwrap();
         assert_eq!(body["name"], "OutdatedCursor");
         assert_eq!(body["message"], "see ya");
     }

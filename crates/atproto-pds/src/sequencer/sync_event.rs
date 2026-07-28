@@ -17,24 +17,25 @@
 
 use crate::actor_store::PublicRealmBackend;
 use crate::actor_store::sql::SqlActorStore;
-use crate::errors::{PdsError, PdsResult};
+use crate::errors::PdsResult;
 use crate::sequencer::{EventType, OutboxReader};
 use std::path::Path;
 
-/// Per-spec `#sync` payload. `did` is the repo whose state is being
-/// force-set; `head` is the head commit CID; `rev` is its TID; `blocks`
-/// is the byte count of the imported repo (informational — not the
-/// spec `blocks` CARv1 field, which a future enhancement may populate
-/// for hold-over consumers).
+/// Inputs a caller has on hand when it wants a `#sync` published.
+///
+/// This is not the wire shape — [`crate::sequencer::payload::SyncBody`] is.
+/// `head` and `blocks` are what the caller knows about the import that
+/// prompted the event; neither is a field of `#sync`, which carries only
+/// `did`, `blocks` (a CARv1) and `rev`.
 #[derive(Debug, Clone)]
 pub struct SyncEvent<'a> {
     /// Repo DID.
     pub did: &'a str,
-    /// Head commit CID (string form).
+    /// Head commit CID (string form). Diagnostic only.
     pub head: &'a str,
     /// Head rev (TID).
     pub rev: &'a str,
-    /// Block count from the source CAR (informational).
+    /// Block count from the source CAR. Diagnostic only.
     pub blocks: usize,
 }
 
@@ -65,14 +66,12 @@ pub async fn publish_sync_via_backend(
 }
 
 fn encode_payload(event: &SyncEvent<'_>) -> PdsResult<Vec<u8>> {
-    let payload = serde_json::json!({
-        "did": event.did,
-        "rev": event.rev,
-        "head": event.head,
-        "blocks": event.blocks,
-    });
-    serde_json::to_vec(&payload).map_err(|e| PdsError::Storage {
-        reason: format!("encode #sync payload: {e}"),
+    // `blocks` is a CARv1, not a count. It is empty until the commit path
+    // builds one (F-FIRE-02); `head` is not a field of `#sync` at all.
+    crate::sequencer::payload::encode(&crate::sequencer::payload::SyncBody {
+        did: event.did.to_string(),
+        blocks: Vec::new(),
+        rev: event.rev.to_string(),
     })
 }
 
@@ -109,10 +108,21 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row.0, "sync");
-        let payload: serde_json::Value = serde_json::from_slice(&row.1).unwrap();
-        assert_eq!(payload["did"], "did:plc:alice");
-        assert_eq!(payload["head"], "bafyalice");
-        assert_eq!(payload["rev"], "3kmev");
-        assert_eq!(payload["blocks"], 42);
+        // Stored as DAG-CBOR in the lexicon's `#sync` shape: `did`, `blocks`,
+        // `rev` and nothing else. `head` and the source block count are the
+        // caller's context, not fields of the event.
+        let atproto_dasl::Ipld::Map(payload) = atproto_dasl::from_slice(&row.1).unwrap() else {
+            panic!("a #sync body is a map")
+        };
+        assert_eq!(
+            payload["did"],
+            atproto_dasl::Ipld::String("did:plc:alice".to_string())
+        );
+        assert_eq!(
+            payload["rev"],
+            atproto_dasl::Ipld::String("3kmev".to_string())
+        );
+        assert!(matches!(payload["blocks"], atproto_dasl::Ipld::Bytes(_)));
+        assert!(!payload.contains_key("head"), "{payload:?}");
     }
 }

@@ -691,12 +691,9 @@ async fn emit_identity_event(
     handle: Option<&str>,
 ) -> crate::errors::PdsResult<()> {
     let store = crate::actor_store::sql::SqlActorStore::open(data_dir, did).await?;
-    let payload = serde_json::json!({
-        "did": did,
-        "handle": handle,
-    });
-    let bytes = serde_json::to_vec(&payload).map_err(|e| crate::errors::PdsError::Storage {
-        reason: format!("encode #identity payload: {e}"),
+    let bytes = crate::sequencer::payload::encode(&crate::sequencer::payload::IdentityBody {
+        did: did.to_string(),
+        handle: handle.map(str::to_string),
     })?;
     let outbox = crate::sequencer::OutboxReader::new(store.pool().clone());
     outbox

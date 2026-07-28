@@ -13,6 +13,7 @@
 pub mod event_bus;
 pub mod frame;
 pub mod outbox;
+pub mod payload;
 pub mod sync_event;
 
 pub use event_bus::{EventBus, SubscribeEvent};

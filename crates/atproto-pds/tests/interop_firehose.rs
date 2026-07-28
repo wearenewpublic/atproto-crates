@@ -44,19 +44,17 @@ use tower::ServiceExt;
 ///
 /// Every entry here is a statement that a known, filed defect is still open —
 /// never add one to silence a genuine regression.
-const KNOWN_FAILURES: &[(&str, &str)] = &[
-    // F-FIRE-01 — the CBOR body is an envelope, `{seq, repo, time, payload}`,
-    // with the event's own fields nested one level down under `payload`. No
-    // member of the `com.atproto.sync.subscribeRepos` union has that shape, so
-    // a relay decoding against the lexicon finds none of the required fields.
-    // The lexicon body is flat. See gap-analysis roadmap item M1.13.
-    ("commit body is flat", "F-FIRE-01"),
-    // F-FIRE-04 — payloads are stored as JSON and re-encoded to DAG-CBOR on the
-    // way out (see the comment at `sequencer/frame.rs:107-114`). JSON has no
-    // byte-string type, so `blocks` — which the lexicon types as `bytes` and
-    // which must carry a CARv1 slice — comes back out as a text string.
-    ("commit blocks is a CBOR byte string", "F-FIRE-04"),
-];
+/// Checks that do not pass yet, each mapped to the finding that explains it.
+///
+/// Every entry here is a statement that a known, filed defect is still open —
+/// never add one to silence a genuine regression.
+///
+/// Empty since bodies became flat and lexicon-shaped, and stopped
+/// round-tripping through JSON. Note what that does *not* mean: `blocks` is
+/// well-typed and empty, not populated. Carrying a real CARv1 is F-FIRE-02, and
+/// `blocks_is_present_but_empty` below pins the current state so the gap stays
+/// visible rather than being implied by a green tick.
+const KNOWN_FAILURES: &[(&str, &str)] = &[];
 
 /// Look up a check in [`KNOWN_FAILURES`], returning the finding ID if listed.
 fn known_failure(check: &str) -> Option<&'static str> {
@@ -119,21 +117,31 @@ const COMMIT_REQUIRED_FIELDS: &[&str] = &[
     "blobs", "blocks", "commit", "ops", "rebase", "repo", "rev", "seq", "since", "time", "tooBig",
 ];
 
-/// A representative `#commit` payload in the shape the lexicon specifies.
-fn lexicon_commit_payload() -> Value {
-    json!({
-        "seq": 42,
-        "rebase": false,
-        "tooBig": false,
-        "repo": "did:plc:a",
-        "commit": { "$link": "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454" },
-        "rev": "3kmev",
-        "since": Value::Null,
-        "blocks": { "$bytes": "oQFiaGk" },
-        "ops": [],
-        "blobs": [],
-        "time": "2026-07-28T00:00:00.000Z",
+/// A representative stored `#commit` body.
+///
+/// Built through the production encoder, because the *storage format* is part
+/// of what changed: bodies are DAG-CBOR now, not JSON. The assertions below
+/// stay derived from the lexicon rather than from this helper — what is
+/// constructed here is only the input.
+fn stored_commit_body() -> Vec<u8> {
+    use atproto_pds::sequencer::payload::{CommitBody, encode};
+    encode(&CommitBody {
+        rebase: false,
+        too_big: false,
+        repo: "did:plc:a".to_string(),
+        commit: atproto_dasl::Cid(
+            "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"
+                .parse()
+                .unwrap(),
+        ),
+        rev: "3kmev".to_string(),
+        since: None,
+        blocks: Vec::new(),
+        ops: Vec::new(),
+        blobs: Vec::new(),
+        prev_data: None,
     })
+    .expect("the body should encode")
 }
 
 /// Split a CBOR frame into its header and body halves.
@@ -147,7 +155,7 @@ fn split_frame<'a>(frame: &'a [u8], expected_header: &[u8]) -> &'a [u8] {
 
 #[test]
 fn interop_cbor_header_bytes() {
-    let payload = serde_json::to_vec(&lexicon_commit_payload()).unwrap();
+    let payload = stored_commit_body();
     let (frame, is_text) = encode_event(
         Encoding::Cbor,
         "commit",
@@ -196,7 +204,7 @@ fn interop_info_header_bytes() {
 /// exact bytes would only record how far off it is.
 #[test]
 fn interop_commit_body_matches_lexicon() {
-    let payload = serde_json::to_vec(&lexicon_commit_payload()).unwrap();
+    let payload = stored_commit_body();
     let (frame, _) = encode_event(
         Encoding::Cbor,
         "commit",
@@ -207,9 +215,14 @@ fn interop_commit_body_matches_lexicon() {
     )
     .expect("commit frame should encode");
 
-    let body: Value = atproto_dasl::from_slice(split_frame(&frame, COMMIT_HEADER_CBOR))
-        .expect("frame body should decode as DAG-CBOR");
-    let map = body.as_object().expect("frame body should be a map");
+    // Decoded into the data model rather than into JSON: the body carries a
+    // link and a byte string, neither of which `serde_json::Value` can hold.
+    let body: atproto_dasl::Ipld =
+        atproto_dasl::from_slice(split_frame(&frame, COMMIT_HEADER_CBOR))
+            .expect("frame body should decode as DAG-CBOR");
+    let atproto_dasl::Ipld::Map(map) = body else {
+        panic!("frame body should be a map, got {body:?}")
+    };
 
     let mut failures = Vec::new();
 
@@ -228,16 +241,13 @@ fn interop_commit_body_matches_lexicon() {
         &mut failures,
     );
 
-    // `blocks` is typed `bytes` in the lexicon. Once decoded from DAG-CBOR into
-    // `serde_json::Value`, a CBOR byte string surfaces as the `$bytes` sentinel
-    // object; a CBOR text string surfaces as a plain string.
-    let blocks_is_bytes = map
-        .get("blocks")
-        .is_some_and(|value| value.get("$bytes").is_some());
+    // `blocks` is typed `bytes` in the lexicon, so it must be a CBOR byte
+    // string and not text.
+    let blocks_is_bytes = matches!(map.get("blocks"), Some(atproto_dasl::Ipld::Bytes(_)));
     reconcile(
         "commit blocks is a CBOR byte string",
         (!blocks_is_bytes).then(|| match map.get("blocks") {
-            Some(value) => format!("blocks decoded as {value}"),
+            Some(value) => format!("blocks decoded as {value:?}"),
             None => "blocks absent from the body entirely".to_string(),
         }),
         &mut failures,
@@ -370,5 +380,35 @@ async fn subscribe_repos_end_to_end() {
         "first frame is not a #commit event\n  expected header: {}\n  got frame start: {}",
         hex::encode(COMMIT_HEADER_CBOR),
         hex::encode(&frame[..frame.len().min(COMMIT_HEADER_CBOR.len())])
+    );
+}
+
+/// `blocks` is well-typed but carries nothing yet.
+///
+/// The firehose is a notification stream, not a data feed, until the commit
+/// path builds a CARv1 slice (F-FIRE-02). Asserted rather than left implicit so
+/// that a passing conformance harness is not mistaken for a working feed — and
+/// so this test fails, loudly, the moment the gap is closed.
+#[test]
+fn blocks_is_present_but_empty_pending_car_slices() {
+    let (frame, _) = encode_event(
+        Encoding::Cbor,
+        "commit",
+        1,
+        "did:plc:a",
+        &stored_commit_body(),
+        "2026-07-28T00:00:00.000Z",
+    )
+    .expect("commit frame should encode");
+
+    let atproto_dasl::Ipld::Map(map) =
+        atproto_dasl::from_slice(split_frame(&frame, COMMIT_HEADER_CBOR)).expect("body decodes")
+    else {
+        panic!("body should be a map")
+    };
+    assert_eq!(
+        map.get("blocks"),
+        Some(&atproto_dasl::Ipld::Bytes(Vec::new())),
+        "when F-FIRE-02 lands this should carry a CARv1 and this test should be replaced"
     );
 }

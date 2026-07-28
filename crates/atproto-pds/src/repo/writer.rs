@@ -445,20 +445,18 @@ impl RepoWriter {
                 })?;
         }
 
-        // Outbox: build the Sync 1.1 #commit payload.
+        // Outbox: the `#commit` body, in the shape the subscription's union
+        // declares. `seq` and `time` belong to the delivery and are added when
+        // the frame is built.
         let repo_ops = ops_with_prev_cids(&diffs);
-        let payload = serde_json::json!({
-            "did": did,
-            "rev": rev,
-            "commit": commit_cid.to_string(),
-            "data": new_root.to_string(),
-            "prev": prev_commit_cid,
-            "prevData": prev_data_cid,
-            "ops": repo_ops,
-        });
-        let payload_bytes = serde_json::to_vec(&payload).map_err(|e| PdsError::Storage {
-            reason: format!("encode outbox payload: {e}"),
-        })?;
+        let payload_bytes = crate::sequencer::payload::encode(&commit_body(
+            did,
+            &commit_cid,
+            &rev,
+            prior.as_ref().map(|(_, rev, _)| rev.clone()),
+            prev_data_cid.as_deref(),
+            repo_ops.clone(),
+        )?)?;
         sqlx::query("INSERT INTO outbox (event_type, payload, created_at) VALUES (?, ?, ?)")
             .bind(EventType::Commit.as_str())
             .bind(&payload_bytes)
@@ -723,18 +721,14 @@ impl RepoWriter {
             })
             .collect();
         let repo_ops = ops_with_prev_cids(&diffs);
-        let payload = serde_json::json!({
-            "did": did,
-            "rev": rev,
-            "commit": commit_cid.to_string(),
-            "data": new_root.to_string(),
-            "prev": commit_row.prev_cid,
-            "prevData": commit_row.prev_data_cid,
-            "ops": repo_ops,
-        });
-        let payload_bytes = serde_json::to_vec(&payload).map_err(|e| PdsError::Storage {
-            reason: format!("encode outbox payload: {e}"),
-        })?;
+        let payload_bytes = crate::sequencer::payload::encode(&commit_body(
+            did,
+            &commit_cid,
+            &rev,
+            prior.as_ref().map(|row| row.rev.clone()),
+            commit_row.prev_data_cid.as_deref(),
+            repo_ops.clone(),
+        )?)?;
         let commit_cid_str = commit_cid.to_string();
         let batch = CommitBatch {
             commit: &commit_row,
@@ -773,6 +767,43 @@ impl RepoWriter {
 pub async fn outbox_latest_seq(store: &SqlActorStore) -> PdsResult<Option<i64>> {
     let outbox = OutboxReader::new(store.pool().clone());
     outbox.latest_seq().await
+}
+
+/// Assemble a `#commit` body for the firehose.
+///
+/// `since` is the revision of the previous commit from this repo — the point a
+/// subscriber would be resuming from — and is null for a repository's first
+/// commit. `blocks` and `blobs` are present and empty: both are required
+/// fields, and filling them is F-FIRE-02 and F-BLOB-02 respectively.
+fn commit_body(
+    did: &str,
+    commit_cid: &cid::Cid,
+    rev: &str,
+    since: Option<String>,
+    prev_data_cid: Option<&str>,
+    ops: Vec<atproto_repo::mst::RepoOp>,
+) -> PdsResult<crate::sequencer::payload::CommitBody> {
+    let prev_data = prev_data_cid
+        .map(|text| {
+            text.parse::<cid::Cid>()
+                .map(atproto_dasl::Cid::from)
+                .map_err(|e: cid::Error| PdsError::Storage {
+                    reason: format!("parse prevData for #commit: {e}"),
+                })
+        })
+        .transpose()?;
+    Ok(crate::sequencer::payload::CommitBody {
+        rebase: false,
+        too_big: false,
+        repo: did.to_string(),
+        commit: atproto_dasl::Cid::from(*commit_cid),
+        rev: rev.to_string(),
+        since,
+        blocks: Vec::new(),
+        ops,
+        blobs: Vec::new(),
+        prev_data,
+    })
 }
 
 #[cfg(test)]
@@ -948,9 +979,21 @@ mod tests {
         let outbox = OutboxReader::new(store.pool().clone());
         let events = outbox.read_after(None, 100).await.unwrap();
         assert_eq!(events.len(), 1, "one batch → one #commit event");
-        let payload: serde_json::Value = serde_json::from_slice(&events[0].payload).unwrap();
-        assert_eq!(payload["rev"], serde_json::Value::String(rev.clone()));
-        assert_eq!(payload["ops"].as_array().unwrap().len(), 3);
+        // The stored body is DAG-CBOR in the lexicon's `#commit` shape.
+        let atproto_dasl::Ipld::Map(payload) =
+            atproto_dasl::from_slice(&events[0].payload).unwrap()
+        else {
+            panic!("a #commit body is a map")
+        };
+        assert_eq!(payload["rev"], atproto_dasl::Ipld::String(rev.clone()));
+        assert_eq!(
+            payload["repo"],
+            atproto_dasl::Ipld::String("did:plc:alice".to_string())
+        );
+        let atproto_dasl::Ipld::List(ops) = &payload["ops"] else {
+            panic!("ops is a list")
+        };
+        assert_eq!(ops.len(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
