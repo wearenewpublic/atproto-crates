@@ -218,6 +218,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: `importRepo` wrote no record index, so an imported repository was invisible to every
+  record API. It persisted blocks and commit rows and stopped; `getRecord`, `listRecords` and
+  `describeRepo` all resolve through `repo_record`, which nothing populated — despite the module doc
+  saying the import would index records.
+
+  So the import reported success, the commit chain verified inductively, and the account then
+  presented as empty: not-found for every record, an empty page, no collections. Silent data loss at
+  the last step of a migration, with every step reporting success.
+
+  The import now walks the head commit's MST and indexes what it holds, then reads each record and
+  records the blob references it carries — so `listMissingBlobs` answers the question a migrating
+  client asks next, instead of always saying nothing is owed.
+
+  Two limits worth knowing. Records are indexed at the head commit's rev rather than the rev each was
+  actually written at; deriving true per-record revs means walking every historical commit's tree and
+  diffing, which the reference implementation does not do on import either. And when a CAR omits a
+  block its MST names — which is what a diff slice is — the record is still indexed and only its blob
+  walk is skipped, because refusing the whole import over one absent block would be a worse failure
+  than the one being fixed.
+
 - `atproto-pds`: record→blob reference tracking was implemented, tested, and never invoked. The trait
   method, all three backend implementations and the free functions existed with their own unit tests,
   and nothing in the write path called any of them — despite a doc comment stating the writer did.

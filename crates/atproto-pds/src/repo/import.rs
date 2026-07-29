@@ -110,6 +110,160 @@ pub struct RepoImporter<'a> {
 }
 
 impl<'a> RepoImporter<'a> {
+    /// Walk the imported MST and write the record index plus blob references.
+    ///
+    /// `rev` is the head commit's, not the rev at which each record was
+    /// actually written. Deriving true per-record revs means walking every
+    /// historical commit's tree and diffing; the reference implementation does
+    /// not do that on import either. The value is a lower bound on recency, and
+    /// saying so here is better than a number that looks precise and is not.
+    async fn index_records(
+        &self,
+        store: &crate::actor_store::sql::SqlActorStore,
+        did: &str,
+        root: &cid::Cid,
+        rev: &str,
+    ) -> PdsResult<()> {
+        use atproto_repo::RepoConfig;
+        use atproto_repo::mst::Mst;
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Enumerate through whichever block storage the import wrote to.
+        let entries = if let Some(backend) = self.backend {
+            let storage = backend.open_block_storage(did).await?;
+            let mst = Mst::from_root(*root, storage, RepoConfig::default());
+            mst.entries().await
+        } else {
+            let storage = crate::actor_store::sql::SqlBlockStorage::open(store.pool().clone())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("open block storage for indexing: {e}"),
+                })?;
+            let mst = Mst::from_root(*root, storage, RepoConfig::default());
+            mst.entries().await
+        }
+        .map_err(|e| PdsError::Storage {
+            reason: format!("walk imported MST: {e}"),
+        })?;
+
+        for (key, record_cid) in entries {
+            let Some((collection, rkey)) = key.split_once('/') else {
+                tracing::warn!(did, key, "skipping MST key that is not collection/rkey");
+                continue;
+            };
+            let uri = format!("at://{did}/{collection}/{rkey}");
+            let cid_str = record_cid.0.to_string();
+
+            if let Some(backend) = self.backend {
+                backend
+                    .repo_record
+                    .upsert(
+                        did,
+                        &crate::actor_store::RecordRow {
+                            uri: uri.clone(),
+                            cid: cid_str.clone(),
+                            collection: collection.to_string(),
+                            rkey: rkey.to_string(),
+                            rev: rev.to_string(),
+                            indexed_at: now.clone(),
+                        },
+                    )
+                    .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO repo_record (uri, cid, collection, rkey, rev, indexed_at)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (collection, rkey) DO UPDATE SET
+                        cid = excluded.cid, rev = excluded.rev, indexed_at = excluded.indexed_at",
+                )
+                .bind(&uri)
+                .bind(&cid_str)
+                .bind(collection)
+                .bind(rkey)
+                .bind(rev)
+                .bind(&now)
+                .execute(store.pool())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("index imported record: {e}"),
+                })?;
+            }
+
+            self.index_blob_refs(store, did, &uri, &record_cid.0)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Record the blob references an imported record carries.
+    ///
+    /// A CAR may legitimately omit blocks its MST names — that is what a diff
+    /// slice is. When a record's block is absent the row is still indexed and
+    /// the blob walk is skipped: the record genuinely exists in the tree, and
+    /// refusing the whole import over one absent block would be a worse failure
+    /// than the one being fixed.
+    async fn index_blob_refs(
+        &self,
+        store: &crate::actor_store::sql::SqlActorStore,
+        did: &str,
+        uri: &str,
+        record_cid: &cid::Cid,
+    ) -> PdsResult<()> {
+        use atproto_dasl::storage::BlockStorage;
+
+        let bytes = if let Some(backend) = self.backend {
+            let storage = backend.open_block_storage(did).await?;
+            storage.get(record_cid).await.ok().flatten()
+        } else {
+            let storage = crate::actor_store::sql::SqlBlockStorage::open(store.pool().clone())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("open block storage for blob refs: {e}"),
+                })?;
+            storage.get(record_cid).await.ok().flatten()
+        };
+        let Some(bytes) = bytes else {
+            tracing::debug!(
+                did,
+                uri,
+                "imported record block absent from the CAR; blob refs not indexed"
+            );
+            return Ok(());
+        };
+
+        let Ok(value) = atproto_dasl::atproto_json::from_slice(&bytes) else {
+            tracing::warn!(
+                did,
+                uri,
+                "imported record did not decode; blob refs skipped"
+            );
+            return Ok(());
+        };
+
+        for blob in crate::blob::walk_blob_refs(&value) {
+            if let Some(backend) = self.backend {
+                backend
+                    .blob
+                    .add_ref(
+                        did,
+                        &crate::actor_store::BlobRefRow {
+                            record_uri: uri.to_string(),
+                            blob_cid: blob.inner.ref_.link.clone(),
+                            mime_type: blob.inner.mime_type.clone(),
+                            size: blob.inner.size,
+                        },
+                    )
+                    .await?;
+            } else {
+                crate::blob::add_ref(store, uri, &blob).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> RepoImporter<'a> {
     /// Construct.
     #[must_use]
     pub fn new(data_dir: &'a Path) -> Self {
@@ -335,6 +489,17 @@ impl<'a> RepoImporter<'a> {
 
         let head = chain.last().expect("non-empty chain");
         let head_cid = head.cid().map_err(PdsError::Repo)?;
+
+        // Index the records the imported tree holds.
+        //
+        // Every record read resolves through `repo_record` — `getRecord`,
+        // `listRecords`, `describeRepo` — and the import wrote blocks and
+        // commits and stopped. So `importRepo` reported success, the chain
+        // verified, and the account then presented as empty: not-found for
+        // every record, an empty page, no collections. Silent data loss at the
+        // last step of a migration.
+        self.index_records(&store, account_did, &head.data.0, &head.rev)
+            .await?;
 
         // Emit a Sync 1.1 `#sync` event onto the firehose stream. Per the
         // lexicon, `#sync` force-sets the head commit without a diff —

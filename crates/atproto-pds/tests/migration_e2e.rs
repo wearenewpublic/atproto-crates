@@ -125,6 +125,74 @@ async fn minimal_car_for(did: &str) -> Vec<u8> {
     buf
 }
 
+/// A CAR carrying one real record in a real MST.
+///
+/// `minimal_car_for` builds an empty tree, which cannot show whether the import
+/// indexes anything. This builds the tree properly — record block, MST nodes,
+/// commit — so the assertions afterwards are about the import and not about the
+/// fixture.
+///
+/// `omit_blob_block` leaves the referenced blob out of the CAR, which is the
+/// normal case for a migration: blobs transfer separately, and
+/// `listMissingBlobs` is how the client learns which ones it still owes.
+async fn car_with_record(
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    record: serde_json::Value,
+) -> Vec<u8> {
+    use atproto_dasl::storage::{BlockStorage, MemoryStorage};
+    use atproto_repo::RepoConfig;
+    use atproto_repo::mst::Mst;
+
+    let record_bytes = atproto_dasl::atproto_json::to_vec(&record).unwrap();
+    let record_cid = atproto_dasl::cid::compute_cid(&record_bytes);
+
+    let mut storage = MemoryStorage::new();
+    storage
+        .put(&record_cid, record_bytes.clone())
+        .await
+        .unwrap();
+    let mut mst = Mst::new(storage, RepoConfig::default());
+    mst.insert(
+        &format!("{collection}/{rkey}"),
+        atproto_dasl::Cid(record_cid),
+    )
+    .await
+    .unwrap();
+    let root = mst.root().cloned().expect("a populated tree has a root");
+
+    let signed = UnsignedCommit::new(
+        did.to_string(),
+        atproto_dasl::Cid(root),
+        "3jui7kd2z2y2e".to_string(),
+        None,
+    )
+    .sign(vec![0u8; 64]);
+    let commit_bytes = signed.to_bytes().unwrap();
+    let commit_cid = signed.cid().unwrap();
+
+    let storage = mst.into_storage();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut writer = CarWriter::new(&mut buf, vec![atproto_dasl::Cid(commit_cid)])
+        .await
+        .unwrap();
+    writer
+        .write_block(&CarBlock {
+            cid: commit_cid,
+            data: commit_bytes,
+        })
+        .await
+        .unwrap();
+    let cids: Vec<_> = storage.cids().collect();
+    for cid in cids {
+        let data = storage.get(&cid).await.unwrap().unwrap();
+        writer.write_block(&CarBlock { cid, data }).await.unwrap();
+    }
+    writer.finish().await.unwrap();
+    buf
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn full_migration_sequence() {
     let (app, manager, _tmp) = build_app().await;
@@ -323,4 +391,189 @@ async fn migration_create_account_requires_service_auth() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
     assert_eq!(body["error"], "AuthRequired");
+}
+
+// ---------------------------------------------------------------------------
+//  Record indexing on import (F-MIG-01).
+//
+//  Every record read resolves through `repo_record`, and the import wrote
+//  blocks and commits and stopped. So `importRepo` reported success and the
+//  account then presented as empty — silent data loss at the last step of a
+//  migration.
+// ---------------------------------------------------------------------------
+
+/// Import a CAR as `did`, returning the response status.
+async fn import_car(app: &axum::Router, token: &str, car: Vec<u8>) -> StatusCode {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.repo.importRepo")
+        .method("POST")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/vnd.ipld.car")
+        .body(Body::from(car))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Set up a deactivated migrating account and return its access token.
+async fn migrating_account(app: &axum::Router, manager: &AccountManager, did: &str) -> String {
+    manager
+        .create_account(
+            CreateAccountParams::new(did, "imported.example", "pw")
+                .with_state(AccountState::Deactivated),
+        )
+        .await
+        .expect("migrating account");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("session password");
+    let (_, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.createSession",
+        json!({"identifier": "imported.example", "password": "pw"}),
+        None,
+    )
+    .await;
+    body["accessJwt"].as_str().unwrap().to_string()
+}
+
+/// An imported repository is readable through every record API.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_repo_is_visible_to_the_record_apis() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:imported";
+    let token = migrating_account(&app, &manager, did).await;
+
+    let car = car_with_record(
+        did,
+        "app.bsky.feed.post",
+        "abc123",
+        json!({ "$type": "app.bsky.feed.post", "text": "imported" }),
+    )
+    .await;
+    assert_eq!(import_car(&app, &token, car).await, StatusCode::OK);
+
+    // The account is deactivated mid-migration, so read as the owner.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey=abc123"
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an imported record was not found: {body}"
+    );
+    assert_eq!(body["value"]["text"], "imported");
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!("/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["records"].as_array().map(Vec::len),
+        Some(1),
+        "listRecords returned an empty page for an imported repo: {body}"
+    );
+
+    let (status, body) = get_json(
+        app,
+        &format!("/xrpc/com.atproto.repo.describeRepo?repo={did}"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["collections"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|v| v == "app.bsky.feed.post")),
+        "describeRepo listed no collections for an imported repo: {body}"
+    );
+}
+
+/// A blob an imported record references, and the CAR did not carry, is
+/// reported as still owed.
+///
+/// This is the question a migrating client asks next, and the answer used to be
+/// "nothing" regardless.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_record_reports_the_blobs_it_still_needs() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:importedblob";
+    let token = migrating_account(&app, &manager, did).await;
+
+    let blob_cid =
+        atproto_dasl::cid::compute_raw_cid(b"a photo that travels separately").to_string();
+    let car = car_with_record(
+        did,
+        "app.bsky.feed.post",
+        "withmedia",
+        json!({
+            "$type": "app.bsky.feed.post",
+            "text": "look",
+            "embed": {
+                "images": [{
+                    "alt": "a",
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": blob_cid },
+                        "mimeType": "image/jpeg",
+                        "size": 4321,
+                    }
+                }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(import_car(&app, &token, car).await, StatusCode::OK);
+
+    let (status, body) = get_json(
+        app,
+        &format!("/xrpc/com.atproto.repo.listMissingBlobs?did={did}"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reported: Vec<&str> = body["blobs"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|b| b["cid"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        reported,
+        vec![blob_cid.as_str()],
+        "the client was told it owed nothing: {body}"
+    );
+}
+
+/// Importing the same CAR twice leaves one of each record.
+#[tokio::test(flavor = "multi_thread")]
+async fn importing_twice_is_idempotent() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:importedtwice";
+    let token = migrating_account(&app, &manager, did).await;
+
+    for _ in 0..2 {
+        let car = car_with_record(
+            did,
+            "app.bsky.feed.post",
+            "abc123",
+            json!({ "$type": "app.bsky.feed.post", "text": "imported" }),
+        )
+        .await;
+        assert_eq!(import_car(&app, &token, car).await, StatusCode::OK);
+    }
+
+    let (_, body) = get_json(
+        app,
+        &format!("/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
 }
