@@ -139,7 +139,24 @@ pub async fn update_handle(
     Json(input): Json<UpdateHandleInput>,
 ) -> Result<StatusCode, XrpcError> {
     let (htm, htu) = request_htm_htu(&parts);
-    let did = require_authn_sub(&parts, &state, &htm, &htu).await?;
+    let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
+
+    // Rotating the handle is an identity change, not a repo write, and it is
+    // one of the four things `scope=atproto` alone used to permit. App-password
+    // sessions carry no scopes and are full-authority.
+    if subject.is_oauth() {
+        subject
+            .scopes()
+            .assert_identity_handle()
+            .map_err(|missing| {
+                XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "InsufficientScope",
+                    format!("this token does not grant {}", missing.scope),
+                )
+            })?;
+    }
+    let did = subject.sub().to_string();
     do_update_handle(&state, &did, &input.handle).await?;
     Ok(StatusCode::OK)
 }

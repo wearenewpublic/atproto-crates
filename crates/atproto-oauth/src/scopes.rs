@@ -161,6 +161,18 @@ pub enum RepoAction {
     Delete,
 }
 
+impl RepoAction {
+    /// The action's spelling in a `repo:` scope string.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RepoAction::Create => "create",
+            RepoAction::Update => "update",
+            RepoAction::Delete => "delete",
+        }
+    }
+}
+
 /// RPC scope with lexicon method and audience constraints
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RpcScope {
@@ -1082,6 +1094,156 @@ impl ScopesSet {
     /// The raw granted scope strings.
     pub fn scopes(&self) -> &[String] {
         &self.scopes
+    }
+
+    /// Whether a legacy `transition:generic` grant is present.
+    ///
+    /// `transition:generic` is the migration scope meaning "legacy full
+    /// access": it predates granular scopes and is what most AT Protocol OAuth
+    /// clients request today. Enforcing the granular axes without honouring it
+    /// would refuse every such client, so it satisfies the repo, blob, rpc and
+    /// identity assertions below.
+    ///
+    /// It is deliberately *not* a wildcard for `space:` — spaces post-date it,
+    /// so nothing granted it expecting space access.
+    fn has_legacy_generic(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(
+                Scope::parse(scope),
+                Ok(Scope::Transition(TransitionScope::Generic))
+            )
+        })
+    }
+
+    /// Returns `true` if some granted `repo:` scope permits `action` on
+    /// `collection`.
+    pub fn allows_repo(&self, collection: &str, action: &RepoAction) -> bool {
+        self.has_legacy_generic()
+            || self.scopes.iter().any(|scope| match Scope::parse(scope) {
+                Ok(Scope::Repo(repo)) => {
+                    let collection_ok = match &repo.collection {
+                        RepoCollection::All => true,
+                        RepoCollection::Nsid(nsid) => nsid == collection,
+                    };
+                    collection_ok && repo.actions.contains(action)
+                }
+                _ => false,
+            })
+    }
+
+    /// Asserts that some granted `repo:` scope permits `action` on
+    /// `collection`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// the minimal scope that would have satisfied the write, so a client can
+    /// act on the refusal rather than guess.
+    pub fn assert_repo(
+        &self,
+        collection: &str,
+        action: &RepoAction,
+    ) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_repo(collection, action) {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(format!(
+                "repo:{collection}?action={}",
+                action.as_str()
+            )))
+        }
+    }
+
+    /// Returns `true` if some granted `blob:` scope accepts `mime`.
+    pub fn allows_blob(&self, mime: &str) -> bool {
+        let Ok(requested) = MimePattern::from_str(mime) else {
+            return false;
+        };
+        self.has_legacy_generic()
+            || self.scopes.iter().any(|scope| match Scope::parse(scope) {
+                Ok(Scope::Blob(blob)) => {
+                    blob.accept.iter().any(|pattern| pattern.grants(&requested))
+                }
+                _ => false,
+            })
+    }
+
+    /// Asserts that some granted `blob:` scope accepts `mime`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// the minimal scope that would have satisfied the upload.
+    pub fn assert_blob(&self, mime: &str) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_blob(mime) {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(format!(
+                "blob:{mime}"
+            )))
+        }
+    }
+
+    /// Returns `true` if some granted `rpc:` scope permits calling `lxm` at
+    /// `aud`.
+    pub fn allows_rpc(&self, lxm: &str, aud: &str) -> bool {
+        self.has_legacy_generic()
+            || self.scopes.iter().any(|scope| match Scope::parse(scope) {
+                Ok(Scope::Rpc(rpc)) => {
+                    let lxm_ok = rpc.lxm.iter().any(|granted| match granted {
+                        RpcLexicon::All => true,
+                        RpcLexicon::Nsid(nsid) => nsid == lxm,
+                    });
+                    let aud_ok = rpc.aud.iter().any(|granted| match granted {
+                        RpcAudience::All => true,
+                        RpcAudience::Did(did) => did == aud,
+                    });
+                    lxm_ok && aud_ok
+                }
+                _ => false,
+            })
+    }
+
+    /// Asserts that some granted `rpc:` scope permits calling `lxm` at `aud`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// the minimal scope that would have satisfied the call.
+    pub fn assert_rpc(&self, lxm: &str, aud: &str) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_rpc(lxm, aud) {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(format!(
+                "rpc:{lxm}?aud={aud}"
+            )))
+        }
+    }
+
+    /// Returns `true` if some granted `identity:` scope permits changing the
+    /// account handle.
+    pub fn allows_identity_handle(&self) -> bool {
+        self.has_legacy_generic()
+            || self.scopes.iter().any(|scope| {
+                matches!(
+                    Scope::parse(scope),
+                    Ok(Scope::Identity(IdentityScope::Handle | IdentityScope::All))
+                )
+            })
+    }
+
+    /// Asserts that some granted `identity:` scope permits changing the handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// the minimal scope that would have satisfied the change.
+    pub fn assert_identity_handle(&self) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_identity_handle() {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new("identity:handle"))
+        }
     }
 
     /// Returns `true` if any granted `space:` scope satisfies the given record
@@ -2505,5 +2667,121 @@ mod tests {
             "s1",
             SpaceAction::Read,
         )));
+    }
+
+    // --- granular enforcement (F-OAUTH-12) --------------------------------
+
+    fn set(scope: &str) -> ScopesSet {
+        ScopesSet::from_scope_string(scope)
+    }
+
+    /// `atproto` alone authorises nothing beyond announcing that other AT
+    /// Protocol scopes will be used. It was previously enough for everything.
+    #[test]
+    fn atproto_alone_grants_no_granular_access() {
+        let s = set("atproto");
+        assert!(!s.allows_repo("app.bsky.feed.post", &RepoAction::Create));
+        assert!(!s.allows_blob("image/png"));
+        assert!(!s.allows_rpc("app.bsky.feed.getTimeline", "did:web:appview.example"));
+        assert!(!s.allows_identity_handle());
+    }
+
+    #[test]
+    fn repo_scope_is_bounded_by_collection_and_action() {
+        let s = set("atproto repo:app.bsky.feed.post?action=create");
+        assert!(s.allows_repo("app.bsky.feed.post", &RepoAction::Create));
+        assert!(
+            !s.allows_repo("app.bsky.feed.post", &RepoAction::Delete),
+            "a create grant must not confer delete"
+        );
+        assert!(
+            !s.allows_repo("app.bsky.graph.follow", &RepoAction::Create),
+            "a grant for one collection must not confer another"
+        );
+    }
+
+    #[test]
+    fn repo_wildcard_covers_every_collection() {
+        let s = set("atproto repo:*?action=create&action=delete");
+        assert!(s.allows_repo("anything.at.all", &RepoAction::Create));
+        assert!(s.allows_repo("anything.at.all", &RepoAction::Delete));
+        assert!(!s.allows_repo("anything.at.all", &RepoAction::Update));
+    }
+
+    #[test]
+    fn blob_scope_is_bounded_by_mime() {
+        let s = set("atproto blob:image/*");
+        assert!(s.allows_blob("image/png"));
+        assert!(
+            !s.allows_blob("text/html"),
+            "an image grant must not confer uploading a document"
+        );
+        assert!(set("atproto blob:*/*").allows_blob("text/html"));
+    }
+
+    #[test]
+    fn rpc_scope_is_bounded_by_method_and_audience() {
+        let s = set("atproto rpc:app.bsky.feed.getTimeline?aud=did:web:appview.example");
+        assert!(s.allows_rpc("app.bsky.feed.getTimeline", "did:web:appview.example"));
+        assert!(
+            !s.allows_rpc("app.bsky.feed.getTimeline", "did:web:elsewhere.example"),
+            "a grant for one audience must not confer another"
+        );
+        assert!(
+            !s.allows_rpc("chat.bsky.convo.sendMessage", "did:web:appview.example"),
+            "a grant for one method must not confer another"
+        );
+    }
+
+    /// `transition:generic` is the legacy full-access scope most clients still
+    /// request. Enforcing the granular axes without honouring it would refuse
+    /// every one of them.
+    #[test]
+    fn transition_generic_satisfies_every_granular_axis() {
+        let s = set("atproto transition:generic");
+        assert!(s.allows_repo("app.bsky.feed.post", &RepoAction::Create));
+        assert!(s.allows_blob("text/html"));
+        assert!(s.allows_rpc("chat.bsky.convo.sendMessage", "did:web:anywhere.example"));
+        assert!(s.allows_identity_handle());
+    }
+
+    /// It is not a wildcard for spaces: spaces post-date it, so nothing was
+    /// granted it expecting space access.
+    #[test]
+    fn transition_generic_does_not_confer_space_access() {
+        let s = set("atproto transition:generic");
+        let target = SpaceTarget::new(
+            "com.example.space",
+            "did:plc:owner",
+            "default",
+            SpaceAction::Create,
+        );
+        assert!(!s.allows_space(&target));
+    }
+
+    /// A refusal names the scope that would have worked.
+    #[test]
+    fn a_refusal_names_the_missing_scope() {
+        let s = set("atproto");
+        assert_eq!(
+            s.assert_repo("app.bsky.feed.post", &RepoAction::Create)
+                .unwrap_err()
+                .scope,
+            "repo:app.bsky.feed.post?action=create"
+        );
+        assert_eq!(
+            s.assert_blob("image/png").unwrap_err().scope,
+            "blob:image/png"
+        );
+        assert_eq!(
+            s.assert_rpc("a.b.c", "did:web:x.example")
+                .unwrap_err()
+                .scope,
+            "rpc:a.b.c?aud=did:web:x.example"
+        );
+        assert_eq!(
+            s.assert_identity_handle().unwrap_err().scope,
+            "identity:handle"
+        );
     }
 }

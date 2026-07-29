@@ -28,7 +28,7 @@
 //! the operator-configured URL when the requested DID matches
 //! `bsky_app_view_did`, and otherwise returns `502 ProxyDidUnknown`.
 
-use crate::http::auth::{bearer_token, request_htm_htu, require_authn_sub};
+use crate::http::auth::{bearer_token, request_htm_htu};
 use crate::http::errors::XrpcError;
 use crate::http::proxy_target::ProxyTarget;
 use crate::http::space_auth::local_signing_key;
@@ -193,7 +193,28 @@ async fn proxy_call(
     })?;
     let parts = build_parts_for_authn(&headers, &method)?;
     let (htm, htu) = request_htm_htu(&parts);
-    let caller = require_authn_sub(&parts, state, &htm, &htu).await?;
+    let subject = crate::http::auth::require_authn(&parts, state, &htm, &htu).await?;
+
+    // `rpc:` scopes bound which method may be called at which audience. Without
+    // this a token could proxy arbitrary calls to arbitrary services on the
+    // holder's behalf — the PDS signs each one with the caller's own key, so
+    // the upstream sees a request the account genuinely authorised.
+    //
+    // App-password sessions carry no scopes and are full-authority, matching
+    // how the repo, blob and space assertions treat them.
+    if subject.is_oauth() {
+        subject
+            .scopes()
+            .assert_rpc(nsid, &target.did)
+            .map_err(|missing| {
+                XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "InsufficientScope",
+                    format!("this token does not grant {}", missing.scope),
+                )
+            })?;
+    }
+    let caller = subject.sub().to_string();
     let signing_key = local_signing_key(manager, &caller).await?;
     let token = mint_proxy_service_auth(&caller, &target.did, nsid, &signing_key)?;
 

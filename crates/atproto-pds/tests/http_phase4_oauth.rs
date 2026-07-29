@@ -1,7 +1,7 @@
 //! Phase 4 OAuth integration tests — PAR → authorize → token end-to-end.
 
 use atproto_identity::key::{KeyData, KeyType, generate_key};
-use atproto_oauth::dpop::auth_dpop;
+use atproto_oauth::dpop::{auth_dpop, request_dpop};
 use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
@@ -143,6 +143,75 @@ async fn post_form(
 /// Run PAR + authorize and return the issued authorization code.
 async fn authorize_for_code(app: &axum::Router, challenge: &str) -> String {
     authorize_for_code_with_jkt(app, challenge, None).await
+}
+
+/// Run the full PAR → authorize → token exchange and return an access token
+/// carrying exactly `scope`.
+async fn token_with_scope(app: &axum::Router, key: &KeyData, scope: &str) -> String {
+    let (verifier, challenge) = pkce_pair();
+    let (_, par_body) = post_json(
+        app.clone(),
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": scope, "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par_body["request_uri"].as_str().unwrap().to_string();
+    let (_, authz) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.example",
+            "password": "pw", "approve": true,
+        }),
+    )
+    .await;
+    let code = authz["code"].as_str().unwrap().to_string();
+    let (status, tokens) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {tokens}");
+    tokens["access_token"].as_str().unwrap().to_string()
+}
+
+/// Attempt a record write with `token`, returning the status.
+async fn write_with_token(
+    app: &axum::Router,
+    key: &KeyData,
+    token: &str,
+    collection: &str,
+) -> StatusCode {
+    let uri = "/xrpc/com.atproto.repo.createRecord";
+    let (dpop, _, _) = request_dpop(key, "POST", &format!("http://test.example{uri}"), token)
+        .expect("mint DPoP proof");
+    let request = Request::builder()
+        .uri(uri)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "repo": "did:plc:alice",
+                "collection": collection,
+                "record": { "$type": collection, "text": "hi" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
 }
 
 /// Run PAR + authorize, optionally pinning a DPoP thumbprint at PAR time.
@@ -905,4 +974,147 @@ async fn a_session_survives_repeated_refreshes_bound_to_one_key() {
         assert_eq!(body["token_type"], "DPoP", "refresh {round}");
         refresh = body["refresh_token"].as_str().unwrap().to_string();
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Granular scope enforcement (F-OAUTH-12).
+//
+//  The authorization server parsed and stored what it granted; the resource
+//  server never consulted it. Every OAuth token behaved as a wildcard.
+// ---------------------------------------------------------------------------
+
+/// `atproto` alone must not authorise a repo write.
+///
+/// It is the scope that says "other AT Protocol scopes will be used" — on its
+/// own it grants nothing, and it used to grant everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn atproto_alone_cannot_write_a_record() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let token = token_with_scope(&app, &key, "atproto").await;
+    let status = write_with_token(&app, &key, &token, "app.bsky.feed.post").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a token granted only `atproto` wrote a record"
+    );
+}
+
+/// A grant for one collection does not confer another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repo_grant_is_bounded_by_collection() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let token = token_with_scope(&app, &key, "atproto repo:app.bsky.feed.post?action=create").await;
+
+    assert_eq!(
+        write_with_token(&app, &key, &token, "app.bsky.feed.post").await,
+        StatusCode::OK,
+        "the granted collection should be writable"
+    );
+    assert_eq!(
+        write_with_token(&app, &key, &token, "app.bsky.graph.follow").await,
+        StatusCode::FORBIDDEN,
+        "a grant for one collection conferred another"
+    );
+}
+
+/// The legacy migration scope keeps working.
+///
+/// `transition:generic` is what most AT Protocol OAuth clients request today.
+/// Enforcing the granular axes without honouring it would refuse all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn transition_generic_still_writes() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+    assert_eq!(
+        write_with_token(&app, &key, &token, "app.bsky.feed.post").await,
+        StatusCode::OK,
+        "the legacy full-access scope must keep working"
+    );
+}
+
+/// The refusal names the scope that would have worked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scope_refusal_says_what_was_needed() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let token = token_with_scope(&app, &key, "atproto").await;
+
+    let uri = "/xrpc/com.atproto.repo.createRecord";
+    let (dpop, _, _) = request_dpop(&key, "POST", &format!("http://test.example{uri}"), &token)
+        .expect("mint DPoP proof");
+    let request = Request::builder()
+        .uri(uri)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "repo": "did:plc:alice",
+                "collection": "app.bsky.feed.post",
+                "record": { "$type": "app.bsky.feed.post", "text": "hi" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    assert_eq!(body["error"], "InsufficientScope");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("repo:app.bsky.feed.post?action=create"),
+        "the refusal should name the scope that would have worked: {body}"
+    );
+}
+
+/// An app-password session is unaffected — it carries no scopes and is
+/// full-authority, which is how the space assertions already treat it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_password_session_is_not_scope_checked() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let (_, session) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.createSession",
+        json!({ "identifier": "alice.example", "password": "pw" }),
+    )
+    .await;
+    let token = session["accessJwt"]
+        .as_str()
+        .expect("accessJwt")
+        .to_string();
+
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.createRecord")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "repo": "did:plc:alice",
+                "collection": "app.bsky.feed.post",
+                "record": { "$type": "app.bsky.feed.post", "text": "hi" }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
 }

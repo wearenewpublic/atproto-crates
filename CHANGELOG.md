@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds` / `atproto-oauth`: granular OAuth scopes were parsed, stored, and never consulted, so
+  every token behaved as a wildcard. The authorization server recorded exactly what the user granted
+  — `repo:` with a collection and action, `blob:` with MIME patterns, `rpc:` with method and audience
+  — and the resource server had no reference to `scope` anywhere in its write path. `scope=atproto`
+  alone could write every collection, upload any MIME type, rotate the handle and proxy arbitrary
+  calls on the holder's behalf. The authorization server's decisions were not enforced by the
+  resource server.
+
+  `atproto-oauth::scopes` gains the missing `allows_*`/`assert_*` pairs for repo, blob, rpc and
+  identity, mirroring the `space:` ones that already existed. A refusal names the minimal scope that
+  would have satisfied the request (`InsufficientScope`, with e.g.
+  `repo:app.bsky.feed.post?action=create`), so a client can act on it rather than guess.
+
+  Enforced on `createRecord`, `putRecord`, `deleteRecord`, `applyWrites`, `uploadBlob`, the `rpc:`
+  proxy path and `updateHandle`. `applyWrites` is checked per operation rather than once for the
+  batch: one call can touch several collections with different verbs, and a token scoped to create in
+  one collection must not delete in another by riding along.
+
+  **`transition:generic` satisfies all four axes.** It is the legacy full-access migration scope and
+  is what most AT Protocol OAuth clients request today; enforcing the granular axes without honouring
+  it would refuse every one of them. It is deliberately *not* a wildcard for `space:` — spaces
+  post-date it, so nothing was granted it expecting space access.
+
+  App-password sessions are not scope-checked. They carry no scopes by construction and are
+  full-authority, which is the rule the existing `space:` assertions already applied.
+
+  **A token granted narrow scopes is now refused where it previously succeeded.** That is the fix,
+  but it will surface as breakage in any client that requested less than it actually used.
+
 - `atproto-pds`: anyone could claim any DID. `createAccount` took no request parts at all — it could
   not read a header if it wanted to — and used a caller-supplied `did` verbatim. An attacker got a
   session bound to the victim's identity, had this server answer `describeRepo`, `getRepo` and

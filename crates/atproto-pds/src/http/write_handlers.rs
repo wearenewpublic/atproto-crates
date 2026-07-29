@@ -123,6 +123,47 @@ async fn require_writable_session(
     Ok(subject)
 }
 
+/// Refuse a write the granted OAuth scopes do not cover.
+///
+/// The authorization server parsed and stored what it granted and the resource
+/// server never consulted it, so every OAuth token behaved as a wildcard:
+/// `scope=atproto` alone could write every collection. App-password sessions
+/// carry no scopes by construction and are full-authority, so they are not
+/// checked — the same rule `assert_space_scope` already applies to spaces.
+fn assert_repo_scope(
+    subject: &AuthSubject,
+    collection: &str,
+    action: atproto_oauth::scopes::RepoAction,
+) -> Result<(), XrpcError> {
+    if !subject.is_oauth() {
+        return Ok(());
+    }
+    subject
+        .scopes()
+        .assert_repo(collection, &action)
+        .map_err(|missing| {
+            XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "InsufficientScope",
+                format!("this token does not grant {}", missing.scope),
+            )
+        })
+}
+
+/// Refuse a blob upload the granted OAuth scopes do not cover.
+fn assert_blob_scope(subject: &AuthSubject, mime: &str) -> Result<(), XrpcError> {
+    if !subject.is_oauth() {
+        return Ok(());
+    }
+    subject.scopes().assert_blob(mime).map_err(|missing| {
+        XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            format!("this token does not grant {}", missing.scope),
+        )
+    })
+}
+
 /// Inputs for `com.atproto.repo.createRecord`.
 #[derive(Debug, Deserialize)]
 pub struct CreateRecordInput {
@@ -200,6 +241,11 @@ pub async fn create_record(
     let writer = writer(&state)?;
     let repo_did = resolve_repo_did(&state, &input.repo).await?;
     assert_subject(&claims, &repo_did)?;
+    assert_repo_scope(
+        &claims,
+        &input.collection,
+        atproto_oauth::scopes::RepoAction::Create,
+    )?;
 
     let rkey = input.rkey.unwrap_or_else(|| Tid::new().to_string());
     let result = writer
@@ -253,6 +299,11 @@ pub async fn put_record(
     let writer = writer(&state)?;
     let repo_did = resolve_repo_did(&state, &input.repo).await?;
     assert_subject(&claims, &repo_did)?;
+    assert_repo_scope(
+        &claims,
+        &input.collection,
+        atproto_oauth::scopes::RepoAction::Update,
+    )?;
 
     let result = writer
         .apply_writes(
@@ -303,6 +354,11 @@ pub async fn delete_record(
     let writer = writer(&state)?;
     let repo_did = resolve_repo_did(&state, &input.repo).await?;
     assert_subject(&claims, &repo_did)?;
+    assert_repo_scope(
+        &claims,
+        &input.collection,
+        atproto_oauth::scopes::RepoAction::Delete,
+    )?;
 
     let result = writer
         .apply_writes(
@@ -432,6 +488,24 @@ pub async fn apply_writes(
             "InvalidRequest",
             "writes must be non-empty",
         ));
+    }
+
+    // Asserted per operation, not once for the batch: one `applyWrites` can
+    // touch several collections with different verbs, and a token scoped to
+    // create in one collection must not delete in another by riding along.
+    for entry in &input.writes {
+        let (collection, action) = match entry {
+            ApplyWritesEntry::Create { collection, .. } => {
+                (collection, atproto_oauth::scopes::RepoAction::Create)
+            }
+            ApplyWritesEntry::Update { collection, .. } => {
+                (collection, atproto_oauth::scopes::RepoAction::Update)
+            }
+            ApplyWritesEntry::Delete { collection, .. } => {
+                (collection, atproto_oauth::scopes::RepoAction::Delete)
+            }
+        };
+        assert_repo_scope(&claims, collection, action)?;
     }
 
     let ops: Vec<WriteOp> = input
@@ -655,6 +729,7 @@ pub async fn upload_blob(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
+    assert_blob_scope(&claims, &mime)?;
     let did = claims.sub();
     if let Some(backend) = state.public_realm_backend.as_ref() {
         // Trait-dispatched path.
