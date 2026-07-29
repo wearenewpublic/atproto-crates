@@ -34,7 +34,11 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_ADMIN_PASSWORD: &str = "admin-default-CHANGE-ME";
 
 /// Verify the admin Basic-auth header.
-fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
+///
+/// Rate-limited and constant-time. One shared secret guards every admin verb,
+/// so a `!=` gave a timing oracle against it and an unbounded endpoint gave an
+/// online guessing oracle — the second being the larger of the two.
+async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
     let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,
@@ -77,7 +81,21 @@ fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
             "expected user:pass format",
         )
     })?;
-    if password != admin_password(state) {
+    // Bounded before comparing: an attacker who can guess without limit does
+    // not need a timing side-channel.
+    state
+        .rate_limiter
+        .try_acquire("admin-auth")
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RateLimited",
+                format!("admin authentication rate-limit hit: {e}"),
+            )
+        })?;
+
+    if !crate::security::secret_eq(password, admin_password(state)) {
         return Err(XrpcError::new(
             StatusCode::UNAUTHORIZED,
             "AdminAuthenticationFailed",
@@ -127,7 +145,7 @@ pub async fn get_account_info(
     parts: Parts,
     Query(params): Query<AccountInfoParams>,
 ) -> Result<Json<AccountInfoResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let directory = state.reader.accounts();
     let row = if params.did.starts_with("did:") {
         directory.lookup_did(&params.did).await
@@ -176,7 +194,7 @@ pub async fn update_subject_status(
     parts: Parts,
     Json(input): Json<UpdateSubjectStatusInput>,
 ) -> Result<Json<UpdateSubjectStatusResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -223,7 +241,7 @@ pub async fn get_subject_status(
     parts: Parts,
     Query(params): Query<GetSubjectStatusParams>,
 ) -> Result<Json<GetSubjectStatusResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let directory = state.reader.accounts();
     let row = directory
         .lookup_did(&params.did)
@@ -255,7 +273,7 @@ pub async fn delete_account(
     parts: Parts,
     Json(input): Json<DeleteAccountInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -312,7 +330,7 @@ pub async fn search_accounts(
     parts: Parts,
     Query(q): Query<SearchAccountsQuery>,
 ) -> Result<Json<SearchAccountsResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let limit = q.limit.unwrap_or(25).clamp(1, 100);
     let directory = state.reader.accounts();
     let rows = directory
@@ -379,7 +397,7 @@ pub async fn get_invite_codes(
     parts: Parts,
     Query(q): Query<GetInviteCodesQuery>,
 ) -> Result<Json<GetInviteCodesResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -445,7 +463,7 @@ pub async fn get_account_infos(
     parts: Parts,
     Query(q): Query<GetAccountInfosQuery>,
 ) -> Result<Json<GetAccountInfosResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let dids: Vec<&str> = q
         .dids
         .split(',')
@@ -522,7 +540,7 @@ pub async fn send_email(
     parts: Parts,
     Json(input): Json<SendEmailInput>,
 ) -> Result<Json<SendEmailResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let directory = state.reader.accounts();
     let row = directory
         .lookup_did(&input.recipient_did)
@@ -577,7 +595,7 @@ pub async fn update_account_email(
     parts: Parts,
     Json(input): Json<UpdateAccountEmailInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -630,7 +648,7 @@ pub async fn update_account_handle(
     parts: Parts,
     Json(input): Json<UpdateAccountHandleInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     crate::http::identity_handlers::do_update_handle(&state, &input.did, &input.handle).await?;
     Ok(StatusCode::OK)
 }
@@ -662,7 +680,7 @@ pub async fn update_account_password(
     parts: Parts,
     Json(input): Json<UpdateAccountPasswordInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -747,7 +765,7 @@ pub async fn takedown_space_record(
     parts: Parts,
     Json(input): Json<TakedownSpaceRecordInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -844,7 +862,7 @@ pub async fn revoke_service_auth(
     parts: Parts,
     Json(input): Json<RevokeServiceAuthInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -879,7 +897,7 @@ pub async fn disable_account_invites(
     parts: Parts,
     Json(input): Json<InviteToggleInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     set_invite_flag(&state, &input.did, 0).await
 }
 
@@ -891,7 +909,7 @@ pub async fn enable_account_invites(
     parts: Parts,
     Json(input): Json<InviteToggleInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     set_invite_flag(&state, &input.did, 1).await
 }
 
@@ -967,7 +985,7 @@ pub async fn force_repo_sync(
     parts: Parts,
     Json(input): Json<ForceRepoSyncInput>,
 ) -> Result<Json<ForceRepoSyncResponse>, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1059,7 +1077,7 @@ pub async fn disable_invite_codes(
     parts: Parts,
     Json(input): Json<DisableInviteCodesInput>,
 ) -> Result<StatusCode, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,

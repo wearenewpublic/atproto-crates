@@ -21,7 +21,7 @@ use axum::http::request::Parts;
 use axum::response::{Html, IntoResponse, Response};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64STD};
 
-fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
+async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
     let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,
@@ -64,11 +64,26 @@ fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
             "expected user:pass",
         )
     })?;
+    // Same bound and same comparison as the XRPC admin surface: the dashboard
+    // guards the same verbs behind the same secret, so it cannot be the softer
+    // of the two doors.
+    state
+        .rate_limiter
+        .try_acquire("admin-auth")
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RateLimited",
+                format!("admin authentication rate-limit hit: {e}"),
+            )
+        })?;
+
     let expected = state
         .admin_password
         .as_deref()
         .unwrap_or(DEFAULT_ADMIN_PASSWORD);
-    if password != expected {
+    if !crate::security::secret_eq(password, expected) {
         return Err(XrpcError::new(
             StatusCode::UNAUTHORIZED,
             "AdminAuthenticationFailed",
@@ -88,7 +103,7 @@ pub async fn dashboard(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Response, XrpcError> {
-    require_admin(&parts, &state)?;
+    require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,

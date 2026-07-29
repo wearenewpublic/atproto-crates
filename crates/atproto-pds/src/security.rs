@@ -27,6 +27,41 @@ use tokio::sync::Mutex;
 
 use crate::errors::{PdsError, PdsResult};
 
+/// Compare two secrets without leaking their contents through timing.
+///
+/// A `!=` on `&str` short-circuits at the first differing byte, so the time it
+/// takes to reject a guess reveals how much of the prefix was right — enough to
+/// recover a secret one byte at a time against an endpoint an attacker can call
+/// repeatedly.
+///
+/// Both sides are MAC'd under a key generated for this call and the tags are
+/// compared through HMAC's own verifier. That is constant-time in the contents
+/// *and* independent of length: hashing first means a 4-byte guess and a
+/// 400-byte guess take the same path, so the comparison leaks neither the
+/// secret nor its size. The per-call key means the tags are useless to an
+/// attacker who somehow observes them.
+#[must_use]
+pub fn secret_eq(presented: &str, expected: &str) -> bool {
+    use hmac::{Hmac, KeyInit, Mac};
+    use rand::RngExt;
+    use sha2::Sha256;
+
+    let mut key = [0u8; 32];
+    rand::rng().fill(&mut key);
+
+    let tag = |value: &str| {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key)
+            .expect("HMAC accepts a key of any length");
+        mac.update(value.as_bytes());
+        mac.finalize().into_bytes()
+    };
+
+    let mut verifier =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(&key).expect("HMAC accepts a key of any length");
+    verifier.update(presented.as_bytes());
+    verifier.verify_slice(&tag(expected)).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 //  JTI replay guard
 // ---------------------------------------------------------------------------

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: the single secret guarding every admin verb was comparable by timing, guessable
+  without limit, and — in any deployment that had not set `PDS_PRODUCTION=true` — published in this
+  repository. Three defects on one door:
+  - **Non-constant-time compare.** `admin/handlers.rs` and `admin/dashboard.rs` used `!=` on `&str`,
+    which short-circuits at the first differing byte, so rejection time revealed how much of the
+    prefix was right. Both now go through one shared `secret_eq`, which MACs each side under a
+    per-call key and compares through HMAC's verifier — constant-time in the contents and
+    independent of length, so neither the password nor its size leaks.
+  - **No rate limit.** An attacker who can guess without limit does not need a side-channel at all.
+    Both surfaces now pass through the existing sliding-window limiter before comparing.
+  - **A live default password.** `admin-default-CHANGE-ME` is a constant in this crate, and it was
+    refused only when `PDS_PRODUCTION=true` — so *forgetting* the flag selected the insecure branch.
+    Startup now refuses the sentinel everywhere unless `PDS_ALLOW_DEV_DEFAULTS=true` says the
+    deployment is unreachable by anyone else, and that opt-in cannot be combined with
+    `PDS_PRODUCTION`.
+
+  **Operators and developers:** a PDS with no `PDS_ADMIN_PASSWORD` set now fails to start. Set a real
+  password, or set `PDS_ALLOW_DEV_DEFAULTS=true` for a local instance. This is deliberate — absence
+  of configuration used to fail open.
+
 - `atproto-pds`: an uploaded blob could render as a document on this origin — stored XSS against the
   authorization server. `com.atproto.sync.getBlob` set only `Content-Type`, echoing the MIME the
   uploader declared in its request header, which is neither validated nor sniffed. Upload

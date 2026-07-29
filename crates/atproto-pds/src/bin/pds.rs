@@ -93,6 +93,13 @@ struct Args {
     #[arg(long, env = "PDS_DID_PLC_URL")]
     plc_directory: Option<String>,
 
+    /// Permit the development-default admin password. Without this the PDS
+    /// refuses to start when `PDS_ADMIN_PASSWORD` is the sentinel, because
+    /// that value is a constant in this crate and therefore public. Set it
+    /// only for a deployment nobody else can reach.
+    #[arg(long, env = "PDS_ALLOW_DEV_DEFAULTS", default_value_t = false)]
+    allow_dev_defaults: bool,
+
     /// Refuse startup with development-default secrets. Set this in production.
     #[arg(long, env = "PDS_PRODUCTION", default_value_t = false)]
     production: bool,
@@ -372,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
     // PDS_PRODUCTION=true. See.
     let startup = StartupConfig {
         production: args.production,
+        allow_dev_defaults: args.allow_dev_defaults,
         jwt_secret: args.jwt_secret.clone(),
         admin_password: args.admin_password.clone(),
         service_did: args.service_did.clone(),

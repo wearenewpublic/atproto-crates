@@ -664,3 +664,48 @@ async fn admin_disable_invite_codes_marks_disabled() {
         .expect("code present");
     assert_eq!(found["disabled"], true);
 }
+
+/// The rewritten comparison still accepts the right password and rejects the
+/// wrong one.
+///
+/// A constant-time rewrite is exactly the kind of change that can silently
+/// break correctness — an always-false comparison leaks nothing and locks
+/// everyone out, and an always-true one leaks nothing either. Neither shows up
+/// in a timing measurement, so the property worth testing is the boring one.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_auth_still_distinguishes_right_from_wrong() {
+    let (app, _tmp) = build_app().await;
+
+    for (label, password, expect_ok) in [
+        ("exact", ADMIN_PASSWORD.to_string(), true),
+        ("wrong", "definitely-not-it".to_string(), false),
+        // A prefix and an extension: a length-sensitive comparison would treat
+        // these differently from an unrelated string.
+        ("prefix", ADMIN_PASSWORD[..4].to_string(), false),
+        ("extended", format!("{ADMIN_PASSWORD}x"), false),
+        ("empty", String::new(), false),
+    ] {
+        let request = Request::builder()
+            .uri("/xrpc/com.atproto.admin.getAccountInfo?did=did:plc:nobody")
+            .header(
+                "authorization",
+                format!("Basic {}", B64STD.encode(format!("admin:{password}"))),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let status = app.clone().oneshot(request).await.unwrap().status();
+        if expect_ok {
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "the correct password was rejected ({label})"
+            );
+        } else {
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a wrong password was accepted ({label})"
+            );
+        }
+    }
+}
