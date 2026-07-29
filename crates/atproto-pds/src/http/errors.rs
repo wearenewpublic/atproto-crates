@@ -52,6 +52,17 @@ impl From<PdsError> for XrpcError {
             }
             // The identity lexicons name these, and a client acts on which one
             // it got: correct the handle, pick another, or go fix DNS.
+            PdsError::InvalidRecord { reason } => {
+                XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRecord", reason)
+            }
+            // Named rather than folded into `InvalidRequest`: the caller asked
+            // for something this server cannot do, which is a different remedy
+            // from a malformed request.
+            PdsError::ValidationUnavailable => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "ValidationUnavailable",
+                "Lexicon schema validation is not implemented on this server; omit `validate` or set it to false",
+            ),
             PdsError::InvalidHandle { handle, reason } => XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "InvalidHandle",

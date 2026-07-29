@@ -10,8 +10,9 @@
 //! - `import` — CAR ingest with inductive verification + per-commit
 //!   signature verification against historical PLC keys.
 
-#[cfg(feature = "sqlite")]
 pub mod car_export;
+#[cfg(feature = "sqlite")]
+pub mod prepare;
 
 /// CARv1 slices for the firehose `blocks` field.
 pub mod commit_car;

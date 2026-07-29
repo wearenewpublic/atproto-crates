@@ -147,6 +147,30 @@ pub enum PdsError {
         reason: String,
     },
 
+    /// error-atproto-pds-repo-3: a record failed a structural check.
+    ///
+    /// Structural rather than schema: the record key grammar, the collection
+    /// NSID, and the `$type` field. These are checked before the commit
+    /// because the repository is append-only — a key containing `/` produces a
+    /// record whose MST path and AT-URI disagree, and nothing can rewrite it
+    /// once the commit is signed and sequenced.
+    #[error("error-atproto-pds-repo-3 record rejected: {reason}")]
+    InvalidRecord {
+        /// Which check failed.
+        reason: String,
+    },
+
+    /// error-atproto-pds-repo-4: the caller required schema validation that
+    /// this build cannot perform.
+    ///
+    /// `validate: true` means "refuse this write unless you validated it".
+    /// Accepting it while validating nothing would be a control that reads as
+    /// working and is not.
+    #[error(
+        "error-atproto-pds-repo-4 validate=true was requested but Lexicon schema validation is not implemented on this server"
+    )]
+    ValidationUnavailable,
+
     /// error-atproto-pds-admin-1: a moderation subject could not be addressed.
     ///
     /// `updateSubjectStatus` takes an open union, so an unrecognized `$type`

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: records were written with no structural checks of any kind. `repo/writer.rs`
+  interpolated the record key straight into the MST path and encoded the value without inspecting
+  `$type`. Neither failure is recoverable once the commit is signed and sequenced: a key containing
+  `/` produces a record whose MST path and its own AT-URI disagree, and a record without `$type`
+  cannot be decoded by any consumer.
+
+  Every write now passes three checks first — the collection is a valid NSID, the record key matches
+  the record-key grammar (1–512 characters from `[A-Za-z0-9.:_~-]`, never `.` or `..`), and `$type`
+  agrees with the collection. The validators already existed in `atproto-lexicon`, which this crate
+  has always depended on; nothing called them.
+
+  `$type` is **supplied** from the collection when absent rather than refused, which is what the
+  reference does. A record with no `$type` is undecodable, and filling it in is what makes it
+  decodable — refusing would only turn away writes the reference accepts. A `$type` that *disagrees*
+  with the collection is refused.
+
+  The checks run before the write lock and before anything is encoded, so a refused `applyWrites`
+  batch lands none of its ops — as its lexicon requires.
+
+  **Record keys this server previously accepted are now refused.** Existing repositories may already
+  contain such records; nothing here rewrites them and reads are unaffected.
+
 - `atproto-pds`: rate limiting reached six call sites out of 104 routes, and every bucket key was
   derived from caller-supplied input — `createSession:{identifier}`, `createAccount:{handle}`,
   `requestPasswordReset:{email}`. A password sprayer varied `identifier` and got a fresh bucket per
@@ -311,6 +333,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Added
+- `atproto-pds`: `validate` is accepted on `createRecord`, `putRecord` and `applyWrites`, and
+  `validationStatus` is returned. (`deleteRecord` declares neither — there is no record to validate.)
+
+  Lexicon schema validation is not implemented, so `validate: true` is **refused by name** with
+  `ValidationUnavailable` rather than accepted and ignored. A caller who explicitly asked for
+  validation is better served by an error naming the gap than by a success that validated nothing.
+  `validate: false` and unset both write. `validationStatus` reports `unknown`, which is the honest
+  value while no schema engine is wired — `valid` would claim a check that did not happen.
+
 - `atproto-pds`: record- and blob-level takedown. `updateSubjectStatus`'s two non-account subject
   kinds had no storage behind them, so an operator asked to remove one illegal post or one illegal
   image had no option short of taking down the whole account.

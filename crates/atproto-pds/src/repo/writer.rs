@@ -183,6 +183,18 @@ impl RepoWriter {
                 what: "applyWrites called with empty ops".to_string(),
             });
         }
+
+        // Structural checks before the lock is taken and before anything is
+        // encoded. The repository is append-only: a record key containing `/`
+        // produces a record whose MST path and its own AT-URI disagree, and
+        // nothing rewrites that once the commit is signed and sequenced.
+        //
+        // Applied here rather than in either write path so both get it, and so
+        // a batch is refused whole — `applyWrites` says "the entire operation
+        // will fail", and half a batch landing because op 3 was malformed
+        // would be worse than the malformed op itself.
+        let ops = Self::prepare_ops(ops)?;
+
         let lock = self.lock_for(did);
         let _guard = lock.lock().await;
 
@@ -193,6 +205,35 @@ impl RepoWriter {
             }
             None => self.apply_writes_legacy(did, ops, swap_commit).await,
         }
+    }
+
+    /// Apply the structural checks to a batch, returning the ops to write.
+    ///
+    /// `$type` is filled in from the collection when absent, which is what the
+    /// reference does — a record with no `$type` is undecodable by every
+    /// consumer, and supplying it is what makes it decodable. A `$type` that
+    /// disagrees with the collection is refused.
+    ///
+    /// Deletes carry no value, so only their collection and key are checked.
+    ///
+    /// # Errors
+    ///
+    /// [`PdsError::InvalidRecord`] naming the op and the check that failed.
+    fn prepare_ops(ops: Vec<WriteOp>) -> PdsResult<Vec<WriteOp>> {
+        use crate::repo::prepare;
+        ops.into_iter()
+            .map(|mut op| {
+                prepare::check_collection(&op.collection)?;
+                // An empty key on create means "generate a TID", which the
+                // handler does before this point; anything that arrives here
+                // is a key the caller chose.
+                prepare::check_rkey(&op.rkey)?;
+                if let Some(value) = op.value.take() {
+                    op.value = Some(prepare::reconcile_type(&op.collection, value)?);
+                }
+                Ok(op)
+            })
+            .collect()
     }
 
     /// Refuse the write when the caller's expected commit is not the current

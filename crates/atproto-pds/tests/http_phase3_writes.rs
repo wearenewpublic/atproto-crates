@@ -173,7 +173,7 @@ async fn put_then_delete_round_trip() {
         "/xrpc/com.atproto.repo.putRecord",
         json!({
             "repo": "did:plc:alice",
-            "collection": "c.col",
+            "collection": "com.example.record",
             "rkey": "k",
             "record": {"v": 1}
         }),
@@ -188,7 +188,7 @@ async fn put_then_delete_round_trip() {
         "/xrpc/com.atproto.repo.putRecord",
         json!({
             "repo": "did:plc:alice",
-            "collection": "c.col",
+            "collection": "com.example.record",
             "rkey": "k",
             "record": {"v": 2}
         }),
@@ -203,7 +203,7 @@ async fn put_then_delete_round_trip() {
         "/xrpc/com.atproto.repo.deleteRecord",
         json!({
             "repo": "did:plc:alice",
-            "collection": "c.col",
+            "collection": "com.example.record",
             "rkey": "k"
         }),
         Some(&token),
@@ -214,7 +214,7 @@ async fn put_then_delete_round_trip() {
     // Verify gone.
     let (status, _) = get_json(
         app,
-        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=c.col&rkey=k",
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=com.example.record&rkey=k",
         None,
     )
     .await;
@@ -233,11 +233,11 @@ async fn apply_writes_atomic_batch() {
             "repo": "did:plc:alice",
             "writes": [
                 {"$type": "com.atproto.repo.applyWrites#create",
-                 "collection": "c.col", "rkey": "a", "value": {"v": 1}},
+                 "collection": "com.example.record", "rkey": "a", "value": {"v": 1}},
                 {"$type": "com.atproto.repo.applyWrites#create",
-                 "collection": "c.col", "rkey": "b", "value": {"v": 2}},
+                 "collection": "com.example.record", "rkey": "b", "value": {"v": 2}},
                 {"$type": "com.atproto.repo.applyWrites#create",
-                 "collection": "c.col", "rkey": "c", "value": {"v": 3}},
+                 "collection": "com.example.record", "rkey": "c", "value": {"v": 3}},
             ]
         }),
         Some(&token),
@@ -263,7 +263,7 @@ async fn apply_writes_atomic_batch() {
     // Verify the records are listable.
     let (status, list) = get_json(
         app,
-        "/xrpc/com.atproto.repo.listRecords?repo=did:plc:alice&collection=c.col",
+        "/xrpc/com.atproto.repo.listRecords?repo=did:plc:alice&collection=com.example.record",
         None,
     )
     .await;
@@ -303,7 +303,7 @@ async fn duplicate_create_rejected_over_http() {
         "/xrpc/com.atproto.repo.createRecord",
         json!({
             "repo": "did:plc:alice",
-            "collection": "c.col",
+            "collection": "com.example.record",
             "rkey": "k",
             "record": {}
         }),
@@ -316,7 +316,7 @@ async fn duplicate_create_rejected_over_http() {
         "/xrpc/com.atproto.repo.createRecord",
         json!({
             "repo": "did:plc:alice",
-            "collection": "c.col",
+            "collection": "com.example.record",
             "rkey": "k",
             "record": {}
         }),
@@ -617,4 +617,316 @@ async fn two_writers_on_one_read_do_not_both_succeed() {
     let body: Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["value"]["text"], "first writer");
+}
+
+// ---------------------------------------------------------------------------
+//  F-REC-05 (structural half) — the schema-free checks.
+//
+//  The repository is append-only. A record key containing `/` lands at an MST
+//  path that does not match its own AT-URI, and a record with no `$type` is
+//  undecodable by every consumer — and by the time either is noticed, the
+//  commit is signed and sequenced. None of it was checked.
+// ---------------------------------------------------------------------------
+
+/// A repo with one record in it, so `head_commit` has a head to report.
+async fn seeded_repo() -> (axum::Router, Arc<AccountManager>, String, TempDir) {
+    let (app, manager, tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "seed",
+            "record": {"$type": "app.bsky.feed.post", "text": "seed"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed: {body}");
+    (app, manager, token, tmp)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_key_outside_the_grammar_is_refused_before_any_commit() {
+    let (app, _m, token, _tmp) = seeded_repo().await;
+    let head_before = head_commit(&app, "did:plc:alice", &token).await;
+
+    for bad in ["with/slash", "with space", ".", "..", "with?query"] {
+        let (status, body) = post_with(
+            &app,
+            &token,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+                "repo": "did:plc:alice",
+                "collection": "app.bsky.feed.post",
+                "rkey": bad,
+                "record": {"$type": "app.bsky.feed.post", "text": "hi"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} — body: {body}");
+        assert_eq!(body["error"], "InvalidRecord", "{bad:?}");
+    }
+
+    // A refusal that still moved the repo would be a different bug wearing the
+    // same status code.
+    assert_eq!(
+        head_commit(&app, "did:plc:alice", &token).await,
+        head_before,
+        "a refused write must not advance the commit chain"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_absent_type_is_filled_in_from_the_collection() {
+    // The reference supplies it rather than refusing (`repo/prepare.ts:167`).
+    // Refusing would turn away writes the reference accepts; supplying is what
+    // makes the stored record decodable, which is the point of the finding.
+    let (app, _m, token, _tmp) = seeded_repo().await;
+
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "notype",
+            "record": {"text": "no type here"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, got) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=app.bsky.feed.post&rkey=notype",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {got}");
+    assert_eq!(
+        got["value"]["$type"], "app.bsky.feed.post",
+        "the stored record must carry a $type"
+    );
+    assert_eq!(got["value"]["text"], "no type here");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_that_disagrees_with_the_collection_is_refused() {
+    let (app, _m, token, _tmp) = seeded_repo().await;
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "mismatch",
+            "record": {"$type": "app.bsky.feed.like", "text": "hi"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRecord");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collection_that_is_not_an_nsid_is_refused() {
+    let (app, _m, token, _tmp) = seeded_repo().await;
+    for bad in ["notannsid", "two.parts", "app.bsky."] {
+        let (status, body) = post_with(
+            &app,
+            &token,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+                "repo": "did:plc:alice",
+                "collection": bad,
+                "rkey": "abc",
+                "record": {"text": "hi"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} — body: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_checks_apply_to_every_write_path() {
+    let (app, _m, token, _tmp) = seeded_repo().await;
+
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "bad/key",
+            "record": {"text": "hi"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "putRecord — body: {body}");
+
+    // A delete carries no value, but the key still has to be one this
+    // repository could have stored.
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.deleteRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "bad/key",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "deleteRecord — body: {body}"
+    );
+
+    // applyWrites — and the whole batch fails, per its lexicon.
+    let head_before = head_commit(&app, "did:plc:alice", &token).await;
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({
+            "repo": "did:plc:alice",
+            "writes": [
+                {
+                    "$type": "com.atproto.repo.applyWrites#create",
+                    "collection": "app.bsky.feed.post",
+                    "rkey": "fine",
+                    "value": {"text": "ok"},
+                },
+                {
+                    "$type": "com.atproto.repo.applyWrites#create",
+                    "collection": "app.bsky.feed.post",
+                    "rkey": "bad/key",
+                    "value": {"text": "not ok"},
+                },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "applyWrites — body: {body}"
+    );
+    assert_eq!(
+        head_commit(&app, "did:plc:alice", &token).await,
+        head_before,
+        "one bad op must take the whole batch down, not land the good half"
+    );
+    let (status, _) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=app.bsky.feed.post&rkey=fine",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the valid op in a refused batch must not have been written"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_true_is_refused_by_name_rather_than_ignored() {
+    // Accepting `validate: true` and validating nothing is the failure mode
+    // this report keeps finding: a control that reads as working and is not.
+    let (app, _m, token, _tmp) = seeded_repo().await;
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "wantsvalidation",
+            "record": {"text": "hi"},
+            "validate": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "ValidationUnavailable");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_false_and_unset_both_write_and_report_honestly() {
+    let (app, _m, token, _tmp) = seeded_repo().await;
+
+    // Unset: the write happens and the status is `unknown`, because no schema
+    // engine ran. Reporting `valid` would claim a check that did not happen.
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "unset",
+            "record": {"text": "hi"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["validationStatus"], "unknown");
+
+    // Explicitly skipped: no status at all.
+    let (status, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "rkey": "skipped",
+            "record": {"text": "hi"},
+            "validate": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("validationStatus").is_none(),
+        "a skipped validation reports nothing: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_keys_the_protocol_allows_still_write() {
+    // The control. Every test above asserts a refusal, and a prepare step that
+    // refused everything would pass all of them.
+    let (app, _m, token, _tmp) = seeded_repo().await;
+    for rkey in [
+        "3jui7kp54ic2i",
+        "self",
+        "with.dots",
+        "with-dash",
+        "with:colon",
+        "with~tilde",
+    ] {
+        let (status, body) = post_with(
+            &app,
+            &token,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+                "repo": "did:plc:alice",
+                "collection": "app.bsky.feed.post",
+                "rkey": rkey,
+                "record": {"$type": "app.bsky.feed.post", "text": "hi"},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rkey} — body: {body}");
+    }
 }

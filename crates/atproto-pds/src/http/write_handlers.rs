@@ -175,6 +175,10 @@ pub struct CreateRecordInput {
     pub rkey: Option<String>,
     /// Record value (DAG-CBOR-encodable JSON).
     pub record: serde_json::Value,
+    /// Lexicon schema validation: `false` skips it, `true` requires it, unset
+    /// validates against known lexicons only. Declared on all four write
+    /// methods and previously accepted by none.
+    pub validate: Option<bool>,
     /// Compare-and-swap on the repo's current commit. The write is refused
     /// with `InvalidSwap` if the repository has moved on since the caller read
     /// it. Declared before and never read.
@@ -192,6 +196,11 @@ pub struct WriteRecordResponse {
     pub cid: Option<String>,
     /// New commit metadata.
     pub commit: WriteCommitInfo,
+    /// What validation this server performed. `unknown` while no schema
+    /// engine is wired — reporting `valid` would claim a check that did not
+    /// happen. Omitted when the caller asked for validation to be skipped.
+    #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<&'static str>,
 }
 
 /// Commit metadata returned with a write.
@@ -249,6 +258,13 @@ pub async fn create_record(
         atproto_oauth::scopes::RepoAction::Create,
     )?;
 
+    // `validate: true` means "refuse this write unless you validated it".
+    // Accepting it while validating nothing would be a control that reads as
+    // working and is not, so it is refused by name until the schema engine is
+    // wired.
+    let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
+    validate.ensure_supported().map_err(XrpcError::from)?;
+
     let rkey = input.rkey.unwrap_or_else(|| Tid::new().to_string());
     let result = writer
         .apply_writes_with_swap(
@@ -273,6 +289,7 @@ pub async fn create_record(
             cid: result.commit_cid,
             rev: result.rev,
         },
+        validation_status: validate.status(),
     }))
 }
 
@@ -290,6 +307,11 @@ pub struct PutRecordInput {
     /// Optional swap-record guard.
     #[serde(rename = "swapRecord")]
     pub swap_record: Option<String>,
+    /// Lexicon schema validation: `false` skips it, `true` requires it, unset
+    /// validates against known lexicons only. Declared and previously not
+    /// accepted. (`deleteRecord` does not take it — the lexicon has no such
+    /// field, since a delete has no record to validate.)
+    pub validate: Option<bool>,
     /// Compare-and-swap on the repo's current commit.
     #[serde(rename = "swapCommit")]
     pub swap_commit: Option<String>,
@@ -310,6 +332,9 @@ pub async fn put_record(
         &input.collection,
         atproto_oauth::scopes::RepoAction::Update,
     )?;
+
+    let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
+    validate.ensure_supported().map_err(XrpcError::from)?;
 
     let result = writer
         .apply_writes_with_swap(
@@ -334,6 +359,7 @@ pub async fn put_record(
             cid: result.commit_cid,
             rev: result.rev,
         },
+        validation_status: validate.status(),
     }))
 }
 
@@ -389,10 +415,13 @@ pub async fn delete_record(
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
         cid: None,
+        // `deleteRecord` declares no `validate` field and no
+        // `validationStatus`: there is no record to validate.
         commit: WriteCommitInfo {
             cid: result.commit_cid,
             rev: result.rev,
         },
+        validation_status: None,
     }))
 }
 
@@ -403,6 +432,11 @@ pub struct ApplyWritesInput {
     pub repo: String,
     /// Writes batch.
     pub writes: Vec<ApplyWritesEntry>,
+    /// Lexicon schema validation: `false` skips it, `true` requires it, unset
+    /// validates against known lexicons only. Declared and previously not
+    /// accepted. (`deleteRecord` does not take it — the lexicon has no such
+    /// field, since a delete has no record to validate.)
+    pub validate: Option<bool>,
     /// Compare-and-swap on the repo's current commit. Guards the whole batch:
     /// the lexicon says "the entire operation will fail".
     #[serde(rename = "swapCommit")]
@@ -463,6 +497,9 @@ pub enum ApplyWritesResult {
         uri: String,
         /// CID of the record value.
         cid: String,
+        /// What validation this server performed.
+        #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
+        validation_status: Option<&'static str>,
     },
     /// A record was updated.
     #[serde(rename = "com.atproto.repo.applyWrites#updateResult")]
@@ -471,6 +508,9 @@ pub enum ApplyWritesResult {
         uri: String,
         /// CID of the new record value.
         cid: String,
+        /// What validation this server performed.
+        #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
+        validation_status: Option<&'static str>,
     },
     /// A record was deleted. Carries nothing else.
     #[serde(rename = "com.atproto.repo.applyWrites#deleteResult")]
@@ -526,6 +566,9 @@ pub async fn apply_writes(
         assert_repo_scope(&claims, collection, action)?;
     }
 
+    let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
+    validate.ensure_supported().map_err(XrpcError::from)?;
+
     let ops: Vec<WriteOp> = input
         .writes
         .into_iter()
@@ -578,10 +621,12 @@ pub async fn apply_writes(
             RepoOpAction::Create => ApplyWritesResult::Create {
                 uri: w.uri,
                 cid: w.cid.unwrap_or_default(),
+                validation_status: validate.status(),
             },
             RepoOpAction::Update => ApplyWritesResult::Update {
                 uri: w.uri,
                 cid: w.cid.unwrap_or_default(),
+                validation_status: validate.status(),
             },
             RepoOpAction::Delete => ApplyWritesResult::Delete {},
         })

@@ -164,7 +164,7 @@ async fn list_records_paginates_over_http() {
         seed_record(
             tmp.path(),
             "did:plc:alice",
-            "c.col",
+            "com.example.record",
             r,
             serde_json::json!({"r": r}),
         )
@@ -172,7 +172,7 @@ async fn list_records_paginates_over_http() {
     }
     let (status, body) = get_json(
         app,
-        "/xrpc/com.atproto.repo.listRecords?repo=did:plc:alice&collection=c.col&limit=2",
+        "/xrpc/com.atproto.repo.listRecords?repo=did:plc:alice&collection=com.example.record&limit=2",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
