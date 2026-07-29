@@ -997,7 +997,7 @@ pub async fn update_account_password(
 /// Inputs for `admin.takedownSpaceRecord`.
 #[derive(Debug, Deserialize)]
 pub struct TakedownSpaceRecordInput {
-    /// Space URI (`ats://owner/type/key`).
+    /// Space URI (`at://owner/space/type/key`).
     pub space: String,
     /// NSID collection.
     pub collection: String,

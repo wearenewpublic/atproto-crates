@@ -704,7 +704,7 @@ mod tests {
             .build()
             .unwrap();
         let guard = crate::security::JtiReplayGuard::new(64);
-        let space: SpaceUri = "ats://did:plc:owner/app.bsky.group/default"
+        let space: SpaceUri = "at://did:plc:owner/space/app.bsky.group/default"
             .parse()
             .unwrap();
 

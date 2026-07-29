@@ -8,7 +8,7 @@
 //!    **delegation token** (spec "Delegation token", lines 147-176): a JWT with
 //!    header `typ=atproto-space-delegation+jwt`, `kid="#atproto"`, signed by
 //!    the member's atproto signing key. Claims: `iss` (member DID),
-//!    `aud=<spaceDid>#atproto_space_host`, `sub` (the space `ats://` URI),
+//!    `aud=<spaceDid>#atproto_space_host`, `sub` (the space `at://` URI),
 //!    `iat`, `exp=iat+60`, `jti`. It carries no `lxm` claim and says nothing
 //!    about the app. Single-use, default 60-second TTL.
 //! 2. The app presents that delegation token (in the `Authorization: Bearer`
@@ -17,7 +17,7 @@
 //!    mints a **space credential** (spec "Space credential", lines 200-230): a
 //!    JWT with header `typ=atproto-space-credential+jwt`,
 //!    `kid="#atproto_space"`, signed by the authority's space signing key.
-//!    Claims: `iss` (authority DID), `sub` (the space `ats://` URI),
+//!    Claims: `iss` (authority DID), `sub` (the space `at://` URI),
 //!    `client_id` (the attested app, omitted when no attestation), `iat`,
 //!    `exp=iat+7200`, `jti`. It has no `aud`. Default 2-hour TTL.
 //!
@@ -76,7 +76,7 @@ pub struct DelegationToken {
     /// Audience — the space host service fragment
     /// (`<spaceDid>#atproto_space_host`).
     pub aud: String,
-    /// Subject — the space being requested, an `ats://` URI.
+    /// Subject — the space being requested, an `at://…/space/…` URI.
     pub sub: String,
     /// Issued-at timestamp (seconds since epoch).
     pub iat: u64,
@@ -91,7 +91,7 @@ pub struct DelegationToken {
 pub struct SpaceCredential {
     /// Issuer DID — the space authority.
     pub iss: String,
-    /// Subject — the space the credential reads, an `ats://` URI.
+    /// Subject — the space the credential reads, an `at://…/space/…` URI.
     pub sub: String,
     /// Attested application identity (the verified client attestation's
     /// `iss`). Omitted on the wire when the request carried no attestation
@@ -263,7 +263,7 @@ fn check_exp(exp: u64) -> SpaceResult<()> {
 /// Mint a delegation token signed by the member's atproto signing key.
 ///
 /// The token's `aud` is set to the space host service fragment
-/// (`<spaceDid>#atproto_space_host`) and `sub` to the space `ats://` URI, per
+/// (`<spaceDid>#atproto_space_host`) and `sub` to the space `at://` URI, per
 /// spec lines 166-167. The header carries `kid="#atproto"`.
 ///
 /// # Errors

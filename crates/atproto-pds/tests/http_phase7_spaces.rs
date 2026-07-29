@@ -299,7 +299,7 @@ async fn create_space_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let uri = body["uri"].as_str().unwrap();
-    assert_eq!(uri, "ats://did:plc:owner/app.bsky.group/default");
+    assert_eq!(uri, "at://did:plc:owner/space/app.bsky.group/default");
 
     // getSpace returns {uri, config}; config carries the default mint policy.
     let (status, info) = get_json(
@@ -339,7 +339,7 @@ async fn create_space_auto_generates_skey() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let uri = body["uri"].as_str().unwrap();
-    assert!(uri.starts_with("ats://did:plc:owner/app.bsky.group/"));
+    assert!(uri.starts_with("at://did:plc:owner/space/app.bsky.group/"));
     // The auto-generated skey is a non-empty TID.
     assert!(uri.rsplit('/').next().unwrap().len() >= 10);
 }
@@ -936,7 +936,8 @@ async fn get_repo_state_signed_commit() {
 //  Credential flow: getDelegationToken -> getSpaceCredential, mint authz
 // ---------------------------------------------------------------------------
 
-/// Read scope string covering the default space (`ats://did:plc:owner/app.bsky.group/default`).
+/// Read scope string covering the default space
+/// (`at://did:plc:owner/space/app.bsky.group/default`).
 fn read_scope() -> String {
     "atproto space:app.bsky.group?did=did:plc:owner&skey=default&action=read".to_string()
 }
@@ -1207,7 +1208,7 @@ async fn list_repos_wrong_space_credential_rejected() {
         app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
-            urlencode("ats://did:plc:owner/app.bsky.group/missing")
+            urlencode("at://did:plc:owner/space/app.bsky.group/missing")
         ),
         Some(&credential),
     )

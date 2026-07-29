@@ -908,7 +908,7 @@ pub struct GetSpaceRecordQuery {
 /// Output of `getRecord`.
 #[derive(Debug, Serialize)]
 pub struct GetSpaceRecordResponse {
-    /// AT-URI of the record (`ats://owner/type/key/collection/rkey`).
+    /// AT-URI of the record (`at://owner/space/type/key/author/collection/rkey`).
     pub uri: String,
     /// CID of the record value (DAG-CBOR).
     pub cid: String,
@@ -1145,6 +1145,8 @@ pub struct RepoStateQuery {
 /// `#signedCommit` field table (lines 307-316).
 #[derive(Debug, Serialize)]
 pub struct SignedCommitDto {
+    /// Commit format version. Listed first in the lexicon's `required` set.
+    pub ver: u32,
     /// `sha256` of the LtHash state (32 bytes), as `{"$bytes": ...}`.
     pub hash: BytesValue,
     /// `HMAC-SHA256` over `hash`, as `{"$bytes": ...}`.
@@ -1179,6 +1181,7 @@ impl SignedCommitDto {
     /// Convert an [`atproto_space::Commit`] into its `$bytes`-encoded wire DTO.
     fn from_commit(c: atproto_space::Commit) -> Self {
         Self {
+            ver: c.ver,
             hash: BytesValue(c.hash),
             mac: BytesValue(c.mac),
             ikm: BytesValue(c.ikm),
@@ -1203,12 +1206,17 @@ pub struct StateResponse {
 ///
 /// Rehydrates the [`PdsSetHash`](crate::realm::PdsSetHash) lattice from the
 /// 2048-byte state persisted in [`RepoState`](atproto_space::RepoState),
-/// derives the 32-byte commitment, and signs a [`SpaceContext`] (the full
-/// `ats://` space URI + rev) with `signing_key`, per the 0016 Permissioned Data
-/// draft (§ Commit signature). Returns `None` when the state is empty (no
-/// commits yet).
+/// derives the 32-byte commitment, and signs a [`SpaceContext`] (space URI,
+/// author DID, rev) with `signing_key`, per the 0016 Permissioned Data draft
+/// (§ Commit signature). Returns `None` when the state is empty (no commits
+/// yet).
+///
+/// `author` is the DID of the repo the state belongs to. It is bound into the
+/// `ctx`, which is what domain-separates the signature within a space — a
+/// signature without it covers any author's commit at the same rev.
 fn signed_commit_from_state(
     space: &SpaceUri,
+    author: &str,
     state: &atproto_space::RepoState,
     signing_key: &atproto_identity::key::KeyData,
 ) -> Result<Option<SignedCommitDto>, XrpcError> {
@@ -1225,6 +1233,7 @@ fn signed_commit_from_state(
     })?;
     let ctx = atproto_space::SpaceContext {
         space: space.to_string(),
+        author: author.to_string(),
         rev: rev.to_string(),
     };
     let commit = atproto_space::create_commit(&set_hash, &ctx, signing_key).map_err(|e| {
@@ -1256,7 +1265,7 @@ pub async fn get_repo_state(
         .map_err(XrpcError::from)?;
     let manager = account_manager(&state)?;
     let signing_key = local_signing_key(manager, &q.repo).await?;
-    let commit = signed_commit_from_state(&uri, &st, &signing_key)?;
+    let commit = signed_commit_from_state(&uri, &q.repo, &st, &signing_key)?;
     Ok(Json(StateResponse { commit }))
 }
 
@@ -1368,7 +1377,7 @@ pub async fn list_repo_ops(
     let commit = if caught_up {
         let manager = account_manager(&state)?;
         let signing_key = local_signing_key(manager, &q.repo).await?;
-        signed_commit_from_state(&uri, &page.state, &signing_key)?
+        signed_commit_from_state(&uri, &q.repo, &page.state, &signing_key)?
     } else {
         None
     };
@@ -1465,7 +1474,7 @@ pub async fn get_delegation_token(
 /// space and an optional client attestation.
 #[derive(Debug, Deserialize)]
 pub struct GetSpaceCredentialInput {
-    /// The space being requested, an `ats://` URI.
+    /// The space being requested, an `at://…/space/…` URI.
     pub space: String,
     /// Optional client attestation (compact JWT) establishing the app's
     /// identity. Required only when the space gates on app identity
@@ -2650,7 +2659,7 @@ mod scope_gate_tests {
     use std::sync::Arc;
 
     fn space_uri() -> SpaceUri {
-        parse_space_uri("ats://did:plc:owner/app.bsky.group/default").unwrap()
+        parse_space_uri("at://did:plc:owner/space/app.bsky.group/default").unwrap()
     }
 
     /// Minimal `HttpState` with no declaration resolver configured (the

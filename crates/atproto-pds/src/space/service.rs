@@ -703,7 +703,7 @@ mod tests {
     async fn load_mint_authz_inputs_missing_space_not_found() {
         let (svc, _tmp) = fresh_service().await;
         // No createSpace — the owner store has no row for this URI.
-        let uri: SpaceUri = "ats://did:plc:owner/app.bsky.group/missing"
+        let uri: SpaceUri = "at://did:plc:owner/space/app.bsky.group/missing"
             .parse()
             .unwrap();
         let inputs = svc
@@ -837,7 +837,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_unknown_space_is_not_found() {
         let (svc, _tmp) = fresh_service().await;
-        let uri: SpaceUri = "ats://did:plc:owner/app.bsky.group/missing"
+        let uri: SpaceUri = "at://did:plc:owner/space/app.bsky.group/missing"
             .parse()
             .unwrap();
         assert!(matches!(

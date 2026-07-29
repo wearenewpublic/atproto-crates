@@ -453,16 +453,16 @@ mod tests {
 
     #[test]
     fn record_key_layout_is_prefix_scannable() {
-        let k = record_key("ats://did:plc:o/t/k", "c", "rkey-1");
-        let prefix = record_prefix("ats://did:plc:o/t/k", "c");
+        let k = record_key("at://did:plc:o/space/t/k", "c", "rkey-1");
+        let prefix = record_prefix("at://did:plc:o/space/t/k", "c");
         assert!(k.starts_with(&prefix));
     }
 
     #[test]
     fn oplog_key_within_rev_orders_by_idx() {
-        let k0 = oplog_key("ats://x/y/z", "abc", 0);
-        let k1 = oplog_key("ats://x/y/z", "abc", 1);
-        let k10 = oplog_key("ats://x/y/z", "abc", 10);
+        let k0 = oplog_key("at://x/space/y/z", "abc", 0);
+        let k1 = oplog_key("at://x/space/y/z", "abc", 1);
+        let k10 = oplog_key("at://x/space/y/z", "abc", 10);
         assert!(k0 < k1);
         assert!(k1 < k10);
     }
@@ -471,8 +471,8 @@ mod tests {
     fn oplog_key_orders_across_revs() {
         // A composite `(rev, idx)` cursor resumes at the exact op key, so the
         // last idx of one rev sorts before the first idx of the next rev.
-        let rev_a_last = oplog_key("ats://x/y/z", "abc", 99);
-        let rev_b_first = oplog_key("ats://x/y/z", "abd", 0);
+        let rev_a_last = oplog_key("at://x/space/y/z", "abc", 99);
+        let rev_b_first = oplog_key("at://x/space/y/z", "abd", 0);
         assert!(rev_a_last < rev_b_first);
     }
 }

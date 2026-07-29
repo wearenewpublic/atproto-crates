@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Changed
+- **`atproto-space` / `atproto-pds`: the permissioned-data commit format changed in three coupled
+  ways. Spaces created before this release must be recreated.**
+
+  Nothing this server emitted for spaces has ever interoperated with a conformant peer, for three
+  reasons that had to be fixed together:
+
+  - **The `ctx` omitted the author DID.** The 0016 draft builds it as
+    `"atproto-space-v1" || len+space || len+author || len+rev || len+ikm`; this crate emitted
+    `[space, rev, ikm]`. So `sig` and `mac` were computed over different bytes than any peer — and
+    the signature did not bind the author, losing the draft's domain separation *within* a space.
+  - **The signed commit had no `ver`.** `ver` is first in the lexicon's `required` set and is
+    currently `1`. Every emitted commit failed schema validation on a required field before any
+    crypto ran, and there was no version discriminator to negotiate a future `ctx` construction with.
+  - **The URI scheme was `ats://{did}/{type}/{skey}`.** Every draft lexicon types the space
+    parameter as `at-uri`, and the reference form is
+    `at://{did}/space/{type}/{skey}[/{author}/{collection}/{rkey}]` — a fixed `space` marker where a
+    public URI carries a collection NSID. The two are unambiguous because a collection has dots and
+    the marker does not.
+
+  The third change is why the other two could not ship alone: `space` is length-prefixed into the
+  `ctx`, so changing the string changes the signed bytes regardless.
+
+  `ats://` is still **accepted on input** and normalized, so a caller holding an old URI gets an
+  answer rather than a syntax error. Nothing emits it. A commit carrying an unknown `ver` is refused
+  before the MAC is checked, so a version mismatch does not present as a crypto failure.
+
+  **There is no migration, and one would not help.** The space URI is the primary key of the `space`
+  table with nine FK-referencing tables, so the strings *could* be rewritten — but `sig` and `mac`
+  on every stored commit were computed over the old `ctx`. Rewriting the URI produces rows that look
+  conformant and fail verification. Commits can only be re-signed, which needs each author's signing
+  key. Since none of this data was ever interoperable, recreating spaces is the honest path.
+
 - `atproto-pds`: **PostgreSQL accounts storage and S3 blob storage are documented as unsupported,
   and configuring either now refuses at boot.**
 

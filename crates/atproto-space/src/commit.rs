@@ -19,7 +19,8 @@
 //!
 //! ```text
 //! ctx = "atproto-space-v1"                          // fixed protocol tag, NO length prefix
-//!   || uint16be(len(space)) || space                // space URI (ats://authority/type/skey)
+//!   || uint16be(len(space))  || space  // space URI (at://authority/space/type/skey)
+//!   || uint16be(len(author)) || author // author DID of the repo
 //!   || uint16be(len(rev))   || rev                  // commit revision (TID)
 //!   || uint16be(len(ikm))   || ikm                  // per-commit nonce
 //! ```
@@ -51,14 +52,20 @@ const DOMAIN_PREFIX: &[u8] = b"atproto-space-v1";
 
 /// Context bound into a commit via the signature and the MAC's HKDF info.
 ///
-/// Per the 0016 Permissioned Data draft (spec lines 288–297) the on-the-wire
-/// `ctx` is `[space, rev, ikm]` length-prefixed; the `ikm` is supplied per
-/// commit (it is part of the [`Commit`]), so this struct carries only the
-/// stable `[space, rev]` pair.
+/// Per the 0016 draft the on-the-wire `ctx` is
+/// `[space, author, rev, ikm]` length-prefixed; the `ikm` is supplied per
+/// commit (it is part of the [`Commit`]), so this struct carries the stable
+/// `[space, author, rev]` triple.
+///
+/// The author DID is what gives the signature domain separation *within* a
+/// space: without it, a signature over one author's commit is a signature over
+/// any author's commit at the same rev.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceContext {
-    /// Full space URI (`ats://{spaceDid}/{spaceType}/{skey}`).
+    /// Full space URI (`at://{spaceDid}/space/{spaceType}/{skey}`).
     pub space: String,
+    /// DID of the repo author this commit belongs to.
+    pub author: String,
     /// Rev (TID) for this commit.
     pub rev: String,
 }
@@ -66,25 +73,46 @@ pub struct SpaceContext {
 /// Encode the commit `ctx` (signature message + HKDF info).
 ///
 /// `"atproto-space-v1"` followed by each field length-prefixed with a
-/// big-endian `uint16`, in the order `[space, rev, ikm]` (spec lines 293–297).
+/// big-endian `uint16`, in the order `[space, author, rev, ikm]` — the TLS 1.3
+/// §3.4 variable-length-vector encoding the draft specifies.
+///
+/// The lengths are big-endian here and little-endian in the LtHash lanes. That
+/// is not an inconsistency to tidy up: the two come from different specs and
+/// each keeps its native byte order.
 #[must_use]
 pub fn encode_ctx(context: &SpaceContext, ikm: &[u8]) -> Vec<u8> {
     let space = context.space.as_bytes();
+    let author = context.author.as_bytes();
     let rev = context.rev.as_bytes();
-    let mut out = Vec::with_capacity(DOMAIN_PREFIX.len() + space.len() + rev.len() + ikm.len() + 6);
+    let mut out = Vec::with_capacity(
+        DOMAIN_PREFIX.len() + space.len() + author.len() + rev.len() + ikm.len() + 8,
+    );
     out.extend_from_slice(DOMAIN_PREFIX);
-    for field in [space, rev, ikm] {
+    for field in [space, author, rev, ikm] {
         out.extend_from_slice(&(field.len() as u16).to_be_bytes());
         out.extend_from_slice(field);
     }
     out
 }
 
+/// The only commit format version this build produces or accepts.
+///
+/// Corresponds to the `v1` in the `ctx` protocol tag `atproto-space-v1`; a
+/// future ctx construction is expected to arrive with a new `ver`, which is
+/// what makes this field the negotiation point rather than a decoration.
+pub const COMMIT_VERSION: u32 = 1;
+
 /// A signed permissioned-data commit (`com.atproto.space.defs#signedCommit`).
 ///
-/// Wire field order matches the lexicon required set `[hash, mac, ikm, sig, rev]`.
+/// Carries the lexicon's full required set `[ver, hash, mac, ikm, sig, rev]`.
+/// The order in that array is not a wire-order requirement — JSON objects are
+/// unordered and canonical DAG-CBOR sorts keys by length then bytes — so what
+/// matters is that every one of them is present, which `ver` previously was
+/// not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
+    /// Commit format version. Always [`COMMIT_VERSION`].
+    pub ver: u32,
     /// `sha256` of the LtHash state (32 bytes).
     #[serde(with = "serde_bytes")]
     pub hash: Vec<u8>,
@@ -138,19 +166,33 @@ pub fn create_commit_with_ikm(
 
     let ctx = encode_ctx(context, ikm);
     let mac = derive_mac(ikm, hash, &ctx)?;
-    // Per spec line 302: the signature is over the full `ctx` (space, rev, ikm)
-    // — never the hash — so a leaked commit is deniable.
+    // The signature is over the full `ctx` (space, author, rev, ikm) — never
+    // the hash — so a leaked commit is deniable.
     let sig = identity_sign(signing_key, &ctx).map_err(|e| SpaceError::Signature {
         reason: e.to_string(),
     })?;
 
     Ok(Commit {
+        ver: COMMIT_VERSION,
         hash: hash.to_vec(),
         mac,
         ikm: ikm.to_vec(),
         sig,
         rev: context.rev.clone(),
     })
+}
+
+/// Refuse a commit whose format version this build does not implement.
+///
+/// # Errors
+///
+/// [`SpaceError::UnsupportedCommitVersion`] when `ver` is not
+/// [`COMMIT_VERSION`].
+pub fn check_commit_version(commit: &Commit) -> SpaceResult<()> {
+    if commit.ver != COMMIT_VERSION {
+        return Err(SpaceError::UnsupportedCommitVersion { ver: commit.ver });
+    }
+    Ok(())
 }
 
 /// Derive `HMAC-SHA256(HKDF-Expand(ikm, ctx), hash)`.
@@ -186,6 +228,10 @@ fn derive_mac(ikm: &[u8], hash: &[u8], ctx: &[u8]) -> SpaceResult<Vec<u8>> {
 ///   tampered, or wrong context).
 /// - [`SpaceError::Hkdf`] — `ikm` is not 32 bytes, or derivation failed.
 pub fn verify_commit(context: &SpaceContext, commit: &Commit) -> SpaceResult<()> {
+    // Version before crypto. A commit carrying a `ver` this build does not know
+    // was signed over a `ctx` this build does not know how to rebuild, so
+    // proceeding would report a version mismatch as a MAC failure.
+    check_commit_version(commit)?;
     if commit.ikm.len() != 32 {
         return Err(SpaceError::Hkdf {
             reason: format!("ikm must be 32 bytes, got {}", commit.ikm.len()),
@@ -243,7 +289,8 @@ mod tests {
 
     fn test_context() -> SpaceContext {
         SpaceContext {
-            space: "ats://did:plc:owner/app.bsky.group/default".to_string(),
+            space: "at://did:plc:owner/space/app.bsky.group/default".to_string(),
+            author: "did:plc:author".to_string(),
             rev: "3jui7kd2z2y2e".to_string(),
         }
     }
@@ -305,7 +352,7 @@ mod tests {
         let (priv_key, _) = test_keypair();
         let ctx = test_context();
         let other = SpaceContext {
-            space: "ats://did:plc:owner/app.bsky.group/other".to_string(),
+            space: "at://did:plc:owner/space/app.bsky.group/other".to_string(),
             ..ctx.clone()
         };
         let h = fresh_set_hash();
@@ -369,20 +416,94 @@ mod tests {
     }
 
     /// The `ctx` byte layout: tag, then uint16be-length-prefixed fields in the
-    /// fixed order `[space, rev, ikm]` (spec lines 293–297).
+    /// fixed order `[space, author, rev, ikm]`.
+    ///
+    /// Written as literal bytes rather than by re-running the encoder, because
+    /// a test that rebuilds the value the same way agrees with any field order
+    /// the implementation happens to use — which is exactly how the author DID
+    /// went missing.
     #[test]
-    fn commit_ctx_layout() {
+    fn commit_ctx_layout_is_a_known_answer() {
         let ctx = SpaceContext {
-            space: "s".to_string(),
+            space: "sp".to_string(),
+            author: "au".to_string(),
             rev: "r".to_string(),
         };
         let ikm = [0xABu8; 4];
         let encoded = encode_ctx(&ctx, &ikm);
-        let mut expected = b"atproto-space-v1".to_vec();
-        for f in [b"s".as_slice(), b"r".as_slice(), &ikm] {
-            expected.extend_from_slice(&(f.len() as u16).to_be_bytes());
-            expected.extend_from_slice(f);
-        }
+
+        let expected: Vec<u8> = [
+            b"atproto-space-v1".as_slice(),
+            &[0x00, 0x02],
+            b"sp",
+            &[0x00, 0x02],
+            b"au",
+            &[0x00, 0x01],
+            b"r",
+            &[0x00, 0x04],
+            &[0xAB, 0xAB, 0xAB, 0xAB],
+        ]
+        .concat();
         assert_eq!(encoded, expected);
+    }
+
+    /// The author DID is what separates two authors' commits within one space.
+    /// Without it in the `ctx`, a signature over one author's commit is a
+    /// signature over any author's commit at the same rev.
+    #[test]
+    fn domain_separation_by_author() {
+        let (priv_key, _) = test_keypair();
+        let ctx = test_context();
+        let other = SpaceContext {
+            author: "did:plc:someoneelse".to_string(),
+            ..ctx.clone()
+        };
+        let h = fresh_set_hash();
+        let commit = create_commit(&h, &ctx, &priv_key).unwrap();
+        assert!(matches!(
+            verify_commit(&other, &commit),
+            Err(SpaceError::CommitTagMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_commit_carries_version_one() {
+        let (priv_key, _) = test_keypair();
+        let commit = create_commit(&fresh_set_hash(), &test_context(), &priv_key).unwrap();
+        assert_eq!(commit.ver, COMMIT_VERSION);
+        assert_eq!(commit.ver, 1, "the lexicon says currently 1");
+    }
+
+    #[test]
+    fn an_unknown_version_is_refused_before_the_mac_is_checked() {
+        // Reporting a version mismatch as a MAC failure would send an
+        // implementor looking for a crypto bug that is not there.
+        let (priv_key, _) = test_keypair();
+        let ctx = test_context();
+        let mut commit = create_commit(&fresh_set_hash(), &ctx, &priv_key).unwrap();
+        commit.ver = 2;
+        assert!(matches!(
+            verify_commit(&ctx, &commit),
+            Err(SpaceError::UnsupportedCommitVersion { ver: 2 })
+        ));
+    }
+
+    #[test]
+    fn every_lexicon_required_field_is_present() {
+        // `required: ["ver","hash","mac","ikm","sig","rev"]`. Asserting the
+        // set, not the order: JSON objects are unordered and canonical
+        // DAG-CBOR sorts its own keys, so an order assertion here would be
+        // testing serde_json rather than this struct.
+        let (priv_key, _) = test_keypair();
+        let commit = create_commit(&fresh_set_hash(), &test_context(), &priv_key).unwrap();
+        let json = serde_json::to_value(&commit).unwrap();
+        let obj = json.as_object().unwrap();
+        for field in ["ver", "hash", "mac", "ikm", "sig", "rev"] {
+            assert!(
+                obj.contains_key(field),
+                "{field} missing from the wire form"
+            );
+        }
+        assert_eq!(obj.len(), 6, "no extra fields: {json}");
     }
 }

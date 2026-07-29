@@ -592,7 +592,7 @@ mod tests {
             .unwrap();
         let manifest = ExportManifest {
             version: 999,
-            space: "ats://did:plc:owner/app.bsky.group/default".to_string(),
+            space: "at://did:plc:owner/space/app.bsky.group/default".to_string(),
             member_did: None,
             set_hash: None,
             rev: None,

@@ -55,7 +55,7 @@ pub struct SpaceCommitResult {
     pub rev: String,
     /// New SetHash (hex-encoded). Serialized as `setHash`.
     pub set_hash: String,
-    /// Per-op AT-URIs (`ats://` form).
+    /// Per-op AT-URIs (`at://…/space/…` form).
     pub uris: Vec<String>,
     /// Per-op record CIDs, parallel to `uris`. `None` for delete ops.
     pub cids: Vec<Option<String>>,
@@ -222,10 +222,13 @@ impl SpaceWriter {
         if !exists {
             // Idempotent no-op: report current state without a new commit.
             let state = repo.current_state().await.map_err(space_err)?;
-            let uri = format!(
-                "ats://{}/{}/{}/{}/{}/{}",
-                space.space_did, space.space_type, space.space_key, member_did, collection, rkey
-            );
+            let uri = atproto_space::RecordUri::new(
+                space.clone(),
+                member_did.to_string(),
+                collection.to_string(),
+                rkey.to_string(),
+            )
+            .to_string();
             return Ok(SpaceCommitResult {
                 rev: state.rev.unwrap_or_default(),
                 set_hash: state.set_hash.map(hex::encode).unwrap_or_default(),
@@ -268,14 +271,24 @@ impl SpaceWriter {
             } else {
                 op.rkey.clone()
             };
-            // Six-segment permissioned record URI, including the author DID:
-            // ats://<spaceDid>/<spaceType>/<skey>/<authorDid>/<collection>/<rkey>.
+            // Permissioned record URI, including the author DID:
+            // at://<spaceDid>/space/<spaceType>/<skey>/<authorDid>/<collection>/<rkey>.
             // The author segment is required — records are not colocated, so two
             // members writing the same (collection, rkey) must not collide.
-            output_uris.push(format!(
-                "ats://{}/{}/{}/{}/{}/{}",
-                space.space_did, space.space_type, space.space_key, member_did, op.collection, rkey
-            ));
+            //
+            // Built through `RecordUri` rather than a format string so the
+            // scheme and marker live in one place; the two hand-rolled copies
+            // this replaces were the reason the format change had to be found
+            // by grep.
+            output_uris.push(
+                atproto_space::RecordUri::new(
+                    space.clone(),
+                    member_did.to_string(),
+                    op.collection.clone(),
+                    rkey.clone(),
+                )
+                .to_string(),
+            );
             // Compute the value's CID (from DAG-CBOR) for create/update.
             let (cid, value_bytes) = match op.action {
                 SpaceWriteAction::Create | SpaceWriteAction::Update => {
@@ -309,6 +322,7 @@ impl SpaceWriter {
         let set_hash_hex = hex::encode(&prepared.storage_commit.new_set_hash);
         let context = SpaceContext {
             space: space.to_string(),
+            author: member_did.to_string(),
             rev: rev.clone(),
         };
 
@@ -523,7 +537,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.uris[0].starts_with("ats://did:plc:owner/app.bsky.group/default/"));
+        assert!(result.uris[0].starts_with("at://did:plc:owner/space/app.bsky.group/default/"));
         assert!(!result.set_hash.is_empty());
     }
 

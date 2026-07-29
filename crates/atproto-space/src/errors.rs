@@ -8,7 +8,17 @@ use thiserror::Error;
 /// Errors returned by `atproto-space` operations.
 #[derive(Debug, Error)]
 pub enum SpaceError {
-    /// error-atproto-space-types-1: invalid `ats://` URI.
+    /// A commit carries a format version this build does not implement.
+    ///
+    /// Distinct from a MAC failure: the bytes may be perfectly valid, signed
+    /// over a `ctx` construction this build cannot rebuild.
+    #[error("error-atproto-space-commit-2 unsupported commit version: {ver}, expected 1")]
+    UnsupportedCommitVersion {
+        /// The version the commit declared.
+        ver: u32,
+    },
+
+    /// error-atproto-space-types-1: invalid space URI.
     #[error("error-atproto-space-types-1 invalid space URI: {uri}")]
     InvalidSpaceUri {
         /// The URI string that failed parsing.

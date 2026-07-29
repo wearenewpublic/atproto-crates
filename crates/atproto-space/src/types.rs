@@ -1,15 +1,34 @@
 //! Core types for permissioned-data spaces.
 //!
 //! `SpaceUri`, `SpaceType`, `SpaceKey`, `RecordUri` are wrapper newtypes around
-//! strings that validate at construction time. They are abstracted so the URI
-//! scheme (`ats://` per the 0016 Permissioned Data draft) can change without
-//! callers needing to update.
+//! strings that validate at construction time. Callers build and print URIs
+//! through them rather than formatting strings, so the scheme and the `space`
+//! marker live in one place — which is exactly what the change from `ats://`
+//! to `at://{did}/space/{type}/{skey}` needed and did not have: two hand-rolled
+//! `format!` copies in the writer had to be found by grep.
 
 use crate::errors::{SpaceError, SpaceResult};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// URI scheme for permissioned data spaces (per the 0016 Permissioned Data draft).
+/// Canonical URI scheme for permissioned data spaces.
+///
+/// Space URIs are ordinary `at://` URIs. The 0016 draft and the reference
+/// (`packages/syntax/src/space-uri.ts`) both put a fixed `space` marker segment
+/// where a public URI would carry a collection NSID; the two are unambiguous
+/// because a collection always contains dots and the marker never does.
+pub const AT_SCHEME: &str = "at://";
+
+/// The fixed second path segment of every space URI.
+pub const SPACE_MARKER: &str = "space";
+
+/// Legacy scheme, accepted on input and rewritten.
+///
+/// This crate emitted `ats://{did}/{type}/{skey}` before the marker form was
+/// adopted. It is still parsed so a caller holding an old URI gets an answer
+/// rather than a syntax error — but nothing emits it, and a commit signed
+/// against one can never verify, because the space string is length-prefixed
+/// into `ctx`.
 pub const ATS_SCHEME: &str = "ats://";
 
 /// A space type — an NSID describing the space modality (e.g., `app.bsky.group`).
@@ -86,10 +105,11 @@ impl fmt::Display for SpaceKey {
     }
 }
 
-/// A space URI: `ats://<authority-did>/<space-type>/<space-key>`.
+/// A space URI: `at://<authority-did>/space/<space-type>/<space-key>`.
 ///
 /// The components are validated at construction. The full URI is round-trip
-/// stable through `Display` and `parse`.
+/// stable through `Display` and `parse`. Legacy `ats://<did>/<type>/<key>` is
+/// accepted on input and normalized to the canonical form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct SpaceUri {
@@ -111,52 +131,60 @@ impl SpaceUri {
         }
     }
 
-    /// Parse from the canonical wire form `ats://<owner-did>/<type>/<key>`.
+    /// Parse `at://<did>/space/<type>/<key>`, or the legacy
+    /// `ats://<did>/<type>/<key>`.
     ///
     /// # Errors
     ///
     /// Returns [`SpaceError::InvalidSpaceUri`] (or a more specific component
     /// error) on failure.
     pub fn parse(s: &str) -> SpaceResult<Self> {
-        let stripped = s
-            .strip_prefix(ATS_SCHEME)
-            .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
-
-        // Split into 3 parts: space_did, space_type, space_key.
-        // space_did itself may contain `:` but no `/`, so we split on `/`.
-        let mut parts = stripped.splitn(3, '/');
-        let space_did = parts
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?
-            .to_string();
-        let space_type_str = parts
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
-        let space_key_str = parts
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
-
-        if !space_did.starts_with("did:") {
-            return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
+        let bad = || SpaceError::InvalidSpaceUri { uri: s.to_string() };
+        let parts = split_space_path(s, 3).ok_or_else(bad)?;
+        if !parts[0].starts_with("did:") {
+            return Err(bad());
         }
-
         Ok(Self {
-            space_did,
-            space_type: SpaceType::new(space_type_str)?,
-            space_key: SpaceKey::new(space_key_str)?,
+            space_did: parts[0].to_string(),
+            space_type: SpaceType::new(parts[1])?,
+            space_key: SpaceKey::new(parts[2])?,
         })
     }
+}
+
+/// Strip the scheme and marker, returning `expected` non-empty path segments
+/// plus any trailing ones.
+///
+/// Handles both the canonical `at://<did>/space/<...>` and the legacy
+/// `ats://<did>/<...>`, so every caller gets the marker handling once rather
+/// than repeating it.
+fn split_space_path(s: &str, expected: usize) -> Option<Vec<&str>> {
+    let parts: Vec<&str> = if let Some(rest) = s.strip_prefix(AT_SCHEME) {
+        let all: Vec<&str> = rest.split('/').collect();
+        // `did` + marker + the rest.
+        if all.len() < 2 || all[1] != SPACE_MARKER {
+            return None;
+        }
+        let mut v = vec![all[0]];
+        v.extend_from_slice(&all[2..]);
+        v
+    } else if let Some(rest) = s.strip_prefix(ATS_SCHEME) {
+        rest.split('/').collect()
+    } else {
+        return None;
+    };
+    if parts.len() != expected || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(parts)
 }
 
 impl fmt::Display for SpaceUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}{}/{}/{}",
-            ATS_SCHEME, self.space_did, self.space_type, self.space_key
+            "{}{}/{}/{}/{}",
+            AT_SCHEME, self.space_did, SPACE_MARKER, self.space_type, self.space_key
         )
     }
 }
@@ -183,14 +211,15 @@ impl std::str::FromStr for SpaceUri {
     }
 }
 
-/// A permissioned **record** URI of six components:
-/// `ats://<spaceDid>/<spaceType>/<skey>/<authorDid>/<collection>/<rkey>`.
+/// A permissioned **record** URI:
+/// `at://<spaceDid>/space/<spaceType>/<skey>/<authorDid>/<collection>/<rkey>`.
 ///
-/// The first three components are the [`SpaceUri`]; the remaining three
-/// identify a record authored by `author_did` within that space. All six
-/// segments are required to identify a permissioned record (the space does not
-/// colocate records — each author's records live in their own permissioned
-/// repo, so the author DID is part of the address).
+/// The first four segments are the [`SpaceUri`]; the remaining three identify a
+/// record authored by `author_did` within that space. All of them are required
+/// (the space does not colocate records — each author's records live in their
+/// own permissioned repo, so the author DID is part of the address).
+///
+/// The legacy six-segment `ats://` form is accepted on input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecordUri {
     /// The space the record belongs to (first three URI segments).
@@ -215,26 +244,21 @@ impl RecordUri {
         }
     }
 
-    /// Parse from the canonical six-segment wire form.
+    /// Parse the canonical wire form, or the legacy `ats://` six-segment one.
     ///
     /// # Errors
     ///
     /// Returns [`SpaceError::InvalidSpaceUri`] if the URI does not have exactly
-    /// six non-empty segments or a component fails validation.
+    /// the required non-empty segments or a component fails validation.
     pub fn parse(s: &str) -> SpaceResult<Self> {
-        let stripped = s
-            .strip_prefix(ATS_SCHEME)
-            .ok_or_else(|| SpaceError::InvalidSpaceUri { uri: s.to_string() })?;
-        // A record URI has EXACTLY six segments; a 7th `/` (or any extra
-        // segment) is rejected rather than absorbed into the rkey.
-        let parts: Vec<&str> = stripped.split('/').collect();
-        if parts.len() != 6 || parts.iter().any(|p| p.is_empty()) {
-            return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
-        }
+        let bad = || SpaceError::InvalidSpaceUri { uri: s.to_string() };
+        // Exactly six segments after the marker is stripped; a seventh is
+        // rejected rather than absorbed into the rkey.
+        let parts = split_space_path(s, 6).ok_or_else(bad)?;
         let space = SpaceUri::new(
             {
                 if !parts[0].starts_with("did:") {
-                    return Err(SpaceError::InvalidSpaceUri { uri: s.to_string() });
+                    return Err(bad());
                 }
                 parts[0].to_string()
             },
@@ -356,13 +380,26 @@ mod tests {
 
     #[test]
     fn record_uri_round_trip() {
-        let s = "ats://did:plc:auth/app.bsky.group/default/did:plc:alice/app.bsky.feed.post/3jui";
+        let s =
+            "at://did:plc:auth/space/app.bsky.group/default/did:plc:alice/app.bsky.feed.post/3jui";
         let parsed = RecordUri::parse(s).unwrap();
         assert_eq!(parsed.author_did, "did:plc:alice");
         assert_eq!(parsed.collection, "app.bsky.feed.post");
         assert_eq!(parsed.rkey, "3jui");
         assert_eq!(parsed.space.space_did, "did:plc:auth");
         assert_eq!(parsed.to_string(), s);
+    }
+
+    #[test]
+    fn a_legacy_record_uri_parses_and_normalizes() {
+        let legacy =
+            "ats://did:plc:auth/app.bsky.group/default/did:plc:alice/app.bsky.feed.post/3jui";
+        let parsed = RecordUri::parse(legacy).unwrap();
+        assert_eq!(
+            parsed.to_string(),
+            "at://did:plc:auth/space/app.bsky.group/default/did:plc:alice/app.bsky.feed.post/3jui",
+            "a legacy URI comes back canonical, never as it went in"
+        );
     }
 
     #[test]
@@ -396,9 +433,31 @@ mod tests {
 
     #[test]
     fn space_uri_roundtrip() {
-        let original = "ats://did:plc:example/app.bsky.group/default";
+        let original = "at://did:plc:example/space/app.bsky.group/default";
         let parsed = SpaceUri::parse(original).unwrap();
         assert_eq!(parsed.to_string(), original);
+    }
+
+    #[test]
+    fn a_legacy_space_uri_parses_and_normalizes() {
+        // Accepted so a caller holding an old URI gets an answer rather than a
+        // syntax error — but nothing emits it again.
+        let parsed = SpaceUri::parse("ats://did:plc:example/app.bsky.group/default").unwrap();
+        assert_eq!(
+            parsed.to_string(),
+            "at://did:plc:example/space/app.bsky.group/default"
+        );
+    }
+
+    #[test]
+    fn the_space_marker_is_required_on_the_canonical_form() {
+        // Without the marker check, `at://did/app.bsky.group/default` would
+        // parse as a space URI whose type is a collection — the ambiguity the
+        // marker exists to prevent.
+        assert!(SpaceUri::parse("at://did:plc:x/app.bsky.group/default").is_err());
+        assert!(SpaceUri::parse("at://did:plc:x/notspace/app.bsky.group/default").is_err());
+        assert!(SpaceUri::parse("at://did:plc:x/space/app.bsky.group").is_err());
+        assert!(SpaceUri::parse("at://did:plc:x/space/app.bsky.group/default/extra").is_err());
     }
 
     #[test]
@@ -412,9 +471,12 @@ mod tests {
 
     #[test]
     fn space_uri_serde_round_trip() {
-        let uri = SpaceUri::parse("ats://did:plc:example/app.bsky.group/default").unwrap();
+        let uri = SpaceUri::parse("at://did:plc:example/space/app.bsky.group/default").unwrap();
         let json = serde_json::to_string(&uri).unwrap();
-        assert_eq!(json, "\"ats://did:plc:example/app.bsky.group/default\"");
+        assert_eq!(
+            json,
+            "\"at://did:plc:example/space/app.bsky.group/default\""
+        );
         let parsed: SpaceUri = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, uri);
     }
