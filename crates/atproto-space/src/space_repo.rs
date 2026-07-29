@@ -110,9 +110,10 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
         collection: &str,
         cursor: Option<&str>,
         limit: u32,
+        reverse: bool,
     ) -> SpaceResult<RecordPage> {
         self.storage
-            .list_records(&self.space, collection, cursor, limit)
+            .list_records(&self.space, collection, cursor, limit, reverse)
             .await
     }
 
@@ -181,6 +182,10 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
                         cid: Some(cid),
                         prev: None,
                         did: None,
+                        // Written keys-only; the value is joined in at read time
+                        // from the current record, which is what implements the
+                        // lexicon's "omitted when superseded".
+                        value: None,
                     });
                 }
                 OpAction::Update => {
@@ -225,6 +230,10 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
                         cid: Some(new_cid),
                         prev: Some(prior_row.cid),
                         did: None,
+                        // Written keys-only; the value is joined in at read time
+                        // from the current record, which is what implements the
+                        // lexicon's "omitted when superseded".
+                        value: None,
                     });
                 }
                 OpAction::Delete => {
@@ -253,6 +262,10 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
                         cid: None,
                         prev: Some(prior_row.cid),
                         did: None,
+                        // Written keys-only; the value is joined in at read time
+                        // from the current record, which is what implements the
+                        // lexicon's "omitted when superseded".
+                        value: None,
                     });
                 }
             }
@@ -361,6 +374,7 @@ pub mod memory {
             collection: &str,
             cursor: Option<&str>,
             limit: u32,
+            reverse: bool,
         ) -> SpaceResult<RecordPage> {
             let inner = self.inner.lock().unwrap();
             let mut rows: Vec<RecordRow> = inner
@@ -368,12 +382,17 @@ pub mod memory {
                 .iter()
                 .filter(|((s, c, _), _)| s == space && c == collection)
                 .filter(|((_, _, rkey), _)| match cursor {
+                    Some(cur) if reverse => rkey.as_str() < cur,
                     Some(cur) => rkey.as_str() > cur,
                     None => true,
                 })
                 .map(|(_, row)| row.clone())
                 .collect();
-            rows.sort_by(|a, b| a.rkey.cmp(&b.rkey));
+            if reverse {
+                rows.sort_by(|a, b| b.rkey.cmp(&a.rkey));
+            } else {
+                rows.sort_by(|a, b| a.rkey.cmp(&b.rkey));
+            }
             let cursor_out = if rows.len() > limit as usize {
                 rows.truncate(limit as usize);
                 rows.last().map(|r| r.rkey.clone())

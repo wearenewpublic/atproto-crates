@@ -140,6 +140,8 @@ impl<S: SpaceMembersStorage, H: SetHash> SpaceMembers<S, H> {
                 cid: None,
                 prev: None,
                 did: Some(op.did.clone()),
+                // Member ops name a DID, not a record; there is no value.
+                value: None,
             });
         }
 

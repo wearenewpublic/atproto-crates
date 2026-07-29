@@ -124,6 +124,7 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
         collection: &str,
         cursor: Option<&str>,
         limit: u32,
+        reverse: bool,
     ) -> SpaceResult<RecordPage> {
         let limit = limit.clamp(1, 100) as usize;
         let prefix = record_prefix(&space.to_string(), collection);
@@ -141,10 +142,19 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
             let (k, v) = kv
                 .into_inner()
                 .map_err(|e| fjall_err(format!("scan record: {e}")))?;
-            if let Some(c) = cursor_key.as_ref()
-                && k.as_ref() <= c.as_slice()
-            {
-                continue;
+            // Ascending keeps rows strictly after the cursor; descending keeps
+            // rows strictly before it. `cursor_key` has a trailing NUL making
+            // it strictly-greater than the cursor row, so the descending
+            // comparison uses the bare prefix+rkey instead.
+            if let Some(c) = cursor_key.as_ref() {
+                let past = if reverse {
+                    k.as_ref() >= &c[..c.len() - 1]
+                } else {
+                    k.as_ref() <= c.as_slice()
+                };
+                if past {
+                    continue;
+                }
             }
             // Decode the rkey from the trailing segment of the key.
             let suffix = &k[prefix.len()..];
@@ -159,9 +169,17 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
                 repo_rev: value.repo_rev,
                 indexed_at: value.indexed_at,
             });
-            if records.len() >= limit {
+            if !reverse && records.len() >= limit {
                 break;
             }
+        }
+        if reverse {
+            // The keyspace scan is ascending, so a descending page is the
+            // *last* `limit` rows in reverse. The break above stopped at
+            // `limit` ascending rows, which is the wrong end — collect the
+            // whole prefix and take from the tail instead.
+            records.reverse();
+            records.truncate(limit);
         }
         let cursor = records.last().map(|r| r.rkey.clone());
         Ok(RecordPage { records, cursor })
@@ -297,6 +315,33 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
                 .map_err(|e| fjall_err(format!("idx parse: {e}")))?;
 
             let row: OplogRow = decode(&v)?;
+            // Inline the record's value only when the op's own CID is still the
+            // current one. A superseded op's CID is not, so it gets `None` —
+            // the lexicon's "omitted when superseded" — and a delete has no CID
+            // to match at all. Matching on `(collection, rkey)` alone would
+            // attach the *new* value to an *old* op.
+            let value = match (
+                row.collection.as_deref(),
+                row.rkey.as_deref(),
+                row.cid.as_deref(),
+            ) {
+                (Some(coll), Some(rk), Some(op_cid)) => {
+                    let key = record_key(&space.to_string(), coll, rk);
+                    match self
+                        .store
+                        .space_record()
+                        .get(&key)
+                        .map_err(|e| fjall_err(format!("oplog value join: {e}")))?
+                    {
+                        Some(bytes) => {
+                            let cur: RecordValue = decode(&bytes)?;
+                            (cur.cid == op_cid).then_some(cur.value)
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
             ops.push(OplogEntry {
                 rev,
                 idx,
@@ -306,6 +351,7 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
                 cid: row.cid,
                 prev: row.prev,
                 did: None,
+                value,
             });
             if ops.len() >= limit {
                 break;
@@ -384,10 +430,10 @@ mod tests {
             .await
             .unwrap();
         }
-        let page = repo.list_records("c", None, 2).await.unwrap();
+        let page = repo.list_records("c", None, 2, false).await.unwrap();
         assert_eq!(page.records.len(), 2);
         let next = repo
-            .list_records("c", page.cursor.as_deref(), 10)
+            .list_records("c", page.cursor.as_deref(), 10, false)
             .await
             .unwrap();
         assert_eq!(next.records.len(), 2);

@@ -137,6 +137,18 @@ pub struct OplogEntry {
     /// DID being added/removed (members only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
+    /// DAG-CBOR-encoded value of the record **as it currently stands**, for
+    /// create and update ops.
+    ///
+    /// `None` for deletes, for member ops, and — the case worth naming — when
+    /// this op has been *superseded* by a later one on the same
+    /// `(collection, rkey)`. The lexicon requires that omission, and the
+    /// implementation gets it by matching the op's own `cid` against the current
+    /// record's: a superseded op's CID is no longer current, so it finds
+    /// nothing. Matching on `(collection, rkey)` alone would inline the *new*
+    /// value against an *old* op, which is worse than omitting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Vec<u8>>,
 }
 
 /// A page of oplog entries returned by `read_oplog`.
@@ -248,13 +260,19 @@ pub trait SpaceRepoStorage: Send + Sync {
         rkey: &str,
     ) -> SpaceResult<Option<RecordRow>>;
 
-    /// List records in a collection. Cursor is the last `rkey` from the prior page (`None` = first page).
+    /// List records in a collection. Cursor is the last `rkey` from the prior
+    /// page (`None` = first page).
+    ///
+    /// `reverse` walks descending `rkey` order, per the lexicon's `reverse`
+    /// parameter. The cursor is still the last `rkey` delivered, so paging
+    /// composes with either direction.
     async fn list_records(
         &self,
         space: &SpaceUri,
         collection: &str,
         cursor: Option<&str>,
         limit: u32,
+        reverse: bool,
     ) -> SpaceResult<RecordPage>;
 
     /// List all collections present in this space's record store.

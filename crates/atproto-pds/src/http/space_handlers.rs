@@ -970,17 +970,30 @@ pub struct ListSpaceRecordsQuery {
     pub collection: Option<String>,
     /// Cursor (last `rkey`). Ignored when `collection` is omitted.
     pub cursor: Option<String>,
-    /// Page size.
+    /// Page size. Clamped to the lexicon's 1–100.
     pub limit: Option<u32>,
     /// DID of the member whose repo to read from. If omitted, defaults to
     /// the authenticated subject (OAuth auth). Required when using
     /// space-credential auth.
     pub repo: Option<String>,
+    /// Reverse the record order.
+    #[serde(default)]
+    pub reverse: bool,
+    /// Return `{collection, rkey, cid}` only, omitting inlined values.
+    ///
+    /// Defaults to `false`: the lexicon inlines values by default, and a
+    /// keys-only listing made sync quadratic — one `getRecord` round trip per
+    /// record, with no bulk path.
+    #[serde(rename = "excludeValues", default)]
+    pub exclude_values: bool,
 }
 
-/// One record in `listRecords` — keys-only per
-/// `com.atproto.space.listRecords#record` (`{collection, rkey, cid}`). Fetch
-/// the value separately via `getRecord`.
+/// One record in `listRecords`, per `com.atproto.space.listRecords#record`.
+///
+/// `value` is inlined **by default**; `excludeValues` reduces the entry to
+/// `{collection, rkey, cid}`. It previously always omitted the value, which
+/// made sync quadratic: a syncer had to issue one `getRecord` per record with
+/// no bulk path, so initial backfill was unusable.
 #[derive(Debug, Serialize)]
 pub struct SpaceRecordItem {
     /// NSID collection.
@@ -989,6 +1002,9 @@ pub struct SpaceRecordItem {
     pub rkey: String,
     /// CID of the record value.
     pub cid: String,
+    /// The record's value, inlined by default. Omitted when `excludeValues`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
 }
 
 /// Output of `listRecords`.
@@ -1028,25 +1044,47 @@ pub async fn list_records(
             &uri,
             resolved.auth,
             &resolved.target_repo,
-            q.collection.as_deref(),
-            q.cursor.as_deref(),
-            q.limit.unwrap_or(50),
+            crate::space::reader::RecordListing {
+                collection: q.collection.as_deref(),
+                cursor: q.cursor.as_deref(),
+                limit: q.limit.unwrap_or(50).clamp(1, 100),
+                reverse: q.reverse,
+            },
         )
         .await
         .map_err(XrpcError::from)?;
-    let records: Vec<SpaceRecordItem> = page
-        .records
-        .into_iter()
-        .map(|r| SpaceRecordItem {
+    let mut records = Vec::with_capacity(page.records.len());
+    for r in page.records {
+        let value = if q.exclude_values {
+            None
+        } else {
+            Some(decode_record_value(&r.value)?)
+        };
+        records.push(SpaceRecordItem {
             collection: r.collection,
             rkey: r.rkey,
             cid: r.cid,
-        })
-        .collect();
+            value,
+        });
+    }
     Ok(Json(ListSpaceRecordsResponse {
         records,
         cursor: page.cursor,
     }))
+}
+
+/// Decode a stored DAG-CBOR record value into its JSON representation.
+///
+/// The same path the public reader uses, so a link stored as CBOR tag 42 comes
+/// back as `{"$link": …}` rather than as a raw map.
+fn decode_record_value(bytes: &[u8]) -> Result<serde_json::Value, XrpcError> {
+    atproto_dasl::atproto_json::from_slice(bytes).map_err(|e| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("decode permissioned record value: {e}"),
+        )
+    })
 }
 
 /// Resolved auth + read-target DID for a Spaces record read.
@@ -1341,6 +1379,9 @@ pub struct RepoOplogQuery {
     pub since: Option<String>,
     /// Page size.
     pub limit: Option<u32>,
+    /// Return operation metadata only, omitting inlined values.
+    #[serde(rename = "excludeValues", default)]
+    pub exclude_values: bool,
 }
 
 /// One records-oplog entry, wire shape per `com.atproto.space.listRepoOps#opEntry`.
@@ -1360,6 +1401,14 @@ pub struct RecordOpEntry {
     pub cid: Option<String>,
     /// Prior record CID; `null` for creates.
     pub prev: Option<String>,
+    /// The record's current value, inlined for creates and updates.
+    ///
+    /// Omitted when `excludeValues` is set, for deletes, and when this op has
+    /// been superseded by a later write to the same `(collection, rkey)` — the
+    /// storage layer decides the last case by matching the op's own CID against
+    /// the current record's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
 }
 
 /// Output of `listRepoOps`.
@@ -1421,17 +1470,24 @@ pub async fn list_repo_ops(
             .last()
             .map(|o| OplogCursor::new(o.rev.clone(), o.idx).to_token())
     };
-    let ops: Vec<RecordOpEntry> = page
-        .ops
-        .into_iter()
-        .map(|o| RecordOpEntry {
+    let mut ops = Vec::with_capacity(page.ops.len());
+    for o in page.ops {
+        // `o.value` is already `None` for deletes and for superseded ops — the
+        // storage layer matched on the op's own CID. `excludeValues` drops the
+        // rest.
+        let value = match (&o.value, q.exclude_values) {
+            (Some(bytes), false) => Some(decode_record_value(bytes)?),
+            _ => None,
+        };
+        ops.push(RecordOpEntry {
             rev: o.rev,
             collection: o.collection.unwrap_or_default(),
             rkey: o.rkey.unwrap_or_default(),
             cid: o.cid,
             prev: o.prev,
-        })
-        .collect();
+            value,
+        });
+    }
 
     let commit = if caught_up {
         let manager = account_manager(&state)?;

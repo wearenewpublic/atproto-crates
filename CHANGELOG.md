@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: `com.atproto.space.listRecords` and `listRepoOps` returned no record values, so a
+  syncer had to issue one `getRecord` per record with no bulk path — initial backfill was unusable and
+  the pull design became quadratic. Both lexicons inline the value **by default**; the in-code comment
+  claiming keys-only *"per `com.atproto.space.listRecords#record`"* contradicted the lexicon it named.
+
+  Values are now inlined by default on both endpoints, with `excludeValues` as the opt-out, and
+  `listRecords` gains `reverse`.
+
+  `listRepoOps` omits the value in the three cases the lexicon requires: `excludeValues`, deletes, and
+  **ops superseded by a later write**. The last is implemented by matching the op's own CID against
+  the current record's, so a superseded op finds nothing. Joining on `(collection, rkey)` alone would
+  attach the *newer* value to the *older* op, which is worse than omitting it.
+
+  `listRecords` also clamps `limit` to the lexicon's 1–100; `listRepoOps` keeps its own 1–1000. They
+  are not the same bound.
+
+  **Responses are substantially larger by default.** That is the fix; `excludeValues` restores the old
+  shape for callers that only want keys.
+
 - `atproto-pds`: `com.atproto.space.getSpace` described the space from the **caller's** per-actor store
   rather than the authority's. Two consequences: a member's store acquires a space row with column
   defaults the moment they first write, so a client asking about an `allowList` space was told `open`

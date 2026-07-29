@@ -751,7 +751,7 @@ async fn list_records_keys_only_paginated() {
     let (status, body) = get_json(
         app,
         &format!(
-            "/xrpc/com.atproto.space.listRecords?space={}&collection=c&limit=2",
+            "/xrpc/com.atproto.space.listRecords?space={}&collection=c&limit=2&excludeValues=true",
             urlencode(&uri)
         ),
         Some(&owner_token),
@@ -761,6 +761,10 @@ async fn list_records_keys_only_paginated() {
     let records = body["records"].as_array().unwrap();
     assert_eq!(records.len(), 2);
     // Keys-only shape: {collection, rkey, cid} and NO value.
+    //
+    // This test used to omit `excludeValues` and assert the same thing, which
+    // pinned the divergence: the lexicon inlines values by default and only
+    // `excludeValues` reduces an entry to its keys.
     assert_eq!(records[0]["collection"], "c");
     assert!(records[0]["rkey"].as_str().is_some());
     assert!(records[0]["cid"].as_str().is_some());
@@ -2097,4 +2101,238 @@ async fn a_deleted_space_is_still_not_found() {
 
     let (status, body) = get_space(&app, &uri, &owner).await;
     assert_ne!(status, StatusCode::OK, "body: {body}");
+}
+
+// ---------------------------------------------------------------------------
+//  F-SPACE-03 — inlined record values on the sync path.
+//
+//  `listRecords` and `listRepoOps` returned keys only, so a syncer had to
+//  issue one `getRecord` per record with no bulk path: initial backfill was
+//  unusable and the pull design became quadratic. Both lexicons inline the
+//  value **by default** and offer `excludeValues` as the opt-out; the in-code
+//  comment claiming keys-only "per the lexicon" contradicted the lexicon it
+//  named.
+// ---------------------------------------------------------------------------
+
+async fn list_space_records(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    extra: &str,
+) -> (StatusCode, Value) {
+    get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&collection=c{extra}",
+            urlencode(uri)
+        ),
+        Some(token),
+    )
+    .await
+}
+
+async fn list_ops(app: &axum::Router, uri: &str, repo: &str, token: &str, extra: &str) -> Value {
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRepoOps?space={}&repo={repo}{extra}",
+            urlencode(uri)
+        ),
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listRepoOps: {body}");
+    body
+}
+
+async fn space_write(app: &axum::Router, uri: &str, token: &str, writes: Value) {
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({"space": uri, "writes": writes}),
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "applyWrites: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_records_inlines_values_by_default() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    // A value containing a `$link`, so the decode path is exercised rather than
+    // just the plumbing: a raw CBOR tag 42 would come back as a map, not a link.
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{
+            "action": "create", "collection": "c", "rkey": "r1",
+            "value": {"text": "hi", "ref": {"$link": "bafyreiabc"}}
+        }]),
+    )
+    .await;
+
+    let (status, body) = list_space_records(&app, &uri, &owner, "").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let rec = &body["records"][0];
+    assert_eq!(rec["rkey"], "r1");
+    assert_eq!(
+        rec["value"]["text"], "hi",
+        "the value must be inlined by default, or sync needs one getRecord per record: {body}"
+    );
+    assert_eq!(
+        rec["value"]["ref"]["$link"], "bafyreiabc",
+        "a stored CBOR link must come back as $link, not a raw map: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_records_honours_reverse() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    for r in ["a", "b", "c"] {
+        space_write(
+            &app,
+            &uri,
+            &owner,
+            json!([{"action": "create", "collection": "c", "rkey": r, "value": {"k": r}}]),
+        )
+        .await;
+    }
+
+    let (_, fwd) = list_space_records(&app, &uri, &owner, "").await;
+    let fwd_keys: Vec<&str> = fwd["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["rkey"].as_str().unwrap())
+        .collect();
+    assert_eq!(fwd_keys, vec!["a", "b", "c"]);
+
+    let (_, rev) = list_space_records(&app, &uri, &owner, "&reverse=true").await;
+    let rev_keys: Vec<&str> = rev["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["rkey"].as_str().unwrap())
+        .collect();
+    assert_eq!(rev_keys, vec!["c", "b", "a"]);
+
+    // And reverse paginates: the cursor must move backwards, not restart.
+    let (_, page1) = list_space_records(&app, &uri, &owner, "&reverse=true&limit=2").await;
+    let cursor = page1["cursor"].as_str().unwrap().to_string();
+    let (_, page2) = list_space_records(
+        &app,
+        &uri,
+        &owner,
+        &format!("&reverse=true&limit=2&cursor={cursor}"),
+    )
+    .await;
+    let p2: Vec<&str> = page2["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["rkey"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        p2,
+        vec!["a"],
+        "reverse pagination must continue, not restart"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_repo_ops_inlines_values_and_omits_superseded_ones() {
+    // The subtle half. The lexicon: value is "omitted when excludeValues is
+    // set, for deletes, or when the value has been superseded by a later
+    // operation". A join on (collection, rkey) alone would attach the *new*
+    // value to the *old* op, which is worse than omitting it.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "create", "collection": "c", "rkey": "r1", "value": {"v": "first"}}]),
+    )
+    .await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "update", "collection": "c", "rkey": "r1", "value": {"v": "second"}}]),
+    )
+    .await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "create", "collection": "c", "rkey": "r2", "value": {"v": "kept"}}]),
+    )
+    .await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "delete", "collection": "c", "rkey": "r2"}]),
+    )
+    .await;
+
+    let body = list_ops(&app, &uri, "did:plc:owner", &owner, "").await;
+    let ops = body["ops"].as_array().unwrap();
+    assert_eq!(
+        ops.len(),
+        4,
+        "four ops: create, update, create, delete: {body}"
+    );
+
+    // op 0 — the superseded create.
+    assert_eq!(ops[0]["rkey"], "r1");
+    assert!(
+        ops[0].get("value").is_none(),
+        "a superseded op must not inline a value, least of all the newer one: {body}"
+    );
+    // op 1 — the current update.
+    assert_eq!(ops[1]["value"]["v"], "second");
+    // op 2 — a create whose record was later deleted, so no current row matches.
+    assert!(ops[2].get("value").is_none());
+    // op 3 — the delete itself has no cid and so no value.
+    assert_eq!(ops[3]["cid"], Value::Null);
+    assert!(ops[3].get("value").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_repo_ops_exclude_values_omits_every_value() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "create", "collection": "c", "rkey": "r1", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let inlined = list_ops(&app, &uri, "did:plc:owner", &owner, "").await;
+    assert!(
+        inlined["ops"][0]["value"].is_object(),
+        "control: inlined by default: {inlined}"
+    );
+
+    let excluded = list_ops(&app, &uri, "did:plc:owner", &owner, "&excludeValues=true").await;
+    assert!(
+        excluded["ops"][0].get("value").is_none(),
+        "excludeValues must omit it: {excluded}"
+    );
+    // The metadata is still there.
+    assert_eq!(excluded["ops"][0]["rkey"], "r1");
+    assert!(excluded["ops"][0]["cid"].as_str().is_some());
 }

@@ -94,15 +94,19 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
         collection: &str,
         cursor: Option<&str>,
         limit: u32,
+        reverse: bool,
     ) -> SpaceResult<RecordPage> {
         let limit = limit.clamp(1, 100);
+        // Direction flips both the ordering and the cursor comparison; getting
+        // one without the other returns the first page forever.
+        let (order, cmp) = if reverse { ("DESC", "<") } else { ("ASC", ">") };
         let rows: Vec<(String, String, Vec<u8>, String, String)> = match cursor {
             Some(cur) => {
-                sqlx::query_as(
+                sqlx::query_as(&format!(
                     "SELECT rkey, cid, value, repo_rev, indexed_at FROM space_record
-                 WHERE space = ? AND collection = ? AND rkey > ?
-                 ORDER BY rkey ASC LIMIT ?",
-                )
+                 WHERE space = ? AND collection = ? AND rkey {cmp} ?
+                 ORDER BY rkey {order} LIMIT ?"
+                ))
                 .bind(space.to_string())
                 .bind(collection)
                 .bind(cur)
@@ -111,11 +115,11 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
                 .await
             }
             None => {
-                sqlx::query_as(
+                sqlx::query_as(&format!(
                     "SELECT rkey, cid, value, repo_rev, indexed_at FROM space_record
                  WHERE space = ? AND collection = ?
-                 ORDER BY rkey ASC LIMIT ?",
-                )
+                 ORDER BY rkey {order} LIMIT ?"
+                ))
                 .bind(space.to_string())
                 .bind(collection)
                 .bind(limit as i64)
@@ -263,15 +267,20 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
             String,
             Option<String>,
             Option<String>,
-        )> = match since {
-            Some(cur) => {
-                // `(rev, idx) > (since.rev, since.idx)` so an atomic batch
-                // (entries sharing a rev) that exceeds `limit` pages fully.
-                sqlx::query_as(
-                    "SELECT rev, idx, action, collection, rkey, cid, prev
-                     FROM space_record_oplog
-                     WHERE space = ? AND (rev > ? OR (rev = ? AND idx > ?))
-                     ORDER BY rev ASC, idx ASC LIMIT ?",
+            Option<Vec<u8>>,
+        )> =
+            match since {
+                Some(cur) => {
+                    // `(rev, idx) > (since.rev, since.idx)` so an atomic batch
+                    // (entries sharing a rev) that exceeds `limit` pages fully.
+                    sqlx::query_as(
+                    "SELECT o.rev, o.idx, o.action, o.collection, o.rkey, o.cid, o.prev, r.value
+                     FROM space_record_oplog o
+                     LEFT JOIN space_record r
+                       ON r.space = o.space AND r.collection = o.collection
+                      AND r.rkey = o.rkey AND r.cid = o.cid
+                     WHERE o.space = ? AND (o.rev > ? OR (o.rev = ? AND o.idx > ?))
+                     ORDER BY o.rev ASC, o.idx ASC LIMIT ?",
                 )
                 .bind(space.to_string())
                 .bind(&cur.rev)
@@ -280,24 +289,26 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
-            }
-            None => {
-                sqlx::query_as(
-                    "SELECT rev, idx, action, collection, rkey, cid, prev
-                     FROM space_record_oplog WHERE space = ?
-                     ORDER BY rev ASC, idx ASC LIMIT ?",
+                }
+                None => sqlx::query_as(
+                    "SELECT o.rev, o.idx, o.action, o.collection, o.rkey, o.cid, o.prev, r.value
+                     FROM space_record_oplog o
+                     LEFT JOIN space_record r
+                       ON r.space = o.space AND r.collection = o.collection
+                      AND r.rkey = o.rkey AND r.cid = o.cid
+                     WHERE o.space = ?
+                     ORDER BY o.rev ASC, o.idx ASC LIMIT ?",
                 )
                 .bind(space.to_string())
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
-                .await
+                .await,
             }
-        }
-        .map_err(|e| sql_err(format!("read_oplog: {e}")))?;
+            .map_err(|e| sql_err(format!("read_oplog: {e}")))?;
         let ops = rows
             .into_iter()
             .map(
-                |(rev, idx, action, collection, rkey, cid, prev)| OplogEntry {
+                |(rev, idx, action, collection, rkey, cid, prev, value)| OplogEntry {
                     rev,
                     idx: idx as u32,
                     action,
@@ -306,6 +317,11 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
                     cid,
                     prev,
                     did: None,
+                    // The join matched on the op's own CID, so this is `None`
+                    // for a delete (no cid) and for an op superseded by a
+                    // later write (cid no longer current) — exactly the two
+                    // omissions the lexicon requires, with no bookkeeping.
+                    value,
                 },
             )
             .collect();
@@ -460,7 +476,7 @@ mod tests {
                 .unwrap();
             repo.apply_commit(p).await.unwrap();
         }
-        let page = repo.list_records("c", None, 2).await.unwrap();
+        let page = repo.list_records("c", None, 2, false).await.unwrap();
         assert_eq!(page.records.len(), 2);
         assert!(page.cursor.is_some());
     }

@@ -61,6 +61,24 @@ pub enum SpaceReadAuth<'a> {
     },
 }
 
+/// What to list, and how, for [`SpaceReader::list_records`].
+///
+/// Grouped rather than passed as four positional parameters: `cursor`, `limit`
+/// and `reverse` are one concept, and at the call site
+/// `(None, None, 50, false)` says nothing about which is which.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordListing<'a> {
+    /// NSID collection, or `None` to list across every collection in the space.
+    pub collection: Option<&'a str>,
+    /// Cursor — the last `rkey` from the prior page. Ignored when `collection`
+    /// is `None`.
+    pub cursor: Option<&'a str>,
+    /// Page size. The storage layer clamps to the lexicon's 1–100.
+    pub limit: u32,
+    /// Walk descending `rkey` order.
+    pub reverse: bool,
+}
+
 /// Permissioned-record reader.
 pub struct SpaceReader {
     data_dir: PathBuf,
@@ -135,10 +153,14 @@ impl SpaceReader {
         space: &SpaceUri,
         auth: SpaceReadAuth<'_>,
         target_repo: &str,
-        collection: Option<&str>,
-        cursor: Option<&str>,
-        limit: u32,
+        listing: RecordListing<'_>,
     ) -> PdsResult<RecordPage> {
+        let RecordListing {
+            collection,
+            cursor,
+            limit,
+            reverse,
+        } = listing;
         self.verify_auth(space, &auth).await?;
         self.ensure_space_live(space).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
@@ -149,7 +171,7 @@ impl SpaceReader {
         match collection {
             Some(coll) => {
                 let mut page = repo
-                    .list_records(coll, cursor, limit)
+                    .list_records(coll, cursor, limit, reverse)
                     .await
                     .map_err(PdsError::Space)?;
                 let taken: std::collections::HashSet<String> =
@@ -164,7 +186,7 @@ impl SpaceReader {
                 let mut all_records = Vec::new();
                 for coll in collections {
                     let mut page = repo
-                        .list_records(&coll, None, limit)
+                        .list_records(&coll, None, limit, reverse)
                         .await
                         .map_err(PdsError::Space)?;
                     let taken: std::collections::HashSet<String> =
@@ -450,9 +472,12 @@ mod tests {
                     account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
-                Some("app.bsky.group.message"),
-                None,
-                10,
+                RecordListing {
+                    collection: Some("app.bsky.group.message"),
+                    cursor: None,
+                    limit: 10,
+                    reverse: false,
+                },
             )
             .await
             .unwrap();
@@ -493,9 +518,12 @@ mod tests {
                     account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
-                None,
-                None,
-                10,
+                RecordListing {
+                    collection: None,
+                    cursor: None,
+                    limit: 10,
+                    reverse: false,
+                },
             )
             .await
             .unwrap();
@@ -723,9 +751,12 @@ mod tests {
                     account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
-                Some("app.bsky.group.message"),
-                None,
-                10,
+                RecordListing {
+                    collection: Some("app.bsky.group.message"),
+                    cursor: None,
+                    limit: 10,
+                    reverse: false,
+                },
             )
             .await
             .unwrap();
