@@ -23,6 +23,84 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 
+/// The lexicon method an inbound migration's service-auth token must name.
+const CREATE_ACCOUNT_LXM: &str = "com.atproto.server.createAccount";
+
+/// Verify that the caller controls the DID they are claiming.
+///
+/// The proof is a service-auth token issued by the DID's current host, bound to
+/// this PDS (`aud`) and to this method (`lxm`), and signed by the `#atproto`
+/// key published in the DID's own document. That document is fetched live, so
+/// the check is against what the identity says about itself right now — which
+/// is the only thing that distinguishes a migration from a squat.
+///
+/// There is deliberately no way to switch this off. An escape hatch here would
+/// be set on exactly the deployments that most need the check, and a DID that
+/// cannot be resolved is a DID whose control cannot be demonstrated.
+async fn verify_inbound_did_claim(
+    state: &HttpState,
+    parts: &Parts,
+    claimed_did: &str,
+) -> Result<(), XrpcError> {
+    let token = parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::UNAUTHORIZED,
+                "AuthRequired",
+                format!(
+                    "creating an account for an existing DID requires a service-auth token from \
+                     {claimed_did}'s current host, bound to this server with lxm \
+                     {CREATE_ACCOUNT_LXM}"
+                ),
+            )
+        })?;
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(crate::user_agent())
+        .build()
+        .unwrap_or_default();
+    let plc_dir = state.plc_service.as_ref().map(|p| p.directory_hostname());
+
+    let claims = crate::space::service_auth::verify_service_auth(
+        &http,
+        token,
+        plc_dir,
+        &state.service_did,
+        CREATE_ACCOUNT_LXM,
+        state
+            .account_manager
+            .as_deref()
+            .map(crate::account::AccountManager::account_pool_ref),
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    // The token proves control of whatever `iss` names. It has to name the DID
+    // being claimed, or a valid token for one identity would create accounts
+    // for any other.
+    if claims.iss != claimed_did {
+        tracing::warn!(
+            claimed = %claimed_did,
+            issuer = %claims.iss,
+            "createAccount rejected: service-auth issuer is not the DID being claimed"
+        );
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "AuthDenied",
+            format!(
+                "service-auth token was issued by {}, not by {claimed_did}",
+                claims.iss
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Inputs for `com.atproto.server.createAccount`.
 #[derive(Debug, Deserialize)]
 pub struct CreateAccountInput {
@@ -80,6 +158,7 @@ async fn enforce_rate_limit(state: &HttpState, key: &str) -> Result<(), XrpcErro
 /// Handler for `com.atproto.server.createAccount`.
 pub async fn create_account(
     State(state): State<HttpState>,
+    parts: Parts,
     Json(input): Json<CreateAccountInput>,
 ) -> Result<Json<SessionResponse>, XrpcError> {
     // Rate-limit by handle (the externally-visible identifier in the request).
@@ -181,29 +260,55 @@ pub async fn create_account(
     // identifier + a P-256 rotation key. Otherwise (test paths, account
     // migration), trust the caller-supplied DID and let the manager
     // generate the signing key.
-    let (did, rotation_key_ref, signing_key_ref) = if let Some(d) = input.did.clone() {
-        (d, None, None)
-    } else {
-        let plc_service = state.plc_service.as_ref().ok_or_else(|| {
-            XrpcError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "PlcUnavailable",
-                "PLC genesis is not configured on this PDS; supply `did` directly",
+    // A caller-supplied DID must be proven, not taken on trust.
+    //
+    // Adopting one verbatim let anyone squat an arbitrary DID: obtain a session
+    // bound to the victim's identity, have this PDS serve `describeRepo`,
+    // `getRepo` and firehose events for it, and permanently deny the victim an
+    // inbound migration here. Forged commits fail relay signature verification,
+    // so the damage is bounded — the lockout is not.
+    //
+    // Proof is an inbound service-auth token issued by the DID's *current*
+    // host: `iss` is the DID being claimed, `aud` is this PDS, and `lxm` is
+    // this method. The signature is checked against the `#atproto` key in the
+    // DID's own document, so only whoever controls that identity today can
+    // move it here. This is the other face of F-SVC-14 — no canonical endpoint
+    // accepted an inbound service-auth token at all.
+    let (did, rotation_key_ref, signing_key_ref, verified_migration) =
+        if let Some(d) = input.did.clone() {
+            verify_inbound_did_claim(&state, &parts, &d).await?;
+            (d, None, None, true)
+        } else {
+            let plc_service = state.plc_service.as_ref().ok_or_else(|| {
+                XrpcError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "PlcUnavailable",
+                    "PLC genesis is not configured on this PDS; supply `did` directly",
+                )
+            })?;
+            let outcome = plc_service
+                .genesis(&input.handle)
+                .await
+                .map_err(XrpcError::from)?;
+            (
+                outcome.did,
+                Some(outcome.rotation_key_ref),
+                Some(outcome.signing_key_ref),
+                false,
             )
-        })?;
-        let outcome = plc_service
-            .genesis(&input.handle)
-            .await
-            .map_err(XrpcError::from)?;
-        (
-            outcome.did,
-            Some(outcome.rotation_key_ref),
-            Some(outcome.signing_key_ref),
-        )
-    };
+        };
 
     let row = manager
         .create_account(CreateAccountParams {
+            // A verified inbound migration lands deactivated: until the DID
+            // document points here, the repository must not be publicly
+            // readable or emitting firehose events. Locally-issued DIDs are
+            // an ordinary signup and land active.
+            state: if verified_migration {
+                AccountState::Deactivated
+            } else {
+                AccountState::Active
+            },
             did: &did,
             handle: &input.handle,
             email: input.email.as_deref(),
@@ -245,28 +350,15 @@ pub async fn create_account(
     // session to; createAccount issues an implicit "primary" app password
     // on account creation, mirroring how the TS reference treats the
     // password.
-    let primary = app_password::create(&manager.account_pool(), &row.did, "__primary__", true)
+    let primary_id = manager
+        .set_primary_password(&row.did, &input.password)
         .await
         .map_err(XrpcError::from)?;
-    // Re-set the primary's password to match what the user supplied, so a
-    // subsequent createSession with the same password verifies. We re-hash
-    // the user's password and overwrite the row.
-    let user_hash = account::hash_password(&input.password).map_err(XrpcError::from)?;
-    // §5.4 — `update_hash_by_id` dispatches per backend.
-    app_password::update_hash_by_id(&manager.account_pool(), &primary.row.id, &user_hash)
-        .await
-        .map_err(|e| {
-            XrpcError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                e.to_string(),
-            )
-        })?;
 
     let tokens = session::issue_pair(
         &state.service_did,
         &row.did,
-        &primary.row.id,
+        &primary_id,
         true,
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
@@ -948,9 +1040,53 @@ pub struct ReserveSigningKeyInput {
 /// DID return the same key.
 pub async fn reserve_signing_key(
     State(state): State<HttpState>,
+    parts: Parts,
     Json(input): Json<ReserveSigningKeyInput>,
 ) -> Result<Json<ReserveSigningKeyResponse>, XrpcError> {
+    // Unauthenticated, this generated a fresh keypair on every call and stored
+    // a row for whatever `did` the caller named — unbounded key generation and
+    // reservation squatting for anyone who could reach the endpoint, and the
+    // precursor primitive for claiming a DID outright.
+    let claims = require_access_jwt(&parts, &state)?;
     let manager = account_manager(&state)?;
+
+    // A caller may only reserve against its own DID. `did` is optional in the
+    // lexicon; when present it must be the session subject.
+    if let Some(requested) = input.did.as_deref()
+        && requested != claims.sub
+    {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "AuthDenied",
+            format!("cannot reserve a signing key for {requested}"),
+        ));
+    }
+    let subject = input.did.clone().unwrap_or_else(|| claims.sub.clone());
+
+    // Idempotent: a repeat call returns the key already reserved. The row id
+    // used to be a millisecond timestamp, so every call wrote a fresh row and
+    // handed back a different key while the reservation kept the first one.
+    if let Some(existing_ref) = manager
+        .lookup_reserved_signing_key(&subject)
+        .await
+        .map_err(XrpcError::from)?
+    {
+        let key = manager
+            .key_store()
+            .get(&existing_ref)
+            .await
+            .map_err(XrpcError::from)?;
+        let public = atproto_identity::key::to_public(&key).map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                format!("derive pub: {e}"),
+            )
+        })?;
+        return Ok(Json(ReserveSigningKeyResponse {
+            signing_key: public.to_string(),
+        }));
+    }
     use atproto_identity::key::{KeyType, generate_key, to_public};
     let signing_priv = generate_key(KeyType::P256Private).map_err(|e| {
         XrpcError::new(
@@ -971,15 +1107,13 @@ pub async fn reserve_signing_key(
         .put(&signing_priv)
         .await
         .map_err(XrpcError::from)?;
-    if let Some(did) = input.did.as_deref() {
-        // Best-effort note in the signing_key table for later attribution.
-        // §5.4 — `reserve_signing_key` dispatches per backend.
-        let now = chrono::Utc::now().to_rfc3339();
-        let id = format!("reserved-{}", chrono::Utc::now().timestamp_millis());
-        let _ = manager
-            .reserve_signing_key(&id, did, "P256Private", &key_ref, &now)
-            .await;
-    }
+    // Idempotent per DID. The row id was a millisecond timestamp, so every call
+    // wrote a fresh row and the dedupe guard the docs describe never fired.
+    let now = chrono::Utc::now().to_rfc3339();
+    let id = format!("reserved-{subject}");
+    let _ = manager
+        .reserve_signing_key(&id, &subject, "P256Private", &key_ref, &now)
+        .await;
     Ok(Json(ReserveSigningKeyResponse {
         signing_key: signing_pub.to_string(),
     }))

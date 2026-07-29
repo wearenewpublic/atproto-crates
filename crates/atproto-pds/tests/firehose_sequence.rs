@@ -10,7 +10,7 @@
 //! they cover (F-FIRE-05) was invisible from inside a single actor's outbox.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -25,7 +25,7 @@ use tokio_websockets::ClientBuilder;
 use tower::ServiceExt;
 
 /// Build a PDS router backed by a temporary directory.
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -42,32 +42,36 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
 /// Create an account and return its access token.
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let request = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "did": did, "handle": handle, "password": "pw" })).unwrap(),
-        ))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"]
-        .as_str()
-        .expect("createAccount should return an access token")
-        .to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 /// Write one record, asserting the write succeeded.
@@ -140,11 +144,11 @@ async fn serve(app: axum::Router) -> std::net::SocketAddr {
 /// consuming the stream sees the same cursor value denote two different events.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_repositories_never_share_a_seq() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let alice = "did:plc:seqalice";
     let bob = "did:plc:seqbob";
-    let alice_token = create_account(&app, alice, "alice.seq.example").await;
-    let bob_token = create_account(&app, bob, "bob.seq.example").await;
+    let alice_token = create_account(&app, &manager, alice, "alice.seq.example").await;
+    let bob_token = create_account(&app, &manager, bob, "bob.seq.example").await;
 
     let addr = serve(app.clone()).await;
     let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor")
@@ -184,11 +188,11 @@ async fn two_repositories_never_share_a_seq() {
 /// strands every event between the two.
 #[tokio::test(flavor = "multi_thread")]
 async fn seq_increases_strictly_in_wire_order() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let dids = ["did:plc:seqmono1", "did:plc:seqmono2", "did:plc:seqmono3"];
     let mut tokens = Vec::new();
     for (index, did) in dids.iter().enumerate() {
-        tokens.push(create_account(&app, did, &format!("mono{index}.seq.example")).await);
+        tokens.push(create_account(&app, &manager, did, &format!("mono{index}.seq.example")).await);
     }
 
     let addr = serve(app.clone()).await;
@@ -238,9 +242,9 @@ async fn seq_increases_strictly_in_wire_order() {
 /// history as already-seen.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_repository_continues_the_stream_rather_than_restarting_it() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let first = "did:plc:seqfirst";
-    let first_token = create_account(&app, first, "first.seq.example").await;
+    let first_token = create_account(&app, &manager, first, "first.seq.example").await;
 
     let addr = serve(app.clone()).await;
     let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor")
@@ -253,7 +257,7 @@ async fn a_new_repository_continues_the_stream_rather_than_restarting_it() {
 
     // Only now does the second account exist.
     let second = "did:plc:seqsecond";
-    let second_token = create_account(&app, second, "second.seq.example").await;
+    let second_token = create_account(&app, &manager, second, "second.seq.example").await;
     write_record(&app, second, &second_token, "three").await;
 
     let mut seqs = Vec::new();
@@ -281,11 +285,11 @@ async fn a_new_repository_continues_the_stream_rather_than_restarting_it() {
 /// Resuming at a cursor returns the tail exactly — no skips, no repeats.
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_from_a_cursor_returns_the_exact_tail() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let dids = ["did:plc:seqres1", "did:plc:seqres2"];
     let mut tokens = Vec::new();
     for (index, did) in dids.iter().enumerate() {
-        tokens.push(create_account(&app, did, &format!("res{index}.seq.example")).await);
+        tokens.push(create_account(&app, &manager, did, &format!("res{index}.seq.example")).await);
     }
 
     let addr = serve(app.clone()).await;
@@ -341,4 +345,23 @@ async fn resume_from_a_cursor_returns_the_exact_tail() {
         replayed, expected,
         "resuming at {resume_at} must replay exactly the events above it"
     );
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

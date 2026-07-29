@@ -27,7 +27,7 @@
 //! HS256 OAuth access token directly (mirroring `tests/dpop_enforcement.rs`).
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -52,7 +52,7 @@ const CLIENT_ID: &str = "https://app.example/client-metadata.json";
 
 /// Build a fresh PDS app with the full Spaces wiring (service + writer +
 /// reader + sync). Returns the router and the owning `TempDir`.
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -75,7 +75,7 @@ async fn build_app() -> (axum::Router, TempDir) {
 
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         JWT_SECRET.to_vec(),
         false,
@@ -83,28 +83,25 @@ async fn build_app() -> (axum::Router, TempDir) {
     .with_writer(writer)
     .with_spaces(svc, space_writer, space_reader, space_sync);
 
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
 /// Create an account and return its app-password session access token.
-async fn create_account_and_token(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account_and_token(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 /// Mint an OAuth access JWT (`typ=at-oauth-access`, HS256 over `JWT_SECRET`)
@@ -290,8 +287,8 @@ async fn exchange_credential(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_space_round_trip() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
 
     let (status, body) = post_json(
         app.clone(),
@@ -318,7 +315,7 @@ async fn create_space_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_space_requires_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.simplespace.createSpace",
@@ -331,8 +328,8 @@ async fn create_space_requires_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_space_auto_generates_skey() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.simplespace.createSpace",
@@ -349,8 +346,8 @@ async fn create_space_auto_generates_skey() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_space_did_must_match_caller() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.simplespace.createSpace",
@@ -363,8 +360,8 @@ async fn create_space_did_must_match_caller() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_space_reflects_in_get_space() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &token, "default").await;
 
     let (status, _) = post_json(
@@ -388,8 +385,8 @@ async fn update_space_reflects_in_get_space() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_space_then_get_space_fails() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &token, "default").await;
 
     let (status, _) = post_json(
@@ -447,8 +444,8 @@ async fn delete_space_then_get_space_fails() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_space_seeds_owner_in_member_list() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &token, "default").await;
 
     let (status, body) = get_json(
@@ -468,9 +465,10 @@ async fn create_space_seeds_owner_in_member_list() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn add_remove_then_list_members() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let _ = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     let (status, _) = post_json(
@@ -532,9 +530,10 @@ async fn add_remove_then_list_members() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn add_member_by_non_owner_rejected() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let eve_token = create_account_and_token(&app, "did:plc:eve", "eve.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let eve_token = create_account_and_token(&app, &manager, "did:plc:eve", "eve.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     let (status, _) = post_json(
@@ -553,9 +552,11 @@ async fn add_member_by_non_owner_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_writes_then_read_back() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let alice_token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let alice_token =
+        create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     post_json(
         app.clone(),
@@ -607,8 +608,9 @@ async fn apply_writes_then_read_back() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_writes_empty_batch_rejected() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     let (status, _) = post_json(
         app,
@@ -622,8 +624,9 @@ async fn apply_writes_empty_batch_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_put_delete_record_single_ops() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     // createRecord (owner writes to its own repo).
@@ -706,8 +709,9 @@ async fn create_put_delete_record_single_ops() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_record_repo_must_match_subject() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     let (status, _) = post_json(
         app,
@@ -726,8 +730,9 @@ async fn create_record_repo_must_match_subject() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_records_keys_only_paginated() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     for r in ["a", "b", "c"] {
@@ -765,8 +770,9 @@ async fn list_records_keys_only_paginated() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_records_across_all_collections() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     for (collection, rkey) in [
@@ -801,9 +807,11 @@ async fn list_records_across_all_collections() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_record_oauth_with_repo_override() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let alice_token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let alice_token =
+        create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     post_json(
         app.clone(),
@@ -857,8 +865,9 @@ async fn get_record_oauth_with_repo_override() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_repo_state_signed_commit() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     // Empty repo: no commit yet.
@@ -934,9 +943,10 @@ fn read_scope() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delegation_token_then_space_credential_member_allowed() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let _ = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     post_json(
         app.clone(),
@@ -1008,8 +1018,9 @@ async fn delegation_token_then_space_credential_member_allowed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delegation_token_requires_oauth_client_id() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // App-password session token carries no client_id -> 403.
     let (status, _) = get_json(
@@ -1026,9 +1037,10 @@ async fn delegation_token_requires_oauth_client_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn space_credential_non_member_denied() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let _ = create_account_and_token(&app, "did:plc:eve", "eve.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:eve", "eve.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // Eve is NOT a member. She can still mint a delegation token (it's just a
     // signed assertion), but the owner's getSpaceCredential mint authz must
@@ -1052,9 +1064,10 @@ async fn space_credential_non_member_denied() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn space_credential_app_allowlist_denies_unattested() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let _ = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     post_json(
         app.clone(),
@@ -1123,7 +1136,7 @@ async fn space_credential_registers_recipient_idempotently() {
     let space_sync = Arc::new(SpaceSync::new(data_dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         JWT_SECRET.to_vec(),
         false,
@@ -1132,8 +1145,9 @@ async fn space_credential_registers_recipient_idempotently() {
     .with_spaces(svc, space_writer, space_reader, space_sync);
     let app = build_router(state);
 
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
-    let _ = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     post_json(
         app.clone(),
@@ -1181,8 +1195,9 @@ async fn space_credential_registers_recipient_idempotently() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_wrong_space_credential_rejected() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // A credential minted for `default` does not authorize a different space
     // URI: the `sub` claim must match the requested space, so the verify gate
@@ -1202,8 +1217,9 @@ async fn list_repos_wrong_space_credential_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_empty_writer_set() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // listRepos is space-credential-only: mint a real, authority-signed
     // credential for the owner (an implicit member of their own space).
@@ -1224,8 +1240,9 @@ async fn list_repos_empty_writer_set() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_rejects_oauth_token() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // listRepos accepts a space credential ONLY (spec XRPC table). An OAuth /
     // session bearer — even the owner's — must be rejected with 401.
@@ -1262,8 +1279,9 @@ async fn list_repos_rejects_oauth_token() {
 /// string alone — on every host/sync read method.
 #[tokio::test(flavor = "multi_thread")]
 async fn forged_space_credential_rejected_on_read_methods() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     let forged = forge_space_credential("did:plc:owner", &uri);
 
@@ -1319,8 +1337,9 @@ async fn forged_space_credential_rejected_on_read_methods() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_blob_requires_repo_and_gates_auth() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     // Missing bearer -> unauthorized.
@@ -1356,8 +1375,9 @@ async fn get_blob_requires_repo_and_gates_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn register_notify_requires_space_credential() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // A plain session token is not a space credential -> 401.
     let (status, _) = post_json(
@@ -1376,8 +1396,9 @@ async fn register_notify_requires_space_credential() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn notify_write_requires_service_auth() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     // Contentless payload, but no bearer -> unauthorized.
     let (status, _) = post_json(
@@ -1405,8 +1426,9 @@ async fn notify_write_requires_service_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn notify_space_deleted_requires_service_auth() {
-    let (app, _tmp) = build_app().await;
-    let owner_token = create_account_and_token(&app, "did:plc:owner", "owner.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
     let (status, _) = post_json(
         app,
@@ -1416,4 +1438,23 @@ async fn notify_space_deleted_requires_service_auth() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

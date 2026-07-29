@@ -8,7 +8,7 @@
 //! `/.well-known/did.json`.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager, AccountState};
+use atproto_pds::account::{AccountDirectory, AccountManager, AccountState, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -72,20 +72,26 @@ async fn get_json(app: axum::Router, path: &str) -> (StatusCode, Value) {
     )
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"did": did, "handle": handle, "password": "pw"})).unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert!(resp.status().is_success(), "createAccount failed");
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 /// Write one record so the account has a commit for `listRepos` to report.
@@ -110,7 +116,7 @@ async fn write_a_record(app: &axum::Router, did: &str, token: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn describe_server_reports_did_and_domains() {
-    let (app, _, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, body) = get_json(app, "/xrpc/com.atproto.server.describeServer").await;
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -124,8 +130,8 @@ async fn describe_server_reports_did_and_domains() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_reports_did_head_and_rev() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.test.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.test.example").await;
     write_a_record(&app, "did:plc:alice", &token).await;
 
     let (status, body) = get_json(app, "/xrpc/com.atproto.sync.listRepos").await;
@@ -149,8 +155,8 @@ async fn list_repos_reports_did_head_and_rev() {
 /// than announced with a value a relay would then fail to fetch.
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_omits_accounts_with_no_commits() {
-    let (app, _, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.test.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.test.example").await;
 
     let (status, body) = get_json(app, "/xrpc/com.atproto.sync.listRepos").await;
     assert_eq!(status, StatusCode::OK);
@@ -160,7 +166,7 @@ async fn list_repos_omits_accounts_with_no_commits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_reports_inactive_accounts_with_a_status() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.test.example").await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.test.example").await;
     write_a_record(&app, "did:plc:alice", &token).await;
     manager
         .set_state("did:plc:alice", AccountState::Takendown)
@@ -176,10 +182,10 @@ async fn list_repos_reports_inactive_accounts_with_a_status() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_repos_paginates() {
-    let (app, _, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     for i in 0..3 {
         let did = format!("did:plc:user{i}");
-        let token = create_account(&app, &did, &format!("user{i}.test.example")).await;
+        let token = create_account(&app, &manager, &did, &format!("user{i}.test.example")).await;
         write_a_record(&app, &did, &token).await;
     }
 
@@ -205,8 +211,8 @@ async fn list_repos_paginates() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn well_known_atproto_did_resolves_a_hosted_handle() {
-    let (app, _, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.test.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.test.example").await;
 
     let (status, body) = get(app, "/.well-known/atproto-did", Some("alice.test.example")).await;
     assert_eq!(status, StatusCode::OK);
@@ -216,8 +222,8 @@ async fn well_known_atproto_did_resolves_a_hosted_handle() {
 /// A port in the `Host` header must not defeat the lookup.
 #[tokio::test(flavor = "multi_thread")]
 async fn well_known_atproto_did_ignores_the_host_port() {
-    let (app, _, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.test.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.test.example").await;
 
     let (status, body) = get(
         app,
@@ -232,14 +238,14 @@ async fn well_known_atproto_did_ignores_the_host_port() {
 /// A resolver has to be able to tell "not here" from "here, but blank".
 #[tokio::test(flavor = "multi_thread")]
 async fn well_known_atproto_did_404s_for_an_unknown_handle() {
-    let (app, _, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = get(app, "/.well-known/atproto-did", Some("nobody.test.example")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn well_known_did_json_serves_the_service_document() {
-    let (app, _, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, body) = get_json(app, "/.well-known/did.json").await;
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -358,4 +364,23 @@ async fn a_simple_request_carries_the_origin_header() {
             "`{header}` is unreadable cross-origin, so a client cannot act on it: {exposed:?}"
         );
     }
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

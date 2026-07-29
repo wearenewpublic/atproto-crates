@@ -12,7 +12,7 @@
 
 use atproto_identity::key::{KeyType, generate_key};
 use atproto_oauth::dpop::{extract_jwk_thumbprint, request_dpop};
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -33,7 +33,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const JWT_SECRET: &[u8] = b"test-secret-do-not-use-in-prod-32!";
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -50,31 +50,29 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         JWT_SECRET.to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert!(resp.status().is_success(), "createAccount failed");
+async fn create_account(_app: &axum::Router, manager: &AccountManager, did: &str, handle: &str) {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
 }
 
 /// Mint an OAuth access JWT with `typ=at-oauth-access` and the supplied
@@ -134,8 +132,8 @@ async fn write_with(app: &axum::Router, bearer: &str, dpop: Option<&str>) -> (St
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dpop_bound_token_rejected_without_proof() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Generate a key just to derive a stable thumbprint — we don't use it
     // for signing in this scenario since we never include a proof.
@@ -157,8 +155,8 @@ async fn dpop_bound_token_rejected_without_proof() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dpop_bound_token_accepted_with_fresh_proof() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let key = generate_key(KeyType::P256Private).unwrap();
     let token = {
@@ -190,8 +188,8 @@ async fn dpop_bound_token_accepted_with_fresh_proof() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dpop_replay_rejected() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let key = generate_key(KeyType::P256Private).unwrap();
     let token = {

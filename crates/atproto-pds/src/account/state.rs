@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Account lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountState {
     /// Normal operation — reads and writes allowed.
+    #[default]
     Active,
     /// Voluntary deactivation — identity may be served, repo not accessible
     /// to public sync.

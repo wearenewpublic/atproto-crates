@@ -1,7 +1,7 @@
 //! Phase 3 HTTP integration tests — write endpoints.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -30,34 +30,31 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
     let app = build_router(state);
-    (app, tmp)
+    (app, manager, tmp)
 }
 
-async fn create_account_and_token(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account_and_token(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 async fn post_json(
@@ -98,8 +95,8 @@ async fn get_json(app: axum::Router, path: &str, bearer: Option<&str>) -> (Statu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_record_round_trip_over_http() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = post_json(
         app.clone(),
@@ -131,7 +128,7 @@ async fn create_record_round_trip_over_http() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_without_auth_rejected() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.repo.createRecord",
@@ -144,10 +141,11 @@ async fn create_without_auth_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cross_account_write_rejected() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     // Two accounts.
-    let alice_token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
-    let _ = create_account_and_token(&app, "did:plc:bob", "bob.example").await;
+    let alice_token =
+        create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:bob", "bob.example").await;
 
     // Alice tries to write to bob's repo.
     let (status, _) = post_json(
@@ -167,8 +165,8 @@ async fn cross_account_write_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn put_then_delete_round_trip() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, _) = post_json(
         app.clone(),
@@ -225,8 +223,8 @@ async fn put_then_delete_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_writes_atomic_batch() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = post_json(
         app.clone(),
@@ -275,8 +273,8 @@ async fn apply_writes_atomic_batch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_with_auto_rkey_generates_tid() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = post_json(
         app,
@@ -298,8 +296,8 @@ async fn create_with_auto_rkey_generates_tid() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicate_create_rejected_over_http() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = post_json(
         app.clone(),
         "/xrpc/com.atproto.repo.createRecord",
@@ -330,8 +328,8 @@ async fn duplicate_create_rejected_over_http() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_advances_latest_commit_endpoint() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Pre-write: no commits → 404.
     let (status, _) = get_json(
@@ -366,4 +364,23 @@ async fn write_advances_latest_commit_endpoint() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["cid"].as_str().is_some());
     assert!(body["rev"].as_str().is_some());
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

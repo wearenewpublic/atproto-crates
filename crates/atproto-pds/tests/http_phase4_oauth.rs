@@ -2,7 +2,7 @@
 
 use atproto_identity::key::{KeyData, KeyType, generate_key};
 use atproto_oauth::dpop::auth_dpop;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -34,32 +34,30 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
     let app = build_router(state);
-    (app, tmp)
+    (app, manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert!(resp.status().is_success(), "createAccount failed");
+async fn create_account(_app: &axum::Router, manager: &AccountManager, did: &str, handle: &str) {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
 }
 
 async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -203,7 +201,7 @@ async fn post_token(app: axum::Router, body: Value, key: &KeyData) -> (StatusCod
 
 #[tokio::test(flavor = "multi_thread")]
 async fn metadata_documents_published() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, body) = get_json(app.clone(), "/.well-known/oauth-authorization-server").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["issuer"], "https://test.example");
@@ -223,7 +221,7 @@ async fn metadata_documents_published() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn jwks_returns_keys_array() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, body) = get_json(app, "/oauth/jwks").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["keys"].as_array().is_some());
@@ -231,9 +229,9 @@ async fn jwks_returns_keys_array() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn par_then_authorize_then_token_flow() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let key = dpop_key();
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (verifier, challenge) = pkce_pair();
 
     // 1. PAR.
@@ -296,7 +294,7 @@ async fn par_then_authorize_then_token_flow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn par_rejects_non_s256_pkce() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, body) = post_json(
         app,
         "/oauth/par",
@@ -317,7 +315,7 @@ async fn par_rejects_non_s256_pkce() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn par_rejects_missing_atproto_scope() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, body) = post_json(
         app,
         "/oauth/par",
@@ -338,9 +336,9 @@ async fn par_rejects_missing_atproto_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_rejects_pkce_mismatch() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let key = dpop_key();
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (_verifier, challenge) = pkce_pair();
 
     let (_, par_body) = post_json(
@@ -384,9 +382,9 @@ async fn token_rejects_pkce_mismatch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_token_rotates() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let key = dpop_key();
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (verifier, challenge) = pkce_pair();
 
     let (_, par_body) = post_json(
@@ -456,8 +454,8 @@ async fn refresh_token_rotates() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authorize_decline_is_access_denied() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (_verifier, challenge) = pkce_pair();
 
     let (_, par_body) = post_json(
@@ -487,7 +485,7 @@ async fn authorize_decline_is_access_denied() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_unsupported_grant_type_rejected() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let key = dpop_key();
     let (status, body) = post_token(
         app,
@@ -538,7 +536,7 @@ async fn oauth_state_persists_across_restart() {
         .with_oauth_state(oauth);
         let app = build_router(state);
 
-        create_account(&app, "did:plc:alice", "alice.example").await;
+        create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
         let (s, body) = post_json(
             app.clone(),
@@ -642,7 +640,7 @@ async fn oauth_state_persists_across_restart() {
 /// see it on the consent screen; only the destination is the attacker's.
 #[tokio::test(flavor = "multi_thread")]
 async fn par_rejects_redirect_uri_not_registered_by_the_client() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (_, challenge) = pkce_pair();
 
     let (status, body) = post_json(
@@ -674,8 +672,8 @@ async fn par_rejects_redirect_uri_not_registered_by_the_client() {
 /// redeemable by whoever holds it.
 #[tokio::test(flavor = "multi_thread")]
 async fn token_rejects_request_without_a_dpop_proof() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let key = dpop_key();
     let (verifier, challenge) = pkce_pair();
     let code = authorize_for_code(&app, &challenge).await;
@@ -710,8 +708,8 @@ async fn token_rejects_request_without_a_dpop_proof() {
 /// received a token bound to the attacker's key.
 #[tokio::test(flavor = "multi_thread")]
 async fn token_rejects_a_dpop_key_other_than_the_one_pinned_at_authorization() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let victim_key = dpop_key();
     let attacker_key = dpop_key();
     let (verifier, challenge) = pkce_pair();
@@ -746,8 +744,8 @@ async fn token_rejects_a_dpop_key_other_than_the_one_pinned_at_authorization() {
 /// A refresh token must not be usable by a key other than the one it is bound to.
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_rejects_a_dpop_key_other_than_the_bound_one() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let key = dpop_key();
     let attacker_key = dpop_key();
     let (verifier, challenge) = pkce_pair();
@@ -790,8 +788,8 @@ async fn refresh_rejects_a_dpop_key_other_than_the_bound_one() {
 /// Form encoding is what every standard client sends, and it must work.
 #[tokio::test(flavor = "multi_thread")]
 async fn par_and_token_accept_form_encoding() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let key = dpop_key();
     let (verifier, challenge) = pkce_pair();
 
@@ -863,9 +861,9 @@ async fn par_and_token_accept_form_encoding() {
 /// that a thumbprint is always present and always the real one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_survives_repeated_refreshes_bound_to_one_key() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let key = dpop_key();
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (verifier, challenge) = pkce_pair();
 
     let code = authorize_for_code(&app, &challenge).await;

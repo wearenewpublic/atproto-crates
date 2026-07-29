@@ -12,7 +12,7 @@
 //! integration would need a mock PLC server).
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -41,33 +41,35 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 async fn get_json(app: axum::Router, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
@@ -108,8 +110,8 @@ async fn post_json(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_handle_returns_local_did() {
-    let (app, _tmp) = build_app().await;
-    let _ = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let _ = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = get_json(
         app,
@@ -123,7 +125,7 @@ async fn resolve_handle_returns_local_did() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resolve_handle_unknown_returns_404() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
 
     let (status, _) = get_json(
         app,
@@ -136,8 +138,8 @@ async fn resolve_handle_unknown_returns_404() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_plc_operation_signature_returns_token() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = post_json(
         app,
@@ -165,7 +167,7 @@ async fn request_plc_operation_signature_returns_token() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_plc_operation_signature_requires_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.identity.requestPlcOperationSignature",
@@ -182,8 +184,8 @@ async fn request_plc_operation_signature_requires_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_recommended_did_credentials_returns_local_state() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = get_json(
         app,
@@ -209,7 +211,7 @@ async fn get_recommended_did_credentials_returns_local_state() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_recommended_did_credentials_requires_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = get_json(
         app,
         "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
@@ -227,8 +229,8 @@ async fn get_recommended_did_credentials_requires_auth() {
 async fn refresh_identity_emits_event_for_did_web() {
     // did:web doesn't trigger a PLC fetch; the handler still emits an
     // `#identity` event into the per-actor outbox so consumers re-resolve.
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:web:alice.example", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:web:alice.example", "alice.example").await;
 
     let (status, body) = post_json(
         app,
@@ -245,7 +247,7 @@ async fn refresh_identity_emits_event_for_did_web() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_identity_requires_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.identity.refreshIdentity",
@@ -254,4 +256,23 @@ async fn refresh_identity_requires_auth() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

@@ -11,7 +11,7 @@
 //! two places and the other nine did not have it.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager, AccountState};
+use atproto_pds::account::{AccountDirectory, AccountManager, AccountState, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -52,19 +52,21 @@ async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     (build_router(state), manager, tmp)
 }
 
-async fn create_account(app: &axum::Router) -> String {
-    let request = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "did": DID, "handle": HANDLE, "password": "pw" })).unwrap(),
-        ))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(app: &axum::Router, manager: &AccountManager) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(DID, HANDLE, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(DID, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, HANDLE).await
 }
 
 /// Write a record, returning its rkey so `getRecord` can ask for a real one.
@@ -170,7 +172,7 @@ fn public_read_paths(blob_cid: &str, block_cid: &str, rkey: &str) -> Vec<String>
 #[tokio::test(flavor = "multi_thread")]
 async fn a_takedown_closes_every_public_read_path() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app).await;
+    let token = create_account(&app, &manager).await;
     let rkey = write_a_record_rkey(&app, &token).await;
 
     // Every path answers before the takedown, so a refusal afterwards is the
@@ -209,7 +211,7 @@ async fn the_refusal_names_the_state() {
         (AccountState::Suspended, "RepoSuspended"),
     ] {
         let (app, manager, _tmp) = build_app().await;
-        let token = create_account(&app).await;
+        let token = create_account(&app, &manager).await;
         write_a_record(&app, &token).await;
         manager.set_state(DID, state).await.unwrap();
 
@@ -232,7 +234,7 @@ async fn the_refusal_names_the_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_taken_down_account_cannot_write() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app).await;
+    let token = create_account(&app, &manager).await;
     assert_eq!(write_a_record(&app, &token).await, StatusCode::OK);
 
     manager
@@ -255,12 +257,20 @@ async fn a_taken_down_account_cannot_write() {
 async fn a_taken_down_account_cannot_refresh() {
     let (app, manager, _tmp) = build_app().await;
 
+    manager
+        .create_account(CreateAccountParams::new(DID, HANDLE, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(DID, "pw")
+        .await
+        .expect("fixture account needs a session password");
     let request = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
+        .uri("/xrpc/com.atproto.server.createSession")
         .method("POST")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({ "did": DID, "handle": HANDLE, "password": "pw" })).unwrap(),
+            serde_json::to_vec(&json!({ "identifier": HANDLE, "password": "pw" })).unwrap(),
         ))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
@@ -293,7 +303,7 @@ async fn a_taken_down_account_cannot_refresh() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_taken_down_account_cannot_activate_itself() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app).await;
+    let token = create_account(&app, &manager).await;
     manager
         .set_state(DID, AccountState::Takendown)
         .await
@@ -325,7 +335,7 @@ async fn a_taken_down_account_cannot_activate_itself() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deactivated_account_can_still_activate_itself() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app).await;
+    let token = create_account(&app, &manager).await;
     manager
         .set_state(DID, AccountState::Deactivated)
         .await
@@ -373,4 +383,23 @@ async fn an_unknown_did_creates_no_store() {
         after.len(),
         "an unauthenticated request for an invented DID created storage on disk"
     );
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

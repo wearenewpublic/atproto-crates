@@ -8,7 +8,7 @@
 //! path. Nothing below hand-writes an NSID.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -84,19 +84,26 @@ async fn build_app(app_view: Option<&Upstream>) -> (axum::Router, Arc<AccountMan
     (build_router(state), manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"did": did, "handle": handle, "password": "pw"})).unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 async fn get(app: axum::Router, path: &str, token: &str) -> StatusCode {
@@ -112,8 +119,8 @@ async fn get(app: axum::Router, path: &str, token: &str) -> StatusCode {
 #[tokio::test(flavor = "multi_thread")]
 async fn proxying_forwards_the_full_nsid_and_query() {
     let upstream = start_upstream().await;
-    let (app, _mgr, _tmp) = build_app(Some(&upstream)).await;
-    let token = create_account(&app, "did:plc:alice", "alice.test").await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.test").await;
 
     let status = get(
         app,
@@ -135,8 +142,8 @@ async fn proxying_forwards_the_full_nsid_and_query() {
 #[tokio::test(flavor = "multi_thread")]
 async fn proxying_without_a_query_sends_a_bare_path() {
     let upstream = start_upstream().await;
-    let (app, _mgr, _tmp) = build_app(Some(&upstream)).await;
-    let token = create_account(&app, "did:plc:alice", "alice.test").await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.test").await;
 
     assert_eq!(
         get(app, "/xrpc/app.bsky.actor.getProfile", &token).await,
@@ -152,8 +159,8 @@ async fn proxying_without_a_query_sends_a_bare_path() {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_proxied_namespace_is_routed() {
     let upstream = start_upstream().await;
-    let (app, _mgr, _tmp) = build_app(Some(&upstream)).await;
-    let token = create_account(&app, "did:plc:alice", "alice.test").await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.test").await;
 
     for path in [
         "/xrpc/app.bsky.feed.getTimeline",
@@ -192,8 +199,8 @@ async fn every_proxied_namespace_is_routed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn locally_served_com_atproto_methods_are_not_shadowed() {
     let upstream = start_upstream().await;
-    let (app, _mgr, _tmp) = build_app(Some(&upstream)).await;
-    create_account(&app, "did:plc:alice", "alice.test").await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    create_account(&app, &manager, "did:plc:alice", "alice.test").await;
 
     // Served locally, and must stay that way.
     let resp = app
@@ -217,10 +224,29 @@ async fn locally_served_com_atproto_methods_are_not_shadowed() {
 /// than silently served.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unconfigured_proxy_is_refused() {
-    let (app, _mgr, _tmp) = build_app(None).await;
-    let token = create_account(&app, "did:plc:alice", "alice.test").await;
+    let (app, manager, _tmp) = build_app(None).await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.test").await;
     assert_eq!(
         get(app, "/xrpc/app.bsky.feed.getTimeline", &token).await,
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

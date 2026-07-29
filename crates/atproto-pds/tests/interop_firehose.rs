@@ -25,7 +25,7 @@
 //! to delete the entry, so the table cannot silently rot.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -262,7 +262,7 @@ fn interop_commit_body_matches_lexicon() {
 }
 
 /// Build a PDS router backed by a temporary directory.
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -279,32 +279,36 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
 /// Create an account and return its access token.
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let request = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({ "did": did, "handle": handle, "password": "pw" })).unwrap(),
-        ))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"]
-        .as_str()
-        .expect("createAccount should return an access token")
-        .to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 /// Connect a WebSocket subscriber to a live `subscribeRepos` and read one frame.
@@ -316,9 +320,9 @@ async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
 /// binary frame read back off the socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn subscribe_repos_end_to_end() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let did = "did:plc:firehosee2e";
-    let token = create_account(&app, did, "e2e.test.example").await;
+    let token = create_account(&app, &manager, did, "e2e.test.example").await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -413,4 +417,23 @@ fn the_encoder_passes_a_car_slice_through_unchanged() {
         Some(&atproto_dasl::Ipld::Bytes(car)),
         "the frame encoder must not touch the CAR the write path built"
     );
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

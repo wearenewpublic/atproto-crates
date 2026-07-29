@@ -7,7 +7,7 @@
 
 use atproto_identity::key::{KeyData, validate as identity_validate};
 use atproto_identity::key::{KeyType, to_public};
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -52,24 +52,21 @@ async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     (build_router(state), manager, tmp)
 }
 
-async fn create_account_and_token(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account_and_token(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 async fn account_signing_pubkey(manager: &AccountManager, did: &str) -> KeyData {
@@ -119,7 +116,7 @@ async fn get_token(app: axum::Router, path: &str, bearer: Option<&str>) -> (Stat
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_round_trip_signature_verifies() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = get_token(
         app,
@@ -161,7 +158,7 @@ async fn service_auth_round_trip_signature_verifies() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_requires_session() {
-    let (app, _, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = get_token(
         app,
         "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example",
@@ -173,8 +170,8 @@ async fn service_auth_requires_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_rejects_non_did_aud() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = get_token(
         app,
         "/xrpc/com.atproto.server.getServiceAuth?aud=https://example.com",
@@ -186,8 +183,8 @@ async fn service_auth_rejects_non_did_aud() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_rejects_expiry_beyond_one_hour() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
         &format!(
@@ -203,8 +200,8 @@ async fn service_auth_rejects_expiry_beyond_one_hour() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_omits_lxm_when_not_provided() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
         "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example",
@@ -237,8 +234,8 @@ async fn service_auth_omits_lxm_when_not_provided() {
 /// service built on that library before the signature is even checked.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_header_is_typed_jwt() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
         "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts",
@@ -253,8 +250,8 @@ async fn service_auth_header_is_typed_jwt() {
 /// Omitting `exp` yields the one-minute default.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_defaults_to_sixty_seconds() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
         "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:x.example&lxm=app.bsky.feed.getPosts",
@@ -272,8 +269,8 @@ async fn service_auth_defaults_to_sixty_seconds() {
 /// An `exp` already in the past is refused rather than silently honoured.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_rejects_expiry_in_the_past() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
         &format!(
@@ -291,8 +288,8 @@ async fn service_auth_rejects_expiry_in_the_past() {
 /// it is a general-purpose credential and is capped at a minute.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_caps_method_less_tokens_at_one_minute() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) = get_token(
         app,
         &format!(
@@ -309,8 +306,8 @@ async fn service_auth_caps_method_less_tokens_at_one_minute() {
 /// Account-management methods must never be reachable through service auth.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_refuses_protected_methods() {
-    let (app, _, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     for lxm in [
         "com.atproto.identity.updateHandle",
         "com.atproto.server.createAppPassword",
@@ -335,7 +332,7 @@ async fn service_auth_refuses_protected_methods() {
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_restricts_takendown_accounts_to_migration() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
     manager
         .set_state(
             "did:plc:alice",
@@ -375,8 +372,8 @@ async fn service_auth_restricts_takendown_accounts_to_migration() {
 /// session — an app password without the privileged flag — must not mint one.
 #[tokio::test(flavor = "multi_thread")]
 async fn service_auth_refuses_privileged_methods_to_unprivileged_sessions() {
-    let (app, _, _tmp) = build_app().await;
-    create_account_and_token(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let unprivileged = atproto_pds::account::session::issue_pair(
         "did:web:test.example",
@@ -414,4 +411,23 @@ async fn service_auth_refuses_privileged_methods_to_unprivileged_sessions() {
         StatusCode::OK,
         "ordinary methods stay available: {body}"
     );
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

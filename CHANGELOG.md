@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: anyone could claim any DID. `createAccount` took no request parts at all — it could
+  not read a header if it wanted to — and used a caller-supplied `did` verbatim. An attacker got a
+  session bound to the victim's identity, had this server answer `describeRepo`, `getRepo` and
+  firehose events for it, and permanently denied the victim an inbound migration here. Forged commits
+  fail relay signature verification, so the damage was bounded; the lockout was not.
+
+  A caller-supplied DID now requires an inbound service-auth token issued by that DID's **current**
+  host: `iss` is the DID being claimed, `aud` is this server, `lxm` is `com.atproto.server.
+  createAccount`, and the signature is checked against the `#atproto` key in the DID's own document,
+  fetched live. Only whoever controls that identity today can move it here. This is also the first
+  canonical endpoint on this server to accept an inbound service-auth token at all — `verify_service_
+  auth` previously had two callers, both in Spaces.
+
+  **There is no way to switch this off.** An escape hatch would be set on exactly the deployments
+  that most need the check.
+
+  A verified inbound migration now lands **deactivated**, as the canonical sequence requires —
+  create → import → `submitPlcOperation` → activate. Landing active meant the repository was
+  publicly readable and emitting firehose events before the DID document pointed here, and left
+  `activateAccount` with nothing to gate.
+
+  `reserveSigningKey` is session-gated and idempotent. Unauthenticated, it generated a fresh keypair
+  on every call and wrote a reservation row for whatever `did` the caller named — unbounded key
+  generation and reservation squatting for anyone who could reach it. Worse, the row id was a
+  millisecond timestamp, so the first reservation was kept while every subsequent call handed back a
+  *different* key: the key returned and the key reserved diverged after the first request. A repeat
+  call now returns the key already reserved, and a caller may only reserve against its own DID.
+
 - `atproto-pds`: a takedown did almost nothing. Account state was enforced on two public read paths
   and nowhere else, so a moderation action removed record-level reads while the account's complete
   repository CAR, its raw blocks and every blob stayed anonymously downloadable — and the account

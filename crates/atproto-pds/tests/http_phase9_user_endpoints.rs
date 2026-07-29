@@ -7,7 +7,7 @@
 //!   moderation service when configured, 503 otherwise.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::RepoReader;
@@ -66,24 +66,26 @@ async fn post_json(
     (status, value)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "originalpw",
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 /// Helper — read the most-recent email_token row for a DID + purpose, if any.
@@ -107,8 +109,8 @@ async fn fetch_email_token(manager: &AccountManager, did: &str, purpose: &str) -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_email_confirmation_412_when_no_email() {
-    let (app, _tmp, _manager) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     // No email set on the account → precondition failed.
     let (status, _) = post_json(
         app,
@@ -123,7 +125,7 @@ async fn request_email_confirmation_412_when_no_email() {
 #[tokio::test(flavor = "multi_thread")]
 async fn confirm_email_round_trip_sets_email_confirmed_at() {
     let (app, _tmp, manager) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Seed account.email so requestEmailConfirmation passes the precondition.
     sqlx::query("UPDATE account SET email = ? WHERE did = ?")
@@ -178,7 +180,7 @@ async fn confirm_email_round_trip_sets_email_confirmed_at() {
 #[tokio::test(flavor = "multi_thread")]
 async fn request_email_confirmation_400_when_already_confirmed() {
     let (app, _tmp, manager) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     sqlx::query("UPDATE account SET email = ?, email_confirmed_at = ? WHERE did = ?")
         .bind("alice@example.com")
         .bind(chrono::Utc::now().to_rfc3339())
@@ -217,7 +219,7 @@ async fn request_password_reset_returns_200_for_unknown_email() {
 #[tokio::test(flavor = "multi_thread")]
 async fn reset_password_round_trip_lets_user_log_in_with_new_password() {
     let (app, _tmp, manager) = build_app().await;
-    let _ = create_account(&app, "did:plc:alice", "alice.example").await;
+    let _ = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     sqlx::query("UPDATE account SET email = ? WHERE did = ?")
         .bind("alice@example.com")
         .bind("did:plc:alice")
@@ -287,8 +289,8 @@ async fn reset_password_rejects_short_password() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_report_503_when_unconfigured() {
-    let (app, _tmp, _manager) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.moderation.createReport",
@@ -313,4 +315,23 @@ async fn create_report_requires_auth() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

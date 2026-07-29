@@ -1,7 +1,7 @@
 //! Phase 6 admin-endpoint integration tests.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -17,7 +17,7 @@ use tower::ServiceExt;
 
 const ADMIN_PASSWORD: &str = "admin-test-secret";
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -34,7 +34,7 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
@@ -42,25 +42,23 @@ async fn build_app() -> (axum::Router, TempDir) {
     .with_writer(writer)
     .with_admin_password(ADMIN_PASSWORD.to_string());
     let app = build_router(state);
-    (app, tmp)
+    (app, manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert!(resp.status().is_success(), "createAccount failed");
+async fn create_account(_app: &axum::Router, manager: &AccountManager, did: &str, handle: &str) {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
 }
 
 fn admin_basic() -> String {
@@ -97,8 +95,8 @@ async fn post_admin(app: axum::Router, path: &str, body: Value) -> (StatusCode, 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_get_account_info_round_trip() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = get_admin(
         app,
@@ -112,8 +110,8 @@ async fn admin_get_account_info_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_endpoints_require_basic_auth() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     // No auth header.
     let resp = app
         .clone()
@@ -146,8 +144,8 @@ async fn admin_endpoints_require_basic_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_takedown_then_lift() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Takedown.
     let (status, body) = post_admin(
@@ -183,8 +181,8 @@ async fn admin_takedown_then_lift() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_takedown_blocks_public_reads() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateSubjectStatus",
@@ -209,8 +207,8 @@ async fn admin_takedown_blocks_public_reads() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_delete_account_terminal() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.deleteAccount",
@@ -230,10 +228,10 @@ async fn admin_delete_account_terminal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_search_accounts_substring() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
-    create_account(&app, "did:plc:bob", "bob.example").await;
-    create_account(&app, "did:plc:carol", "carol.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    create_account(&app, &manager, "did:plc:bob", "bob.example").await;
+    create_account(&app, &manager, "did:plc:carol", "carol.example").await;
 
     let (status, body) = get_admin(
         app.clone(),
@@ -252,8 +250,8 @@ async fn admin_search_accounts_substring() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_get_invite_codes_listing() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Issue an invite via the user-facing endpoint (alice as issuer).
     let session_req = Request::builder()
@@ -291,7 +289,7 @@ async fn admin_get_invite_codes_listing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_search_accounts_requires_basic_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -310,9 +308,9 @@ async fn admin_search_accounts_requires_basic_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_get_account_infos_batch() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
-    create_account(&app, "did:plc:bob", "bob.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    create_account(&app, &manager, "did:plc:bob", "bob.example").await;
 
     let (status, body) = get_admin(
         app.clone(),
@@ -330,7 +328,7 @@ async fn admin_get_account_infos_batch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_get_account_infos_rejects_empty_list() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = get_admin(app, "/xrpc/com.atproto.admin.getAccountInfos?dids=").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
@@ -341,8 +339,8 @@ async fn admin_get_account_infos_rejects_empty_list() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_send_email_to_account_with_email() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     // The default createAccount in this test harness doesn't set an email
     // address, so seed one directly via updateAccountEmail (§4.3).
     let (status, _) = post_admin(
@@ -371,8 +369,8 @@ async fn admin_send_email_to_account_with_email() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_send_email_rejects_account_without_email() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = post_admin(
         app,
         "/xrpc/com.atproto.admin.sendEmail",
@@ -393,8 +391,8 @@ async fn admin_send_email_rejects_account_without_email() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_update_account_email_round_trip() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, _) = post_admin(
         app.clone(),
@@ -414,8 +412,8 @@ async fn admin_update_account_email_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_update_account_password_lets_user_log_in() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, _) = post_admin(
         app.clone(),
@@ -465,8 +463,8 @@ async fn admin_update_account_password_lets_user_log_in() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_update_account_password_rejects_short_password() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = post_admin(
         app,
         "/xrpc/com.atproto.admin.updateAccountPassword",
@@ -482,7 +480,7 @@ async fn admin_update_account_password_rejects_short_password() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_revoke_service_auth_appends_blacklist_row() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_admin(
         app,
         "/xrpc/com.atproto.admin.revokeServiceAuth",
@@ -501,8 +499,8 @@ async fn admin_revoke_service_auth_appends_blacklist_row() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_disable_account_invites_blocks_create() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, _) = post_admin(
         app.clone(),
@@ -581,8 +579,8 @@ async fn admin_disable_account_invites_blocks_create() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_force_repo_sync_returns_404_when_no_commits() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, _) = post_admin(
         app,
         "/xrpc/com.atproto.admin.forceRepoSync",
@@ -595,7 +593,7 @@ async fn admin_force_repo_sync_returns_404_when_no_commits() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_force_repo_sync_requires_admin_basic_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -614,8 +612,8 @@ async fn admin_force_repo_sync_requires_admin_basic_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_disable_invite_codes_marks_disabled() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let resp = app
         .clone()
         .oneshot(
@@ -681,7 +679,7 @@ async fn admin_disable_invite_codes_marks_disabled() {
 /// in a timing measurement, so the property worth testing is the boring one.
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_auth_still_distinguishes_right_from_wrong() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
 
     for (label, password, expect_ok) in [
         ("exact", ADMIN_PASSWORD.to_string(), true),
@@ -729,8 +727,8 @@ async fn admin_auth_still_distinguishes_right_from_wrong() {
 /// `com.atproto.admin.defs#accountView` requires `did`, `handle`, `indexedAt`.
 #[tokio::test(flavor = "multi_thread")]
 async fn account_view_carries_the_fields_the_lexicon_requires() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = get_admin(
         app.clone(),
@@ -767,8 +765,8 @@ async fn account_view_carries_the_fields_the_lexicon_requires() {
 /// `searchAccounts` declares `email`, `limit`, `cursor` — and no `q`.
 #[tokio::test(flavor = "multi_thread")]
 async fn search_accounts_takes_the_declared_parameter() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = get_admin(app, "/xrpc/com.atproto.admin.searchAccounts?email=ali").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -782,8 +780,8 @@ async fn search_accounts_takes_the_declared_parameter() {
 /// `updateAccountEmail` names the subject `account`, an at-identifier.
 #[tokio::test(flavor = "multi_thread")]
 async fn update_account_email_takes_an_at_identifier_named_account() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = post_admin(
         app.clone(),
@@ -809,8 +807,8 @@ async fn update_account_email_takes_an_at_identifier_named_account() {
 /// `sendEmail` requires `senderDid` and leaves `subject` optional.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_email_takes_sender_did_and_an_optional_subject() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateAccountEmail",
@@ -839,8 +837,8 @@ async fn send_email_takes_sender_did_and_an_optional_subject() {
 /// `account`.
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_toggles_are_admin_namespaced() {
-    let (app, _tmp) = build_app().await;
-    create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, body) = post_admin(
         app.clone(),

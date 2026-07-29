@@ -155,7 +155,7 @@ impl AccountManager {
                 .bind(Option::<String>::None)
                 .bind(&password_hash)
                 .bind(&now)
-                .bind(AccountState::Active.as_str())
+                .bind(params.state.as_str())
                 .bind(&key_ref)
                 .bind(if params.pds_managed_rotation { 1i64 } else { 0i64 })
                 .bind(params.rotation_key_ref)
@@ -195,7 +195,7 @@ impl AccountManager {
                 .bind(Option::<String>::None)
                 .bind(&password_hash)
                 .bind(&now)
-                .bind(AccountState::Active.as_str())
+                .bind(params.state.as_str())
                 .bind(&key_ref)
                 .bind(params.pds_managed_rotation)
                 .bind(params.rotation_key_ref)
@@ -239,10 +239,37 @@ impl AccountManager {
             email_confirmed_at: None,
             password_hash,
             created_at: now,
-            state: AccountState::Active,
+            state: params.state,
             signing_key_ref: key_ref,
             pds_managed_rotation: params.pds_managed_rotation,
         })
+    }
+
+    /// Seed the implicit "primary" app password used to mint sessions.
+    ///
+    /// `createSession` verifies against an app-password row, never against
+    /// `account.password_hash` directly, so an account without this row exists
+    /// but cannot log in. Account creation therefore has two steps, and having
+    /// them inline in the handler meant every other caller — tests included —
+    /// had to know that and repeat it.
+    ///
+    /// Returns the app-password row id, which a session is issued against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if either write fails.
+    pub async fn set_primary_password(&self, did: &str, password: &str) -> PdsResult<String> {
+        let primary =
+            crate::account::app_password::create(&self.account_pool(), did, "__primary__", true)
+                .await?;
+        let hash = crate::account::hash_password(password)?;
+        crate::account::app_password::update_hash_by_id(
+            &self.account_pool(),
+            &primary.row.id,
+            &hash,
+        )
+        .await?;
+        Ok(primary.row.id)
     }
 
     /// Verify a password against the stored Argon2id hash.
@@ -973,6 +1000,41 @@ impl AccountManager {
         Ok(rows.into_iter().map(|(d,)| d).collect())
     }
 
+    /// The key ref of an existing signing-key reservation for `did`, if any.
+    ///
+    /// `reserve_signing_key` stores the first reservation and ignores later
+    /// ones, so without this lookup the endpoint handed out a fresh key on
+    /// every call while the stored row kept the original — the returned key and
+    /// the reserved key diverged after the first request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if the query fails.
+    pub async fn lookup_reserved_signing_key(&self, did: &str) -> PdsResult<Option<String>> {
+        let row: Option<(String,)> = match self.accounts_pool.kind() {
+            #[cfg(feature = "sqlite")]
+            AccountPoolKind::Sqlite => {
+                sqlx::query_as("SELECT key_ref FROM signing_key WHERE did = ? LIMIT 1")
+                    .bind(did)
+                    .fetch_optional(self.accounts_pool.as_sqlite())
+                    .await
+            }
+            #[cfg(feature = "postgres")]
+            AccountPoolKind::Postgres => {
+                sqlx::query_as("SELECT key_ref FROM signing_key WHERE did = $1 LIMIT 1")
+                    .bind(did)
+                    .fetch_optional(self.accounts_pool.as_postgres())
+                    .await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Ok(None),
+        }
+        .map_err(|e| PdsError::Storage {
+            reason: format!("lookup_reserved_signing_key: {e}"),
+        })?;
+        Ok(row.map(|(r,)| r))
+    }
+
     /// Reserve a signing-key row in the `signing_key` table. Idempotent
     /// — if `id` already exists the call is a no-op. Used by
     /// `reserveSigningKey` (§4.5) so the same physical key can be
@@ -1059,6 +1121,14 @@ pub struct CreateAccountParams<'a> {
     pub rotation_key_ref: Option<&'a str>,
     /// Optional pre-allocated signing-key ref. See `rotation_key_ref`.
     pub signing_key_ref: Option<&'a str>,
+    /// Lifecycle state the account is created in.
+    ///
+    /// An inbound migration lands [`AccountState::Deactivated`]: the canonical
+    /// sequence is create → import → `submitPlcOperation` → activate, and until
+    /// the DID document points here the repository must not be publicly
+    /// readable or emitting firehose events. Landing `Active` also left
+    /// `activateAccount` with nothing to gate.
+    pub state: AccountState,
 }
 
 impl<'a> CreateAccountParams<'a> {
@@ -1074,8 +1144,17 @@ impl<'a> CreateAccountParams<'a> {
             pds_managed_rotation: false,
             rotation_key_ref: None,
             signing_key_ref: None,
+            state: AccountState::Active,
         }
     }
+
+    /// Set the lifecycle state the account is created in.
+    #[must_use]
+    pub fn with_state(mut self, state: AccountState) -> Self {
+        self.state = state;
+        self
+    }
+
     /// Set email.
     #[must_use]
     pub fn with_email(mut self, email: Option<&'a str>) -> Self {

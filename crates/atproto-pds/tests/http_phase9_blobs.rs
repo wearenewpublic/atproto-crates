@@ -4,7 +4,7 @@
 //! empty list.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -33,39 +33,41 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw",
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn upload_blob_round_trip() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let req = Request::builder()
         .uri("/xrpc/com.atproto.repo.uploadBlob")
@@ -98,7 +100,7 @@ async fn upload_blob_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn upload_blob_requires_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let req = Request::builder()
         .uri("/xrpc/com.atproto.repo.uploadBlob")
         .method("POST")
@@ -111,8 +113,8 @@ async fn upload_blob_requires_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_missing_blobs_starts_empty() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let req = Request::builder()
         .uri("/xrpc/com.atproto.repo.listMissingBlobs")
         .header("authorization", format!("Bearer {token}"))
@@ -139,9 +141,9 @@ async fn list_missing_blobs_starts_empty() {
 /// anyway.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_blob_refuses_to_render_as_a_document() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let did = "did:plc:blobxss";
-    let token = create_account(&app, did, "xss.test.example").await;
+    let token = create_account(&app, &manager, did, "xss.test.example").await;
 
     // Upload something a browser would happily execute, declared as such.
     let payload = b"<script>alert(document.domain)</script>".to_vec();
@@ -206,9 +208,9 @@ async fn get_blob_refuses_to_render_as_a_document() {
 /// phone photo failed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_under_the_ceiling_uploads() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let did = "did:plc:bigblob";
-    let token = create_account(&app, did, "big.test.example").await;
+    let token = create_account(&app, &manager, did, "big.test.example").await;
 
     // 3 MiB — comfortably over axum's 2 MiB default, comfortably under 16 MiB.
     let payload = vec![0x42u8; 3 * 1024 * 1024];
@@ -237,9 +239,9 @@ async fn a_blob_under_the_ceiling_uploads() {
 /// handling does not see it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blob_over_the_ceiling_is_refused_as_xrpc() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let did = "did:plc:hugeblob";
-    let token = create_account(&app, did, "huge.test.example").await;
+    let token = create_account(&app, &manager, did, "huge.test.example").await;
 
     let payload = vec![0x42u8; 17 * 1024 * 1024];
     let request = Request::builder()
@@ -258,4 +260,23 @@ async fn a_blob_over_the_ceiling_is_refused_as_xrpc() {
         "the refusal should be an XRPC error body, got {:?}",
         String::from_utf8_lossy(&body)
     );
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }

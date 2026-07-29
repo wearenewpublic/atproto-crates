@@ -18,7 +18,7 @@
 
 use atproto_dasl::car::{CarBlock, CarWriter};
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, AccountState, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -48,13 +48,13 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
 async fn post_json(
@@ -127,34 +127,41 @@ async fn minimal_car_for(did: &str) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_migration_sequence() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
 
     // Step 1+2: create account with a caller-supplied DID (Phase 5 stub
     // for the migrating-account path, which the design says comes in
     // `deactivated` state pending repo import).
     let did = "did:plc:migrate";
     let handle = "migrate.example";
-    let (status, body) = post_json(
+    // Created through the internal API: the endpoint now requires a
+    // service-auth token from the DID's current host, signed by a key in that
+    // DID's document, which a test DID cannot produce. The endpoint's own
+    // behaviour is asserted in `migration_create_account_requires_service_auth`
+    // below.
+    //
+    // Deactivated at creation, which is what the endpoint now does for a
+    // verified inbound migration — the test used to create the account active
+    // and then deactivate it explicitly to mirror a design the code did not
+    // implement.
+    manager
+        .create_account(
+            CreateAccountParams::new(did, handle, "pw").with_state(AccountState::Deactivated),
+        )
+        .await
+        .expect("migrating account");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("session password");
+    let (_, body) = post_json(
         app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": did, "handle": handle, "password": "pw"}),
+        "/xrpc/com.atproto.server.createSession",
+        json!({"identifier": handle, "password": "pw"}),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "createAccount: body {body}");
     let access_jwt = body["accessJwt"].as_str().unwrap().to_string();
-
-    // For the migration sequence, the account should typically start in
-    // `deactivated` state. The Phase 5 createAccount path always activates
-    // — so we explicitly deactivate to mirror the design.
-    let (status, _) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.deactivateAccount",
-        json!({}),
-        Some(&access_jwt),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "deactivate during migration");
 
     // Step 3: importRepo with a valid CAR.
     let car = minimal_car_for(did).await;
@@ -208,12 +215,20 @@ async fn full_migration_sequence() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_with_invalid_car_fails_cleanly() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     let did = "did:plc:migrate";
+    manager
+        .create_account(CreateAccountParams::new(did, "migrate.example", "pw"))
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("session password");
     let (_, body) = post_json(
         app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": did, "handle": "migrate.example", "password": "pw"}),
+        "/xrpc/com.atproto.server.createSession",
+        json!({"identifier": "migrate.example", "password": "pw"}),
         None,
     )
     .await;
@@ -236,14 +251,26 @@ async fn migration_with_invalid_car_fails_cleanly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_importrepo_requires_privileged_session() {
-    let (app, _tmp) = build_app().await;
+    let (app, manager, _tmp) = build_app().await;
     // createAccount path issues a privileged primary password. Then we
     // create a non-privileged app password and try importRepo with that
     // session — expect 403.
+    manager
+        .create_account(CreateAccountParams::new(
+            "did:plc:alice",
+            "alice.example",
+            "pw",
+        ))
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password("did:plc:alice", "pw")
+        .await
+        .expect("session password");
     let (_, body) = post_json(
         app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
+        "/xrpc/com.atproto.server.createSession",
+        json!({"identifier": "alice.example", "password": "pw"}),
         None,
     )
     .await;
@@ -276,4 +303,24 @@ async fn migration_importrepo_requires_privileged_session() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// The endpoint that begins a migration demands proof of the DID.
+///
+/// This is the other half of the flow the tests above exercise with fixtures:
+/// an inbound migration is authorised by a service-auth token from the DID's
+/// current host, and without one `createAccount` must refuse rather than adopt
+/// the identity on the caller's word.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_create_account_requires_service_auth() {
+    let (app, _manager, _tmp) = build_app().await;
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.createAccount",
+        json!({"did": "did:plc:elsewhere", "handle": "elsewhere.example", "password": "pw"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "AuthRequired");
 }

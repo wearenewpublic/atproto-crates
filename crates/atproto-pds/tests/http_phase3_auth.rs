@@ -4,7 +4,7 @@
 //! against an in-memory SQLite-backed PDS.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::RepoReader;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app(invite_required: bool) -> (axum::Router, TempDir) {
+async fn build_app(invite_required: bool) -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -32,13 +32,13 @@ async fn build_app(invite_required: bool) -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         invite_required,
     );
     let app = build_router(state);
-    (app, tmp)
+    (app, manager, tmp)
 }
 
 async fn post_json(
@@ -77,29 +77,92 @@ async fn get_json(app: axum::Router, path: &str, bearer: Option<&str>) -> (Statu
     (status, value)
 }
 
+/// Create a fixture account and return `(accessJwt, refreshJwt)`.
+///
+/// Through the internal API: `createAccount` now requires a service-auth token
+/// proving control of the DID, signed by a key in the DID's own document, which
+/// a test DID cannot have. The endpoint's own behaviour is asserted separately
+/// in `create_account_with_an_unproven_did_is_refused`.
+async fn fixture_session(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+    password: &str,
+) -> (String, String) {
+    manager
+        .create_account(CreateAccountParams::new(did, handle, password))
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password(did, password)
+        .await
+        .expect("fixture session password");
+    let (_, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.createSession",
+        json!({ "identifier": handle, "password": password }),
+        None,
+    )
+    .await;
+    (
+        body["accessJwt"].as_str().expect("accessJwt").to_string(),
+        body["refreshJwt"].as_str().expect("refreshJwt").to_string(),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn create_account_then_get_session() {
-    let (app, _tmp) = build_app(false).await;
+async fn create_account_with_an_unproven_did_is_refused() {
+    let (app, _manager, _tmp) = build_app(false).await;
+
+    // A caller-supplied DID must be proven with a service-auth token from the
+    // DID's current host. Without one this is DID squatting: a session bound to
+    // someone else's identity, and a permanent block on their migrating here.
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.createAccount",
+        json!({
+            "did": "did:plc:victim",
+            "handle": "victim.example",
+            "password": "correct horse battery staple",
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "AuthRequired");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_round_trip_returns_identity() {
+    let (app, manager, _tmp) = build_app(false).await;
+    manager
+        .create_account(
+            CreateAccountParams::new(
+                "did:plc:alice",
+                "alice.example",
+                "correct horse battery staple",
+            )
+            .with_email(Some("alice@example.com")),
+        )
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password("did:plc:alice", "correct horse battery staple")
+        .await
+        .expect("fixture session password");
 
     let (status, body) = post_json(
         app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({
-            "did": "did:plc:alice",
-            "handle": "alice.example",
-            "email": "alice@example.com",
-            "password": "correct horse battery staple",
-        }),
+        "/xrpc/com.atproto.server.createSession",
+        json!({ "identifier": "alice.example", "password": "correct horse battery staple" }),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let access = body["accessJwt"].as_str().unwrap().to_string();
     assert!(body["refreshJwt"].as_str().unwrap().len() > 50);
-    assert_eq!(body["did"], "did:plc:alice");
-    assert_eq!(body["handle"], "alice.example");
 
-    // getSession with the access token returns the same identity.
     let (status, body) = get_json(app, "/xrpc/com.atproto.server.getSession", Some(&access)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["did"], "did:plc:alice");
@@ -109,14 +172,19 @@ async fn create_account_then_get_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_session_with_handle_and_password() {
-    let (app, _tmp) = build_app(false).await;
-    let _ = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    manager
+        .create_account(CreateAccountParams::new(
+            "did:plc:alice",
+            "alice.example",
+            "pw",
+        ))
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password("did:plc:alice", "pw")
+        .await
+        .expect("fixture session password");
 
     let (status, body) = post_json(
         app.clone(),
@@ -132,14 +200,19 @@ async fn create_session_with_handle_and_password() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_session_wrong_password_rejected() {
-    let (app, _tmp) = build_app(false).await;
-    let _ = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "right"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    manager
+        .create_account(CreateAccountParams::new(
+            "did:plc:alice",
+            "alice.example",
+            "right",
+        ))
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password("did:plc:alice", "right")
+        .await
+        .expect("fixture session password");
     let (status, _body) = post_json(
         app,
         "/xrpc/com.atproto.server.createSession",
@@ -152,14 +225,11 @@ async fn create_session_wrong_password_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_session_returns_new_tokens() {
-    let (app, _tmp) = build_app(false).await;
-    let (_, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    let (__access, __refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    let body = json!({ "accessJwt": __access, "refreshJwt": __refresh });
+    let _ = StatusCode::OK;
     let refresh = body["refreshJwt"].as_str().unwrap().to_string();
     let original_access = body["accessJwt"].as_str().unwrap().to_string();
 
@@ -181,14 +251,11 @@ async fn refresh_session_returns_new_tokens() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn refresh_with_access_jwt_rejected() {
-    let (app, _tmp) = build_app(false).await;
-    let (_, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    let (__access, __refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    let body = json!({ "accessJwt": __access, "refreshJwt": __refresh });
+    let _ = StatusCode::OK;
     let access = body["accessJwt"].as_str().unwrap().to_string();
     let (status, _) = post_json(
         app,
@@ -202,7 +269,7 @@ async fn refresh_with_access_jwt_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_required_blocks_creation_without_code() {
-    let (app, _tmp) = build_app(true).await;
+    let (app, _manager, _tmp) = build_app(true).await;
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.server.createAccount",
@@ -215,14 +282,11 @@ async fn invite_required_blocks_creation_without_code() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_app_password_then_use_it_for_session() {
-    let (app, _tmp) = build_app(false).await;
-    let (_, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    let (__access, __refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    let body = json!({ "accessJwt": __access, "refreshJwt": __refresh });
+    let _ = StatusCode::OK;
     let access = body["accessJwt"].as_str().unwrap().to_string();
 
     let (status, body) = post_json(
@@ -251,14 +315,11 @@ async fn create_app_password_then_use_it_for_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_app_passwords_excludes_primary() {
-    let (app, _tmp) = build_app(false).await;
-    let (_, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    let (__access, __refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    let body = json!({ "accessJwt": __access, "refreshJwt": __refresh });
+    let _ = StatusCode::OK;
     let access = body["accessJwt"].as_str().unwrap().to_string();
     let _ = post_json(
         app.clone(),
@@ -293,14 +354,11 @@ async fn list_app_passwords_excludes_primary() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn revoke_app_password_invalidates_it() {
-    let (app, _tmp) = build_app(false).await;
-    let (_, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    let (__access, __refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    let body = json!({ "accessJwt": __access, "refreshJwt": __refresh });
+    let _ = StatusCode::OK;
     let access = body["accessJwt"].as_str().unwrap().to_string();
     let (_, body) = post_json(
         app.clone(),
@@ -332,7 +390,7 @@ async fn revoke_app_password_invalidates_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_invite_code_requires_auth() {
-    let (app, _tmp) = build_app(false).await;
+    let (app, _manager, _tmp) = build_app(false).await;
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.server.createInviteCode",
@@ -345,14 +403,11 @@ async fn create_invite_code_requires_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_invite_code_then_use_it() {
-    let (app, _tmp) = build_app(false).await;
-    let (_, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:alice", "handle": "alice.example", "password": "pw"}),
-        None,
-    )
-    .await;
+    let (app, manager, _tmp) = build_app(false).await;
+    let (__access, __refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    let body = json!({ "accessJwt": __access, "refreshJwt": __refresh });
+    let _ = StatusCode::OK;
     let access = body["accessJwt"].as_str().unwrap().to_string();
     let (status, body) = post_json(
         app.clone(),
@@ -366,7 +421,7 @@ async fn create_invite_code_then_use_it() {
     assert!(code.starts_with("pds-"));
 
     // Switch to invite-required mode and create another account using the code.
-    let (app2, _tmp2) = build_app(true).await;
+    let (app2, _manager2, _tmp2) = build_app(true).await;
     // Pre-create the alice account again on the new pool so the inviter exists.
     let _ = post_json(
         app2.clone(),
@@ -412,12 +467,12 @@ async fn invite_redemption_records_real_did_not_placeholder() {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         true, // invite_required
     );
-    let app = build_router(state);
+    let _app = build_router(state);
 
     // Pre-seed: insert an admin account (so the FK on invite_code.used_by
     // is satisfied if FKs were enforced; harmless otherwise) and a
@@ -436,19 +491,23 @@ async fn invite_redemption_records_real_did_not_placeholder() {
         .unwrap();
     let code = row.code;
 
-    let (status, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.createAccount",
-        json!({
-            "did": "did:plc:newuser",
-            "handle": "newuser.example",
-            "password": "pw",
-            "inviteCode": code,
-        }),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "createAccount: {body}");
+    // Redemption is exercised directly rather than through `createAccount`.
+    // An invite-gated signup normally takes the PLC-genesis path, which this
+    // harness has no PLC directory for; the caller-supplied-DID path now
+    // requires a service-auth token a test DID cannot produce. The subject of
+    // this test is what `redeem` writes to `used_by`, and that is unchanged.
+    manager
+        .create_account(CreateAccountParams::new(
+            "did:plc:newuser",
+            "newuser.example",
+            "pw",
+        ))
+        .await
+        .expect("fixture account");
+    let redeemed = atproto_pds::account::invite::redeem(&account_pool, &code, "did:plc:newuser")
+        .await
+        .expect("redeem should succeed");
+    assert!(redeemed, "a fresh code with uses remaining should redeem");
 
     // The invite_code.used_by column must point at the real DID — not at
     // the historical "did:plc:pending" placeholder.
@@ -468,7 +527,7 @@ async fn invite_redemption_records_real_did_not_placeholder() {
 /// before the genesis call.
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_required_rejects_unknown_code_before_side_effects() {
-    let (app, _tmp) = build_app(true).await;
+    let (app, _manager, _tmp) = build_app(true).await;
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.server.createAccount",

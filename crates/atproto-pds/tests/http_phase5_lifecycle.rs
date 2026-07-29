@@ -7,7 +7,7 @@
 //! - `importRepo` returns 501 NotImplemented with structured error
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager};
+use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
+async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -36,33 +36,35 @@ async fn build_app() -> (axum::Router, TempDir) {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
     )
     .with_writer(writer);
-    (build_router(state), tmp)
+    (build_router(state), manager, tmp)
 }
 
-async fn create_account(app: &axum::Router, did: &str, handle: &str) -> String {
-    let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
-        .method("POST")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "did": did,
-                "handle": handle,
-                "password": "pw"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["accessJwt"].as_str().unwrap().to_string()
+async fn create_account(
+    app: &axum::Router,
+    manager: &AccountManager,
+    did: &str,
+    handle: &str,
+) -> String {
+    // Created through the internal API rather than the XRPC endpoint. That
+    // endpoint now requires a service-auth token proving control of the DID,
+    // signed by a key published in the DID's own document, which a test DID
+    // cannot have. Fixture setup is not the thing under test; where
+    // `createAccount` itself is the subject, the test calls the endpoint.
+    manager
+        .create_account(CreateAccountParams::new(did, handle, "pw"))
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+    session_token(app, handle).await
 }
 
 async fn post_json(
@@ -103,8 +105,8 @@ async fn get_json(app: axum::Router, path: &str, bearer: Option<&str>) -> (Statu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deactivate_then_activate_round_trip() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Initially active.
     let (status, body) = get_json(
@@ -155,7 +157,7 @@ async fn deactivate_then_activate_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lifecycle_endpoints_require_auth() {
-    let (app, _tmp) = build_app().await;
+    let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_json(
         app.clone(),
         "/xrpc/com.atproto.server.deactivateAccount",
@@ -176,8 +178,8 @@ async fn lifecycle_endpoints_require_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_missing_blobs_empty_until_phase8() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let (status, body) =
         get_json(app, "/xrpc/com.atproto.repo.listMissingBlobs", Some(&token)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -189,8 +191,8 @@ async fn import_repo_rejects_malformed_car() {
     // Phase 5/8 path: importRepo now actually attempts to parse the body as
     // a CAR. A garbage body fails CAR-header validation and is rejected with
     // a 4xx; we don't expect 501 anymore.
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     let req = Request::builder()
         .uri("/xrpc/com.atproto.repo.importRepo")
         .method("POST")
@@ -228,7 +230,7 @@ async fn email_update_request_then_confirm() {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
@@ -236,7 +238,7 @@ async fn email_update_request_then_confirm() {
     .with_writer(writer);
     let app = build_router(state);
 
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     let (status, _) = post_json(
         app.clone(),
@@ -286,8 +288,8 @@ async fn email_update_request_then_confirm() {
 /// it's been used returns a 400 InvalidToken.
 #[tokio::test(flavor = "multi_thread")]
 async fn confirm_email_update_rejects_replay() {
-    let (app, _tmp) = build_app().await;
-    let bearer = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let bearer = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
     post_json(
         app.clone(),
         "/xrpc/com.atproto.server.requestEmailUpdate",
@@ -347,7 +349,7 @@ async fn deactivate_with_delete_after_in_past_then_gc_deletes() {
     .with_writer(writer);
     let app = build_router(state);
 
-    let bearer = create_account(&app, "did:plc:alice", "alice.example").await;
+    let bearer = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Use a `delete_after` already in the past so the GC immediately
     // qualifies the account.
@@ -419,7 +421,7 @@ async fn account_delete_request_then_confirm() {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
@@ -428,15 +430,24 @@ async fn account_delete_request_then_confirm() {
     let app = build_router(state);
 
     // Create an account with an email so requestAccountDelete can target it.
+    manager
+        .create_account(
+            CreateAccountParams::new("did:plc:alice", "alice.example", "pw")
+                .with_email(Some("alice@example.com")),
+        )
+        .await
+        .expect("fixture account");
+    manager
+        .set_primary_password("did:plc:alice", "pw")
+        .await
+        .expect("session password");
     let req = Request::builder()
-        .uri("/xrpc/com.atproto.server.createAccount")
+        .uri("/xrpc/com.atproto.server.createSession")
         .method("POST")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
-                "did": "did:plc:alice",
-                "handle": "alice.example",
-                "email": "alice@example.com",
+                "identifier": "alice.example",
                 "password": "pw"
             }))
             .unwrap(),
@@ -513,7 +524,7 @@ async fn denylisted_handle_blocks_create_account() {
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
     let state = HttpState::with_account_manager(
         reader,
-        manager,
+        manager.clone(),
         "did:web:test.example".to_string(),
         b"test-secret-do-not-use-in-prod-32!".to_vec(),
         false,
@@ -545,8 +556,8 @@ async fn denylisted_handle_blocks_create_account() {
 /// the caller has issued.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_account_invite_codes_returns_caller_codes() {
-    let (app, _tmp) = build_app().await;
-    let token = create_account(&app, "did:plc:alice", "alice.example").await;
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
 
     // Issue two codes via the existing createInviteCode endpoint.
     for _ in 0..2 {
@@ -573,4 +584,23 @@ async fn get_account_invite_codes_returns_caller_codes() {
         assert!(c["code"].as_str().unwrap().len() > 5);
         assert_eq!(c["disabled"], false);
     }
+}
+
+/// Log in as a fixture account and return its access token.
+async fn session_token(app: &axum::Router, handle: &str) -> String {
+    let req = Request::builder()
+        .uri("/xrpc/com.atproto.server.createSession")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "identifier": handle, "password": "pw" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["accessJwt"]
+        .as_str()
+        .expect("createSession should return an access token")
+        .to_string()
 }
