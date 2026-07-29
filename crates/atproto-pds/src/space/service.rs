@@ -129,8 +129,22 @@ impl SpaceService {
     /// union (mintPolicy + appAccess + optional managingApp). A tombstoned
     /// space (`deleted_at IS NOT NULL`) or a missing row both yield
     /// [`PdsError::SpaceNotFound`].
-    pub async fn get_space(&self, viewer_did: &str, uri: &SpaceUri) -> PdsResult<GetSpaceOutput> {
-        let store = SqlActorStore::open(&self.data_dir, viewer_did).await?;
+    ///
+    /// Reads the **authority's** store, never the caller's. The draft lexicon
+    /// describes this endpoint as "served by the space host", and the authority
+    /// is the only party holding the real config.
+    ///
+    /// There is deliberately no viewer parameter. This used to take one and open
+    /// the caller's store, which was wrong twice over: `ensure_space_row`
+    /// (`actor_store/sql/space_repo_storage.rs`) gives a member's store a space
+    /// row with column defaults the moment they write, so a client asking about
+    /// an `allowList` space was told `open`; and a member who had never written
+    /// had no row at all and got `SpaceNotFound` for a space they belong to.
+    /// [`GetSpaceOutput`] carries no viewer-dependent field, so the parameter
+    /// only ever selected the wrong store — removing it makes that
+    /// unrepresentable rather than merely fixed.
+    pub async fn get_space(&self, uri: &SpaceUri) -> PdsResult<GetSpaceOutput> {
+        let store = SqlActorStore::open(&self.data_dir, &uri.space_did).await?;
         let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT mint_policy, app_access, managing_app, deleted_at FROM space WHERE uri = ?",
         )
@@ -602,7 +616,7 @@ mod tests {
         assert!(info.is_member);
 
         let uri = info.uri.parse::<SpaceUri>().unwrap();
-        let got = svc.get_space("did:plc:owner", &uri).await.unwrap();
+        let got = svc.get_space(&uri).await.unwrap();
         assert_eq!(got.uri, info.uri);
         // Defaults surface as member-list + #open.
         assert_eq!(got.config["mintPolicy"], "member-list");
@@ -637,7 +651,7 @@ mod tests {
             .await
             .unwrap();
 
-        let got = svc.get_space("did:plc:owner", &uri).await.unwrap();
+        let got = svc.get_space(&uri).await.unwrap();
         assert_eq!(got.config["mintPolicy"], "public");
         assert_eq!(got.config["managingApp"], "did:web:m.example#svc");
         assert_eq!(
@@ -653,7 +667,7 @@ mod tests {
         svc.update_space("did:plc:owner", &uri, clear)
             .await
             .unwrap();
-        let got = svc.get_space("did:plc:owner", &uri).await.unwrap();
+        let got = svc.get_space(&uri).await.unwrap();
         assert!(got.config.get("managingApp").is_none());
     }
 
@@ -800,7 +814,7 @@ mod tests {
 
         // getSpace now reports SpaceNotFound.
         assert!(matches!(
-            svc.get_space("did:plc:owner", &uri).await,
+            svc.get_space(&uri).await,
             Err(PdsError::SpaceNotFound { .. })
         ));
         // The authority's own repo data within the space is erased.

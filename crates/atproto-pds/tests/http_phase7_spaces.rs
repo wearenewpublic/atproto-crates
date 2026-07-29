@@ -1953,3 +1953,148 @@ async fn deleting_the_last_referencing_record_revokes_the_blob() {
         "with no record referencing it, the blob is no longer readable in the space"
     );
 }
+
+// ---------------------------------------------------------------------------
+//  F-SPACE-11 — `getSpace` describes the authority's space, not the caller's.
+//
+//  It used to open the *caller's* per-actor store. Two failures followed:
+//  `ensure_space_row` gives a member's store a space row with column defaults
+//  the moment they write, so a client asking about an `allowList` space was
+//  told `open`; and a member who had never written had no row at all and got
+//  `SpaceNotFound` for a space they belong to.
+//
+//  Every pre-existing unit test passed the authority as the viewer, so
+//  caller-store and authority-store were the same store and none of them could
+//  see this.
+// ---------------------------------------------------------------------------
+
+async fn get_space(app: &axum::Router, space: &str, token: &str) -> (StatusCode, Value) {
+    get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getSpace?space={}",
+            urlencode(space)
+        ),
+        Some(token),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_who_never_wrote_can_describe_the_space() {
+    // Previously `SpaceNotFound`: no write meant no row in the member's store.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let alice = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner),
+    )
+    .await;
+
+    let (status, body) = get_space(&app, &uri, &alice).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a member must be able to describe a space they never wrote to: {body}"
+    );
+    assert_eq!(body["uri"], uri);
+    assert_eq!(
+        body["config"]["$type"],
+        "com.atproto.simplespace.defs#spaceConfig"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_authoritys_config_is_reported_not_the_callers_defaults() {
+    // The test the existing four could not have been. The member writes first,
+    // which is what plants a defaulted space row in *their* store — so a pass
+    // here means the defaulted row is being ignored, not merely absent.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let alice = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // A space whose config is *not* the column defaults.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({
+            "type": "app.bsky.group",
+            "skey": "restricted",
+            "config": {
+                "mintPolicy": "public",
+                "appAccess": {
+                    "$type": "com.atproto.simplespace.defs#allowList",
+                    "allowed": ["did:web:trusted.example"]
+                }
+            }
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createSpace: {body}");
+    let uri = body["uri"].as_str().unwrap().to_string();
+
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner),
+    )
+    .await;
+
+    // Alice writes. This is what plants the defaulted row in her store.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "writes": [{"action": "create", "collection": "c", "rkey": "r1", "value": {"v": 1}}]
+        }),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member write: {body}");
+
+    // Alice asks. She must get the owner's config, not her own defaults.
+    let (status, body) = get_space(&app, &uri, &alice).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["config"]["mintPolicy"], "public",
+        "the caller's defaulted row must not be the answer: {body}"
+    );
+    assert_eq!(
+        body["config"]["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
+        "a client told `open` for an allowList space cannot make a correct \
+         minting decision: {body}"
+    );
+
+    // And the authority gets the identical answer — the endpoint does not
+    // depend on who asked.
+    let (status, owner_body) = get_space(&app, &uri, &owner).await;
+    assert_eq!(status, StatusCode::OK, "body: {owner_body}");
+    assert_eq!(owner_body["config"], body["config"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_space_is_still_not_found() {
+    // Reading the authority's store must not resurrect a tombstoned space.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "doomed").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.deleteSpace",
+        json!({"space": uri}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "deleteSpace: {body}");
+
+    let (status, body) = get_space(&app, &uri, &owner).await;
+    assert_ne!(status, StatusCode::OK, "body: {body}");
+}

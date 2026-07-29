@@ -420,17 +420,11 @@ pub async fn get_space(
     let uri = parse_space_uri(&q.space)?;
     let subject = require_any_authn(&parts, &state, &uri).await?;
     assert_space_read_opt(&state, &subject, &uri).await?;
-    // The space authority hosts the space config; describe from the authority's
-    // store regardless of which member's credential authorized the read.
-    let viewer = match &subject {
-        Some(s) => s.sub().to_string(),
-        None => uri.space_did.clone(),
-    };
+    // The space authority hosts the space config, so `get_space` reads the
+    // authority's store and takes no viewer. Authorization above still decides
+    // *who may ask*; the answer does not depend on who asked.
     let svc = space_service(&state)?;
-    let out = svc
-        .get_space(&viewer, &uri)
-        .await
-        .map_err(XrpcError::from)?;
+    let out = svc.get_space(&uri).await.map_err(XrpcError::from)?;
     Ok(Json(out))
 }
 

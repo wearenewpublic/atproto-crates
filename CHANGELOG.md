@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `atproto-pds`: `com.atproto.space.getSpace` described the space from the **caller's** per-actor store
+  rather than the authority's. Two consequences: a member's store acquires a space row with column
+  defaults the moment they first write, so a client asking about an `allowList` space was told `open`
+  and could not make a correct minting decision; and a member who had never written had no row at all
+  and got `SpaceNotFound` for a space they belong to.
+
+  The draft lexicon describes this endpoint as *"served by the space host"*, and the handler's own
+  comment already said to read the authority's store. The viewer parameter is gone rather than
+  corrected — `getSpace`'s output carries no viewer-dependent field, so the parameter only ever
+  selected the wrong store.
+
+  Authorization is unchanged: who may call `getSpace` is decided as before. Only which store answers.
+
 ### Changed
 - **`atproto-space` / `atproto-pds`: the permissioned-data commit format changed in three coupled
   ways. Spaces created before this release must be recreated.**
