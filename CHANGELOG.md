@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: rate limiting reached six call sites out of 104 routes, and every bucket key was
+  derived from caller-supplied input — `createSession:{identifier}`, `createAccount:{handle}`,
+  `requestPasswordReset:{email}`. A password sprayer varied `identifier` and got a fresh bucket per
+  attempt; a signup flood varied `handle`. The limiter did not bound the attack it most resembles a
+  defence against. Everything else — all repo writes, all of sync, `subscribeRepos`, the whole
+  spaces namespace, `/oauth/par`, `/oauth/authorize`, every admin route — had no limit at all.
+
+  There is now a per-IP limiter over every route, in two tiers: a global budget and a tighter one
+  for the endpoints that mint or consume credentials. The existing per-identifier limits stay —
+  they bound one account being attacked from many addresses, which a per-IP limit cannot see.
+
+  **`X-Forwarded-For` is ignored by default.** A header any client can set is not an identity, and
+  trusting it would hand every caller a private bucket — worse than no limit, because it reads as a
+  defence. Set `PDS_TRUSTED_PROXY_HOPS` to the number of proxies you operate and the address is
+  taken that many entries from the right of the header; each trusted proxy appends what it saw, so
+  counting from the right is what makes the value trustworthy. A chain shorter than configured, or
+  an unparseable entry, falls back to the peer address rather than believing it.
+
+  Tunable via `PDS_RATE_LIMIT`, `PDS_RATE_LIMIT_AUTH`, `PDS_RATE_LIMIT_WINDOW_SECS` and
+  `PDS_RATE_LIMIT_BYPASS_IPS`. The bypass list matters: without it an operator has to choose between
+  limiting attackers and letting their own relay work.
+
+  **Every route is now limited.** Anything doing bulk work from one address — a migration script, a
+  test harness, a backfill — will start seeing 429s. The bypass list is the answer.
+
+- `atproto-pds`: `requestPasswordReset` discarded its rate-limit result (`let _ = try_acquire`), so
+  the limit was decorative. Reset mail goes to an address the requester does not have to control,
+  which made an unbounded endpoint a mail cannon pointed at a third party. It is now fail-closed.
+
+- `atproto-pds`: `PDS_DURABILITY_PROFILE=memory` is refused when `PDS_PRODUCTION=true`. The memory
+  backend keeps the OAuth replay guard and every rate-limit bucket in process, so a restart makes
+  single-use refresh tokens replayable and hands an attacker mid-flood a fresh budget. The crate's
+  own module doc has said so since it was written; nothing checked it.
+
+  **A production deployment on the default profile will not boot until `PDS_DURABILITY_PROFILE=sql`
+  is set, or `PDS_VALKEY_URL` is configured.** Same call as refusing the default admin password.
+
 - `atproto-pds`: `com.atproto.admin.updateSubjectStatus` and `getSubjectStatus` spoke a shape that
   appears nowhere in any lexicon. They took and returned `{did, state}`; the lexicon takes
   `{subject, takedown, deactivated}` where `subject` is a union of `com.atproto.admin.defs#repoRef`,

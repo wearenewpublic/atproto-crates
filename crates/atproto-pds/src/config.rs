@@ -39,6 +39,9 @@ pub struct StartupConfig {
     pub admin_password: String,
     /// The configured service DID.
     pub service_did: String,
+    /// `PDS_DURABILITY_PROFILE` — `memory`, `sql`, or `valkey` when a Valkey
+    /// URL is configured.
+    pub durability_profile: String,
 }
 
 /// Validate startup config; collect every issue + report all at once.
@@ -90,6 +93,19 @@ pub fn validate_production_safety(config: &StartupConfig) -> Result<(), PdsError
                 config.service_did
             ));
         }
+        // The memory backend holds the JTI replay guard and every rate-limit
+        // bucket in process. A restart clears both: single-use OAuth refresh
+        // tokens become replayable, and an attacker mid-flood gets a fresh
+        // budget. The crate's own module doc has always said so; nothing
+        // checked it.
+        if config.durability_profile == "memory" {
+            issues.push(
+                "PDS_DURABILITY_PROFILE=memory keeps the OAuth replay guard and every rate-limit \
+                 bucket in process, so both are lost on restart — refusing to boot in production. \
+                 Set PDS_DURABILITY_PROFILE=sql, or configure PDS_VALKEY_URL."
+                    .to_string(),
+            );
+        }
     }
 
     if issues.is_empty() {
@@ -122,6 +138,7 @@ mod tests {
             jwt_secret: DEV_SENTINEL_JWT_SECRET.to_string(),
             admin_password: "a-real-admin-password".to_string(),
             service_did: "did:web:localhost".to_string(),
+            durability_profile: "sql".to_string(),
         };
         validate_production_safety(&cfg).unwrap();
     }
@@ -134,6 +151,7 @@ mod tests {
             jwt_secret: DEV_SENTINEL_JWT_SECRET.to_string(),
             admin_password: "real-admin-pw".to_string(),
             service_did: "did:web:pds.example.com".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         let issues = match err {
@@ -154,6 +172,7 @@ mod tests {
             jwt_secret: good_secret(),
             admin_password: DEV_SENTINEL_ADMIN_PASSWORD.to_string(),
             service_did: "did:web:pds.example.com".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         let issues = match err {
@@ -164,6 +183,54 @@ mod tests {
     }
 
     #[test]
+    fn memory_durability_rejected_in_production() {
+        // The memory backend loses the OAuth replay guard and every rate-limit
+        // bucket on restart. Single-use refresh tokens become replayable and
+        // an attacker mid-flood gets a fresh budget.
+        let cfg = StartupConfig {
+            production: true,
+            allow_dev_defaults: false,
+            jwt_secret: "x".repeat(32),
+            admin_password: "a-real-admin-password".to_string(),
+            service_did: "did:web:pds.example.com".to_string(),
+            durability_profile: "memory".to_string(),
+        };
+        let err = validate_production_safety(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("PDS_DURABILITY_PROFILE"), "{err}");
+    }
+
+    #[test]
+    fn memory_durability_is_fine_outside_production() {
+        // Refusing it everywhere would break every developer running the
+        // binary with no flags, which is not what the risk warrants.
+        let cfg = StartupConfig {
+            production: false,
+            allow_dev_defaults: false,
+            jwt_secret: "x".repeat(32),
+            admin_password: "a-real-admin-password".to_string(),
+            service_did: "did:web:localhost".to_string(),
+            durability_profile: "memory".to_string(),
+        };
+        validate_production_safety(&cfg).unwrap();
+    }
+
+    #[test]
+    fn valkey_and_sql_both_satisfy_the_production_gate() {
+        for profile in ["sql", "valkey"] {
+            let cfg = StartupConfig {
+                production: true,
+                allow_dev_defaults: false,
+                jwt_secret: "x".repeat(32),
+                admin_password: "a-real-admin-password".to_string(),
+                service_did: "did:web:pds.example.com".to_string(),
+                durability_profile: profile.to_string(),
+            };
+            validate_production_safety(&cfg)
+                .unwrap_or_else(|e| panic!("{profile} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
     fn localhost_service_did_rejected_in_production() {
         let cfg = StartupConfig {
             production: true,
@@ -171,6 +238,7 @@ mod tests {
             jwt_secret: good_secret(),
             admin_password: "real-admin-pw".to_string(),
             service_did: "did:web:localhost".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         let issues = match err {
@@ -188,6 +256,7 @@ mod tests {
             jwt_secret: "short".to_string(),
             admin_password: "any".to_string(),
             service_did: "did:web:localhost".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         let issues = match err {
@@ -205,6 +274,7 @@ mod tests {
             jwt_secret: "short".to_string(),
             admin_password: DEV_SENTINEL_ADMIN_PASSWORD.to_string(),
             service_did: "did:web:localhost".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         let issues = match err {
@@ -227,6 +297,7 @@ mod tests {
             jwt_secret: good_secret(),
             admin_password: "real-admin-pw".to_string(),
             service_did: "did:web:pds.example.com".to_string(),
+            durability_profile: "sql".to_string(),
         };
         validate_production_safety(&cfg).unwrap();
     }
@@ -244,6 +315,7 @@ mod tests {
             jwt_secret: "x".repeat(MIN_JWT_SECRET_LEN),
             admin_password: DEV_SENTINEL_ADMIN_PASSWORD.to_string(),
             service_did: "did:web:localhost".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         assert!(
@@ -261,6 +333,7 @@ mod tests {
             jwt_secret: "x".repeat(MIN_JWT_SECRET_LEN),
             admin_password: DEV_SENTINEL_ADMIN_PASSWORD.to_string(),
             service_did: "did:web:localhost".to_string(),
+            durability_profile: "sql".to_string(),
         };
         validate_production_safety(&cfg).unwrap();
     }
@@ -274,6 +347,7 @@ mod tests {
             jwt_secret: "x".repeat(MIN_JWT_SECRET_LEN),
             admin_password: DEV_SENTINEL_ADMIN_PASSWORD.to_string(),
             service_did: "did:web:pds.example".to_string(),
+            durability_profile: "sql".to_string(),
         };
         let err = validate_production_safety(&cfg).unwrap_err();
         assert!(format!("{err}").contains("PDS_ALLOW_DEV_DEFAULTS"), "{err}");

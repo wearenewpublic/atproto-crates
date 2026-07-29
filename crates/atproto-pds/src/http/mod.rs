@@ -16,6 +16,7 @@ pub mod moderation_handlers;
 pub mod preference_handlers;
 pub mod proxy_handlers;
 pub mod proxy_target;
+pub mod rate_limit;
 pub mod router;
 pub mod service_auth_handlers;
 pub mod space_auth;
@@ -24,5 +25,6 @@ pub mod state;
 pub mod subscribe_handlers;
 pub mod write_handlers;
 
-pub use router::build_router;
+pub use rate_limit::RateLimitPolicy;
+pub use router::{build_router, with_rate_limit};
 pub use state::HttpState;

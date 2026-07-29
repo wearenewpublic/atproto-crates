@@ -137,6 +137,37 @@ struct Args {
     #[arg(long, env = "PDS_EMAIL_FROM_ADDRESS")]
     email_from_address: Option<String>,
 
+    /// Requests per window allowed from one client address on ordinary
+    /// routes. `0` disables the global tier.
+    #[arg(long, env = "PDS_RATE_LIMIT", default_value_t = 300)]
+    rate_limit: usize,
+
+    /// Requests per window allowed from one client address on the
+    /// authentication and account-creation endpoints. Tighter than the global
+    /// tier: a hundred `getRecord` calls a minute is a busy client, a hundred
+    /// `createSession` calls a minute is someone guessing. `0` disables it.
+    #[arg(long, env = "PDS_RATE_LIMIT_AUTH", default_value_t = 30)]
+    rate_limit_auth: usize,
+
+    /// Sliding-window length in seconds for both rate-limit tiers.
+    #[arg(long, env = "PDS_RATE_LIMIT_WINDOW_SECS", default_value_t = 60)]
+    rate_limit_window_secs: u64,
+
+    /// Client addresses exempt from rate limiting — a relay, an AppView, a
+    /// backfill job. Comma-separated. Without this an operator has to choose
+    /// between limiting attackers and letting their own infrastructure work.
+    #[arg(long, env = "PDS_RATE_LIMIT_BYPASS_IPS", value_delimiter = ',')]
+    rate_limit_bypass_ips: Vec<String>,
+
+    /// How many trusted reverse proxies sit in front of this server.
+    ///
+    /// `0` (default) uses the TCP peer address and ignores
+    /// `X-Forwarded-For` entirely — a header any client can set is not an
+    /// identity. Set this to the number of proxies you operate and the client
+    /// address is taken that many entries from the right of the header.
+    #[arg(long, env = "PDS_TRUSTED_PROXY_HOPS", default_value_t = 0)]
+    trusted_proxy_hops: usize,
+
     /// Durability profile for the JTI replay guard + sliding-window rate
     /// limiter. `memory` (default) keeps both in
     /// process — fast but loses state on restart. `sql` persists both to
@@ -383,6 +414,17 @@ async fn main() -> anyhow::Result<()> {
         jwt_secret: args.jwt_secret.clone(),
         admin_password: args.admin_password.clone(),
         service_did: args.service_did.clone(),
+        // Valkey overrides the flag when a URL is configured, so report what
+        // will actually back the guard rather than what was typed.
+        durability_profile: if args
+            .valkey_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            "valkey".to_string()
+        } else {
+            args.durability_profile.clone()
+        },
     };
     validate_production_safety(&startup).map_err(|e| {
         error!(error = ?e, "startup config rejected");
@@ -560,7 +602,12 @@ async fn main() -> anyhow::Result<()> {
     // Valkey/Redis backend wins regardless of `--durability-profile`.
     // Memory is the default for backwards compatibility — operators who
     // need restart-survival opt in.
-    let (jti_guard, rate_limiter) = {
+    //
+    // The per-IP tiers are built from the same backend as everything else. On
+    // a multi-node deployment a rate limit that is not shared across nodes is
+    // a rate limit multiplied by the node count, which is not what the
+    // operator configured.
+    let (jti_guard, rate_limiter, ip_limiter, auth_limiter) = {
         // §5.2 valkey precedence: if the feature is compiled and an URL
         // is configured, prefer it over SQL/memory. Off-feature builds
         // collapse this branch to a no-op.
@@ -570,6 +617,7 @@ async fn main() -> anyhow::Result<()> {
                 && !url.trim().is_empty()
             {
                 info!(url = %url, prefix = %args.valkey_key_prefix, "durability profile: valkey");
+                let rate_window = Duration::from_secs(args.rate_limit_window_secs);
                 let client = atproto_pds::valkey_backend::ValkeyClient::connect(
                     url,
                     &args.valkey_key_prefix,
@@ -578,9 +626,19 @@ async fn main() -> anyhow::Result<()> {
                 (
                     atproto_pds::security::JtiReplayGuard::new_valkey(client.clone()),
                     atproto_pds::security::SlidingWindowLimiter::new_valkey(
+                        client.clone(),
+                        args.rate_limit.max(1),
+                        rate_window,
+                    ),
+                    atproto_pds::security::SlidingWindowLimiter::new_valkey(
+                        client.clone(),
+                        args.rate_limit.max(1),
+                        rate_window,
+                    ),
+                    atproto_pds::security::SlidingWindowLimiter::new_valkey(
                         client,
-                        300,
-                        Duration::from_secs(60),
+                        args.rate_limit_auth.max(1),
+                        rate_window,
                     ),
                 )
             } else {
@@ -591,6 +649,15 @@ async fn main() -> anyhow::Result<()> {
         {
             durability_profile_sql_or_memory(&args, account_manager.pool().clone())
         }
+    };
+
+    // Captured before `args` is partially moved into `HttpState` below.
+    let rate_policy_inputs = RateLimitInputs {
+        global: args.rate_limit,
+        auth: args.rate_limit_auth,
+        window_secs: args.rate_limit_window_secs,
+        trusted_proxy_hops: args.trusted_proxy_hops,
+        bypass_ips: args.rate_limit_bypass_ips.clone(),
     };
 
     // §8.1: DNS resolver for `resolveHandle` dual lookup. The hickory-dns
@@ -739,6 +806,12 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "metrics"))]
     let app = atproto_pds::http::router::with_metrics(app, ());
 
+    // Per-IP rate limiting over every route. The existing per-identifier
+    // limits at `createSession` and friends stay: they bound one account being
+    // attacked from many addresses, which a per-IP limit cannot see.
+    let rate_policy = build_rate_limit_policy(&rate_policy_inputs, ip_limiter, auth_limiter)?;
+    let app = atproto_pds::http::with_rate_limit(app, rate_policy);
+
     // Bind and serve.
     let bind_addr: SocketAddr = format!("{}:{}", args.bind, args.port)
         .parse()
@@ -804,7 +877,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Run axum with graceful shutdown.
     let shutdown_token = token.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    // `into_make_service_with_connect_info` is what puts the peer address in
+    // request extensions. Without it the rate limiter has no address to key on
+    // and silently limits nothing.
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         shutdown_token.cancelled().await;
     });
 
@@ -1148,37 +1228,105 @@ fn parse_external_plc_rotation_key(
 /// rate limiter. Factored out of `main`
 /// so the §5.2 valkey precedence path can fall back to it when the
 /// feature is on but no URL is configured.
+/// Build the JTI guard and the three rate limiters from the durability
+/// profile.
+///
+/// The three limiters are separate instances rather than one shared one so a
+/// flood on the auth tier cannot consume the global tier's budget, and so the
+/// two tiers can carry different limits at all.
 fn durability_profile_sql_or_memory(
     args: &Args,
     pool: sqlx::SqlitePool,
 ) -> (
     atproto_pds::security::JtiReplayGuard,
     atproto_pds::security::SlidingWindowLimiter,
+    atproto_pds::security::SlidingWindowLimiter,
+    atproto_pds::security::SlidingWindowLimiter,
 ) {
+    let window = Duration::from_secs(args.rate_limit_window_secs);
+    // `max(1)` because a limit of zero would refuse every request; disabling a
+    // tier is expressed by the bypass path in `build_rate_limit_policy`, not
+    // by a zero budget here.
+    let global = args.rate_limit.max(1);
+    let auth = args.rate_limit_auth.max(1);
     match args.durability_profile.as_str() {
         "sql" => {
             info!("durability profile: SQL (jti_replay + rate_limit_window persisted)");
             (
                 atproto_pds::security::JtiReplayGuard::new_sql(pool.clone()),
-                atproto_pds::security::SlidingWindowLimiter::new_sql(
-                    pool,
-                    300,
-                    Duration::from_secs(60),
-                ),
+                atproto_pds::security::SlidingWindowLimiter::new_sql(pool.clone(), global, window),
+                atproto_pds::security::SlidingWindowLimiter::new_sql(pool.clone(), global, window),
+                atproto_pds::security::SlidingWindowLimiter::new_sql(pool, auth, window),
             )
         }
         _ => {
-            info!("durability profile: memory (default; loses state on restart)");
+            info!("durability profile: memory (loses state on restart)");
             (
                 atproto_pds::security::JtiReplayGuard::new(100_000),
-                atproto_pds::security::SlidingWindowLimiter::new(
-                    300,
-                    Duration::from_secs(60),
-                    100_000,
-                ),
+                atproto_pds::security::SlidingWindowLimiter::new(global, window, 100_000),
+                atproto_pds::security::SlidingWindowLimiter::new(global, window, 100_000),
+                atproto_pds::security::SlidingWindowLimiter::new(auth, window, 100_000),
             )
         }
     }
+}
+
+/// The subset of `Args` the rate-limit policy needs.
+///
+/// Copied out before `Args` is partially moved into `HttpState`, which is the
+/// only reason this exists rather than passing `&Args`.
+struct RateLimitInputs {
+    global: usize,
+    auth: usize,
+    window_secs: u64,
+    trusted_proxy_hops: usize,
+    bypass_ips: Vec<String>,
+}
+
+/// Assemble the per-IP rate-limit policy from operator configuration.
+///
+/// A tier configured to `0` is disabled by giving it an effectively unbounded
+/// budget rather than by branching in the middleware: the hot path stays one
+/// shape, and "disabled" is a number rather than a code path that might drift.
+fn build_rate_limit_policy(
+    args: &RateLimitInputs,
+    global: atproto_pds::security::SlidingWindowLimiter,
+    auth: atproto_pds::security::SlidingWindowLimiter,
+) -> anyhow::Result<atproto_pds::http::RateLimitPolicy> {
+    let mut bypass = std::collections::HashSet::new();
+    for raw in &args.bypass_ips {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let ip: std::net::IpAddr = trimmed.parse().map_err(|e| {
+            anyhow::anyhow!("PDS_RATE_LIMIT_BYPASS_IPS: {trimmed} is not an IP address: {e}")
+        })?;
+        bypass.insert(ip);
+    }
+    if args.trusted_proxy_hops == 0 {
+        info!(
+            "rate limiting keyed on the TCP peer address; X-Forwarded-For is ignored (set PDS_TRUSTED_PROXY_HOPS if this server is behind a proxy)"
+        );
+    } else {
+        info!(
+            hops = args.trusted_proxy_hops,
+            "rate limiting keyed on X-Forwarded-For, counted from the right"
+        );
+    }
+    info!(
+        global = args.global,
+        auth = args.auth,
+        window_secs = args.window_secs,
+        bypass = bypass.len(),
+        "per-IP rate limit configured"
+    );
+    Ok(atproto_pds::http::RateLimitPolicy::new(
+        global,
+        auth,
+        args.trusted_proxy_hops,
+        bypass,
+    ))
 }
 
 fn init_tracing(filter: &str, otel_endpoint: Option<&str>) {

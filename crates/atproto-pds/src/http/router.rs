@@ -551,3 +551,19 @@ pub fn with_metrics(router: Router, metrics: crate::metrics::Metrics) -> Router 
 pub fn with_metrics(router: Router, _metrics: ()) -> Router {
     router
 }
+
+/// Apply the per-IP rate-limit policy to every route.
+///
+/// Layered outside the router so it runs before routing: a scan of a hundred
+/// nonexistent paths should cost the scanner its budget rather than costing
+/// nothing because none of them matched.
+///
+/// Kept separate from `build_router` so tests can build an unlimited router —
+/// and, more usefully, so a test that *is* about limiting opts in explicitly
+/// rather than inheriting a policy it did not set.
+pub fn with_rate_limit(router: Router, policy: crate::http::rate_limit::RateLimitPolicy) -> Router {
+    use axum::middleware::from_fn;
+    router
+        .layer(from_fn(crate::http::rate_limit::rate_limit_middleware))
+        .layer(axum::Extension(policy))
+}

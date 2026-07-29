@@ -1590,12 +1590,15 @@ pub async fn request_password_reset(
     }
     let manager = account_manager(&state)?;
 
-    // Rate-limit per email. Failure-open: a storage hiccup on the
-    // limiter is logged but doesn't block the user.
-    let _ = state
-        .rate_limiter
-        .try_acquire(&format!("requestPasswordReset:{}", input.email))
-        .await;
+    // Rate-limit per email, fail-closed. This used to discard the result — a
+    // caller could ask for reset mails as fast as it could send requests, and
+    // the limit that existed to stop that was decorative. Reset mail is sent
+    // to an address the requester does not have to control, so an unbounded
+    // endpoint is a mail cannon pointed at a third party.
+    //
+    // The 429 is the same one the middleware returns, so a client that already
+    // handles rate limiting handles this.
+    enforce_rate_limit(&state, &format!("requestPasswordReset:{}", input.email)).await?;
 
     // Look up the account by email. Always 200, regardless of hit/miss.
     // §5.4 — dispatch helper folds the `state = 'active'`
