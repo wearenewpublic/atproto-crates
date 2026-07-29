@@ -680,15 +680,23 @@ pub struct UpdateAccountHandleInput {
 /// §4.3 — runs the same PLC-update flow as `com.atproto.identity.updateHandle`
 /// (signs an `Operation::new_update` against the PDS-managed rotation key
 /// and submits to PLC) but skips the user-OAuth check. Reuses the shared
-/// `crate::http::identity_handlers::do_update_handle` helper so both paths
-/// stay in lockstep.
+/// `crate::http::identity_handlers::do_update_handle_as_admin` helper so both
+/// paths stay in lockstep, including handle validation and the `#identity`
+/// event.
+///
+/// The admin variant permits reserved names: an operator assigning
+/// `support.<their-domain>` to their own support account is doing exactly
+/// what the reserved list exists to stop a stranger doing. Every other
+/// check — syntax, TLD, service-domain shape, ownership proof for an
+/// external domain, uniqueness — applies unchanged.
 pub async fn update_account_handle(
     State(state): State<HttpState>,
     parts: Parts,
     Json(input): Json<UpdateAccountHandleInput>,
 ) -> Result<StatusCode, XrpcError> {
     require_admin(&parts, &state).await?;
-    crate::http::identity_handlers::do_update_handle(&state, &input.did, &input.handle).await?;
+    crate::http::identity_handlers::do_update_handle_as_admin(&state, &input.did, &input.handle)
+        .await?;
     Ok(StatusCode::OK)
 }
 

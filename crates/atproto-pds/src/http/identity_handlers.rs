@@ -6,18 +6,17 @@
 //!   directory first; falls back to HTTP `.well-known/atproto-did` for
 //!   non-local handles. (DNS-resolution is a future enhancement that
 //!   needs a DnsResolver threaded through `HttpState`.)
-//! - `updateHandle` — auth-required. Builds a PLC update operation
-//!   changing `alsoKnownAs`, signs it with the caller's rotation key, and
-//!   submits it to PLC. On success, updates `account.handle` to match.
-//! - `requestPlcOperationSignature` — issues a service-auth token scoped
-//!   to `lxm=com.atproto.identity.signPlcOperation`. Same machinery as
-//!   `getServiceAuth` with the lexicon method locked.
+//! - `updateHandle` — auth-required. Validates the handle, proves the
+//!   caller controls it when it is not under one of this server's domains,
+//!   builds a PLC update operation changing `alsoKnownAs`, signs it with
+//!   the caller's rotation key, and submits it to PLC. On success, updates
+//!   `account.handle` and emits `#identity`.
+//! - `requestPlcOperationSignature` — mails the account a one-time code,
+//!   the second factor for `signPlcOperation`.
 
 use crate::http::auth::{request_htm_htu, require_authn_sub};
 use crate::http::errors::XrpcError;
-use crate::http::space_auth::local_signing_key;
 use crate::http::state::HttpState;
-use atproto_identity::key::{jws_alg, sign as identity_sign};
 use atproto_identity::resolve::{resolve_handle as identity_resolve_handle, resolve_handle_http};
 use axum::Json;
 use axum::extract::{Query, State};
@@ -27,7 +26,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 //  resolveHandle
@@ -165,16 +163,138 @@ pub async fn update_handle(
 ///
 /// Used by both the user-facing `updateHandle` (auth = the account's own
 /// session) and the admin-side `admin.updateAccountHandle` (auth = admin
-/// Basic-auth). The flow is identical: fetch current PLC state → build an
-/// updated `Operation::new_update` with `alsoKnownAs = [at://<new>]` →
-/// sign with the PDS-managed rotation key → submit to PLC → UPDATE the
-/// local `account.handle`.
+/// Basic-auth). The flow is: validate and normalize the handle → fetch
+/// current PLC state → build an updated `Operation::new_update` with
+/// `alsoKnownAs = [at://<new>]` → sign with the PDS-managed rotation key →
+/// submit to PLC → UPDATE the local `account.handle` → emit `#identity`.
 pub async fn do_update_handle(
     state: &HttpState,
     did: &str,
     new_handle: &str,
 ) -> Result<(), XrpcError> {
+    do_update_handle_inner(state, did, new_handle, false).await
+}
+
+/// As [`do_update_handle`], but permitting a reserved name.
+///
+/// An operator assigning `support.example.com` to their own support account
+/// is doing something the reserved list exists to stop a stranger doing.
+pub async fn do_update_handle_as_admin(
+    state: &HttpState,
+    did: &str,
+    new_handle: &str,
+) -> Result<(), XrpcError> {
+    do_update_handle_inner(state, did, new_handle, true).await
+}
+
+/// Validate a handle for `did` and return its normalized form.
+///
+/// Ordering matters and is deliberate: syntax first, then the cheap local
+/// checks, then the network round-trip last. A malformed handle should not
+/// cost a DNS lookup, and none of it should cost a PLC operation.
+async fn validate_handle_for(
+    state: &HttpState,
+    did: &str,
+    new_handle: &str,
+    allow_reserved: bool,
+) -> Result<String, XrpcError> {
+    let handle = crate::handle::normalize_and_validate(new_handle)?;
+
+    // Pessimistic uniqueness check. The storage layer has the authoritative
+    // UNIQUE constraint, but that fires *after* the PLC operation has been
+    // submitted — leaving the DID document pointing at a handle this server
+    // then refuses to record. Checking first keeps the two in step.
+    //
+    // Ahead of the ownership proof because a handle already held here cannot
+    // be claimed no matter who controls the domain, and this costs a local
+    // query rather than a DNS round-trip.
+    if let Some(row) = state
+        .reader
+        .accounts()
+        .lookup_handle(&handle)
+        .await
+        .map_err(XrpcError::from)?
+        && row.did != did
+    {
+        return Err(crate::errors::PdsError::HandleNotAvailable { handle }.into());
+    }
+
+    if crate::handle::is_service_domain(&handle, &state.service_handle_domains) {
+        crate::handle::ensure_service_constraints(
+            &handle,
+            &state.service_handle_domains,
+            allow_reserved,
+        )?;
+    } else {
+        prove_handle_ownership(state, did, &handle).await?;
+    }
+
+    Ok(handle)
+}
+
+/// Require that `handle` already resolves to `did` on the open internet.
+///
+/// This is the only thing standing between "I typed a domain" and "this
+/// server will answer `resolveHandle` for that domain". Without it any
+/// account claims any string.
+///
+/// Uses the spec's dual DNS-plus-HTTPS lookup when a resolver is wired, and
+/// falls back to HTTPS `.well-known/atproto-did` alone when one is not. The
+/// fallback is a weaker signal but still a real proof: it requires control
+/// of the web server the domain points at.
+async fn prove_handle_ownership(
+    state: &HttpState,
+    did: &str,
+    handle: &str,
+) -> Result<(), XrpcError> {
+    let client = reqwest::Client::builder()
+        .user_agent(crate::user_agent())
+        .build()
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                format!("build http client: {e}"),
+            )
+        })?;
+
+    let resolved = if let Some(dns_resolver) = state.dns_resolver.as_ref() {
+        identity_resolve_handle(&client, dns_resolver.as_ref(), handle).await
+    } else {
+        resolve_handle_http(&client, handle).await
+    };
+
+    match resolved {
+        Ok(found) if found == did => Ok(()),
+        Ok(found) => Err(crate::errors::PdsError::HandleOwnershipUnproven {
+            handle: handle.to_string(),
+            did: did.to_string(),
+            resolved: found,
+        }
+        .into()),
+        Err(e) => {
+            tracing::debug!(handle = %handle, did = %did, error = ?e, "handle ownership proof did not resolve");
+            Err(crate::errors::PdsError::HandleOwnershipUnproven {
+                handle: handle.to_string(),
+                did: did.to_string(),
+                resolved: "nothing".to_string(),
+            }
+            .into())
+        }
+    }
+}
+
+async fn do_update_handle_inner(
+    state: &HttpState,
+    did: &str,
+    new_handle: &str,
+    allow_reserved: bool,
+) -> Result<(), XrpcError> {
     use atproto_identity::plc::{Operation, fetch_audit_log};
+
+    // Before anything that costs a network round-trip or writes to PLC. A
+    // rejected handle must not leave the DID document touched.
+    let new_handle = &validate_handle_for(state, did, new_handle, allow_reserved).await?;
 
     let manager = state.account_manager.as_ref().ok_or_else(|| {
         XrpcError::new(
@@ -293,6 +413,15 @@ pub async fn do_update_handle(
         )
     })?;
     tracing::info!(did = %did, handle = %new_handle, "handle updated via PLC");
+
+    // A rename nobody is told about is a rename that only works on this
+    // server. Best-effort, like the reference: the handle is already changed
+    // in PLC and locally, so failing here would report a completed rename as
+    // an error. The user can re-emit by setting the same handle again.
+    if let Err(e) = emit_identity_event(&manager.sequencer(), did, Some(new_handle.as_str())).await
+    {
+        tracing::error!(did = %did, handle = %new_handle, error = ?e, "failed to sequence #identity after handle update");
+    }
     Ok(())
 }
 
@@ -300,23 +429,32 @@ pub async fn do_update_handle(
 //  requestPlcOperationSignature
 // ---------------------------------------------------------------------------
 
-/// Output of `requestPlcOperationSignature`.
-#[derive(Debug, Serialize)]
-pub struct PlcOperationSignatureResponse {
-    /// Service-auth JWT good for `lxm=com.atproto.identity.signPlcOperation`.
-    pub token: String,
-}
+/// TTL for a PLC-operation-signing code.
+///
+/// Shorter than the one-hour email-update window: this code authorizes a
+/// key rotation, and a migration completes in minutes.
+const PLC_TOKEN_TTL_SECS: i64 = 15 * 60;
 
 /// `POST /xrpc/com.atproto.identity.requestPlcOperationSignature`.
 /// Auth-required.
 ///
-/// Issues a short-lived service-auth token scoped to the PLC-signing
-/// lexicon. Same machinery as `getServiceAuth` but with `lxm` locked so a
-/// caller can't reuse the token for unrelated XRPCs.
+/// Mails the account a one-time code, per the lexicon: *"Request an email
+/// with a code to in order to request a signed PLC operation."* The code is
+/// the second factor for `signPlcOperation`, which will sign a key-rotation
+/// operation with the account's rotation key.
+///
+/// The lexicon declares no output and this returns none. It previously
+/// returned a service-auth JWT in the response body, which handed the
+/// second factor to whoever already held the first — an access token alone
+/// then sufficed to rotate the account's keys.
+///
+/// When SMTP is not configured, the shipped `EmailService` stub logs the
+/// code at INFO with a `dev-only:` prefix, so a developer can still
+/// complete the flow locally.
 pub async fn request_plc_operation_signature(
     State(state): State<HttpState>,
     parts: Parts,
-) -> Result<Json<PlcOperationSignatureResponse>, XrpcError> {
+) -> Result<StatusCode, XrpcError> {
     let (htm, htu) = request_htm_htu(&parts);
     let did = require_authn_sub(&parts, &state, &htm, &htu).await?;
 
@@ -327,52 +465,59 @@ pub async fn request_plc_operation_signature(
             "account management is not configured on this PDS",
         )
     })?;
-    let signing_key = local_signing_key(manager, &did).await?;
 
-    let now = now_secs();
-    let exp = now + 60;
-    let claims = serde_json::json!({
-        "iss": did,
-        "aud": did, // PLC self-signing — caller is the audience.
-        "lxm": "com.atproto.identity.signPlcOperation",
-        "iat": now,
-        "exp": exp,
-        "jti": random_jti(),
-    });
-    let header = serde_json::json!({
-        "alg": jws_alg(&signing_key),
-        "typ": crate::http::service_auth_handlers::TYP_SERVICE_AUTH,
-    });
-    let header_b64 = B64URL.encode(serde_json::to_vec(&header).unwrap());
-    let claims_b64 = B64URL.encode(serde_json::to_vec(&claims).unwrap());
-    let signing_input = format!("{header_b64}.{claims_b64}");
-    let sig = identity_sign(&signing_key, signing_input.as_bytes()).map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("sign service-auth jwt: {e}"),
-        )
-    })?;
-    let token = format!("{signing_input}.{}", B64URL.encode(&sig));
-    Ok(Json(PlcOperationSignatureResponse { token }))
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(&did)
+        .await
+        .map_err(XrpcError::from)?
+        .ok_or_else(|| {
+            XrpcError::new(StatusCode::NOT_FOUND, "AccountNotFound", "no such account")
+        })?;
+
+    let token = {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill(&mut bytes);
+        B64URL.encode(bytes)
+    };
+    let expires_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(PLC_TOKEN_TTL_SECS)).to_rfc3339();
+    crate::account::email_token::insert(
+        &manager.account_pool(),
+        &token,
+        &did,
+        crate::account::email_token::PURPOSE_PLC_OPERATION,
+        &expires_at,
+        None,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    // An account with no email on file still gets a token row — the code is
+    // reachable through the operator's logs in a dev deployment, and an
+    // operator running without email has already accepted that.
+    if let Some(address) = account.email.as_deref() {
+        let body = format!(
+            "Your confirmation code for updating your identity is:\n\n  {token}\n\nIt expires in 15 minutes. If you did not request this, someone may have your password — change it."
+        );
+        if let Err(e) = state
+            .email
+            .send(address, "Confirmation code for a PLC operation", &body)
+            .await
+        {
+            tracing::warn!(error = ?e, did = %did, "PLC signature code send failed; code still valid");
+        }
+    } else {
+        tracing::warn!(did = %did, "account has no email on file; PLC signature code was not delivered");
+    }
+
+    Ok(StatusCode::OK)
 }
 
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn random_jti() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill(&mut bytes);
-    B64URL.encode(bytes)
-}
 
 // ---------------------------------------------------------------------------
 //  getRecommendedDidCredentials
@@ -702,7 +847,11 @@ pub async fn refresh_identity(
 
 /// Append an `#identity` event to the firehose stream so tailing
 /// `subscribeRepos` consumers re-resolve the document.
-async fn emit_identity_event(
+///
+/// Called from every path that changes what a consumer would learn by
+/// re-resolving: `refreshIdentity`, both handle-update paths, and
+/// `submitPlcOperation`.
+pub(crate) async fn emit_identity_event(
     sequencer: &crate::sequencer::Sequencer,
     did: &str,
     handle: Option<&str>,

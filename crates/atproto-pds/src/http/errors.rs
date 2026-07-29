@@ -50,6 +50,32 @@ impl From<PdsError> for XrpcError {
             PdsError::NotFound { what } => {
                 XrpcError::new(StatusCode::BAD_REQUEST, "NotFound", what)
             }
+            // The identity lexicons name these, and a client acts on which one
+            // it got: correct the handle, pick another, or go fix DNS.
+            PdsError::InvalidHandle { handle, reason } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidHandle",
+                format!("{handle}: {reason}"),
+            ),
+            PdsError::HandleNotAvailable { handle } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "HandleNotAvailable",
+                format!("the handle {handle} is not available"),
+            ),
+            PdsError::HandleOwnershipUnproven {
+                handle,
+                did,
+                resolved,
+            } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "UnsupportedDomain",
+                format!(
+                    "{handle} must resolve to {did} before it can be claimed; it resolved to {resolved}"
+                ),
+            ),
+            PdsError::InvalidPlcOperation { reason } => {
+                XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRequest", reason)
+            }
             PdsError::SpaceNotFound { uri } => XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "SpaceNotFound",

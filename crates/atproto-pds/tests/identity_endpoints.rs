@@ -3,8 +3,11 @@
 //! Coverage:
 //! - `resolveHandle` for a local account.
 //! - `resolveHandle` for an unknown handle → 404.
-//! - `requestPlcOperationSignature` returns a service-auth JWT scoped to
-//!   the PLC-signing lexicon.
+//! - `requestPlcOperationSignature` mails a one-time code and returns
+//!   nothing, per its lexicon.
+//! - `updateHandle` validation: syntax, disallowed TLDs, uniqueness,
+//!   service-domain shape and the ownership proof for external domains.
+//! - `signPlcOperation`'s emailed-code gate.
 //!
 //! `updateHandle` requires a live PLC directory at the configured
 //! hostname; we don't exercise the full network round-trip here, but the
@@ -137,35 +140,6 @@ async fn resolve_handle_unknown_returns_404() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn request_plc_operation_signature_returns_token() {
-    let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
-
-    let (status, body) = post_json(
-        app,
-        "/xrpc/com.atproto.identity.requestPlcOperationSignature",
-        json!({}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let jwt = body["token"].as_str().unwrap();
-    // Three dot-separated segments.
-    assert_eq!(jwt.split('.').count(), 3);
-
-    // Decode the payload to confirm `lxm` is locked to the PLC method.
-    use base64::Engine as _;
-    let payload_b64 = jwt.split('.').nth(1).unwrap();
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .unwrap();
-    let payload: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(payload["iss"], "did:plc:alice");
-    assert_eq!(payload["lxm"], "com.atproto.identity.signPlcOperation");
-    assert!(payload["jti"].is_string());
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn request_plc_operation_signature_requires_auth() {
     let (app, _manager, _tmp) = build_app().await;
     let (status, _) = post_json(
@@ -275,4 +249,497 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .as_str()
         .expect("createSession should return an access token")
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+//  F-IDENT-02 — updateHandle validates before it touches PLC.
+//
+//  The harness has no PLC directory, so an unvalidated handle reaches the
+//  `plc_service` lookup and returns 503. Every test below asserts a 400
+//  instead: the handle was refused on its own terms, before any network
+//  call and before any PLC operation could be signed.
+// ---------------------------------------------------------------------------
+
+/// Build an app whose operator has pinned `example.test` as a service domain.
+async fn build_app_with_service_domain() -> (axum::Router, Arc<AccountManager>, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_service_handle_domains(vec!["example.test".to_string()]);
+    (build_router(state), manager, tmp)
+}
+
+async fn update_handle(app: &axum::Router, token: &str, handle: &str) -> (StatusCode, Value) {
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.identity.updateHandle",
+        json!({ "handle": handle }),
+        Some(token),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_handle_refuses_a_syntactically_invalid_handle() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example.test").await;
+
+    for bad in [
+        "not a handle",
+        "localhost",
+        "192.168.1.1",
+        "double..dot.test",
+        "-leading.example.test",
+    ] {
+        let (status, body) = update_handle(&app, &token, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} — body: {body}");
+        assert_eq!(body["error"], "InvalidHandle", "{bad}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_handle_refuses_a_disallowed_tld() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example.test").await;
+
+    // `.example` reads as an ordinary handle and is on the upstream
+    // disallowed list. Getting this wrong is how a PDS ends up hosting
+    // handles that can never resolve for anyone else.
+    for bad in ["bob.example", "bob.invalid", "bob.onion", "bob.local"] {
+        let (status, body) = update_handle(&app, &token, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} — body: {body}");
+        assert_eq!(body["error"], "InvalidHandle", "{bad}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_handle_refuses_a_handle_another_account_holds() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example.test").await;
+    let _ = create_account(&app, &manager, "did:plc:bob", "bob.example.test").await;
+
+    let (status, body) = update_handle(&app, &token, "bob.example.test").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "HandleNotAvailable");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_handle_refuses_a_reserved_name_and_a_bad_shape() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example.test").await;
+
+    // Reserved: handing out `admin.example.test` lets the holder impersonate
+    // the operator.
+    let (status, body) = update_handle(&app, &token, "admin.example.test").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "HandleNotAvailable");
+
+    // Too short, too long, and nested — all shape constraints on a handle
+    // issued under a domain this server operates.
+    for bad in [
+        "ab.example.test",
+        "abcdefghijklmnopqrs.example.test",
+        "a.b.example.test",
+    ] {
+        let (status, body) = update_handle(&app, &token, bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} — body: {body}");
+        assert_eq!(body["error"], "InvalidHandle", "{bad}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_handle_refuses_an_unproven_external_domain() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example.test").await;
+
+    // Outside the service domain, so the caller must prove they control it.
+    // `.test` is reserved by RFC 6761 and never resolves; whether the lookup
+    // NXDOMAINs or the sandbox has no network at all, the answer is the
+    // same — no proof, no handle.
+    let (status, body) = update_handle(&app, &token, "definitely-not-mine.someone-else.test").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "UnsupportedDomain");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_handle_still_requires_auth() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let _ = create_account(&app, &manager, "did:plc:alice", "alice.example.test").await;
+
+    let (status, _) = post_json(
+        app,
+        "/xrpc/com.atproto.identity.updateHandle",
+        json!({ "handle": "newname.example.test" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+//  F-IDENT-11 + F-IDENT-03 — the emailed code, and the gate that consumes it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_plc_operation_signature_does_not_hand_back_the_second_factor() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.identity.requestPlcOperationSignature",
+        json!({}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The lexicon declares no output. Returning the code in the response
+    // handed the second factor to whoever already held the first.
+    assert!(
+        body.get("token").is_none(),
+        "the code must not come back in the response: {body}"
+    );
+
+    // It was issued, though — as a row bound to this account and this flow.
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT did, purpose FROM email_token WHERE purpose = 'plc_operation'")
+            .fetch_optional(manager.account_pool().as_sqlite())
+            .await
+            .unwrap();
+    let (did, purpose) = row.expect("a plc_operation token should have been issued");
+    assert_eq!(did, "did:plc:alice");
+    assert_eq!(purpose, "plc_operation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_plc_operation_refuses_without_a_code() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // An access token alone must not be enough to have this server sign a
+    // key rotation with the account's rotation key.
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.identity.signPlcOperation",
+        json!({ "alsoKnownAs": ["at://newname.example.test"] }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_plc_operation_refuses_a_code_belonging_to_another_account() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let bob = create_account(&app, &manager, "did:plc:bob", "bob.example").await;
+
+    // Bob requests a code...
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.identity.requestPlcOperationSignature",
+        json!({}),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bobs_code: (String,) =
+        sqlx::query_as("SELECT token FROM email_token WHERE did = 'did:plc:bob'")
+            .fetch_one(manager.account_pool().as_sqlite())
+            .await
+            .unwrap();
+
+    // ...and Alice tries to spend it.
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.identity.signPlcOperation",
+        json!({ "token": bobs_code.0, "alsoKnownAs": ["at://taken.example.test"] }),
+        Some(&alice),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_plc_operation_refuses_a_code_from_a_different_flow() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // A password-reset code is not a PLC-signing code. Without the purpose
+    // check, any token the account holds would open this door.
+    sqlx::query("INSERT INTO email_token (token, did, purpose, expires_at) VALUES (?, ?, ?, ?)")
+        .bind("wrong-flow")
+        .bind("did:plc:alice")
+        .bind("reset_password")
+        .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+        .execute(manager.account_pool().as_sqlite())
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.identity.signPlcOperation",
+        json!({ "token": "wrong-flow", "alsoKnownAs": ["at://taken.example.test"] }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_plc_operation_refuses_an_expired_code() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    sqlx::query("INSERT INTO email_token (token, did, purpose, expires_at) VALUES (?, ?, ?, ?)")
+        .bind("stale")
+        .bind("did:plc:alice")
+        .bind("plc_operation")
+        .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
+        .execute(manager.account_pool().as_sqlite())
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.identity.signPlcOperation",
+        json!({ "token": "stale", "alsoKnownAs": ["at://taken.example.test"] }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+}
+
+// ---------------------------------------------------------------------------
+//  F-IDENT-05 — submitPlcOperation validates before it forwards.
+//
+//  PLC is append-only. An operation that drops this server's rotation key,
+//  or points the account at another host, cannot be undone by this server
+//  afterwards — so every check runs before submission, and each of these
+//  tests reaches its assertion without a single network call.
+// ---------------------------------------------------------------------------
+
+/// Build an app with a PLC service configured and an account that has a
+/// PDS-managed rotation key.
+///
+/// The directory hostname is deliberately unroutable: every assertion below
+/// must be reached before anything is submitted, so a test that starts
+/// making network calls has stopped testing what it claims to.
+async fn build_app_with_plc() -> (
+    axum::Router,
+    Arc<AccountManager>,
+    String,
+    String,
+    String,
+    TempDir,
+) {
+    use atproto_identity::key::{generate_key, to_public};
+    use atproto_pds::plc::{PlcConfig, PlcService};
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+
+    let rotation_priv = generate_key(KeyType::P256Private).unwrap();
+    let rotation_did = to_public(&rotation_priv).unwrap().to_string();
+    let rotation_ref = key_store.put(&rotation_priv).await.unwrap();
+
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store.clone(),
+        KeyType::K256Private,
+    ));
+    manager
+        .create_account(
+            CreateAccountParams::new("did:plc:alice", "alice.example.test", "pw")
+                .with_keys(Some(&rotation_ref), None)
+                .with_pds_managed_rotation(true),
+        )
+        .await
+        .unwrap();
+    manager
+        .set_primary_password("did:plc:alice", "pw")
+        .await
+        .unwrap();
+
+    let (_, signing_ref, _) = manager
+        .lookup_did_credentials("did:plc:alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let signing_did = to_public(&key_store.get(&signing_ref).await.unwrap())
+        .unwrap()
+        .to_string();
+
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let plc = Arc::new(PlcService::new(
+        PlcConfig::new(
+            "plc.unroutable.test".to_string(),
+            "did:web:pds.example.test".to_string(),
+            "https://pds.example.test".to_string(),
+        ),
+        key_store,
+    ));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:pds.example.test".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_plc_service(plc);
+
+    let app = build_router(state);
+    let token = session_token(&app, "alice.example.test").await;
+    (app, manager, token, rotation_did, signing_did, tmp)
+}
+
+fn plc_op(rotation_keys: Value, signing: &str, aka: &str, endpoint: &str) -> Value {
+    json!({
+        "type": "plc_operation",
+        "rotationKeys": rotation_keys,
+        "verificationMethods": { "atproto": signing },
+        "alsoKnownAs": [aka],
+        "services": {
+            "atproto_pds": {
+                "type": "AtprotoPersonalDataServer",
+                "endpoint": endpoint,
+            }
+        },
+        "prev": "bafyreiprev",
+        "sig": "not-checked-here",
+    })
+}
+
+async fn submit_op(app: &axum::Router, token: &str, op: Value) -> (StatusCode, Value) {
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.identity.submitPlcOperation",
+        json!({ "operation": op }),
+        Some(token),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_plc_operation_refuses_an_operation_dropping_the_servers_rotation_key() {
+    let (app, _m, token, _rotation, _signing, _tmp) = build_app_with_plc().await;
+    let op = plc_op(
+        json!(["did:key:zSomeoneElsesRotationKey"]),
+        "did:key:zAnything",
+        "at://alice.example.test",
+        "https://pds.example.test",
+    );
+    let (status, body) = submit_op(&app, &token, op).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_plc_operation_refuses_an_operation_pointing_at_another_host() {
+    let (app, _m, token, rotation, _signing, _tmp) = build_app_with_plc().await;
+    let op = plc_op(
+        json!([rotation]),
+        "did:key:zAnything",
+        "at://alice.example.test",
+        "https://someone-else.example.test",
+    );
+    let (status, body) = submit_op(&app, &token, op).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_plc_operation_refuses_a_mismatched_signing_key_or_handle() {
+    let (app, _m, token, rotation, _signing, _tmp) = build_app_with_plc().await;
+
+    // Wrong signing key: every commit this server has already signed would
+    // stop verifying against the document.
+    let op = plc_op(
+        json!([rotation]),
+        "did:key:zNotThisAccountsSigningKey",
+        "at://alice.example.test",
+        "https://pds.example.test",
+    );
+    let (status, body) = submit_op(&app, &token, op).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+
+    // Wrong handle: the document would claim a handle this server does not
+    // serve, so bidirectional resolution breaks.
+    let op = plc_op(
+        json!([rotation]),
+        "did:key:zNotThisAccountsSigningKey",
+        "at://someone.else.test",
+        "https://pds.example.test",
+    );
+    let (status, body) = submit_op(&app, &token, op).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_plc_operation_refuses_a_tombstone() {
+    let (app, _m, token, _rotation, _signing, _tmp) = build_app_with_plc().await;
+    let op = json!({
+        "type": "plc_tombstone",
+        "prev": "bafyreiprev",
+        "sig": "not-checked-here",
+    });
+    let (status, body) = submit_op(&app, &token, op).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_plc_operation_lets_a_conformant_operation_through_to_plc() {
+    // Not redundant with the four refusal tests: a check that rejected
+    // everything would pass all of them. This one satisfies every
+    // constraint and asserts the request got *past* validation — it then
+    // fails at the unroutable directory, which is the proof it was
+    // forwarded rather than refused.
+    let (app, _m, token, rotation, signing, _tmp) = build_app_with_plc().await;
+    let op = plc_op(
+        json!([rotation]),
+        &signing,
+        "at://alice.example.test",
+        "https://pds.example.test",
+    );
+    let (status, body) = submit_op(&app, &token, op).await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a conformant operation must not be refused: {body}"
+    );
+    assert!(
+        status.is_server_error(),
+        "expected the unroutable directory to fail the submission, got {status}: {body}"
+    );
 }

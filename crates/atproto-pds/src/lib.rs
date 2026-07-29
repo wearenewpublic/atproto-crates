@@ -43,6 +43,7 @@ pub mod denylist;
 pub mod email;
 pub mod errors;
 pub mod gc;
+pub mod handle;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod keys;

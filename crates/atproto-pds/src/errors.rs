@@ -95,6 +95,58 @@ pub enum PdsError {
         actual: String,
     },
 
+    /// error-atproto-pds-identity-1: the handle is not usable.
+    ///
+    /// Covers both syntax and the policy rules that apply to handles issued
+    /// under a domain this server operates. The lexicons name this
+    /// `InvalidHandle`.
+    #[error("error-atproto-pds-identity-1 invalid handle {handle}: {reason}")]
+    InvalidHandle {
+        /// The handle as supplied, or its normalized form once known.
+        handle: String,
+        /// Why it was refused.
+        reason: String,
+    },
+
+    /// error-atproto-pds-identity-2: the handle is already taken or reserved.
+    ///
+    /// Separate from [`PdsError::InvalidHandle`] because the caller's remedy
+    /// differs — a different handle rather than a corrected one — and because
+    /// the lexicons name it `HandleNotAvailable`.
+    #[error("error-atproto-pds-identity-2 handle not available: {handle}")]
+    HandleNotAvailable {
+        /// The handle that could not be issued.
+        handle: String,
+    },
+
+    /// error-atproto-pds-identity-3: a handle outside this server's domains
+    /// did not resolve back to the account claiming it.
+    ///
+    /// Claiming `example.com` is a statement about a domain the caller says
+    /// they control. Syntax cannot establish that; only resolution can.
+    #[error(
+        "error-atproto-pds-identity-3 handle {handle} does not resolve to {did}: resolved to {resolved}"
+    )]
+    HandleOwnershipUnproven {
+        /// The handle being claimed.
+        handle: String,
+        /// The DID claiming it.
+        did: String,
+        /// What the handle actually resolved to, or `nothing`.
+        resolved: String,
+    },
+
+    /// error-atproto-pds-identity-4: a PLC operation would leave the account
+    /// unreachable through this server.
+    ///
+    /// `submitPlcOperation` exists to catch exactly this before the operation
+    /// becomes part of an append-only log that this server cannot rewrite.
+    #[error("error-atproto-pds-identity-4 refusing to submit PLC operation: {reason}")]
+    InvalidPlcOperation {
+        /// Which constraint the operation violated.
+        reason: String,
+    },
+
     /// error-atproto-pds-auth-2: the repository is not available to callers.
     ///
     /// Distinct from [`PdsError::AuthDenied`] because the sync and blob

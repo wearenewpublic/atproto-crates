@@ -1,6 +1,6 @@
 //! Email-confirmation token lifecycle.
 //!
-//! The `email_token` table backs four user-facing flows that need a
+//! The `email_token` table backs five user-facing flows that need a
 //! one-time bearer-token round trip:
 //!
 //! - **`requestEmailUpdate` / `confirmEmailUpdate`** — change the
@@ -11,8 +11,11 @@
 //!   when the user is locked out; `new_email` is NULL.
 //! - **`requestAccountDelete` / `deleteAccount`** — second-factor
 //!   confirmation for account deletion; `new_email` is NULL.
+//! - **`requestPlcOperationSignature` / `signPlcOperation`** — second
+//!   factor for signing a PLC operation with the account's rotation key;
+//!   `new_email` is NULL and the TTL is 15 minutes rather than an hour.
 //!
-//! All four flows share the same `(token, did, purpose, expires_at,
+//! All five flows share the same `(token, did, purpose, expires_at,
 //! new_email)` row shape. The `purpose` column is the discriminator so
 //! a token issued for one flow can't be redeemed in another.
 //!
@@ -30,6 +33,12 @@ pub const PURPOSE_CONFIRM_EMAIL: &str = "confirm_email";
 pub const PURPOSE_RESET_PASSWORD: &str = "reset_password";
 /// Account-deletion confirmation purpose.
 pub const PURPOSE_DELETE_ACCOUNT: &str = "delete_account";
+/// PLC-operation-signing purpose.
+///
+/// `requestPlcOperationSignature` issues one of these and mails it; the
+/// second factor for having this server sign a key-rotation operation with
+/// the account's rotation key.
+pub const PURPOSE_PLC_OPERATION: &str = "plc_operation";
 
 /// One row from the `email_token` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +196,48 @@ pub async fn delete(pool: &AccountPool, token: &str) -> PdsResult<()> {
         }
     }
     Ok(())
+}
+
+/// Verify a token for `did` and `purpose`, then consume it.
+///
+/// Checks all four properties a one-time token needs — it exists, it is for
+/// this flow, it is bound to this account, and it has not expired — and
+/// deletes it so it cannot be replayed. Returns the row for callers that
+/// need `new_email`.
+///
+/// The email-update and password-reset flows predate this helper and still
+/// check inline; new flows should use it rather than repeat the sequence.
+///
+/// # Errors
+///
+/// [`PdsError::AuthDenied`] when the token is absent, wrong-purpose,
+/// bound to another account, or expired. All four report the same message:
+/// a caller probing tokens should not learn which of the four it hit.
+pub async fn consume(
+    pool: &AccountPool,
+    token: &str,
+    purpose: &str,
+    did: &str,
+) -> PdsResult<EmailTokenRow> {
+    let deny = || PdsError::AuthDenied {
+        reason: "token is invalid or has expired".to_string(),
+    };
+    let row = lookup(pool, token).await?.ok_or_else(deny)?;
+    if row.purpose != purpose || row.did != did {
+        return Err(deny());
+    }
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| PdsError::Storage {
+            reason: format!("email_token expires_at is not RFC-3339: {e}"),
+        })?;
+    if expires <= chrono::Utc::now() {
+        // Consume it anyway; an expired token has no further use and leaving
+        // it behind only waits for the GC sweep.
+        delete(pool, token).await?;
+        return Err(deny());
+    }
+    delete(pool, token).await?;
+    Ok(row)
 }
 
 #[cfg(test)]

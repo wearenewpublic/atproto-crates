@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: `signPlcOperation` would sign a key-rotation operation on the strength of an access
+  token alone. The lexicon takes a `token` — a code the account receives by email — and the handler
+  did not accept the field, let alone check it. `requestPlcOperationSignature`, whose whole job is to
+  issue that code, instead returned a service-auth JWT **in its response body**: the second factor was
+  handed to whoever already held the first. A stolen two-hour access token was enough to have the PDS
+  sign an operation replacing the account's rotation keys, which on an append-only log the PDS cannot
+  then undo.
+
+  `requestPlcOperationSignature` now mails a 15-minute one-time code and returns no body, per its
+  lexicon. `signPlcOperation` requires it, and consumes it — bound to the account, bound to the flow,
+  single-use. A code issued for a password reset does not open this door, and neither does another
+  account's code.
+
+  Operators running without SMTP still see the code: the shipped `EmailService` stub logs it, as it
+  already does for password resets.
+
+- `atproto-pds`: `updateHandle` performed no validation whatsoever. It took the caller's string,
+  wrapped it in `at://`, and put it into a signed PLC operation. Any account could claim any handle —
+  `admin.<the-operator's-domain>`, or a domain belonging to someone else entirely — and this server
+  would then answer `resolveHandle` for it. A collision with an existing handle surfaced as a 500
+  *after* the PLC operation had been submitted, leaving the DID document permanently claiming a handle
+  the local database refused to record.
+
+  Handles are now normalized and checked before anything is signed: syntax via the workspace's own
+  `atproto_identity::validation` (which the PDS had never called), the upstream disallowed-TLD list,
+  uniqueness, and — for a handle under one of this server's domains — length, single-label shape and a
+  reserved-name list. A handle outside those domains must resolve back to the claiming DID first,
+  which is the only thing that can establish the claim is true.
+
+  **Handles this server previously accepted are now refused.** That is the fix.
+
+- `atproto-pds`: `submitPlcOperation` forwarded whatever it was given. The lexicon describes it as
+  *"Validates a PLC operation to ensure that it doesn't violate a service's constraints or get the
+  identity into a bad state, then submits it"*, and validation was the one thing it did not do —
+  making the reason for routing the operation through the PDS at all moot. A migration client with a
+  malformed operation locked itself out of its own identity, permanently, and the server helped.
+
+  Five constraints are now checked before submission: the operation lists this server's rotation key,
+  its `atproto_pds` service has the right type and points at this server, its `atproto` verification
+  method is this account's signing key, and its first `alsoKnownAs` is this account's handle. PLC is
+  append-only, so all of it happens before the POST rather than after.
+
 - `atproto-pds` / `atproto-oauth`: granular OAuth scopes were parsed, stored, and never consulted, so
   every token behaved as a wildcard. The authorization server recorded exactly what the user granted
   — `repo:` with a collection and action, `blob:` with MIME patterns, `rpc:` with method and audience
@@ -218,6 +260,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: no `#identity` event was emitted when a handle changed. `emit_identity_event`
+  existed and was called from exactly one place — `refreshIdentity` — so a rename made through
+  `updateHandle`, `admin.updateAccountHandle` or `submitPlcOperation` reached no relay and no
+  AppView. The new handle worked on this server and nowhere else, with nothing to indicate why.
+
 - `atproto-pds`: `swapCommit` was accepted and never enforced, so concurrent writers clobbered each
   other and both received HTTP 200. `createRecord` declared the field and never read it; `putRecord`,
   `deleteRecord` and `applyWrites` did not accept it at all, though all four lexicons declare it and

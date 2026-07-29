@@ -22,6 +22,7 @@ use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The lexicon method an inbound migration's service-auth token must name.
 const CREATE_ACCOUNT_LXM: &str = "com.atproto.server.createAccount";
@@ -1782,10 +1783,71 @@ pub async fn get_account_invite_codes(
 }
 
 /// Inputs for `com.atproto.identity.signPlcOperation`.
-#[derive(Debug, Deserialize)]
+///
+/// Matches the lexicon: every field is optional and describes a *change*.
+/// Anything omitted is carried over from the DID's current operation, which
+/// this server fetches — the caller does not supply the whole operation, and
+/// cannot, because it does not know `prev`.
+#[derive(Debug, Default, Deserialize)]
 pub struct SignPlcOperationInput {
-    /// Unsigned operation as a JSON object (PLC `Operation` shape pre-signing).
-    pub op: serde_json::Value,
+    /// Code from `com.atproto.identity.requestPlcOperationSignature`.
+    pub token: Option<String>,
+    /// Replacement service map.
+    pub services: Option<HashMap<String, atproto_identity::plc::ServiceEndpoint>>,
+    /// Replacement `alsoKnownAs` list.
+    #[serde(rename = "alsoKnownAs")]
+    pub also_known_as: Option<Vec<String>>,
+    /// Replacement rotation keys.
+    #[serde(rename = "rotationKeys")]
+    pub rotation_keys: Option<Vec<String>>,
+    /// Replacement verification methods.
+    #[serde(rename = "verificationMethods")]
+    pub verification_methods: Option<HashMap<String, String>>,
+}
+
+/// Apply the caller's deltas to the DID's current operation.
+///
+/// Field-wise replacement, not a merge within a field: supplying
+/// `rotationKeys` replaces the list rather than appending to it. That is
+/// what the reference does, and the alternative — union — would make it
+/// impossible to *remove* a rotation key, which is the main reason to
+/// rotate at all.
+///
+/// # Errors
+///
+/// [`PdsError::InvalidPlcOperation`] when the DID's last operation is a
+/// tombstone or a legacy create, neither of which can be updated.
+pub fn apply_plc_deltas(
+    last: atproto_identity::plc::Operation,
+    last_cid: String,
+    input: &SignPlcOperationInput,
+) -> Result<atproto_identity::plc::operations::UnsignedOperation, PdsError> {
+    use atproto_identity::plc::Operation;
+    match last {
+        Operation::PlcOperation {
+            rotation_keys,
+            verification_methods,
+            also_known_as,
+            services,
+            ..
+        } => Ok(Operation::new_update(
+            input.rotation_keys.clone().unwrap_or(rotation_keys),
+            input
+                .verification_methods
+                .clone()
+                .unwrap_or(verification_methods),
+            input.also_known_as.clone().unwrap_or(also_known_as),
+            input.services.clone().unwrap_or(services),
+            last_cid,
+        )),
+        Operation::PlcTombstone { .. } => Err(PdsError::InvalidPlcOperation {
+            reason: "this DID is tombstoned".to_string(),
+        }),
+        Operation::LegacyCreate { .. } => Err(PdsError::InvalidPlcOperation {
+            reason: "this DID's last operation is a legacy create and cannot be updated"
+                .to_string(),
+        }),
+    }
 }
 
 /// Output of `signPlcOperation`.
@@ -1795,21 +1857,42 @@ pub struct SignPlcOperationResponse {
     pub operation: serde_json::Value,
 }
 
-/// `POST /xrpc/com.atproto.identity.signPlcOperation`. Auth-required.
+/// `POST /xrpc/com.atproto.identity.signPlcOperation`. Auth-required, and
+/// additionally gated on a code from `requestPlcOperationSignature`.
 ///
 /// Signs a PLC update operation with the caller's PDS-managed rotation key.
-/// The unsigned `op` arrives from the client (or from `getRecommendedDidCredentials`);
-/// we sign with the rotation key persisted at account-creation and return
-/// the signed operation for the client to submit (or to pass to
-/// `submitPlcOperation` below).
+/// The caller describes what it wants changed; this server fetches the DID's
+/// current operation, applies those changes, signs, and returns the signed
+/// operation for the client to submit (or to pass to `submitPlcOperation`
+/// below).
+///
+/// The token is not optional in practice even though the lexicon marks it so.
+/// This endpoint will sign a rotation of the account's keys — the operation
+/// that can hand the identity to someone else permanently — so an access
+/// token alone must not be enough. That is what the emailed code is for.
 pub async fn sign_plc_operation(
     State(state): State<HttpState>,
     parts: Parts,
     Json(input): Json<SignPlcOperationInput>,
 ) -> Result<Json<SignPlcOperationResponse>, XrpcError> {
-    use atproto_identity::plc::operations::UnsignedOperation;
     let claims = require_access_jwt(&parts, &state)?;
     let manager = account_manager(&state)?;
+
+    let token = input.token.as_deref().ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "a confirmation code from requestPlcOperationSignature is required to sign PLC operations",
+        )
+    })?;
+    crate::account::email_token::consume(
+        &manager.account_pool(),
+        token,
+        crate::account::email_token::PURPOSE_PLC_OPERATION,
+        &claims.sub,
+    )
+    .await
+    .map_err(XrpcError::from)?;
     // The rotation key is tracked in
     // `account.rotation_key_ref` (NOT in the `signing_key` table, which is
     // for the atproto signing key). Pre-genesis rows may have NULL here —
@@ -1839,13 +1922,44 @@ pub async fn sign_plc_operation(
         .await
         .map_err(XrpcError::from)?;
 
-    let unsigned: UnsignedOperation = serde_json::from_value(input.op).map_err(|e| {
+    // The caller supplies deltas, so the current operation is what they are
+    // deltas against — and it also carries `prev`, which the caller has no
+    // way to know.
+    let plc = state.plc_service.as_ref().ok_or_else(|| {
         XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            format!("op must be an unsigned PLC Operation: {e}"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PlcUnavailable",
+            "PDS_DID_PLC_URL is not configured",
         )
     })?;
+    let http = reqwest::Client::builder()
+        .user_agent(crate::user_agent())
+        .build()
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                format!("build http client: {e}"),
+            )
+        })?;
+    let log = atproto_identity::plc::fetch_audit_log(&http, plc.directory_hostname(), &claims.sub)
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::BAD_GATEWAY,
+                "PlcUnavailable",
+                format!("fetch audit log: {e}"),
+            )
+        })?;
+    let last = log.into_iter().rfind(|e| !e.nullified).ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "PLC audit log empty for this DID",
+        )
+    })?;
+    let unsigned = apply_plc_deltas(last.operation, last.cid, &input).map_err(XrpcError::from)?;
+
     let signed = unsigned.sign(&rotation_priv).map_err(|e| {
         XrpcError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1870,16 +1984,112 @@ pub struct SubmitPlcOperationInput {
     pub operation: serde_json::Value,
 }
 
+/// Constraints an operation must satisfy before this server will submit it.
+///
+/// Named so the checks can be unit-tested without a PLC directory or an
+/// account store.
+pub struct PlcSubmitConstraints<'a> {
+    /// Rotation key this server holds for the account, in `did:key` form.
+    pub rotation_key: &'a str,
+    /// This server's public endpoint, as it should appear in
+    /// `services.atproto_pds.endpoint`.
+    pub service_endpoint: &'a str,
+    /// The account's atproto signing key, in `did:key` form.
+    pub signing_key: &'a str,
+    /// The account's current handle.
+    pub handle: &'a str,
+}
+
+/// Reject an operation that would leave the account unreachable here.
+///
+/// The lexicon's own description is the specification for this function:
+/// *"Validates a PLC operation to ensure that it doesn't violate a
+/// service's constraints or get the identity into a bad state, then submits
+/// it to the PLC registry."* Routing the operation through the PDS buys the
+/// user nothing if the PDS forwards it unread.
+///
+/// PLC is append-only. A submitted operation that drops this server's
+/// rotation key cannot be undone by this server, so every one of these is
+/// checked *before* submission, not after.
+///
+/// # Errors
+///
+/// [`PdsError::InvalidPlcOperation`] naming the constraint that failed.
+pub fn check_plc_submit(
+    op: &atproto_identity::plc::Operation,
+    c: &PlcSubmitConstraints<'_>,
+) -> Result<(), PdsError> {
+    use atproto_identity::plc::Operation;
+    let deny = |reason: String| Err(PdsError::InvalidPlcOperation { reason });
+
+    let Operation::PlcOperation {
+        rotation_keys,
+        verification_methods,
+        also_known_as,
+        services,
+        ..
+    } = op
+    else {
+        // A tombstone is a deliberate act of self-destruction and a legacy
+        // create cannot be an update; neither is something to forward on an
+        // account's behalf from a migration flow.
+        return deny("only a plc_operation may be submitted through this server".to_string());
+    };
+
+    if !rotation_keys.iter().any(|k| k == c.rotation_key) {
+        return deny(
+            "the operation does not list this server's rotation key; submitting it would leave this server unable to manage the identity".to_string(),
+        );
+    }
+    match services.get("atproto_pds") {
+        None => return deny("the operation has no atproto_pds service".to_string()),
+        Some(svc) if svc.service_type != "AtprotoPersonalDataServer" => {
+            return deny(format!(
+                "atproto_pds service type is {}, expected AtprotoPersonalDataServer",
+                svc.service_type
+            ));
+        }
+        Some(svc) if svc.endpoint != c.service_endpoint => {
+            return deny(format!(
+                "atproto_pds endpoint is {}, expected {}",
+                svc.endpoint, c.service_endpoint
+            ));
+        }
+        Some(_) => {}
+    }
+    match verification_methods.get("atproto") {
+        None => return deny("the operation has no atproto verification method".to_string()),
+        Some(vm) if vm != c.signing_key => {
+            return deny(format!(
+                "atproto verification method is {vm}, expected this account's signing key {}",
+                c.signing_key
+            ));
+        }
+        Some(_) => {}
+    }
+    let expected_aka = format!("at://{}", c.handle);
+    if also_known_as.first().map(String::as_str) != Some(expected_aka.as_str()) {
+        return deny(format!(
+            "alsoKnownAs[0] is {:?}, expected {expected_aka}",
+            also_known_as.first()
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /xrpc/com.atproto.identity.submitPlcOperation`. Auth-required.
 ///
-/// POSTs the signed operation to the configured PLC directory. Requires the
-/// PDS to have a `PlcService` configured (i.e., `PDS_DID_PLC_URL` was set).
+/// Validates the operation against this server's constraints (see
+/// [`check_plc_submit`]), POSTs it to the configured PLC directory, and
+/// emits `#identity` so consumers re-resolve. Requires the PDS to have a
+/// `PlcService` configured (i.e., `PDS_DID_PLC_URL` was set).
 pub async fn submit_plc_operation(
     State(state): State<HttpState>,
     parts: Parts,
     Json(input): Json<SubmitPlcOperationInput>,
 ) -> Result<axum::http::StatusCode, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
+    let manager = account_manager(&state)?;
     let plc = state.plc_service.as_ref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1895,9 +2105,85 @@ pub async fn submit_plc_operation(
                 format!("operation must be a signed PLC Operation: {e}"),
             )
         })?;
+
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(&claims.sub)
+        .await
+        .map_err(XrpcError::from)?
+        .ok_or_else(|| {
+            XrpcError::new(StatusCode::NOT_FOUND, "AccountNotFound", "no such account")
+        })?;
+    let rotation_key_ref = manager
+        .lookup_rotation_key_ref(&claims.sub)
+        .await
+        .map_err(XrpcError::from)?
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "NoRotationKey",
+                "this account has no PDS-managed rotation key",
+            )
+        })?;
+    let rotation_did = atproto_identity::key::to_public(
+        &manager
+            .key_store()
+            .get(&rotation_key_ref)
+            .await
+            .map_err(XrpcError::from)?,
+    )
+    .map_err(|e| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("derive rotation public key: {e}"),
+        )
+    })?
+    .to_string();
+    let signing_did = atproto_identity::key::to_public(
+        &manager
+            .key_store()
+            .get(&account.signing_key_ref)
+            .await
+            .map_err(XrpcError::from)?,
+    )
+    .map_err(|e| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("derive signing public key: {e}"),
+        )
+    })?
+    .to_string();
+
+    check_plc_submit(
+        &signed,
+        &PlcSubmitConstraints {
+            rotation_key: &rotation_did,
+            service_endpoint: plc.service_endpoint(),
+            signing_key: &signing_did,
+            handle: &account.handle,
+        },
+    )
+    .map_err(XrpcError::from)?;
+
     plc.submit_operation(&claims.sub, &signed)
         .await
         .map_err(XrpcError::from)?;
+
+    // The DID document just changed. Best-effort, as with the handle path:
+    // the operation is already in PLC's append-only log, so failing here
+    // would report a completed change as an error.
+    if let Err(e) = crate::http::identity_handlers::emit_identity_event(
+        &manager.sequencer(),
+        &claims.sub,
+        Some(&account.handle),
+    )
+    .await
+    {
+        tracing::error!(did = %claims.sub, error = ?e, "failed to sequence #identity after submitPlcOperation");
+    }
     Ok(StatusCode::OK)
 }
 
@@ -1949,4 +2235,246 @@ fn require_access_jwt(
 ) -> Result<account::SessionClaims, XrpcError> {
     let raw = bearer_token(parts)?;
     session::verify_access(raw, &state.jwt_secret).map_err(XrpcError::from)
+}
+
+#[cfg(test)]
+mod plc_tests {
+    use super::*;
+    use atproto_identity::plc::{Operation, ServiceEndpoint};
+
+    const ROTATION: &str = "did:key:zRotationKeyOfThisServer";
+    const SIGNING: &str = "did:key:zSigningKeyOfThisAccount";
+    const ENDPOINT: &str = "https://pds.example.test";
+    const HANDLE: &str = "alice.example.test";
+
+    fn constraints() -> PlcSubmitConstraints<'static> {
+        PlcSubmitConstraints {
+            rotation_key: ROTATION,
+            service_endpoint: ENDPOINT,
+            signing_key: SIGNING,
+            handle: HANDLE,
+        }
+    }
+
+    fn services(endpoint: &str, service_type: &str) -> HashMap<String, ServiceEndpoint> {
+        HashMap::from([(
+            "atproto_pds".to_string(),
+            ServiceEndpoint {
+                service_type: service_type.to_string(),
+                endpoint: endpoint.to_string(),
+            },
+        )])
+    }
+
+    /// A well-formed operation that satisfies every constraint.
+    fn good_op() -> Operation {
+        op(
+            vec![ROTATION.to_string()],
+            HashMap::from([("atproto".to_string(), SIGNING.to_string())]),
+            vec![format!("at://{HANDLE}")],
+            services(ENDPOINT, "AtprotoPersonalDataServer"),
+        )
+    }
+
+    /// Build an operation from its four constrained fields.
+    fn op(
+        rotation_keys: Vec<String>,
+        verification_methods: HashMap<String, String>,
+        also_known_as: Vec<String>,
+        services: HashMap<String, ServiceEndpoint>,
+    ) -> Operation {
+        Operation::PlcOperation {
+            rotation_keys,
+            verification_methods,
+            also_known_as,
+            services,
+            prev: Some("bafyprev".to_string()),
+            sig: "sig".to_string(),
+        }
+    }
+
+    fn atproto_vm(key: &str) -> HashMap<String, String> {
+        HashMap::from([("atproto".to_string(), key.to_string())])
+    }
+
+    fn aka(handle: &str) -> Vec<String> {
+        vec![format!("at://{handle}")]
+    }
+
+    fn pds_services() -> HashMap<String, ServiceEndpoint> {
+        services(ENDPOINT, "AtprotoPersonalDataServer")
+    }
+
+    #[test]
+    fn a_conformant_operation_is_accepted() {
+        // Without this the other five tests would pass against a function
+        // that refused everything.
+        assert!(check_plc_submit(&good_op(), &constraints()).is_ok());
+    }
+
+    #[test]
+    fn an_operation_dropping_this_servers_rotation_key_is_refused() {
+        // The one that cannot be undone: PLC is append-only, so once this
+        // lands the server can no longer manage the identity at all.
+        let bad = op(
+            vec!["did:key:zSomeoneElse".to_string()],
+            atproto_vm(SIGNING),
+            aka(HANDLE),
+            pds_services(),
+        );
+        assert!(matches!(
+            check_plc_submit(&bad, &constraints()),
+            Err(PdsError::InvalidPlcOperation { .. })
+        ));
+    }
+
+    #[test]
+    fn an_operation_pointing_elsewhere_is_refused() {
+        // Endpoint belongs to another server — the account would become
+        // unreachable here the moment this lands.
+        let wrong_endpoint = op(
+            vec![ROTATION.to_string()],
+            atproto_vm(SIGNING),
+            aka(HANDLE),
+            services(
+                "https://someone-else.example.test",
+                "AtprotoPersonalDataServer",
+            ),
+        );
+        assert!(check_plc_submit(&wrong_endpoint, &constraints()).is_err());
+
+        // Right endpoint, wrong service type.
+        let wrong_type = op(
+            vec![ROTATION.to_string()],
+            atproto_vm(SIGNING),
+            aka(HANDLE),
+            services(ENDPOINT, "SomethingElse"),
+        );
+        assert!(check_plc_submit(&wrong_type, &constraints()).is_err());
+
+        // No atproto_pds service at all.
+        let no_service = op(
+            vec![ROTATION.to_string()],
+            atproto_vm(SIGNING),
+            aka(HANDLE),
+            HashMap::new(),
+        );
+        assert!(check_plc_submit(&no_service, &constraints()).is_err());
+    }
+
+    #[test]
+    fn an_operation_with_the_wrong_signing_key_is_refused() {
+        // Commits signed by this server would stop verifying against the
+        // document the moment this lands.
+        let bad = op(
+            vec![ROTATION.to_string()],
+            atproto_vm("did:key:zNotThisAccount"),
+            aka(HANDLE),
+            pds_services(),
+        );
+        assert!(check_plc_submit(&bad, &constraints()).is_err());
+
+        let missing = op(
+            vec![ROTATION.to_string()],
+            HashMap::new(),
+            aka(HANDLE),
+            pds_services(),
+        );
+        assert!(check_plc_submit(&missing, &constraints()).is_err());
+    }
+
+    #[test]
+    fn an_operation_with_a_mismatched_handle_is_refused() {
+        let bad = op(
+            vec![ROTATION.to_string()],
+            atproto_vm(SIGNING),
+            aka("someone.else.test"),
+            pds_services(),
+        );
+        assert!(check_plc_submit(&bad, &constraints()).is_err());
+    }
+
+    #[test]
+    fn a_tombstone_is_not_submittable_through_this_server() {
+        let op = Operation::PlcTombstone {
+            prev: "bafyprev".to_string(),
+            sig: "sig".to_string(),
+        };
+        assert!(check_plc_submit(&op, &constraints()).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    //  apply_plc_deltas
+    // -----------------------------------------------------------------
+
+    fn last_op() -> Operation {
+        good_op()
+    }
+
+    #[test]
+    fn omitted_fields_are_carried_over_verbatim() {
+        use atproto_identity::plc::operations::UnsignedOperation;
+        let unsigned = apply_plc_deltas(
+            last_op(),
+            "bafylast".to_string(),
+            &SignPlcOperationInput::default(),
+        )
+        .unwrap();
+        let UnsignedOperation::PlcOperation {
+            rotation_keys,
+            verification_methods,
+            also_known_as,
+            services,
+            prev,
+        } = unsigned
+        else {
+            unreachable!()
+        };
+        assert_eq!(rotation_keys, vec![ROTATION.to_string()]);
+        assert_eq!(verification_methods["atproto"], SIGNING);
+        assert_eq!(also_known_as, vec![format!("at://{HANDLE}")]);
+        assert_eq!(services["atproto_pds"].endpoint, ENDPOINT);
+        // `prev` comes from the fetched operation's CID, never from input —
+        // the caller has no way to know it.
+        assert_eq!(prev, Some("bafylast".to_string()));
+    }
+
+    #[test]
+    fn a_supplied_field_replaces_rather_than_merges() {
+        use atproto_identity::plc::operations::UnsignedOperation;
+        // Replacement is what makes key removal possible. A union would let
+        // a compromised key stay in the list forever.
+        let input = SignPlcOperationInput {
+            rotation_keys: Some(vec!["did:key:zBrandNew".to_string()]),
+            ..Default::default()
+        };
+        let unsigned = apply_plc_deltas(last_op(), "bafylast".to_string(), &input).unwrap();
+        let UnsignedOperation::PlcOperation {
+            rotation_keys,
+            also_known_as,
+            ..
+        } = unsigned
+        else {
+            unreachable!()
+        };
+        assert_eq!(rotation_keys, vec!["did:key:zBrandNew".to_string()]);
+        // Untouched fields still carried over.
+        assert_eq!(also_known_as, vec![format!("at://{HANDLE}")]);
+    }
+
+    #[test]
+    fn a_tombstoned_did_cannot_be_updated() {
+        let tombstone = Operation::PlcTombstone {
+            prev: "bafyprev".to_string(),
+            sig: "sig".to_string(),
+        };
+        assert!(matches!(
+            apply_plc_deltas(
+                tombstone,
+                "bafylast".to_string(),
+                &SignPlcOperationInput::default()
+            ),
+            Err(PdsError::InvalidPlcOperation { .. })
+        ));
+    }
 }
