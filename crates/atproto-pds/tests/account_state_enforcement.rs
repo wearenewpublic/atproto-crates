@@ -70,7 +70,27 @@ async fn create_account(app: &axum::Router, manager: &AccountManager) -> String 
 }
 
 /// Write a record, returning its rkey so `getRecord` can ask for a real one.
-async fn write_a_record_rkey(app: &axum::Router, token: &str) -> String {
+/// Write a record, optionally referencing `blob_cid`.
+///
+/// A public record referencing the blob is what makes the blob publicly
+/// fetchable: `sync.getBlob` serves only blobs a public record names, because
+/// `repo_blob` holds permissioned bytes alongside public ones. An
+/// uploaded-but-unreferenced blob is not public, so a fixture that skipped the
+/// reference would be asserting against a 404 that is correct.
+async fn write_a_record_rkey_with_blob(
+    app: &axum::Router,
+    token: &str,
+    blob_cid: Option<&str>,
+) -> String {
+    let mut record = json!({ "$type": "app.bsky.feed.post", "text": "hello" });
+    if let Some(cid) = blob_cid {
+        record["embed"] = json!({
+            "$type": "blob",
+            "ref": { "$link": cid },
+            "mimeType": "image/png",
+            "size": 16,
+        });
+    }
     let request = Request::builder()
         .uri("/xrpc/com.atproto.repo.createRecord")
         .method("POST")
@@ -80,7 +100,7 @@ async fn write_a_record_rkey(app: &axum::Router, token: &str) -> String {
             serde_json::to_vec(&json!({
                 "repo": DID,
                 "collection": "app.bsky.feed.post",
-                "record": { "$type": "app.bsky.feed.post", "text": "hello" }
+                "record": record,
             }))
             .unwrap(),
         ))
@@ -173,11 +193,15 @@ fn public_read_paths(blob_cid: &str, block_cid: &str, rkey: &str) -> Vec<String>
 async fn a_takedown_closes_every_public_read_path() {
     let (app, manager, _tmp) = build_app().await;
     let token = create_account(&app, &manager).await;
-    let rkey = write_a_record_rkey(&app, &token).await;
+
+    // Upload the blob first, then write a record that references it. The
+    // reference is what makes the blob publicly fetchable — an
+    // uploaded-but-unreferenced blob is 404 from `sync.getBlob` by design.
+    let blob_cid = upload_a_blob(&app, &token).await;
+    let rkey = write_a_record_rkey_with_blob(&app, &token, Some(&blob_cid)).await;
 
     // Every path answers before the takedown, so a refusal afterwards is the
     // takedown and not a route that never worked or a CID that never existed.
-    let blob_cid = upload_a_blob(&app, &token).await;
     let block_cid = head_commit_cid(&app).await;
     for path in public_read_paths(&blob_cid, &block_cid, &rkey) {
         let status = get(&app, &path).await;

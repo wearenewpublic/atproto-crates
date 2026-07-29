@@ -100,6 +100,43 @@ async fn fjall_blob_upload_get_list_round_trip() {
     assert!(cid.starts_with("bafkrei") || cid.starts_with("bafy"));
     assert_eq!(body["blob"]["size"], 11);
 
+    // Reference it from a public record. `sync.getBlob` serves only blobs a
+    // public record names, because `repo_blob` holds permissioned bytes
+    // alongside public ones. The reference lives in the per-actor SQLite while
+    // the bytes live in the fjall keyspace, which is exactly the cross-profile
+    // case this test is here to exercise.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.repo.createRecord")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "repo": "did:plc:alice",
+                        "collection": "app.bsky.feed.post",
+                        "rkey": "with-blob",
+                        "record": {
+                            "$type": "app.bsky.feed.post",
+                            "text": "hi",
+                            "embed": {
+                                "$type": "blob",
+                                "ref": {"$link": cid},
+                                "mimeType": "image/png",
+                                "size": 11,
+                            },
+                        },
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "reference the blob");
+
     // getBlob — verify the bytes round-trip through the fjall keyspace.
     let resp = app
         .clone()

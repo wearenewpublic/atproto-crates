@@ -164,6 +164,36 @@ async fn get_blob_refuses_to_render_as_a_document() {
         .expect("uploadBlob should return the blob ref")
         .to_string();
 
+    // Reference it from a public record. `sync.getBlob` serves only blobs a
+    // public record names, so without this the fetch below 404s and the header
+    // assertions never run — which would look like a pass.
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.createRecord")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "repo": did,
+                "collection": "app.bsky.feed.post",
+                "rkey": "xss",
+                "record": {
+                    "$type": "app.bsky.feed.post",
+                    "text": "payload attached",
+                    "embed": {
+                        "$type": "blob",
+                        "ref": {"$link": cid},
+                        "mimeType": "text/html",
+                        "size": 39,
+                    },
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "reference the blob");
+
     let request = Request::builder()
         .uri(format!(
             "/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"

@@ -1152,6 +1152,42 @@ async fn a_blob_can_be_taken_down_without_touching_the_account() {
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let cid = body["blob"]["ref"]["$link"].as_str().unwrap().to_string();
 
+    // Reference the blob from a public record. `sync.getBlob` serves only
+    // blobs a public record names — `repo_blob` holds permissioned bytes
+    // alongside public ones — so without this the blob would 404 before any
+    // takedown, and the takedown assertion would prove nothing.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.repo.createRecord")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "repo": "did:plc:alice",
+                        "collection": "app.bsky.feed.post",
+                        "rkey": "with-blob",
+                        "record": {
+                            "$type": "app.bsky.feed.post",
+                            "text": "see attached",
+                            "embed": {
+                                "$type": "blob",
+                                "ref": {"$link": cid},
+                                "mimeType": "image/png",
+                                "size": 16,
+                            },
+                        },
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "reference the blob");
+
     let fetch = |app: axum::Router, cid: String| async move {
         app.oneshot(
             Request::builder()

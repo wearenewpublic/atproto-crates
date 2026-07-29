@@ -79,6 +79,39 @@ pub async fn get_blob(
         }
     }
 
+    // Public means publicly referenced. `repo_blob` holds public and
+    // permissioned bytes together — permissioned blobs arrive through the
+    // ordinary `uploadBlob`, since there is no space-specific upload endpoint —
+    // so serving by CID alone let anyone holding a CID read permissioned
+    // content with no credential at all. CIDs are high-entropy but not secret:
+    // they appear in space oplog entries, in `listRepoOps`, in any indexing
+    // AppView, in logs, and to every member including one since removed.
+    //
+    // Reported as `BlobNotFound`, like a takedown: a caller with no business
+    // knowing whether these bytes exist should not learn it from the error.
+    {
+        let manager = state.account_manager.as_deref().ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AccountManagementUnavailable",
+                "account manager not configured",
+            )
+        })?;
+        let store = SqlActorStore::open(manager.data_dir(), &did)
+            .await
+            .map_err(XrpcError::from)?;
+        if !crate::blob::is_publicly_referenced(&store, &q.cid)
+            .await
+            .map_err(XrpcError::from)?
+        {
+            return Err(XrpcError::new(
+                StatusCode::NOT_FOUND,
+                "BlobNotFound",
+                format!("no blob {} for {}", q.cid, q.did),
+            ));
+        }
+    }
+
     let pair = if let Some(backend) = state.public_realm_backend.as_ref() {
         backend
             .blob
@@ -172,12 +205,44 @@ pub async fn list_blobs(
 ) -> Result<axum::Json<ListBlobsResponse>, XrpcError> {
     // Same gate and the same ordering as `getBlob`.
     let did = state.reader.require_available(&q.did).await?.did;
+    // The cursor must advance over CIDs *scanned*, not CIDs *kept*. A page in
+    // which every blob turned out to be permissioned would otherwise yield an
+    // empty `cids` and no cursor, which a client reads as "end of list" while
+    // there is more behind it — or, if it restarts from the beginning, as a
+    // loop.
+    let last_scanned: Option<String>;
     let cids = if let Some(backend) = state.public_realm_backend.as_ref() {
-        backend
+        // The trait cannot express the join — on the fjall profile the bytes are
+        // not in a database that knows about records — so the page is filtered
+        // after the fact. A page may therefore come back shorter than `limit`;
+        // the cursor still advances over the underlying CIDs, so pagination
+        // terminates. The SQLite path below joins in SQL and keeps full pages.
+        let manager = state.account_manager.as_deref().ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AccountManagementUnavailable",
+                "account manager not configured",
+            )
+        })?;
+        let store = SqlActorStore::open(manager.data_dir(), &did)
+            .await
+            .map_err(XrpcError::from)?;
+        let all = backend
             .blob
             .list_all_cids(&did, q.cursor.as_deref(), q.limit.unwrap_or(500))
             .await
-            .map_err(XrpcError::from)?
+            .map_err(XrpcError::from)?;
+        last_scanned = all.last().cloned();
+        let mut kept = Vec::with_capacity(all.len());
+        for cid in all {
+            if crate::blob::is_publicly_referenced(&store, &cid)
+                .await
+                .map_err(XrpcError::from)?
+            {
+                kept.push(cid);
+            }
+        }
+        kept
     } else {
         let manager = state.account_manager.as_deref().ok_or_else(|| {
             XrpcError::new(
@@ -189,10 +254,14 @@ pub async fn list_blobs(
         let store = SqlActorStore::open(manager.data_dir(), &did)
             .await
             .map_err(XrpcError::from)?;
-        crate::blob::list_all(&store, q.cursor.as_deref(), q.limit.unwrap_or(500))
+        // This path joins in SQL, so every row returned is kept and the last
+        // row is both the last scanned and the last kept.
+        let page = crate::blob::list_all(&store, q.cursor.as_deref(), q.limit.unwrap_or(500))
             .await
-            .map_err(XrpcError::from)?
+            .map_err(XrpcError::from)?;
+        last_scanned = page.last().cloned();
+        page
     };
-    let cursor = cids.last().cloned();
+    let cursor = last_scanned;
     Ok(axum::Json(ListBlobsResponse { cids, cursor }))
 }

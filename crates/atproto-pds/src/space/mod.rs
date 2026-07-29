@@ -15,6 +15,7 @@
 //! The auth-extractor extensions for delegation-token/SpaceCredential JWTs
 //! live in the HTTP layer alongside the app-password sessions.
 
+pub mod blob_ref;
 pub mod config;
 pub mod declaration;
 pub mod inbound;

@@ -265,6 +265,10 @@ impl SpaceWriter {
         let mut translated = Vec::with_capacity(ops.len());
         let mut output_uris = Vec::with_capacity(ops.len());
         let mut output_cids = Vec::with_capacity(ops.len());
+        // `(record_uri, value)` per op, for blob-ref maintenance after the
+        // commit is durable. `None` for a delete — the refs still get dropped,
+        // there is just nothing to re-add.
+        let mut ref_work: Vec<(String, Option<serde_json::Value>)> = Vec::with_capacity(ops.len());
         for op in ops {
             let rkey = if matches!(op.action, SpaceWriteAction::Create) && op.rkey.is_empty() {
                 Tid::new().to_string()
@@ -280,15 +284,15 @@ impl SpaceWriter {
             // scheme and marker live in one place; the two hand-rolled copies
             // this replaces were the reason the format change had to be found
             // by grep.
-            output_uris.push(
-                atproto_space::RecordUri::new(
-                    space.clone(),
-                    member_did.to_string(),
-                    op.collection.clone(),
-                    rkey.clone(),
-                )
-                .to_string(),
-            );
+            let record_uri = atproto_space::RecordUri::new(
+                space.clone(),
+                member_did.to_string(),
+                op.collection.clone(),
+                rkey.clone(),
+            )
+            .to_string();
+            ref_work.push((record_uri.clone(), op.value.clone()));
+            output_uris.push(record_uri);
             // Compute the value's CID (from DAG-CBOR) for create/update.
             let (cid, value_bytes) = match op.action {
                 SpaceWriteAction::Create | SpaceWriteAction::Update => {
@@ -355,6 +359,12 @@ impl SpaceWriter {
         // signed by the writer's key. Best-effort: failures are logged but
         // never fail the (already-durable) write. The owner-side inbound
         // handler does the isMember check + fans out to registered recipients.
+        // Record which blobs this space now references. Without it,
+        // `space.getBlob` has no way to tell whether a CID belongs to the space
+        // it was asked about, and the public `sync.getBlob` cannot tell a
+        // permissioned blob from a public one.
+        self.maintain_blob_refs(space, member_did, &ref_work).await;
+
         self.fire_notify_write(space, member_did, &rev, &signing_key)
             .await;
 
@@ -364,6 +374,61 @@ impl SpaceWriter {
             uris: output_uris,
             cids: output_cids,
         })
+    }
+
+    /// Maintain `space_blob_ref` for a committed batch.
+    ///
+    /// Reuses the public realm's [`walk_blob_refs`](crate::blob::walk_blob_refs)
+    /// walker, which recurses to arbitrary depth and validates the whole
+    /// `{$type: "blob", ref: {$link}, mimeType, size}` envelope — a walker
+    /// taught individual lexicons would silently miss every lexicon it had not
+    /// been taught, which for permissioned data means a blob that quietly
+    /// stays publicly readable.
+    ///
+    /// Every op drops its existing references first, including deletes. Adding
+    /// without dropping would leave a blob readable in a space after the last
+    /// record naming it stopped naming it, and nothing would visibly break.
+    ///
+    /// Best-effort, like `notifyWrite`: the commit is already durable, so
+    /// failing here would report a written record as unwritten. Failures log at
+    /// ERROR because the consequence — a blob readable in a space it no longer
+    /// belongs to, or unreadable in one it does — is invisible to the caller.
+    async fn maintain_blob_refs(
+        &self,
+        space: &SpaceUri,
+        member_did: &str,
+        work: &[(String, Option<serde_json::Value>)],
+    ) {
+        let store =
+            match crate::actor_store::sql::SqlActorStore::open(&self.data_dir, member_did).await {
+                Ok(s) => s,
+                Err(error) => {
+                    tracing::error!(error = ?error, did = %member_did, space = %space,
+                    "space blob refs not maintained: cannot open actor store");
+                    return;
+                }
+            };
+        for (record_uri, value) in work {
+            if let Err(error) = crate::space::blob_ref::drop_record_refs(&store, record_uri).await {
+                tracing::error!(error = ?error, uri = %record_uri,
+                    "space blob refs not dropped for record");
+                continue;
+            }
+            let Some(value) = value else { continue };
+            for blob in crate::blob::walk_blob_refs(value) {
+                if let Err(error) = crate::space::blob_ref::add_ref(
+                    &store,
+                    &space.to_string(),
+                    record_uri,
+                    &blob.inner.ref_.link,
+                )
+                .await
+                {
+                    tracing::error!(error = ?error, uri = %record_uri,
+                        "space blob ref not recorded");
+                }
+            }
+        }
     }
 
     /// HOP 1 of the reference two-hop notify path: the writer's PDS POSTs a

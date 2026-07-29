@@ -2308,6 +2308,29 @@ pub async fn get_blob(
         .map_err(XrpcError::from)?;
 
     let manager = account_manager(&state)?;
+
+    // The `space` parameter has to reach the lookup. It previously gated the
+    // request and was then discarded: the blob was fetched by `(repo, cid)`
+    // alone, so a member of one space could read a blob referenced only from
+    // another space in the same account's store.
+    //
+    // Asked as a predicate against the per-actor SQLite rather than joined into
+    // the fetch, because on the fjall profile the bytes are not in a database
+    // that knows about records. Same reasoning as the blob-takedown gate.
+    let store = SqlActorStore::open(manager.data_dir(), &q.repo)
+        .await
+        .map_err(XrpcError::from)?;
+    if !crate::space::blob_ref::is_referenced_in_space(&store, &space.to_string(), &q.cid)
+        .await
+        .map_err(XrpcError::from)?
+    {
+        return Err(XrpcError::new(
+            StatusCode::NOT_FOUND,
+            "BlobNotFound",
+            format!("no blob {} for {}", q.cid, q.repo),
+        ));
+    }
+
     let pair = if let Some(backend) = state.public_realm_backend.as_ref() {
         backend
             .blob
@@ -2315,9 +2338,6 @@ pub async fn get_blob(
             .await
             .map_err(XrpcError::from)?
     } else {
-        let store = SqlActorStore::open(manager.data_dir(), &q.repo)
-            .await
-            .map_err(XrpcError::from)?;
         crate::blob::get_blob(&store, &q.cid)
             .await
             .map_err(XrpcError::from)?

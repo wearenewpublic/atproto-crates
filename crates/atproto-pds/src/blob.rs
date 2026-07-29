@@ -175,9 +175,16 @@ pub async fn put_blob(
     Ok(blob_ref(cid_str, mime_type.to_string(), bytes.len() as u64))
 }
 
-/// Retrieve raw blob bytes by CID.
+/// Retrieve raw blob bytes by CID, without asking why the blob exists.
 ///
 /// Returns `Ok(None)` when the blob is absent.
+///
+/// **Do not call this from an unauthenticated path.** `repo_blob` holds public
+/// and permissioned bytes together — permissioned blobs arrive through the
+/// ordinary `uploadBlob`, because there is no space-specific upload endpoint —
+/// so serving straight from it is what let anyone holding a CID read
+/// permissioned content with no credential. Public paths want
+/// [`get_public_blob`]; space paths gate on `space::blob_ref` first.
 pub async fn get_blob(store: &SqlActorStore, cid: &str) -> PdsResult<Option<(Vec<u8>, String)>> {
     let row: Option<(Vec<u8>, String)> =
         sqlx::query_as("SELECT data, mime_type FROM repo_blob WHERE cid = ?")
@@ -188,6 +195,42 @@ pub async fn get_blob(store: &SqlActorStore, cid: &str) -> PdsResult<Option<(Vec
                 reason: format!("get_blob: {e}"),
             })?;
     Ok(row)
+}
+
+/// Whether a **public** record references `cid`.
+///
+/// The join is the authorization. `repo_blob_ref` is populated from the public
+/// write path only, and `repo_record` holds public records only, so a blob
+/// reachable through both is one a public record put on the open internet. A
+/// blob referenced solely from a permissioned record is not — and neither is one
+/// uploaded but never referenced, which is why an upload is not publicly
+/// fetchable until a record names it.
+///
+/// This is zds's `getPublicBlob` join expressed in this schema; zds is the only
+/// other 0016 implementation and the one that got this right.
+///
+/// A predicate rather than a joined `SELECT … data` because the bytes may not be
+/// in this database at all: on the fjall profile they come from a fjall
+/// keyspace through `PublicRealmBackend`. The per-actor SQLite always exists, so
+/// asking it the *question* works on both profiles while asking it for the
+/// *bytes* would not.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] on backend failure.
+pub async fn is_publicly_referenced(store: &SqlActorStore, cid: &str) -> PdsResult<bool> {
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM repo_blob_ref r
+         JOIN repo_record c ON c.uri = r.record_uri
+         WHERE r.blob_cid = ? LIMIT 1",
+    )
+    .bind(cid)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|e| PdsError::Storage {
+        reason: format!("is_publicly_referenced: {e}"),
+    })?;
+    Ok(row.is_some())
 }
 
 /// Record a record→blob reference (ref-count++).
@@ -263,24 +306,36 @@ pub async fn list_all(
     limit: u32,
 ) -> PdsResult<Vec<String>> {
     let limit = limit.clamp(1, 1000);
-    let rows: Vec<(String,)> = match cursor {
-        Some(c) => {
-            sqlx::query_as("SELECT cid FROM repo_blob WHERE cid > ? ORDER BY cid ASC LIMIT ?")
-                .bind(c)
+    // Same join as `get_public_blob`, for the same reason: enumerating every
+    // stored CID hands out the identifiers of permissioned blobs, and a CID is
+    // all the public endpoint used to require. zds joins the same way in its
+    // public `listBlobs`.
+    const PUBLIC: &str = "AND EXISTS (
+             SELECT 1 FROM repo_blob_ref r
+             JOIN repo_record c ON c.uri = r.record_uri
+             WHERE r.blob_cid = b.cid
+           )";
+    let rows: Vec<(String,)> =
+        match cursor {
+            Some(c) => sqlx::query_as(&format!(
+                "SELECT b.cid FROM repo_blob b WHERE b.cid > ? {PUBLIC} ORDER BY b.cid ASC LIMIT ?"
+            ))
+            .bind(c)
+            .bind(limit as i64)
+            .fetch_all(store.pool())
+            .await,
+            None => {
+                sqlx::query_as(&format!(
+                    "SELECT b.cid FROM repo_blob b WHERE 1 = 1 {PUBLIC} ORDER BY b.cid ASC LIMIT ?"
+                ))
                 .bind(limit as i64)
                 .fetch_all(store.pool())
                 .await
+            }
         }
-        None => {
-            sqlx::query_as("SELECT cid FROM repo_blob ORDER BY cid ASC LIMIT ?")
-                .bind(limit as i64)
-                .fetch_all(store.pool())
-                .await
-        }
-    }
-    .map_err(|e| PdsError::Storage {
-        reason: format!("list_all: {e}"),
-    })?;
+        .map_err(|e| PdsError::Storage {
+            reason: format!("list_all: {e}"),
+        })?;
     Ok(rows.into_iter().map(|(c,)| c).collect())
 }
 

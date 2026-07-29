@@ -63,6 +63,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   believed it had a backend it did not have.
 
 ### Security
+- `atproto-pds`: **permissioned blobs were served to anyone holding the CID, with no credential at
+  all.** There is no `com.atproto.space.uploadBlob`: permissioned blobs are uploaded through the
+  ordinary `com.atproto.repo.uploadBlob` and land in the same `repo_blob` table as public ones.
+  `com.atproto.sync.getBlob` fetched by CID with no join and no auth, and `listBlobs` enumerated every
+  stored CID.
+
+  This reached further than the cross-account record read below, which at least needs an account on
+  the same PDS. CIDs are high-entropy but not secret — they appear in space oplog entries, in
+  `listRepoOps` output, in any AppView indexing the space, in logs, and to every member including one
+  since removed. A removed member retained permanent access to every blob whose CID they ever saw, and
+  deleting the record did not revoke it.
+
+  The public endpoints now serve only blobs a **public** record references — the join across
+  `repo_blob_ref` and `repo_record`, which is zds's `getPublicBlob` construction expressed in this
+  schema. **An uploaded-but-unreferenced blob is no longer publicly fetchable**, which is a behaviour
+  change: nothing should be fetching it before a record names it, and the uploader has the bytes.
+
+- `atproto-pds`: `com.atproto.space.getBlob`'s `space` parameter was decorative. It gated the request
+  and was then discarded — the blob was fetched by `(repo, cid)` alone — so a member of one space
+  could read a blob referenced only from another space in the same account's store.
+
+  A new `space_blob_ref` table records which space references which blob, maintained on the space
+  write path with the same blob-envelope walker the public path uses. `space.getBlob` requires a
+  reference in the space it was asked about, and dropping the last referencing record revokes access.
+
+  Both gates are predicates against the per-actor SQLite rather than joins into the fetch, so they
+  hold on the fjall profile too, where the bytes are not in a database that knows about records.
+
 - `atproto-pds`: **any authenticated local account could read any other local account's permissioned
   records.** `resolve_record_auth` adopted the caller-supplied `repo` query parameter verbatim — no
   comparison against the authenticated subject, no membership lookup — and recorded the read as

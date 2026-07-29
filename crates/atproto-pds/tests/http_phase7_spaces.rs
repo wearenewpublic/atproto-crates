@@ -1659,3 +1659,297 @@ async fn a_removed_member_loses_read_access() {
         "a removed member kept read access: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+//  F-BLOB-03 + F-SPACE-12 — permissioned blobs.
+//
+//  There is no `com.atproto.space.uploadBlob`: permissioned blobs are uploaded
+//  through the ordinary `com.atproto.repo.uploadBlob` and land in the same
+//  `repo_blob` table as public ones. Two defects followed.
+//
+//  F-BLOB-03: `com.atproto.sync.getBlob` served those bytes to anyone holding
+//  the CID, with no credential at all — a longer reach than F-SPACE-07, which
+//  at least needs an account here. CIDs are high-entropy but not secret: they
+//  appear in oplog entries, in `listRepoOps`, in indexing AppViews, in logs,
+//  and to every member including one since removed.
+//
+//  F-SPACE-12: `com.atproto.space.getBlob` gated on `space` and then fetched by
+//  `(repo, cid)` alone, so the parameter never reached the lookup.
+// ---------------------------------------------------------------------------
+
+/// Upload a blob as `token`'s account, returning its CID.
+async fn upload_blob(app: &axum::Router, token: &str, bytes: &'static [u8]) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.repo.uploadBlob")
+                .method("POST")
+                .header("content-type", "image/png")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(bytes.to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["blob"]["ref"]["$link"]
+        .as_str()
+        .expect("uploadBlob returns a blob ref")
+        .to_string()
+}
+
+fn blob_embed(cid: &str) -> Value {
+    json!({
+        "$type": "blob",
+        "ref": {"$link": cid},
+        "mimeType": "image/png",
+        "size": 16,
+    })
+}
+
+async fn sync_get_blob(app: &axum::Router, did: &str, cid: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn space_get_blob(
+    app: &axum::Router,
+    space: &str,
+    repo: &str,
+    cid: &str,
+    token: &str,
+) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/xrpc/com.atproto.space.getBlob?space={}&repo={repo}&cid={cid}",
+                    urlencode(space)
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_permissioned_blob_is_not_served_by_the_public_endpoint() {
+    // The exploit: no credential, just the CID.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let cid = upload_blob(&app, &owner, b"secret image!!!!").await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c", "rkey": "r1",
+                "value": {"embed": blob_embed(&cid)}
+            }]
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "permissioned write: {body}");
+
+    assert_eq!(
+        sync_get_blob(&app, "did:plc:owner", &cid).await,
+        StatusCode::NOT_FOUND,
+        "a blob referenced only from a permissioned record must not be served \
+         by the unauthenticated public endpoint"
+    );
+
+    // And it is not enumerated, either — listing the CIDs is most of the attack.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.sync.listBlobs?did=did:plc:owner",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let listed: Vec<&str> = body["cids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert!(
+        !listed.contains(&cid.as_str()),
+        "listBlobs enumerated a permissioned CID: {listed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_blob_is_served_to_a_member_through_the_space_endpoint() {
+    // The complement, and the control: the gate must withhold the blob from the
+    // public route without breaking the route that is supposed to serve it.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let cid = upload_blob(&app, &owner, b"secret image!!!!").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c", "rkey": "r1",
+                "value": {"embed": blob_embed(&cid)}
+            }]
+        }),
+        Some(&owner),
+    )
+    .await;
+
+    assert_eq!(
+        space_get_blob(&app, &uri, "did:plc:owner", &cid, &owner).await,
+        StatusCode::OK,
+        "a member must still be able to fetch the blob through space.getBlob"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_blob_is_still_served_publicly() {
+    // The other control. A gate that refused everything would pass the two
+    // tests above.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    let cid = upload_blob(&app, &owner, b"public image!!!!").await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:owner",
+            "collection": "app.bsky.feed.post",
+            "rkey": "pub",
+            "record": {"$type": "app.bsky.feed.post", "text": "hi", "embed": blob_embed(&cid)}
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "public write: {body}");
+
+    assert_eq!(
+        sync_get_blob(&app, "did:plc:owner", &cid).await,
+        StatusCode::OK,
+        "a blob a public record references is public"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreferenced_blob_is_not_publicly_fetchable() {
+    // Stated explicitly rather than left implied, because it is a behaviour
+    // change: uploading no longer makes bytes publicly readable. Nothing should
+    // be fetching them before a record names them, and the uploader has them.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let cid = upload_blob(&app, &owner, b"orphan image!!!!").await;
+
+    assert_eq!(
+        sync_get_blob(&app, "did:plc:owner", &cid).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_space_parameter_reaches_the_blob_lookup() {
+    // F-SPACE-12. The same account owns two spaces; a blob referenced only from
+    // the first must not be fetchable through the second.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let space_a = create_space(&app, &owner, "aaa").await;
+    let space_b = create_space(&app, &owner, "bbb").await;
+
+    let cid = upload_blob(&app, &owner, b"space a image!!!").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": space_a,
+            "writes": [{
+                "action": "create", "collection": "c", "rkey": "r1",
+                "value": {"embed": blob_embed(&cid)}
+            }]
+        }),
+        Some(&owner),
+    )
+    .await;
+
+    assert_eq!(
+        space_get_blob(&app, &space_a, "did:plc:owner", &cid, &owner).await,
+        StatusCode::OK,
+        "readable in the space that references it"
+    );
+    assert_eq!(
+        space_get_blob(&app, &space_b, "did:plc:owner", &cid, &owner).await,
+        StatusCode::NOT_FOUND,
+        "the `space` parameter must reach the lookup, not merely gate the request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_the_last_referencing_record_revokes_the_blob() {
+    // The revocation half. Adding refs without dropping them would leave a blob
+    // readable in a space after the only record naming it stopped naming it,
+    // and nothing would visibly break.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let cid = upload_blob(&app, &owner, b"transient image!").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c", "rkey": "r1",
+                "value": {"embed": blob_embed(&cid)}
+            }]
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(
+        space_get_blob(&app, &uri, "did:plc:owner", &cid, &owner).await,
+        StatusCode::OK
+    );
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "writes": [{"action": "delete", "collection": "c", "rkey": "r1"}]
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete: {body}");
+
+    assert_eq!(
+        space_get_blob(&app, &uri, "did:plc:owner", &cid, &owner).await,
+        StatusCode::NOT_FOUND,
+        "with no record referencing it, the blob is no longer readable in the space"
+    );
+}
