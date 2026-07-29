@@ -923,7 +923,7 @@ pub async fn get_record(
     Query(q): Query<GetSpaceRecordQuery>,
 ) -> Result<Json<GetSpaceRecordResponse>, XrpcError> {
     let uri = parse_space_uri(&q.space)?;
-    let resolved = resolve_record_auth(&parts, &state, q.repo.as_deref()).await?;
+    let resolved = resolve_record_auth(&parts, &state, &uri, q.repo.as_deref()).await?;
     if let Some(subject) = &resolved.subject {
         assert_space_record_read(
             &state,
@@ -1014,7 +1014,7 @@ pub async fn list_records(
     Query(q): Query<ListSpaceRecordsQuery>,
 ) -> Result<Json<ListSpaceRecordsResponse>, XrpcError> {
     let uri = parse_space_uri(&q.space)?;
-    let resolved = resolve_record_auth(&parts, &state, q.repo.as_deref()).await?;
+    let resolved = resolve_record_auth(&parts, &state, &uri, q.repo.as_deref()).await?;
     if let Some(subject) = &resolved.subject {
         // listRecords may span every collection in the repo (collection
         // omitted). A `read_self` grant is collection-constrained, so a
@@ -1065,6 +1065,69 @@ struct ResolvedRecordAuth<'a> {
     subject: Option<crate::http::auth::AuthSubject>,
 }
 
+/// Require that a permissioned read is between members of the space.
+///
+/// This is the check the permissioned-data feature exists to provide, and it
+/// was absent: `resolve_record_auth` adopted the caller-supplied `repo`
+/// verbatim, so any authenticated local account could read any other local
+/// account's permissioned records by naming them.
+///
+/// Two questions, both necessary:
+///
+/// - **Is the caller a member?** Otherwise a stranger with an ordinary session
+///   reads a space they were never added to. Skipped for a SpaceCredential:
+///   that credential is signed by the authority and pre-authorises whole-space
+///   read, which [`SpaceReader::verify_auth`] checks.
+/// - **Is the target a member?** A space is not a lens onto arbitrary accounts.
+///   This applies to a SpaceCredential too — an authority authorises reads
+///   *within* its space, not reads of repos outside it.
+///
+/// Deliberately **not** behind the `is_oauth` gate that
+/// [`assert_space_scope`] opens with. Scope asks what a token was granted;
+/// membership asks who the account is. App-password sessions carry no scopes
+/// by construction and are full-authority (see PR #30), so gating membership on
+/// scope enforcement is what let the app-password path through.
+///
+/// Refusals report `SpaceNotFound` rather than a distinct error: whether a
+/// given space contains a given account's records is itself the confidential
+/// fact, and a caller who is not a member should not be able to probe it.
+async fn assert_space_membership(
+    state: &HttpState,
+    uri: &SpaceUri,
+    caller: Option<&str>,
+    target: &str,
+) -> Result<(), XrpcError> {
+    let service = space_service(state)?;
+    let deny = || {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "SpaceNotFound",
+            format!("no such space {uri}"),
+        )
+    };
+    if let Some(caller) = caller
+        && !service
+            .is_member(uri, caller)
+            .await
+            .map_err(XrpcError::from)?
+    {
+        tracing::debug!(space = %uri, caller = %caller, "space read refused: caller is not a member");
+        return Err(deny());
+    }
+    // When the caller reads its own repo, the caller check above already
+    // established membership.
+    if caller != Some(target)
+        && !service
+            .is_member(uri, target)
+            .await
+            .map_err(XrpcError::from)?
+    {
+        tracing::debug!(space = %uri, target = %target, "space read refused: target is not a member");
+        return Err(deny());
+    }
+    Ok(())
+}
+
 /// Decide which auth flavor a record-read uses based on the bearer token's
 /// `typ` header, validate the `repo` parameter against the auth mode, and
 /// return the resolved target DID.
@@ -1080,6 +1143,7 @@ struct ResolvedRecordAuth<'a> {
 async fn resolve_record_auth<'a>(
     parts: &'a Parts,
     state: &HttpState,
+    space: &SpaceUri,
     repo: Option<&str>,
 ) -> Result<ResolvedRecordAuth<'a>, XrpcError> {
     let raw = bearer_token(parts)?;
@@ -1092,6 +1156,9 @@ async fn resolve_record_auth<'a>(
                     "repo is required for space credential auth",
                 )
             })?;
+            // The credential itself is verified downstream; what is checked
+            // here is that the repo it names belongs to this space.
+            assert_space_membership(state, space, None, repo).await?;
             Ok(ResolvedRecordAuth {
                 auth: SpaceReadAuth::SpaceCredential { token: raw },
                 target_repo: repo.to_string(),
@@ -1111,6 +1178,7 @@ async fn resolve_record_auth<'a>(
             let subject = require_authn(parts, state, &htm, &htu).await?;
             let sub = subject.sub().to_string();
             let target_repo = repo.map(|r| r.to_string()).unwrap_or_else(|| sub.clone());
+            assert_space_membership(state, space, Some(&sub), &target_repo).await?;
             Ok(ResolvedRecordAuth {
                 auth: SpaceReadAuth::OwnPds { account_did: sub },
                 target_repo,
@@ -2223,7 +2291,7 @@ pub async fn get_blob(
     let space = parse_space_uri(&q.space)?;
     // `repo` is required by the lexicon; ignore the auth-resolver default by
     // always passing the explicit repo param.
-    let resolved = resolve_record_auth(&parts, &state, Some(q.repo.as_str())).await?;
+    let resolved = resolve_record_auth(&parts, &state, &space, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
         assert_space_scope(
             &state,

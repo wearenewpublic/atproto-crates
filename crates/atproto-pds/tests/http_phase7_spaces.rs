@@ -1459,3 +1459,203 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+// ---------------------------------------------------------------------------
+//  F-SPACE-07 — read-time membership enforcement.
+//
+//  `resolve_record_auth` adopted the caller-supplied `repo` verbatim, with no
+//  comparison against the subject and no membership lookup. So any
+//  authenticated local account could read any other local account's
+//  permissioned records by naming them — the confidentiality property the
+//  whole feature exists to provide did not hold against anyone on the same PDS.
+//
+//  The report scopes this honestly: all three links are shared with the
+//  reference on the `permissioned-data` branch, so it is a hole in 0016 as
+//  implemented by everyone following it, not an authoring error here.
+// ---------------------------------------------------------------------------
+
+/// A space owned by `owner`, containing one record written by member `alice`.
+async fn space_with_alices_record(
+    app: &axum::Router,
+    manager: &Arc<AccountManager>,
+) -> (String, String, String) {
+    let owner_token =
+        create_account_and_token(app, manager, "did:plc:owner", "owner.example").await;
+    let alice_token =
+        create_account_and_token(app, manager, "did:plc:alice", "alice.example").await;
+    let uri = create_space(app, &owner_token, "default").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner_token),
+    )
+    .await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "writes": [{"action": "create", "collection": "c", "rkey": "alice-1", "value": {"who": "alice"}}]
+        }),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed write: {body}");
+    (uri, owner_token, alice_token)
+}
+
+async fn read_alices_record(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
+    get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&collection=c&rkey=alice-1&repo=did:plc:alice",
+            urlencode(uri)
+        ),
+        Some(token),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_member_cannot_read_another_accounts_records() {
+    // The exploit, as a test. An ordinary app-password session for an account
+    // that was never added to the space, naming the victim as `repo`.
+    let (app, manager, _tmp) = build_app().await;
+    let (uri, _owner, _alice) = space_with_alices_record(&app, &manager).await;
+    let mallory =
+        create_account_and_token(&app, &manager, "did:plc:mallory", "mallory.example").await;
+
+    let (status, body) = read_alices_record(&app, &uri, &mallory).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a non-member read Alice's permissioned record: {body}"
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(
+        body["error"], "SpaceNotFound",
+        "whether a space holds an account's records is itself confidential"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_member_cannot_list_another_accounts_records() {
+    // Same override reaches listRecords, which returns the whole repo.
+    let (app, manager, _tmp) = build_app().await;
+    let (uri, _owner, _alice) = space_with_alices_record(&app, &manager).await;
+    let mallory =
+        create_account_and_token(&app, &manager, "did:plc:mallory", "mallory.example").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&repo=did:plc:alice",
+            urlencode(&uri)
+        ),
+        Some(&mallory),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_member_cannot_read_another_accounts_blobs() {
+    let (app, manager, _tmp) = build_app().await;
+    let (uri, _owner, _alice) = space_with_alices_record(&app, &manager).await;
+    let mallory =
+        create_account_and_token(&app, &manager, "did:plc:mallory", "mallory.example").await;
+
+    // The blob need not exist: the membership gate runs before any lookup, so a
+    // refusal here is the gate and not a not-found.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getBlob?space={}&repo=did:plc:alice&cid=bafkreiabc",
+            urlencode(&uri)
+        ),
+        Some(&mallory),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "SpaceNotFound", "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_naming_a_non_member_target_is_refused() {
+    // A space is not a lens onto arbitrary accounts. Alice is a member; Mallory
+    // is not, so Alice may not read Mallory through this space.
+    let (app, manager, _tmp) = build_app().await;
+    let (uri, _owner, alice) = space_with_alices_record(&app, &manager).await;
+    let _mallory =
+        create_account_and_token(&app, &manager, "did:plc:mallory", "mallory.example").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&collection=c&rkey=x&repo=did:plc:mallory",
+            urlencode(&uri)
+        ),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "SpaceNotFound", "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn members_can_still_read_each_other() {
+    // The control, and the point of a shared space. Every test above asserts a
+    // refusal; a gate that refused everything would pass all of them.
+    let (app, manager, _tmp) = build_app().await;
+    let (uri, owner, alice) = space_with_alices_record(&app, &manager).await;
+
+    // Owner (implicitly a member) reads Alice.
+    let (status, body) = read_alices_record(&app, &uri, &owner).await;
+    assert_eq!(status, StatusCode::OK, "owner → alice: {body}");
+    assert_eq!(body["value"]["who"], "alice");
+
+    // Alice reads her own repo, both with and without an explicit `repo`.
+    let (status, body) = read_alices_record(&app, &uri, &alice).await;
+    assert_eq!(status, StatusCode::OK, "alice → alice explicit: {body}");
+    assert_eq!(body["value"]["who"], "alice");
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&collection=c&rkey=alice-1",
+            urlencode(&uri)
+        ),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "alice → alice implicit: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_member_loses_read_access() {
+    // Membership is checked per read, not captured at session creation, so
+    // removal takes effect on the next request.
+    let (app, manager, _tmp) = build_app().await;
+    let (uri, owner, alice) = space_with_alices_record(&app, &manager).await;
+
+    let (status, _) = read_alices_record(&app, &uri, &alice).await;
+    assert_eq!(status, StatusCode::OK, "member reads before removal");
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.removeMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "removeMember: {body}");
+
+    let (status, body) = read_alices_record(&app, &uri, &alice).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a removed member kept read access: {body}"
+    );
+}

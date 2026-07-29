@@ -63,6 +63,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   believed it had a backend it did not have.
 
 ### Security
+- `atproto-pds`: **any authenticated local account could read any other local account's permissioned
+  records.** `resolve_record_auth` adopted the caller-supplied `repo` query parameter verbatim — no
+  comparison against the authenticated subject, no membership lookup — and recorded the read as
+  `OwnPds { account_did: <the caller> }`. `SpaceReader::verify_auth` is a documented no-op for that
+  variant, so nothing downstream checked either. Authenticate with an ordinary app password, name the
+  victim as `repo`, and `getRecord`, `listRecords` and `getBlob` all served their records.
+
+  The confidentiality property the entire permissioned-data feature exists to provide did not hold
+  against anyone on the same PDS.
+
+  Reads are now gated on membership, checked per request: the caller must be a member of the space,
+  and the named repo must be one too. Cross-member reads are unaffected — that is what a shared space
+  is for — and a removed member loses access on their next request rather than at token expiry.
+
+  The gate is **not** behind the `is_oauth` check that scope enforcement opens with. Scope asks what
+  a token was granted; membership asks who the account is. App-password sessions carry no scopes by
+  construction and are full-authority, which is precisely how they reached this code.
+
+  Refusals report `SpaceNotFound`: whether a given space holds a given account's records is itself
+  the confidential fact, and a non-member should not be able to probe it.
+
+  **Scoped honestly: this is inherited, not an authoring error here.** The reference implementation on
+  the `permissioned-data` branch shares all three links — `space/getRecord.ts` destructures `repo`
+  straight into `ctx.actorStore.read(repo, …)`, and `space/util.ts:32-37` skips the scope check for
+  every non-OAuth credential. It wants an upstream issue as well as this fix.
+
 - `atproto-pds`: every authenticated permissioned-record read leaked the caller's DID string.
   `resolve_record_auth` called `Box::leak(sub.clone().into_boxed_str())` on the hottest authenticated
   path in the spaces surface, so any account with a valid session could drive unbounded process
