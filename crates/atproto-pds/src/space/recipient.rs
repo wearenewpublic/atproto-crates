@@ -25,6 +25,7 @@
 
 use crate::errors::{PdsError, PdsResult};
 use atproto_identity::resolve::resolve_handle_http;
+use atproto_identity::validation::validate_service_endpoint;
 
 /// Resolved consumer identity, derivable from a delegation token's issuer +
 /// the attested `client_id`.
@@ -55,6 +56,25 @@ pub async fn resolve_recipient(
     let Some(host) = client_id_origin_host(client_id) else {
         return Ok(stub);
     };
+
+    // `client_id` reaches here from a client attestation, so the host below is
+    // attacker-chosen and this function is about to fetch it — twice, counting
+    // the DID document. The same endpoint policy the attestation verifier
+    // applies to `client_id` applies here, because a host that policy refuses
+    // is exactly the one worth refusing to dereference.
+    //
+    // Resolution failures fall back to the stub by design, so a refusal is
+    // logged: otherwise a guarded host and an unreachable one look identical
+    // from the outside, including to whoever is debugging it.
+    if let Err(err) = validate_service_endpoint(&format!("https://{host}")) {
+        tracing::warn!(
+            client_id = %client_id,
+            host = %host,
+            error = ?err,
+            "recipient resolution refused: client_id host is not a permitted endpoint"
+        );
+        return Ok(stub);
+    }
 
     // Step 2: candidate-handle resolution via .well-known/atproto-did.
     let did = match resolve_handle_http(http, &host).await {
@@ -264,5 +284,74 @@ mod tests {
             .unwrap();
         assert!(!r.fully_resolved);
         assert_eq!(r.service_did, "did:plc:alice");
+    }
+
+    /// A `client_id` host the endpoint policy refuses is never dereferenced.
+    ///
+    /// This function falls back to a stub on any resolution failure, so an
+    /// unreachable host and a refused one produce the same return value. The
+    /// assertion is therefore on the emitted event, which is the only thing
+    /// that distinguishes "we declined to ask" from "we asked and it failed".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsafe_client_id_host_is_not_dereferenced() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Collector(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for Collector {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{:?}", event.metadata().name()));
+                struct Msg(Arc<Mutex<Vec<String>>>);
+                impl tracing::field::Visit for Msg {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.lock().unwrap().push(format!("{value:?}"));
+                        }
+                    }
+                }
+                event.record(&mut Msg(self.0.clone()));
+            }
+        }
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+
+        for hostile in [
+            "https://169.254.169.254/cm.json",
+            "https://2852039166/cm.json",
+            "https://admin.internal/cm.json",
+            "https://box.localhost/cm.json",
+        ] {
+            let collector = Collector::default();
+            let subscriber = tracing_subscriber::registry().with(collector.clone());
+            let guard = tracing::subscriber::set_default(subscriber);
+            let resolved = resolve_recipient(&http, "did:plc:alice", hostile, None)
+                .await
+                .expect("resolution always yields a recipient");
+            drop(guard);
+
+            assert!(
+                !resolved.fully_resolved,
+                "{hostile} should not resolve to a real recipient"
+            );
+            let events = collector.0.lock().unwrap().join(" ");
+            assert!(
+                events.contains("not a permitted endpoint"),
+                "{hostile} was not refused by the endpoint policy — it was \
+                 dereferenced and failed on the network instead: {events}"
+            );
+        }
     }
 }

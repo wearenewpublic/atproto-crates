@@ -24,6 +24,7 @@
 
 use crate::space::config::{AppAccess, MintPolicy};
 use atproto_identity::key::{KeyData, validate as identity_validate};
+use atproto_identity::validation::validate_service_endpoint;
 use atproto_oauth::jwk::WrappedJsonWebKeySet;
 use atproto_space::types::SpaceUri;
 use base64::Engine as _;
@@ -264,12 +265,21 @@ pub async fn verify_client_attestation(
     if payload.iss != payload.sub {
         return Err(invalid("iss != sub".to_string()));
     }
+    // This server dereferences `client_id`, and `client_id` comes from the
+    // attestation — which is to say, from the caller. Without a policy on what
+    // may be named, the endpoint is a request generator pointed wherever an
+    // attacker likes: a cloud metadata service, an internal admin port, a
+    // neighbour on the same host. An `https://` prefix test stops none of those.
+    //
+    // The guard is syntactic — it does not resolve DNS, so it does not defend
+    // against rebinding or a public name pointing inside. It is the layer this
+    // workspace has, and it is the same one the OAuth client-metadata path uses.
     let client_id = payload.iss.clone();
-    if !client_id.starts_with("https://") {
-        return Err(invalid(format!(
-            "client_id is not an https client-metadata URL: {client_id}"
-        )));
-    }
+    validate_service_endpoint(&client_id).map_err(|err| {
+        invalid(format!(
+            "client_id is not a permitted endpoint: {client_id}: {err}"
+        ))
+    })?;
 
     // aud must target this space host.
     let expected_aud = space_host_audience(&space.space_did);
@@ -329,17 +339,26 @@ pub async fn verify_client_attestation(
     // Resolve the JWKS (inline `jwks` wins; else fetch `jwks_uri`).
     let jwks: WrappedJsonWebKeySet = match (metadata.jwks, metadata.jwks_uri) {
         (Some(jwks), _) => jwks,
-        (None, Some(uri)) => http
-            .get(&uri)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| invalid(format!("fetch jwks_uri {uri}: {e}")))?
-            .error_for_status()
-            .map_err(|e| invalid(format!("jwks_uri {uri} status: {e}")))?
-            .json()
-            .await
-            .map_err(|e| invalid(format!("parse jwks_uri {uri}: {e}")))?,
+        (None, Some(uri)) => {
+            // `jwks_uri` is chosen by the same untrusted metadata document, so
+            // it needs the same policy — guarding only `client_id` would let
+            // one hop through a compliant host redirect the second anywhere.
+            validate_service_endpoint(&uri).map_err(|err| {
+                invalid(format!(
+                    "jwks_uri is not a permitted endpoint: {uri}: {err}"
+                ))
+            })?;
+            http.get(&uri)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .map_err(|e| invalid(format!("fetch jwks_uri {uri}: {e}")))?
+                .error_for_status()
+                .map_err(|e| invalid(format!("jwks_uri {uri} status: {e}")))?
+                .json()
+                .await
+                .map_err(|e| invalid(format!("parse jwks_uri {uri}: {e}")))?
+        }
         (None, None) => {
             return Err(invalid(
                 "client-metadata has neither jwks nor jwks_uri".to_string(),
@@ -639,5 +658,85 @@ mod tests {
             r,
             Err(MintDenial::InvalidClientAttestation { .. })
         ));
+    }
+
+    // --- SSRF guard on the attestation fetch paths --------------------------
+
+    /// Build a syntactically valid attestation whose `client_id` is `url`.
+    ///
+    /// The signature is nonsense, which is fine: the `client_id` check runs
+    /// before anything that would look at it, so a rejection attributable to
+    /// the endpoint policy proves the guard fired first.
+    fn attestation_with_client_id(url: &str) -> String {
+        let header = B64URL.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "typ": TYP_CLIENT_ATTESTATION,
+                "alg": "ES256",
+            }))
+            .unwrap(),
+        );
+        let payload = B64URL.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "iss": url,
+                "sub": url,
+                "aud": "https://space.example",
+                "jti": "test-jti",
+                "exp": 99_999_999_999u64,
+            }))
+            .unwrap(),
+        );
+        format!("{header}.{payload}.c2ln")
+    }
+
+    /// A `client_id` the endpoint policy refuses must never be fetched.
+    ///
+    /// The attestation's `client_id` is attacker-supplied and this server
+    /// dereferences it, so without a check it is a request generator pointed at
+    /// whatever the attacker names — cloud metadata services, an internal
+    /// admin port, a neighbour on the same host. A bare `https://` prefix test
+    /// stops none of those.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsafe_client_id_is_refused_before_it_is_fetched() {
+        let http = reqwest::Client::builder()
+            // Any request that escapes the guard fails fast rather than hanging
+            // the suite, and the assertion below still distinguishes the two.
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .unwrap();
+        let guard = crate::security::JtiReplayGuard::new(64);
+        let space: SpaceUri = "ats://did:plc:owner/app.bsky.group/default"
+            .parse()
+            .unwrap();
+
+        for hostile in [
+            "http://app.example/cm.json",
+            "https://169.254.169.254/cm.json",
+            "https://2852039166/cm.json",
+            "https://[::1]/cm.json",
+            "https://user:pw@app.example/cm.json",
+            "https://app.example:8080/cm.json",
+            "https://admin.internal/cm.json",
+            "https://box.localhost/cm.json",
+        ] {
+            let result = verify_client_attestation(
+                &http,
+                &guard,
+                &attestation_with_client_id(hostile),
+                &space,
+            )
+            .await;
+
+            let Err(MintDenial::InvalidClientAttestation { reason }) = result else {
+                panic!("{hostile} was not refused: {result:?}");
+            };
+            assert!(
+                reason.contains("client_id"),
+                "{hostile} was refused, but not for its endpoint: {reason}"
+            );
+            assert!(
+                !reason.contains("fetch") && !reason.contains("status"),
+                "{hostile} was refused only after being fetched: {reason}"
+            );
+        }
     }
 }

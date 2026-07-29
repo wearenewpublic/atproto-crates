@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: the spaces client-attestation path dereferenced attacker-named URLs with no
+  restriction, making the endpoint a request generator pointed wherever a caller liked — a cloud
+  metadata service, an internal admin port, a neighbour on the same host. Three fetches, on one
+  attacker-controlled input:
+  - the attestation's `client_id`, checked only for an `https://` prefix, which stops none of the
+    above;
+  - the `jwks_uri` from the document that fetch returns, checked not at all;
+  - and, from the same `client_id`, the recipient resolver's `.well-known/atproto-did` lookup and
+    the DID-document fetch behind it — a pair the finding does not name.
+
+  All three now pass `atproto_identity::validation::validate_service_endpoint`, the same policy the
+  OAuth client-metadata path has used since the PAR fixes: HTTPS only, no address literal in any
+  form a resolver accepts, no embedded userinfo, no port but 443, and the reserved `.localhost`,
+  `.internal`, `.arpa` and `.local` suffixes refused. The recipient resolver falls back to a stub on
+  any failure, so a refusal is logged at WARN — otherwise a guarded host and an unreachable one are
+  indistinguishable, including to whoever is debugging it.
+
+  **This is a syntactic guard.** It performs no DNS resolution, so it does not defend against
+  rebinding, nor against a public name whose A record points at a private address. It is the layer
+  this workspace has, not a complete SSRF control.
+
+  Operators running a spaces deployment against client metadata on an IP literal, a non-443 port, or
+  a `.localhost` host will find those attestations now refused.
+
 - `atproto-pds`: the single secret guarding every admin verb was comparable by timing, guessable
   without limit, and — in any deployment that had not set `PDS_PRODUCTION=true` — published in this
   repository. Three defects on one door:
