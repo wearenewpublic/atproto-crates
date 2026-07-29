@@ -60,6 +60,19 @@ impl From<PdsError> for XrpcError {
                 "NotSpaceOwner",
                 format!("not the owner of {uri}"),
             ),
+            // The lexicons name one error per state and a caller acts on
+            // which it got: a deactivated repo may come back, a taken-down one
+            // is a moderation decision. `Deleted` reports as not-found rather
+            // than confirming the DID was ever hosted here.
+            PdsError::RepoUnavailable { did, state } => {
+                let name = match state.as_str() {
+                    "takendown" => "RepoTakendown",
+                    "suspended" => "RepoSuspended",
+                    "deactivated" => "RepoDeactivated",
+                    _ => "RepoNotFound",
+                };
+                XrpcError::new(StatusCode::BAD_REQUEST, name, format!("{did} is {state}"))
+            }
             PdsError::AuthDenied { reason } => {
                 XrpcError::new(StatusCode::FORBIDDEN, "Forbidden", reason)
             }

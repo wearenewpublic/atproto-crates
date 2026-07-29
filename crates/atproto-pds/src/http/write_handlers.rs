@@ -64,8 +64,63 @@ fn writer(state: &HttpState) -> Result<&RepoWriter, XrpcError> {
 /// from the live request (DPoP proofs are pinned to those values when the
 /// caller's OAuth token carries a `cnf.jkt` binding).
 async fn require_session(parts: &Parts, state: &HttpState) -> Result<AuthSubject, XrpcError> {
+    require_writable_session(parts, state, false).await
+}
+
+/// Like [`require_session`], but permits a `deactivated` account.
+///
+/// Inbound migration is prescribed as create → deactivate → `importRepo` →
+/// upload the blobs `listMissingBlobs` reports → `activateAccount`, so every
+/// step between the first and the last necessarily runs while the account is
+/// deactivated. Refusing them would make the ordinary migration path
+/// impossible.
+///
+/// Moderated states are refused here exactly as elsewhere: a taken-down
+/// account must not be able to import a repository either.
+async fn require_migration_session(
+    parts: &Parts,
+    state: &HttpState,
+) -> Result<AuthSubject, XrpcError> {
+    require_writable_session(parts, state, true).await
+}
+
+/// Authenticate, then refuse accounts whose state disallows the write.
+///
+/// A valid token is not the same as an account permitted to write.
+/// `AccountState::allows_writes` existed with no caller at all, so a taken-down
+/// account kept writing records and publishing firehose commits until its
+/// refresh token expired — up to 90 days after the moderation action.
+async fn require_writable_session(
+    parts: &Parts,
+    state: &HttpState,
+    allow_deactivated: bool,
+) -> Result<AuthSubject, XrpcError> {
+    use crate::account::AccountState;
+
     let (htm, htu) = request_htm_htu(parts);
-    require_authn(parts, state, &htm, &htu).await
+    let subject = require_authn(parts, state, &htm, &htu).await?;
+
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(subject.sub())
+        .await
+        .map_err(XrpcError::from)?;
+    if let Some(account) = account {
+        let permitted = account.state.allows_writes()
+            || (allow_deactivated && account.state == AccountState::Deactivated);
+        if !permitted {
+            return Err(XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "AccountTakedown",
+                format!(
+                    "account {} is {}, writes disallowed",
+                    account.did, account.state
+                ),
+            ));
+        }
+    }
+    Ok(subject)
 }
 
 /// Inputs for `com.atproto.repo.createRecord`.
@@ -484,7 +539,7 @@ pub async fn list_missing_blobs(
     parts: Parts,
     axum::extract::Query(q): axum::extract::Query<ListMissingBlobsQuery>,
 ) -> Result<Json<ListMissingBlobsResponse>, XrpcError> {
-    let claims = require_session(&parts, &state).await?;
+    let claims = require_migration_session(&parts, &state).await?;
     let limit = q.limit.unwrap_or(500);
     let did = claims.sub();
     if let Some(backend) = state.public_realm_backend.as_ref() {
@@ -591,7 +646,7 @@ pub async fn upload_blob(
     parts: Parts,
     body: axum::body::Body,
 ) -> Result<Json<UploadBlobResponse>, XrpcError> {
-    let claims = require_session(&parts, &state).await?;
+    let claims = require_migration_session(&parts, &state).await?;
     let limit = state.blob_upload_limit_bytes;
     let body = buffer_body(body, limit, || blob_too_large(limit + 1, limit)).await?;
     let mime = parts
@@ -662,7 +717,7 @@ pub async fn import_repo(
     parts: Parts,
     body: axum::body::Body,
 ) -> Result<Json<ImportRepoResponse>, XrpcError> {
-    let claims = require_session(&parts, &state).await?;
+    let claims = require_migration_session(&parts, &state).await?;
     let limit = state.import_limit_bytes;
     let body = buffer_body(body, limit, || car_too_large(limit)).await?;
     if !claims.privileged() {

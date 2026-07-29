@@ -79,6 +79,21 @@ pub enum PdsError {
         to: String,
     },
 
+    /// error-atproto-pds-auth-2: the repository is not available to callers.
+    ///
+    /// Distinct from [`PdsError::AuthDenied`] because the sync and blob
+    /// lexicons declare a named error per state — `RepoTakendown`,
+    /// `RepoSuspended`, `RepoDeactivated` — and a caller is expected to act on
+    /// which one it got. Collapsing them to `Forbidden` is what made all three
+    /// unreachable on the five endpoints that declare them.
+    #[error("error-atproto-pds-auth-2 repository {did} is {state}")]
+    RepoUnavailable {
+        /// DID of the repository.
+        did: String,
+        /// The account state that disallows the operation.
+        state: String,
+    },
+
     /// error-atproto-pds-auth-1: authorization rejected.
     #[error("error-atproto-pds-auth-1 authorization denied: {reason}")]
     AuthDenied {

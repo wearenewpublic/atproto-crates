@@ -100,6 +100,43 @@ impl RepoReader {
         })
     }
 
+    /// Resolve a repository identifier and refuse it if the account is not
+    /// publicly readable.
+    ///
+    /// This is the gate the five sync endpoints and both blob endpoints
+    /// declare in their lexicons and did not have: a takedown removed
+    /// record-level reads while the whole repository CAR, its raw blocks and
+    /// every blob stayed anonymously downloadable. A takedown for illegal
+    /// content did not remove the content.
+    ///
+    /// Resolution happens **before** any per-actor store is opened, which also
+    /// closes the second half of that problem: `SqlActorStore::open` creates
+    /// the directory and runs migrations, so a handler that opened first let an
+    /// unauthenticated caller materialise a SQLite file per DID it invented.
+    ///
+    /// # Errors
+    ///
+    /// [`PdsError::RepoUnavailable`] when the repository is unknown or its
+    /// state disallows public reads.
+    pub async fn require_available(&self, repo: &str) -> PdsResult<crate::account::AccountRow> {
+        let row = if repo.starts_with("did:") {
+            self.accounts.lookup_did(repo).await?
+        } else {
+            self.accounts.lookup_handle(repo).await?
+        };
+        let account = row.ok_or_else(|| PdsError::RepoUnavailable {
+            did: repo.to_string(),
+            state: "not found".to_string(),
+        })?;
+        if !account.state.allows_public_read() {
+            return Err(PdsError::RepoUnavailable {
+                did: account.did.clone(),
+                state: account.state.as_str().to_string(),
+            });
+        }
+        Ok(account)
+    }
+
     /// Open the per-actor store for a DID.
     async fn open_actor(&self, did: &str) -> PdsResult<SqlActorStore> {
         SqlActorStore::open(&self.data_dir, did).await
@@ -355,7 +392,7 @@ impl RepoReader {
 
     /// Implementation of `com.atproto.repo.describeRepo`.
     pub async fn describe_repo(&self, repo: &str) -> PdsResult<DescribeRepoResponse> {
-        let account = self.resolve(repo).await?;
+        let account = self.require_available(repo).await?;
         if let Some(backend) = self.backend.as_ref() {
             let collections = backend.repo_record.list_collections(&account.did).await?;
             let latest = backend.commit_obj.latest(&account.did).await?;
@@ -403,6 +440,14 @@ impl RepoReader {
     }
 
     /// Implementation of `com.atproto.sync.getLatestCommit`.
+    /// Latest commit for a DID, without an availability check.
+    ///
+    /// Deliberately ungated: `com.atproto.sync.listRepos` enumerates every
+    /// repository including taken-down ones, reporting `active: false` and a
+    /// `status` rather than refusing them. The gate belongs on the
+    /// `getLatestCommit` *endpoint*, which answers about one repository and
+    /// declares the takedown errors; putting it here made `listRepos` fail
+    /// outright the moment any account was taken down.
     pub async fn get_latest_commit(&self, did: &str) -> PdsResult<Option<LatestCommitResponse>> {
         let account = self.resolve(did).await?;
         if let Some(backend) = self.backend.as_ref() {
@@ -543,12 +588,20 @@ pub struct RepoStatusResponse {
     pub rev: Option<String>,
 }
 
+/// Refuse a public read against a repository whose state disallows it.
+///
+/// Reports [`PdsError::RepoUnavailable`] rather than a generic denial so that
+/// `getRecord` and `listRecords` answer with the same named errors —
+/// `RepoTakendown`, `RepoSuspended`, `RepoDeactivated` — as the sync and blob
+/// endpoints. Their lexicons declare those too, and a caller that has to branch
+/// on which state it hit should not need a different branch per endpoint.
 fn require_public_read(state: &AccountState, did: &str) -> PdsResult<()> {
     if state.allows_public_read() {
         Ok(())
     } else {
-        Err(PdsError::AuthDenied {
-            reason: format!("{did} is {state}, public reads disallowed"),
+        Err(PdsError::RepoUnavailable {
+            did: did.to_string(),
+            state: state.as_str().to_string(),
         })
     }
 }
@@ -735,8 +788,14 @@ mod tests {
             .execute(reader.accounts().pool())
             .await
             .unwrap();
+        // Reports `RepoUnavailable` rather than a generic denial so the state
+        // survives to the wire as `RepoTakendown`, matching what this endpoint's
+        // lexicon declares and what every other public read path now answers.
         let result = reader.get_record("did:plc:alice", "x.y.z", "k", None).await;
-        assert!(matches!(result, Err(PdsError::AuthDenied { .. })));
+        let Err(PdsError::RepoUnavailable { state, .. }) = result else {
+            panic!("expected RepoUnavailable, got {result:?}")
+        };
+        assert_eq!(state, "takendown");
     }
 
     #[tokio::test(flavor = "multi_thread")]

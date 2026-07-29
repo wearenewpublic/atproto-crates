@@ -202,7 +202,9 @@ async fn admin_takedown_blocks_public_reads() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // A takedown now reports as the lexicon's named error rather than a generic
+    // 403, and does so identically on all nine public read paths.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread")]

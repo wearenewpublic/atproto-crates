@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: a takedown did almost nothing. Account state was enforced on two public read paths
+  and nowhere else, so a moderation action removed record-level reads while the account's complete
+  repository CAR, its raw blocks and every blob stayed anonymously downloadable — and the account
+  kept writing, kept refreshing its session, and could restore itself with one unprivileged call.
+  Five findings, one sentence.
+  - **Reads.** `getRepo`, `getBlocks`, `getBlob`, `listBlobs`, `getLatestCommit` and `describeRepo`
+    had no state check at all; the sync and blob files contained no reference to `AccountState` of
+    any kind. All nine public read paths now share one gate and answer with the errors their
+    lexicons declare — `RepoTakendown`, `RepoSuspended`, `RepoDeactivated` — which were previously
+    unreachable on the five endpoints that declare them. `getRecord` and `listRecords` move from a
+    generic `403 Forbidden` to the same named errors, so a caller branching on state needs one
+    branch rather than one per endpoint.
+  - **Writes.** `AccountState::allows_writes` existed with no caller anywhere, and the write guard
+    never read account state. A taken-down account kept writing records and publishing firehose
+    commits until its refresh token expired — up to 90 days after the moderation action.
+  - **Refresh.** Neither `refreshSession` nor the OAuth refresh grant looked at state;
+    `refreshSession` already had the account row in hand and read only its `did`. Without this the
+    write gate is bounded by a 90-day token rather than by the moderation decision.
+  - **Activation.** `activateAccount` called `set_state(Active)` unconditionally, so an admin
+    takedown was reversible by its subject. Deactivation stays self-service — it is a pause the user
+    chose, and the inbound-migration flow depends on undoing it.
+  - **Storage.** Both blob handlers opened the per-actor store before any check, and
+    `SqlActorStore::open` runs `create_dir_all` and migrations, so an unauthenticated caller could
+    materialise a SQLite file for every DID it cared to invent. The gate now runs first.
+
+  **Deactivated accounts can no longer perform ordinary writes**, which matches `allows_writes` and
+  the reference. `importRepo`, `uploadBlob` and `listMissingBlobs` deliberately still work while
+  deactivated: inbound migration is prescribed as create → deactivate → import → upload → activate,
+  so refusing those would make the ordinary migration path impossible. Moderated states are refused
+  there too — a taken-down account must not import a repository either.
+
+  This hides a taken-down account's data; it does not erase it. `deleteAccount` still performs no
+  data erasure, so a "deleted" account's repository and blobs remain on disk behind these gates.
+
 - `atproto-pds`: the spaces client-attestation path dereferenced attacker-named URLs with no
   restriction, making the endpoint a request generator pointed wherever a caller liked — a cloud
   metadata service, an internal admin port, a neighbour on the same host. Three fetches, on one

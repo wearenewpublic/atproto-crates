@@ -438,6 +438,16 @@ pub async fn refresh_session(
                 "refresh token subject not found",
             )
         })?;
+    // The account row was already loaded here and only its `did` was read. A
+    // refresh token lives 90 days, so without this a token minted before a
+    // takedown kept issuing access tokens for 90 days after it.
+    if !account.state.allows_writes() {
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AccountTakedown",
+            format!("account {} is {}", account.did, account.state),
+        ));
+    }
     let tokens: SessionTokens = session::issue_pair(
         &state.service_did,
         &account.did,
@@ -513,6 +523,30 @@ pub async fn create_app_password(
 ) -> Result<Json<AppPasswordCreated>, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
     let manager = account_manager(&state)?;
+    // Deactivation is self-service and reversible; a takedown or suspension is
+    // a moderation decision and must not be. `valid_transition` still permits
+    // Takendown -> Active because an admin lifting a takedown is legitimate —
+    // the defect was who could ask, not that the transition exists.
+    if let Some(account) = state
+        .reader
+        .accounts()
+        .lookup_did(&claims.sub)
+        .await
+        .map_err(XrpcError::from)?
+        && matches!(
+            account.state,
+            crate::account::AccountState::Takendown | crate::account::AccountState::Suspended
+        )
+    {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "AccountTakedown",
+            format!(
+                "account {} is {}; only an administrator can restore it",
+                account.did, account.state
+            ),
+        ));
+    }
     let created = app_password::create(
         &manager.account_pool(),
         &claims.sub,
@@ -680,6 +714,30 @@ pub async fn activate_account(
 ) -> Result<axum::http::StatusCode, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
     let manager = account_manager(&state)?;
+
+    // Deactivation is self-service and reversible; a takedown or suspension is
+    // a moderation decision and must not be. Without this an admin takedown was
+    // undone by its subject with one unprivileged call.
+    //
+    // `valid_transition` still permits Takendown -> Active, because an
+    // administrator lifting a takedown is legitimate. The defect was who could
+    // ask, not that the transition exists.
+    if let Some(current) = manager
+        .account_state(&claims.sub)
+        .await
+        .map_err(XrpcError::from)?
+        && matches!(current, AccountState::Takendown | AccountState::Suspended)
+    {
+        return Err(XrpcError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "AccountTakedown",
+            format!(
+                "account {} is {current}; only an administrator can restore it",
+                claims.sub
+            ),
+        ));
+    }
+
     manager
         .set_state(&claims.sub, AccountState::Active)
         .await

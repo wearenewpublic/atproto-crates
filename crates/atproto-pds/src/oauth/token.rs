@@ -284,6 +284,23 @@ async fn handle_refresh(
         ));
     }
 
+    // Same rule as the app-password refresh path: a token minted before a
+    // takedown must not keep producing access tokens after it.
+    if let Some(account) = state
+        .reader
+        .accounts()
+        .lookup_did(&handle.did)
+        .await
+        .map_err(XrpcError::from)?
+        && !account.state.allows_writes()
+    {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            format!("account {} is {}", account.did, account.state),
+        ));
+    }
+
     issue_pair(
         &state,
         &handle.did,

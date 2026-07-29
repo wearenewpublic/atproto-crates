@@ -43,10 +43,14 @@ pub async fn get_blob(
     State(state): State<HttpState>,
     Query(q): Query<GetBlobQuery>,
 ) -> Result<Response, XrpcError> {
+    // Availability before storage. `SqlActorStore::open` creates the directory
+    // and runs migrations, so gating after it would let an unauthenticated
+    // caller materialise a SQLite file for every DID it cared to invent.
+    let did = state.reader.require_available(&q.did).await?.did;
     let pair = if let Some(backend) = state.public_realm_backend.as_ref() {
         backend
             .blob
-            .get(&q.did, &q.cid)
+            .get(&did, &q.cid)
             .await
             .map_err(XrpcError::from)?
     } else {
@@ -57,7 +61,7 @@ pub async fn get_blob(
                 "account manager not configured",
             )
         })?;
-        let store = SqlActorStore::open(manager.data_dir(), &q.did)
+        let store = SqlActorStore::open(manager.data_dir(), &did)
             .await
             .map_err(XrpcError::from)?;
         crate::blob::get_blob(&store, &q.cid)
@@ -134,10 +138,12 @@ pub async fn list_blobs(
     State(state): State<HttpState>,
     Query(q): Query<ListBlobsQuery>,
 ) -> Result<axum::Json<ListBlobsResponse>, XrpcError> {
+    // Same gate and the same ordering as `getBlob`.
+    let did = state.reader.require_available(&q.did).await?.did;
     let cids = if let Some(backend) = state.public_realm_backend.as_ref() {
         backend
             .blob
-            .list_all_cids(&q.did, q.cursor.as_deref(), q.limit.unwrap_or(500))
+            .list_all_cids(&did, q.cursor.as_deref(), q.limit.unwrap_or(500))
             .await
             .map_err(XrpcError::from)?
     } else {
@@ -148,7 +154,7 @@ pub async fn list_blobs(
                 "account manager not configured",
             )
         })?;
-        let store = SqlActorStore::open(manager.data_dir(), &q.did)
+        let store = SqlActorStore::open(manager.data_dir(), &did)
             .await
             .map_err(XrpcError::from)?;
         crate::blob::list_all(&store, q.cursor.as_deref(), q.limit.unwrap_or(500))

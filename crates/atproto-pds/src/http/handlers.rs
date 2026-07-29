@@ -222,6 +222,9 @@ pub async fn get_latest_commit(
     State(state): State<HttpState>,
     Query(params): Query<DidParam>,
 ) -> Result<Json<Value>, XrpcError> {
+    // Gated here rather than inside the reader: `listRepos` shares that method
+    // and must list taken-down repositories rather than refuse them.
+    state.reader.require_available(&params.did).await?;
     let result = state.reader.get_latest_commit(&params.did).await?;
     match result {
         Some(commit) => Ok(Json(json!({"cid": commit.cid, "rev": commit.rev}))),
@@ -268,22 +271,9 @@ pub async fn get_repo(
     use axum::http::header;
     use axum::response::IntoResponse;
 
-    let directory = state.reader.accounts();
-    let did = if params.did.starts_with("did:") {
-        params.did.clone()
-    } else {
-        directory
-            .lookup_handle(&params.did)
-            .await?
-            .ok_or_else(|| {
-                XrpcError::new(
-                    StatusCode::BAD_REQUEST,
-                    "RepoNotFound",
-                    format!("handle {} not found", params.did),
-                )
-            })?
-            .did
-    };
+    // Availability first, and before any store is opened: a takedown that
+    // still serves the whole repository CAR has not taken anything down.
+    let did = state.reader.require_available(&params.did).await?.did;
     let car_bytes = if let Some(backend) = state.public_realm_backend.as_ref() {
         match params.since.as_deref() {
             Some(since) => export_repo_car_since_via_backend(backend, &did, since).await?,
@@ -337,22 +327,9 @@ pub async fn get_blocks(
             "cids must be a comma-separated list of CIDs",
         ));
     }
-    let directory = state.reader.accounts();
-    let did = if params.did.starts_with("did:") {
-        params.did.clone()
-    } else {
-        directory
-            .lookup_handle(&params.did)
-            .await?
-            .ok_or_else(|| {
-                XrpcError::new(
-                    StatusCode::BAD_REQUEST,
-                    "RepoNotFound",
-                    format!("handle {} not found", params.did),
-                )
-            })?
-            .did
-    };
+    // Same gate as `getRepo`, for the same reason: raw blocks are the
+    // repository's contents by another name.
+    let did = state.reader.require_available(&params.did).await?.did;
     let car_bytes = if let Some(backend) = state.public_realm_backend.as_ref() {
         export_blocks_car_via_backend(backend, &did, &cids).await?
     } else {
