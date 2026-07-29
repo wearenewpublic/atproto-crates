@@ -19,7 +19,9 @@
 //! - `disableInviteCodes` — bulk-disable a list of codes (§4.6).
 
 use crate::account::{AccountState, hash_password};
+use crate::admin::subject::{StatusAttr, SubjectRef};
 use crate::http::errors::XrpcError;
+use crate::http::extract::XrpcJson;
 use crate::http::state::HttpState;
 use axum::Json;
 use axum::extract::{Query, State};
@@ -204,26 +206,44 @@ pub async fn get_account_info(
 /// Inputs for `updateSubjectStatus`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateSubjectStatusInput {
-    /// DID of the affected account.
-    pub did: String,
-    /// New state (`active`, `deactivated`, `takendown`, `suspended`, `deleted`).
-    pub state: String,
+    /// Account, record or blob being acted on.
+    pub subject: SubjectRef,
+    /// Takedown status to apply or lift.
+    #[serde(default)]
+    pub takedown: Option<StatusAttr>,
+    /// Deactivation status to apply or lift. Accounts only.
+    #[serde(default)]
+    pub deactivated: Option<StatusAttr>,
 }
 
 /// Output of `updateSubjectStatus`.
 #[derive(Debug, Serialize)]
 pub struct UpdateSubjectStatusResponse {
-    /// DID.
-    pub did: String,
-    /// New state.
-    pub state: String,
+    /// The subject as supplied, echoed back.
+    pub subject: SubjectRef,
+    /// The takedown status now in force, when one was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub takedown: Option<StatusAttr>,
 }
 
 /// Handler for `com.atproto.admin.updateSubjectStatus`.
+///
+/// Three subject kinds, per the lexicon's union. Account takedown maps onto
+/// `AccountState::Takendown`, which the public read and write gates already
+/// enforce everywhere. Record and blob takedown are recorded in the per-actor
+/// store and enforced by the readers.
+///
+/// `deactivated` applies only to an account: a record has no deactivated state
+/// and neither does a blob. A request naming one on either is refused rather
+/// than silently ignored, because a moderator who believes they deactivated
+/// something has no way to discover otherwise.
 pub async fn update_subject_status(
     State(state): State<HttpState>,
     parts: Parts,
-    Json(input): Json<UpdateSubjectStatusInput>,
+    // `XrpcJson` rather than `Json`: `subject` is an open union, and a
+    // moderation service naming a type this build has not been taught must get
+    // an XRPC error it can read rather than axum's plain-text 422.
+    XrpcJson(input): XrpcJson<UpdateSubjectStatusInput>,
 ) -> Result<Json<UpdateSubjectStatusResponse>, XrpcError> {
     require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
@@ -233,62 +253,255 @@ pub async fn update_subject_status(
             "account manager not configured",
         )
     })?;
-    let new_state = AccountState::parse(&input.state).ok_or_else(|| {
-        XrpcError::new(
+
+    // The reference refuses this pair outright, and it is worth refusing: the
+    // two halves would fight, and whichever ran last would win silently.
+    if let (Some(t), Some(d)) = (input.takedown.as_ref(), input.deactivated.as_ref())
+        && t.applied
+        && !d.applied
+    {
+        return Err(XrpcError::new(
             StatusCode::BAD_REQUEST,
-            "InvalidAccountState",
-            format!("unknown state {}", input.state),
-        )
-    })?;
-    manager
-        .set_state(&input.did, new_state)
-        .await
-        .map_err(XrpcError::from)?;
+            "InvalidRequest",
+            "cannot activate and take down an account at the same time",
+        ));
+    }
+
+    let did = input.subject.did().map_err(XrpcError::from)?;
+
+    if let Some(takedown) = input.takedown.as_ref() {
+        match &input.subject {
+            SubjectRef::Repo { did } => {
+                let target = if takedown.applied {
+                    AccountState::Takendown
+                } else {
+                    AccountState::Active
+                };
+                manager
+                    .set_state(did, target)
+                    .await
+                    .map_err(XrpcError::from)?;
+            }
+            SubjectRef::Record { uri, .. } => {
+                // Parsed for its shape even though only the DID is needed
+                // here: a malformed URI must fail before anything is written.
+                let _ = crate::admin::subject::parse_record_uri(uri).map_err(XrpcError::from)?;
+                let store = open_actor(&state, &did).await?;
+                crate::takedown::set_record(
+                    &store,
+                    uri,
+                    takedown.applied,
+                    takedown.reference.as_deref(),
+                )
+                .await
+                .map_err(XrpcError::from)?;
+            }
+            SubjectRef::Blob { cid, .. } => {
+                let store = open_actor(&state, &did).await?;
+                crate::takedown::set_blob(
+                    &store,
+                    cid,
+                    takedown.applied,
+                    takedown.reference.as_deref(),
+                )
+                .await
+                .map_err(XrpcError::from)?;
+            }
+        }
+    }
+
+    if let Some(deactivated) = input.deactivated.as_ref() {
+        match &input.subject {
+            SubjectRef::Repo { did } => {
+                let target = if deactivated.applied {
+                    AccountState::Deactivated
+                } else {
+                    AccountState::Active
+                };
+                manager
+                    .set_state(did, target)
+                    .await
+                    .map_err(XrpcError::from)?;
+            }
+            _ => {
+                return Err(XrpcError::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "deactivated applies only to an account subject",
+                ));
+            }
+        }
+    }
+
     Ok(Json(UpdateSubjectStatusResponse {
-        did: input.did,
-        state: new_state.to_string(),
+        subject: input.subject,
+        takedown: input.takedown,
     }))
 }
 
 /// Query params for `getSubjectStatus`.
+///
+/// All three are optional in the lexicon and the caller supplies exactly one
+/// subject: `blob` (with `did`), or `uri`, or `did` alone.
 #[derive(Debug, Deserialize)]
 pub struct GetSubjectStatusParams {
-    /// DID of the subject.
-    pub did: String,
+    /// DID of an account, or the account holding a blob.
+    pub did: Option<String>,
+    /// AT-URI of a record.
+    pub uri: Option<String>,
+    /// CID of a blob. Requires `did`.
+    pub blob: Option<String>,
 }
 
 /// Output of `getSubjectStatus`.
 #[derive(Debug, Serialize)]
 pub struct GetSubjectStatusResponse {
-    /// DID.
-    pub did: String,
-    /// State.
-    pub state: String,
+    /// The subject that was found.
+    pub subject: SubjectRef,
+    /// Takedown status, when one is in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub takedown: Option<StatusAttr>,
+    /// Deactivation status. Accounts only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deactivated: Option<StatusAttr>,
 }
 
 /// Handler for `com.atproto.admin.getSubjectStatus`.
+///
+/// Checked most-specific-first — blob, then record, then account — because a
+/// blob query carries a `did` too, and reading them in the other order would
+/// answer about the account every time.
 pub async fn get_subject_status(
     State(state): State<HttpState>,
     parts: Parts,
     Query(params): Query<GetSubjectStatusParams>,
 ) -> Result<Json<GetSubjectStatusResponse>, XrpcError> {
     require_admin(&parts, &state).await?;
+
+    if let Some(blob_cid) = params.blob.as_deref() {
+        let did = params.did.as_deref().ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "must provide a did to request blob state",
+            )
+        })?;
+        let store = open_actor(&state, did).await?;
+        let takedown = crate::takedown::get_blob(&store, blob_cid)
+            .await
+            .map_err(XrpcError::from)?;
+        return Ok(Json(GetSubjectStatusResponse {
+            subject: SubjectRef::Blob {
+                did: did.to_string(),
+                cid: blob_cid.to_string(),
+                record_uri: None,
+            },
+            takedown: takedown.map(|t| StatusAttr {
+                applied: true,
+                reference: t.reference,
+            }),
+            deactivated: None,
+        }));
+    }
+
+    if let Some(uri) = params.uri.as_deref() {
+        let (did, _, _) = crate::admin::subject::parse_record_uri(uri).map_err(XrpcError::from)?;
+        let store = open_actor(&state, &did).await?;
+        let takedown = crate::takedown::get_record(&store, uri)
+            .await
+            .map_err(XrpcError::from)?;
+        // The record's current CID, so the echoed `strongRef` is a real one.
+        let cid = current_record_cid(&state, &did, uri).await?;
+        return Ok(Json(GetSubjectStatusResponse {
+            subject: SubjectRef::Record {
+                uri: uri.to_string(),
+                cid,
+            },
+            takedown: takedown.map(|t| StatusAttr {
+                applied: true,
+                reference: t.reference,
+            }),
+            deactivated: None,
+        }));
+    }
+
+    let did = params.did.as_deref().ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "no provided subject",
+        )
+    })?;
     let directory = state.reader.accounts();
     let row = directory
-        .lookup_did(&params.did)
+        .lookup_did(did)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
             XrpcError::new(
                 StatusCode::NOT_FOUND,
                 "AccountNotFound",
-                format!("account {} not found", params.did),
+                format!("account {did} not found"),
             )
         })?;
     Ok(Json(GetSubjectStatusResponse {
-        did: params.did,
-        state: row.state.to_string(),
+        subject: SubjectRef::Repo {
+            did: did.to_string(),
+        },
+        takedown: Some(StatusAttr {
+            applied: row.state == AccountState::Takendown,
+            reference: None,
+        }),
+        deactivated: Some(StatusAttr {
+            applied: row.state == AccountState::Deactivated,
+            reference: None,
+        }),
     }))
+}
+
+/// Open the per-actor store for `did`, after confirming the account exists.
+///
+/// Opening blind would create a store for a DID this server does not host,
+/// which is how a typo in a moderation queue becomes a stray database.
+async fn open_actor(
+    state: &HttpState,
+    did: &str,
+) -> Result<crate::actor_store::sql::SqlActorStore, XrpcError> {
+    state
+        .reader
+        .accounts()
+        .lookup_did(did)
+        .await
+        .map_err(XrpcError::from)?
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::NOT_FOUND,
+                "AccountNotFound",
+                format!("account {did} not found"),
+            )
+        })?;
+    crate::actor_store::sql::SqlActorStore::open(state.reader.data_dir(), did)
+        .await
+        .map_err(XrpcError::from)
+}
+
+/// The CID a record currently sits at, so `getSubjectStatus` can echo a
+/// `strongRef` that resolves. Empty when the record is gone — a takedown row
+/// can outlive the record it names.
+async fn current_record_cid(state: &HttpState, did: &str, uri: &str) -> Result<String, XrpcError> {
+    let store = open_actor(state, did).await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT cid FROM repo_record WHERE uri = ?")
+        .bind(uri)
+        .fetch_optional(store.pool())
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                format!("record cid lookup: {e}"),
+            )
+        })?;
+    Ok(row.map(|(c,)| c).unwrap_or_default())
 }
 
 /// Inputs for `deleteAccount`.

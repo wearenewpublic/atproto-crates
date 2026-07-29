@@ -9,6 +9,7 @@ pub mod auth_handlers;
 pub mod blob_handlers;
 pub mod discovery_handlers;
 pub mod errors;
+pub mod extract;
 pub mod handlers;
 pub mod identity_handlers;
 pub mod moderation_handlers;

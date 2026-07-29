@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Security
+- `atproto-pds`: `com.atproto.admin.updateSubjectStatus` and `getSubjectStatus` spoke a shape that
+  appears nowhere in any lexicon. They took and returned `{did, state}`; the lexicon takes
+  `{subject, takedown, deactivated}` where `subject` is a union of `com.atproto.admin.defs#repoRef`,
+  `com.atproto.repo.strongRef` and `#repoBlobRef`. Not one field name overlapped, so every call from
+  Ozone or `pdsadmin` failed to deserialize — this PDS could not be moderated by any canonical tool.
+
+  Both endpoints now speak the union. Account takedown maps onto the existing `takendown` state,
+  which the read and write gates already enforce; `deactivated` maps onto `deactivated` and is
+  refused on a record or blob subject rather than silently ignored.
+
+  **The old `{did, state}` shape is gone with no alias.** It was not an alternative spelling of
+  anything — there is no `state` field in the lexicon — so nothing that spoke the protocol was
+  relying on it.
+
 - `atproto-pds`: `signPlcOperation` would sign a key-rotation operation on the strength of an access
   token alone. The lexicon takes a `token` — a code the account receives by email — and the handler
   did not accept the field, let alone check it. `requestPlcOperationSignature`, whose whole job is to
@@ -258,6 +272,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `com.atproto.admin.revokeServiceAuth` now takes effect. It wrote a blacklist row that no
     verifier read, so an operator revoking a leaked token got 200 OK and nothing happened — a
     security control that reads as working is worse than an absent one.
+
+### Added
+- `atproto-pds`: record- and blob-level takedown. `updateSubjectStatus`'s two non-account subject
+  kinds had no storage behind them, so an operator asked to remove one illegal post or one illegal
+  image had no option short of taking down the whole account.
+
+  A taken-down record disappears from `getRecord` and `listRecords`; a taken-down blob is withheld
+  from `com.atproto.sync.getBlob`. Both report as not-found rather than forbidden, so a probe cannot
+  confirm the content is still stored here. Both lift cleanly, and applying or lifting twice is a
+  no-op — moderation actions arrive from queues that retry.
+
+  Takedowns are recorded in the per-actor SQLite on both storage profiles. Records and blobs
+  dispatch through `PublicRealmBackend`, so a column on `repo_record` or `repo_blob` would have
+  covered the SQLite profile and silently missed fjall.
 
 ### Fixed
 - `atproto-pds`: no `#identity` event was emitted when a handle changed. `emit_identity_event`

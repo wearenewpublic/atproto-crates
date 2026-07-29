@@ -60,6 +60,7 @@ pub mod sequencer;
 pub mod service_auth_blacklist;
 pub mod shutdown;
 pub mod space;
+pub mod takedown;
 pub mod telemetry;
 #[cfg(feature = "valkey")]
 pub mod valkey_backend;

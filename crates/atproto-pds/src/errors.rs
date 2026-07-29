@@ -147,6 +147,18 @@ pub enum PdsError {
         reason: String,
     },
 
+    /// error-atproto-pds-admin-1: a moderation subject could not be addressed.
+    ///
+    /// `updateSubjectStatus` takes an open union, so an unrecognized `$type`
+    /// or an unparseable AT-URI is a client error rather than a server one —
+    /// and naming which is which is the difference between a moderator
+    /// retrying correctly and retrying identically.
+    #[error("error-atproto-pds-admin-1 invalid moderation subject: {reason}")]
+    InvalidSubject {
+        /// What was wrong with the subject.
+        reason: String,
+    },
+
     /// error-atproto-pds-auth-2: the repository is not available to callers.
     ///
     /// Distinct from [`PdsError::AuthDenied`] because the sync and blob

@@ -151,7 +151,10 @@ async fn admin_takedown_then_lift() {
     let (status, body) = post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateSubjectStatus",
-        json!({"did": "did:plc:alice", "state": "takendown"}),
+        json!({
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:alice"},
+            "takedown": {"applied": true},
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -161,13 +164,17 @@ async fn admin_takedown_then_lift() {
         "/xrpc/com.atproto.admin.getSubjectStatus?did=did:plc:alice",
     )
     .await;
-    assert_eq!(body["state"], "takendown");
+    assert_eq!(body["takedown"]["applied"], true);
+    assert_eq!(body["subject"]["$type"], "com.atproto.admin.defs#repoRef");
 
     // Lift.
     let (status, _) = post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateSubjectStatus",
-        json!({"did": "did:plc:alice", "state": "active"}),
+        json!({
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:alice"},
+            "takedown": {"applied": false},
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -176,7 +183,7 @@ async fn admin_takedown_then_lift() {
         "/xrpc/com.atproto.admin.getSubjectStatus?did=did:plc:alice",
     )
     .await;
-    assert_eq!(body["state"], "active");
+    assert_eq!(body["takedown"]["applied"], false);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -186,7 +193,10 @@ async fn admin_takedown_blocks_public_reads() {
     post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateSubjectStatus",
-        json!({"did": "did:plc:alice", "state": "takendown"}),
+        json!({
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:alice"},
+            "takedown": {"applied": true},
+        }),
     )
     .await;
 
@@ -220,7 +230,10 @@ async fn admin_delete_account_terminal() {
     let (status, _) = post_admin(
         app,
         "/xrpc/com.atproto.admin.updateSubjectStatus",
-        json!({"did": "did:plc:alice", "state": "active"}),
+        json!({
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:alice"},
+            "takedown": {"applied": false},
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -864,4 +877,442 @@ async fn invite_toggles_are_admin_namespaced() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+//  F-MOD-03 + F-BLOB-15 — the canonical subject union, and the two subject
+//  kinds it makes addressable.
+//
+//  Until now `updateSubjectStatus` took `{did, state}`, a shape that appears
+//  nowhere in the lexicon. Ozone and `pdsadmin` send `{subject, takedown}`, so
+//  every canonical moderation call failed to deserialize — and record and blob
+//  subjects had no storage behind them at all.
+// ---------------------------------------------------------------------------
+
+fn repo_ref(did: &str) -> Value {
+    json!({"$type": "com.atproto.admin.defs#repoRef", "did": did})
+}
+
+fn strong_ref(uri: &str, cid: &str) -> Value {
+    json!({"$type": "com.atproto.repo.strongRef", "uri": uri, "cid": cid})
+}
+
+fn blob_ref(did: &str, cid: &str) -> Value {
+    json!({"$type": "com.atproto.admin.defs#repoBlobRef", "did": did, "cid": cid})
+}
+
+/// Log in as the account and create a record through the XRPC surface, so the
+/// takedown tests act on a record that really exists.
+async fn seed_record(app: &axum::Router, handle: &str, rkey: &str, text: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.server.createSession")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"identifier": handle, "password": "pw"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let token = body["accessJwt"].as_str().unwrap().to_string();
+    let did = body["did"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.repo.createRecord")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "repo": did,
+                        "collection": "app.bsky.feed.post",
+                        "rkey": rkey,
+                        "record": {"$type": "app.bsky.feed.post", "text": text},
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::OK, "seed record: {body}");
+    body["cid"].as_str().unwrap().to_string()
+}
+
+async fn get_record(app: &axum::Router, did: &str, rkey: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={rkey}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn list_rkeys(app: &axum::Router, did: &str) -> Vec<String> {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|r| {
+            r["uri"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_subject_status_speaks_the_canonical_union() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // The exact body Ozone sends. Under the old `{did, state}` shape this was
+    // a deserialization failure, not a partial success.
+    let (status, body) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({
+            "subject": repo_ref("did:plc:alice"),
+            "takedown": {"applied": true, "ref": "ozone-action-1"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["subject"]["$type"], "com.atproto.admin.defs#repoRef");
+    assert_eq!(body["subject"]["did"], "did:plc:alice");
+    assert_eq!(body["takedown"]["applied"], true);
+    assert_eq!(body["takedown"]["ref"], "ozone-action-1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_can_be_taken_down_without_touching_the_account() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let cid = seed_record(&app, "alice.example", "bad", "illegal").await;
+    seed_record(&app, "alice.example", "good", "fine").await;
+
+    let uri = "at://did:plc:alice/app.bsky.feed.post/bad";
+    assert_eq!(
+        get_record(&app, "did:plc:alice", "bad").await,
+        StatusCode::OK
+    );
+
+    let (status, body) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({
+            "subject": strong_ref(uri, &cid),
+            "takedown": {"applied": true, "ref": "mod-9"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The point of the whole finding: one record gone, the account and its
+    // other records untouched.
+    assert_eq!(
+        get_record(&app, "did:plc:alice", "bad").await,
+        StatusCode::BAD_REQUEST,
+        "a taken-down record must not be readable"
+    );
+    assert_eq!(
+        get_record(&app, "did:plc:alice", "good").await,
+        StatusCode::OK,
+        "its neighbours must be unaffected"
+    );
+    let rkeys = list_rkeys(&app, "did:plc:alice").await;
+    assert_eq!(
+        rkeys,
+        vec!["good".to_string()],
+        "listRecords must filter it"
+    );
+
+    // And it lifts.
+    let (status, _) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({"subject": strong_ref(uri, &cid), "takedown": {"applied": false}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        get_record(&app, "did:plc:alice", "bad").await,
+        StatusCode::OK
+    );
+    assert_eq!(list_rkeys(&app, "did:plc:alice").await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_takedown_is_reported_by_get_subject_status() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let cid = seed_record(&app, "alice.example", "bad", "illegal").await;
+    let uri = "at://did:plc:alice/app.bsky.feed.post/bad";
+
+    post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({"subject": strong_ref(uri, &cid), "takedown": {"applied": true, "ref": "mod-9"}}),
+    )
+    .await;
+
+    let (status, body) = get_admin(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.admin.getSubjectStatus?uri={}",
+            urlencode(uri)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["subject"]["$type"], "com.atproto.repo.strongRef");
+    assert_eq!(body["subject"]["uri"], uri);
+    // The echoed strongRef carries the record's real CID, not one the caller
+    // supplied — a moderator reading status should learn what is there now.
+    assert_eq!(body["subject"]["cid"], cid);
+    assert_eq!(body["takedown"]["applied"], true);
+    assert_eq!(body["takedown"]["ref"], "mod-9");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blob_can_be_taken_down_without_touching_the_account() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // Upload a blob as the account.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.server.createSession")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"identifier": "alice.example", "password": "pw"}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let token = body["accessJwt"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.atproto.repo.uploadBlob")
+                .method("POST")
+                .header("content-type", "image/png")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(b"not really a png".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let cid = body["blob"]["ref"]["$link"].as_str().unwrap().to_string();
+
+    let fetch = |app: axum::Router, cid: String| async move {
+        app.oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/xrpc/com.atproto.sync.getBlob?did=did:plc:alice&cid={cid}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    };
+    assert_eq!(fetch(app.clone(), cid.clone()).await, StatusCode::OK);
+
+    let (status, body) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({
+            "subject": blob_ref("did:plc:alice", &cid),
+            "takedown": {"applied": true, "ref": "mod-11"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Withheld, and reported as absent rather than forbidden: a probe should
+    // not confirm the bytes are still stored here.
+    assert_eq!(
+        fetch(app.clone(), cid.clone()).await,
+        StatusCode::NOT_FOUND,
+        "a taken-down blob must not be served"
+    );
+
+    let (_, body) = get_admin(
+        app.clone(),
+        &format!("/xrpc/com.atproto.admin.getSubjectStatus?did=did:plc:alice&blob={cid}"),
+    )
+    .await;
+    assert_eq!(
+        body["subject"]["$type"],
+        "com.atproto.admin.defs#repoBlobRef"
+    );
+    assert_eq!(body["takedown"]["applied"], true);
+    assert_eq!(body["takedown"]["ref"], "mod-11");
+
+    // Lift restores it.
+    post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({"subject": blob_ref("did:plc:alice", &cid), "takedown": {"applied": false}}),
+    )
+    .await;
+    assert_eq!(fetch(app, cid).await, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deactivated_round_trips_on_an_account_and_is_refused_elsewhere() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let cid = seed_record(&app, "alice.example", "one", "hi").await;
+
+    let (status, _) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({"subject": repo_ref("did:plc:alice"), "deactivated": {"applied": true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.getSubjectStatus?did=did:plc:alice",
+    )
+    .await;
+    assert_eq!(body["deactivated"]["applied"], true);
+
+    // A record has no deactivated state. Refused rather than ignored, so a
+    // moderator who thinks they deactivated something finds out.
+    let (status, _) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({
+            "subject": strong_ref("at://did:plc:alice/app.bsky.feed.post/one", &cid),
+            "deactivated": {"applied": true},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contradictory_takedown_and_activation_is_refused() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // Whichever half ran last would win silently, so neither runs.
+    let (status, _) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({
+            "subject": repo_ref("did:plc:alice"),
+            "takedown": {"applied": true},
+            "deactivated": {"applied": false},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, body) = get_admin(
+        app,
+        "/xrpc/com.atproto.admin.getSubjectStatus?did=did:plc:alice",
+    )
+    .await;
+    assert_eq!(
+        body["takedown"]["applied"], false,
+        "the refused request must not have applied half of itself"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_subject_status_needs_a_subject_and_a_blob_needs_a_did() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, _) = get_admin(app.clone(), "/xrpc/com.atproto.admin.getSubjectStatus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = get_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.getSubjectStatus?blob=bafkreiabc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A malformed record URI is a client error, named as such.
+    let (status, _) = get_admin(
+        app,
+        "/xrpc/com.atproto.admin.getSubjectStatus?uri=not-a-uri",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_subject_type_is_refused() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, _) = post_admin(
+        app,
+        "/xrpc/com.atproto.admin.updateSubjectStatus",
+        json!({
+            "subject": {"$type": "com.example.notASubject", "did": "did:plc:alice"},
+            "takedown": {"applied": true},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Percent-encode the characters an AT-URI carries that a query string cannot.
+fn urlencode(s: &str) -> String {
+    s.replace(':', "%3A").replace('/', "%2F")
 }

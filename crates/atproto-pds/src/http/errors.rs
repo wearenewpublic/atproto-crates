@@ -76,6 +76,9 @@ impl From<PdsError> for XrpcError {
             PdsError::InvalidPlcOperation { reason } => {
                 XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRequest", reason)
             }
+            PdsError::InvalidSubject { reason } => {
+                XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRequest", reason)
+            }
             PdsError::SpaceNotFound { uri } => XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "SpaceNotFound",

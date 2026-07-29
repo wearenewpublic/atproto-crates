@@ -47,6 +47,38 @@ pub async fn get_blob(
     // and runs migrations, so gating after it would let an unauthenticated
     // caller materialise a SQLite file for every DID it cared to invent.
     let did = state.reader.require_available(&q.did).await?.did;
+
+    // Blob-level takedown. Checked before the bytes are fetched and reported as
+    // `BlobNotFound` rather than a distinct error: an operator removing an
+    // illegal image should not leave behind a response that confirms it is
+    // still stored here.
+    //
+    // The takedown row lives in the per-actor SQLite on both storage profiles,
+    // so this gate holds whether the bytes came from SQLite or from fjall.
+    {
+        let manager = state.account_manager.as_deref().ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AccountManagementUnavailable",
+                "account manager not configured",
+            )
+        })?;
+        let store = SqlActorStore::open(manager.data_dir(), &did)
+            .await
+            .map_err(XrpcError::from)?;
+        if crate::takedown::get_blob(&store, &q.cid)
+            .await
+            .map_err(XrpcError::from)?
+            .is_some()
+        {
+            return Err(XrpcError::new(
+                StatusCode::NOT_FOUND,
+                "BlobNotFound",
+                format!("no blob {} for {}", q.cid, q.did),
+            ));
+        }
+    }
+
     let pair = if let Some(backend) = state.public_realm_backend.as_ref() {
         backend
             .blob

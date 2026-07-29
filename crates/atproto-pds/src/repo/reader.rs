@@ -153,10 +153,27 @@ impl RepoReader {
         let account = self.resolve(repo).await?;
         require_public_read(&account.state, &account.did)?;
 
+        // A record-level takedown hides the record from every public read, the
+        // same way `space_record_takedown` does in the permissioned realm.
+        // Checked before the CID is resolved so a taken-down record is
+        // indistinguishable from one that was never written — a moderator
+        // removing something should not leave a probe that says "still here".
+        //
+        // The store is opened once and reused by the legacy branch below.
+        // `SqlActorStore::open` builds a fresh connection pool and runs
+        // migrations on each call, so opening it twice per read would be a
+        // real cost rather than a bookkeeping detail.
+        let uri = format!("at://{}/{}/{}", account.did, collection, rkey);
+        let store = self.open_actor(&account.did).await?;
+        if crate::takedown::get_record(&store, &uri).await?.is_some() {
+            return Err(PdsError::NotFound {
+                what: format!("record {collection}/{rkey} not found"),
+            });
+        }
+
         // Resolve the record CID through the trait surface when a backend
         // is wired; otherwise fall back to the legacy SQL-direct path.
         let cid_str = if let Some(backend) = self.backend.as_ref() {
-            let uri = format!("at://{}/{}/{}", account.did, collection, rkey);
             let row = backend
                 .repo_record
                 .get_by_uri(&account.did, &uri)
@@ -173,7 +190,6 @@ impl RepoReader {
             }
             row.cid
         } else {
-            let store = self.open_actor(&account.did).await?;
             let pool = store.pool();
             let row: Option<(String,)> = match cid {
                 Some(c) => sqlx::query_as(
@@ -214,14 +230,11 @@ impl RepoReader {
                     reason: format!("get_record block fetch: {e}"),
                 })?
         } else {
-            let store = self.open_actor(&account.did).await?;
-            let pool = store.pool();
-            let block_storage =
-                SqlBlockStorage::open(pool.clone())
-                    .await
-                    .map_err(|e| PdsError::Storage {
-                        reason: format!("open block_storage: {e}"),
-                    })?;
+            let block_storage = SqlBlockStorage::open(store.pool().clone())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("open block_storage: {e}"),
+                })?;
             atproto_dasl::storage::BlockStorage::get(&block_storage, &parsed_cid)
                 .await
                 .map_err(|e| PdsError::Storage {
@@ -271,9 +284,21 @@ impl RepoReader {
                 .repo_record
                 .list_by_collection(&account.did, collection, cursor, limit)
                 .await?;
+            // One query for the collection's takedown set rather than one per
+            // record; it is almost always empty.
+            let takedown_store = self.open_actor(&account.did).await?;
+            let taken_down = crate::takedown::taken_down_in_collection(
+                &takedown_store,
+                &account.did,
+                collection,
+            )
+            .await?;
             let block_storage = backend.open_block_storage(&account.did).await?;
             let mut records = Vec::with_capacity(rows.len());
             for r in &rows {
+                if taken_down.contains(&r.uri) {
+                    continue;
+                }
                 let parsed_cid: cid::Cid =
                     r.cid.parse().map_err(|e: cid::Error| PdsError::Storage {
                         reason: format!("invalid CID stored: {e}"),
@@ -355,8 +380,13 @@ impl RepoReader {
                 .map_err(|e| PdsError::Storage {
                     reason: format!("open block_storage: {e}"),
                 })?;
+        let taken_down =
+            crate::takedown::taken_down_in_collection(&store, &account.did, collection).await?;
         let mut records = Vec::with_capacity(rows.len());
         for (uri, cid_str, _rkey) in &rows {
+            if taken_down.contains(uri) {
+                continue;
+            }
             let parsed_cid: cid::Cid =
                 cid_str.parse().map_err(|e: cid::Error| PdsError::Storage {
                     reason: format!("invalid CID stored: {e}"),

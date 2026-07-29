@@ -7,6 +7,8 @@
 
 pub mod dashboard;
 pub mod handlers;
+pub mod subject;
 
 pub use dashboard::dashboard as dashboard_handler;
 pub use handlers::*;
+pub use subject::{StatusAttr, SubjectRef};
