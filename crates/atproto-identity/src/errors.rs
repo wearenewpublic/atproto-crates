@@ -562,6 +562,16 @@ pub enum KeyError {
         /// Description of the Ed25519 error
         error: String,
     },
+
+    /// An ECDSA signature was presented in the non-canonical high-S form.
+    ///
+    /// Both `(r, s)` and `(r, -s)` verify, so accepting either leaves a
+    /// signature malleable — anyone holding a valid one can derive a second,
+    /// different byte string that also verifies. AT Protocol requires low-S.
+    #[error(
+        "error-atproto-identity-key-14 Signature is malleable: S value is in the upper half of the curve order; AT Protocol requires the low-S form"
+    )]
+    SignatureMalleable,
 }
 
 /// Error types that can occur when working with WebVH DIDs

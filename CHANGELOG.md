@@ -103,6 +103,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-identity`: P-256 and P-384 signatures were not low-S normalized, and verification accepted
+  the high-S form. ECDSA signatures are malleable — for every valid `(r, s)` the pair `(r, -s)`
+  verifies just as well — and AT Protocol requires the canonical low-S form. `k256` normalizes inside
+  its own signing primitive, which is why K-256 account keys were never affected; `p256` and `p384`
+  ship an empty `SignPrimitive` impl, so nothing normalized theirs.
+
+  Measured rather than assumed: signing 64 times with a fresh P-256 key produced **27 high-S
+  signatures**, a coin flip as predicted. A peer enforcing low-S rejects each of those, so a P-256
+  key was failing roughly half its signatures at random, permanently.
+
+  `sign` now normalizes for all three curves, and `validate` refuses a high-S signature outright
+  (`error-atproto-identity-key-14`) rather than accepting either form. Accepting both was the second
+  half of the problem: anyone holding a valid signature could derive a different byte string that
+  also verified, so "the signature over this commit" was not a unique value — which is exactly what
+  anything content-addressing or deduplicating a signature relies on.
+
+  This is a published library other projects sign with, so the blast radius was never limited to this
+  PDS. **Verification is now stricter**: a high-S signature produced by an older version of this
+  crate, or by another implementation that does not normalize, is rejected where it used to pass.
+
 - `atproto-pds`: five admin request/response shapes did not match their lexicons, so a canonical
   client failed against every one of them. Verified against the published schemas rather than
   against the report's summary, which surfaced two things the report does not mention.

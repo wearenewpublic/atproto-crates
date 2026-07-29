@@ -290,14 +290,49 @@ pub fn identify_key(key: &str) -> Result<KeyData, KeyError> {
     }
 }
 
+/// Refuse a signature in the non-canonical high-S form.
+///
+/// ECDSA signatures are malleable: for every valid `(r, s)` the pair `(r, -s)`
+/// verifies just as well. AT Protocol requires the low-S form, so accepting
+/// both means anyone holding a valid signature can derive a second, different
+/// byte string that also verifies — and "the signature over this commit" stops
+/// being a unique value, which is the property anything content-addressing or
+/// deduplicating a signature depends on.
+// `SignatureSize<C>: ArrayLength<u8>` is the bound `Signature::s` requires. The
+// only path to `ArrayLength` from here is `elliptic_curve`'s re-export, which is
+// deprecated in favour of generic-array 1.x — a migration that belongs to the
+// `ecdsa` crate, not to this bound. Suppressed rather than worked around,
+// because dropping the bound does not compile and duplicating the check per
+// curve would be three copies of one line.
+#[allow(deprecated)]
+fn reject_high_s<C>(signature: &ecdsa::Signature<C>) -> Result<(), KeyError>
+where
+    C: ecdsa::PrimeCurve + ecdsa::elliptic_curve::CurveArithmetic,
+    ecdsa::SignatureSize<C>: ecdsa::elliptic_curve::generic_array::ArrayLength<u8>,
+{
+    use ecdsa::elliptic_curve::scalar::IsHigh;
+
+    if signature.s().is_high().into() {
+        return Err(KeyError::SignatureMalleable);
+    }
+    Ok(())
+}
+
 /// Validates a signature against content using the provided key.
 ///
 /// Supports both public and private keys for signature verification.
+///
+/// # Errors
+///
+/// Returns [`KeyError::SignatureMalleable`] for an ECDSA signature in the
+/// high-S form, which AT Protocol does not accept, before checking whether it
+/// verifies at all.
 pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<(), KeyError> {
     match *key_data.key_type() {
         KeyType::P256Public => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
+            reject_high_s(&signature)?;
             let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(key_data.bytes())
                 .map_err(|error| KeyError::P256Error { error })?;
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
@@ -306,6 +341,7 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::P384Public => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
+            reject_high_s(&signature)?;
             let verifying_key = p384::ecdsa::VerifyingKey::from_sec1_bytes(key_data.bytes())
                 .map_err(|error| KeyError::P384Error { error })?;
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
@@ -314,6 +350,7 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::K256Public => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
+            reject_high_s(&signature)?;
             let verifying_key = k256::ecdsa::VerifyingKey::from_sec1_bytes(key_data.bytes())
                 .map_err(|error| KeyError::K256Error { error })?;
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
@@ -322,6 +359,7 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::P256Private => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
+            reject_high_s(&signature)?;
             let secret_key: p256::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
@@ -333,6 +371,7 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::P384Private => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
+            reject_high_s(&signature)?;
             let secret_key: p384::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
@@ -344,6 +383,7 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::K256Private => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
+            reject_high_s(&signature)?;
             let secret_key: k256::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
@@ -439,7 +479,11 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
             let signature: p256::ecdsa::Signature = signing_key
                 .try_sign(content)
                 .map_err(|error| KeyError::ECDSAError { error })?;
-            Ok(signature.to_vec())
+            // `p256` ships an empty `SignPrimitive` impl, so unlike `k256` it
+            // does not normalize for us. Without this the crate emits the
+            // high-S form roughly half the time, and a peer enforcing low-S
+            // rejects exactly those.
+            Ok(signature.normalize_s().unwrap_or(signature).to_vec())
         }
         KeyType::P384Private => {
             let secret_key: p384::SecretKey =
@@ -449,7 +493,8 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
             let signature: p384::ecdsa::Signature = signing_key
                 .try_sign(content)
                 .map_err(|error| KeyError::ECDSAError { error })?;
-            Ok(signature.to_vec())
+            // As for P-256: `p384` does not normalize on signing either.
+            Ok(signature.normalize_s().unwrap_or(signature).to_vec())
         }
         KeyType::K256Private => {
             let secret_key: k256::SecretKey =
@@ -459,7 +504,10 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
             let signature: k256::ecdsa::Signature = signing_key
                 .try_sign(content)
                 .map_err(|error| KeyError::ECDSAError { error })?;
-            Ok(signature.to_vec())
+            // `k256` normalizes inside its own `SignPrimitive`, which is why
+            // K-256 account keys were never affected. Stated rather than
+            // relied on silently.
+            Ok(signature.normalize_s().unwrap_or(signature).to_vec())
         }
         KeyType::Ed25519Private => {
             let key_bytes: &[u8; 32] =
@@ -2123,5 +2171,138 @@ mod tests {
         assert_eq!(&decoded[3..], &signature[..]);
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    //  Low-S normalization (F-REPO-06).
+    // -----------------------------------------------------------------------
+
+    /// Report the S-half of a 64-byte P-256/P-384/K-256 signature.
+    fn s_is_high(signature: &[u8], key_type: &KeyType) -> bool {
+        use ecdsa::elliptic_curve::scalar::IsHigh;
+
+        match key_type {
+            KeyType::P256Private | KeyType::P256Public => {
+                p256::ecdsa::Signature::from_slice(signature)
+                    .map(|sig| sig.s().is_high().into())
+                    .unwrap_or(false)
+            }
+            KeyType::P384Private | KeyType::P384Public => {
+                p384::ecdsa::Signature::from_slice(signature)
+                    .map(|sig| sig.s().is_high().into())
+                    .unwrap_or(false)
+            }
+            KeyType::K256Private | KeyType::K256Public => {
+                k256::ecdsa::Signature::from_slice(signature)
+                    .map(|sig| sig.s().is_high().into())
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Every signature this crate produces must be low-S.
+    ///
+    /// ECDSA signatures are malleable: for every valid `(r, s)` the pair
+    /// `(r, -s)` verifies just as well, so a signature has two forms and only
+    /// one of them is canonical. AT Protocol requires the low-S form, and a
+    /// peer that enforces it rejects the other — roughly half of all
+    /// signatures, at random, for the life of the key.
+    ///
+    /// `k256` normalizes inside its own signing primitive, which is why K-256
+    /// account keys were never affected. `p256` and `p384` ship an empty
+    /// `SignPrimitive` impl, so nothing normalized theirs.
+    ///
+    /// 64 iterations: a single sign has a ~50% chance of being low-S by luck,
+    /// so one round would pass against unfixed code half the time. The odds of
+    /// 64 consecutive coincidences are about 1 in 2^64.
+    #[test]
+    fn every_signature_is_low_s() {
+        for key_type in [
+            KeyType::P256Private,
+            KeyType::P384Private,
+            KeyType::K256Private,
+        ] {
+            let key = generate_key(key_type.clone()).expect("key generation should succeed");
+            let mut high = 0;
+            for round in 0..64u32 {
+                let content = format!("message {round}");
+                let signature = sign(&key, content.as_bytes()).expect("signing should succeed");
+                if s_is_high(&signature, &key_type) {
+                    high += 1;
+                }
+            }
+            assert_eq!(
+                high, 0,
+                "{key_type:?} produced {high}/64 high-S signatures; a peer enforcing \
+                 low-S rejects each of them"
+            );
+        }
+    }
+
+    /// A high-S signature must be refused on verify.
+    ///
+    /// Producing low-S is half the contract. Accepting high-S leaves the
+    /// signature malleable in the other direction: anyone holding a valid
+    /// signature can derive a second, different byte string that also verifies,
+    /// so "the signature over this commit" stops being a unique value.
+    #[test]
+    fn a_high_s_signature_is_refused() {
+        for key_type in [
+            KeyType::P256Private,
+            KeyType::P384Private,
+            KeyType::K256Private,
+        ] {
+            let key = generate_key(key_type.clone()).expect("key generation should succeed");
+            let content = b"content to sign";
+            let low = sign(&key, content).expect("signing should succeed");
+            assert!(
+                validate(&key, &low, content).is_ok(),
+                "{key_type:?}: a freshly-signed signature must verify"
+            );
+
+            // Take the high-S form of the same signature: still mathematically
+            // valid over the same content, just the non-canonical one of the
+            // two. Before this fix `sign` returned either form at random, so
+            // the flip is conditional rather than unconditional.
+            let high = if s_is_high(&low, &key_type) {
+                low.clone()
+            } else {
+                flip_s(&low, &key_type)
+            };
+            assert!(
+                s_is_high(&high, &key_type),
+                "{key_type:?}: test setup failed to produce a high-S signature"
+            );
+            assert!(
+                validate(&key, &high, content).is_err(),
+                "{key_type:?} accepted a high-S signature, so a signature is not a unique value"
+            );
+        }
+    }
+
+    /// Negate the S component, yielding the other valid form of a signature.
+    fn flip_s(signature: &[u8], key_type: &KeyType) -> Vec<u8> {
+        match key_type {
+            KeyType::P256Private | KeyType::P256Public => {
+                let sig = p256::ecdsa::Signature::from_slice(signature).unwrap();
+                p256::ecdsa::Signature::from_scalars(sig.r().to_bytes(), (-sig.s()).to_bytes())
+                    .unwrap()
+                    .to_vec()
+            }
+            KeyType::P384Private | KeyType::P384Public => {
+                let sig = p384::ecdsa::Signature::from_slice(signature).unwrap();
+                p384::ecdsa::Signature::from_scalars(sig.r().to_bytes(), (-sig.s()).to_bytes())
+                    .unwrap()
+                    .to_vec()
+            }
+            KeyType::K256Private | KeyType::K256Public => {
+                let sig = k256::ecdsa::Signature::from_slice(signature).unwrap();
+                k256::ecdsa::Signature::from_scalars(sig.r().to_bytes(), (-sig.s()).to_bytes())
+                    .unwrap()
+                    .to_vec()
+            }
+            other => panic!("{other:?} is not an ECDSA key type"),
+        }
     }
 }
