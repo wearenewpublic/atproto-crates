@@ -444,11 +444,11 @@ pub fn build_router(state: HttpState) -> Router {
         )
         // §4.6
         .route(
-            "/xrpc/com.atproto.server.disableAccountInvites",
+            "/xrpc/com.atproto.admin.disableAccountInvites",
             post(admin::disable_account_invites),
         )
         .route(
-            "/xrpc/com.atproto.server.enableAccountInvites",
+            "/xrpc/com.atproto.admin.enableAccountInvites",
             post(admin::enable_account_invites),
         )
         .route(

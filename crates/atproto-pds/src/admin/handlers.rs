@@ -105,6 +105,28 @@ async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError
     Ok(())
 }
 
+/// Resolve an `at-identifier` — a handle or a DID — to the account's DID.
+///
+/// Several admin inputs are typed `at-identifier` rather than `did`, so
+/// accepting only a DID makes a conformant request fail.
+async fn resolve_at_identifier(state: &HttpState, identifier: &str) -> Result<String, XrpcError> {
+    let directory = state.reader.accounts();
+    let row = if identifier.starts_with("did:") {
+        directory.lookup_did(identifier).await
+    } else {
+        directory.lookup_handle(identifier).await
+    }
+    .map_err(XrpcError::from)?;
+
+    row.map(|r| r.did).ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::NOT_FOUND,
+            "AccountNotFound",
+            format!("account {identifier} not found"),
+        )
+    })
+}
+
 fn admin_password(state: &HttpState) -> &str {
     state
         .admin_password
@@ -119,9 +141,21 @@ pub struct AccountInfoParams {
     pub did: String,
 }
 
-/// Output of `getAccountInfo`.
+/// `com.atproto.admin.defs#accountView`.
+///
+/// The lexicon requires `did`, `handle` and `indexedAt`; it declares no
+/// `createdAt`. This shape previously emitted `createdAt` and omitted
+/// `indexedAt`, so a client validating against the schema rejected every
+/// account this server described.
+///
+/// `indexedAt` carries the account's creation time — when this server came to
+/// know of the account, which for a locally-created account is the same moment.
+///
+/// The optional `invites`, `invitedBy`, `invitesDisabled`, `deactivatedAt` and
+/// `threatSignatures` are not populated; they are optional, and filling them is
+/// a question about data this server does not track rather than about shape.
 #[derive(Debug, Serialize)]
-pub struct AccountInfoResponse {
+pub struct AccountView {
     /// DID.
     pub did: String,
     /// Handle.
@@ -132,11 +166,9 @@ pub struct AccountInfoResponse {
     /// Email confirmation timestamp.
     #[serde(rename = "emailConfirmedAt", skip_serializing_if = "Option::is_none")]
     pub email_confirmed_at: Option<String>,
-    /// Lifecycle state.
-    pub state: String,
-    /// Creation timestamp.
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
+    /// When this server indexed the account.
+    #[serde(rename = "indexedAt")]
+    pub indexed_at: String,
 }
 
 /// Handler for `com.atproto.admin.getAccountInfo`.
@@ -144,7 +176,7 @@ pub async fn get_account_info(
     State(state): State<HttpState>,
     parts: Parts,
     Query(params): Query<AccountInfoParams>,
-) -> Result<Json<AccountInfoResponse>, XrpcError> {
+) -> Result<Json<AccountView>, XrpcError> {
     require_admin(&parts, &state).await?;
     let directory = state.reader.accounts();
     let row = if params.did.starts_with("did:") {
@@ -160,13 +192,12 @@ pub async fn get_account_info(
             format!("account {} not found", params.did),
         )
     })?;
-    Ok(Json(AccountInfoResponse {
+    Ok(Json(AccountView {
         did: row.did,
         handle: row.handle,
         email: row.email,
         email_confirmed_at: row.email_confirmed_at,
-        state: row.state.to_string(),
-        created_at: row.created_at,
+        indexed_at: row.created_at,
     }))
 }
 
@@ -291,34 +322,26 @@ pub async fn delete_account(
 /// Query params for `searchAccounts`.
 #[derive(Debug, Deserialize)]
 pub struct SearchAccountsQuery {
-    /// Substring to match against handle/email (case-insensitive).
-    #[serde(rename = "q")]
-    pub query: String,
+    /// Search term. Named `email` because that is the only search parameter
+    /// `com.atproto.admin.searchAccounts` declares — this endpoint previously
+    /// required an undeclared `q` and ignored `email`, so a canonical caller
+    /// got a 400 and an operator's `email=` was silently dropped.
+    ///
+    /// The underlying match still covers handle as well as email, so searching
+    /// by handle still works; it is spelled `email=` because the lexicon has no
+    /// other spelling for it.
+    pub email: Option<String>,
     /// Cursor (last DID).
     pub cursor: Option<String>,
-    /// Page size (default 25, max 100).
+    /// Page size. The lexicon declares default 50, min 1, max 100.
     pub limit: Option<u32>,
-}
-
-/// One account in the search results.
-#[derive(Debug, Serialize)]
-pub struct SearchAccountItem {
-    /// DID.
-    pub did: String,
-    /// Handle.
-    pub handle: String,
-    /// State.
-    pub state: String,
-    /// Creation timestamp.
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
 }
 
 /// Output of `searchAccounts`.
 #[derive(Debug, Serialize)]
 pub struct SearchAccountsResponse {
     /// Page of accounts.
-    pub accounts: Vec<SearchAccountItem>,
+    pub accounts: Vec<AccountView>,
     /// Cursor for the next page (None when exhausted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
@@ -331,21 +354,23 @@ pub async fn search_accounts(
     Query(q): Query<SearchAccountsQuery>,
 ) -> Result<Json<SearchAccountsResponse>, XrpcError> {
     require_admin(&parts, &state).await?;
-    let limit = q.limit.unwrap_or(25).clamp(1, 100);
+    let limit = q.limit.unwrap_or(50).clamp(1, 100);
     let directory = state.reader.accounts();
+    let term = q.email.unwrap_or_default();
     let rows = directory
-        .search_accounts(&q.query, q.cursor.as_deref(), limit)
+        .search_accounts(&term, q.cursor.as_deref(), limit)
         .await
         .map_err(XrpcError::from)?;
     let cursor = rows.last().map(|r| r.did.clone());
     Ok(Json(SearchAccountsResponse {
         accounts: rows
             .into_iter()
-            .map(|r| SearchAccountItem {
+            .map(|r| AccountView {
                 did: r.did,
                 handle: r.handle,
-                state: r.state.to_string(),
-                created_at: r.created_at,
+                email: r.email,
+                email_confirmed_at: r.email_confirmed_at,
+                indexed_at: r.created_at,
             })
             .collect(),
         cursor,
@@ -448,7 +473,7 @@ pub struct GetAccountInfosResponse {
     /// One entry per requested DID (in input order). DIDs that don't exist
     /// are omitted from the response — callers diff their inputs against
     /// the returned DIDs to discover misses.
-    pub infos: Vec<AccountInfoResponse>,
+    pub infos: Vec<AccountView>,
 }
 
 /// Handler for `com.atproto.admin.getAccountInfos`.
@@ -485,19 +510,18 @@ pub async fn get_account_infos(
         ));
     }
     let directory = state.reader.accounts();
-    let mut infos: Vec<AccountInfoResponse> = Vec::with_capacity(dids.len());
+    let mut infos: Vec<AccountView> = Vec::with_capacity(dids.len());
     // Sequential lookups: AccountDirectory is single-instance and SQLite
     // pool is small; 100-DID batches at typical SQLite read latency are
     // sub-100ms and admin endpoints aren't latency-critical.
     for did in dids {
         if let Some(row) = directory.lookup_did(did).await.map_err(XrpcError::from)? {
-            infos.push(AccountInfoResponse {
+            infos.push(AccountView {
                 did: row.did,
                 handle: row.handle,
                 email: row.email,
                 email_confirmed_at: row.email_confirmed_at,
-                state: row.state.to_string(),
-                created_at: row.created_at,
+                indexed_at: row.created_at,
             });
         }
     }
@@ -515,10 +539,20 @@ pub struct SendEmailInput {
     /// `account.email`.
     #[serde(rename = "recipientDid")]
     pub recipient_did: String,
-    /// Email subject line.
-    pub subject: String,
+    /// DID of the operator or service sending the message. Required by the
+    /// lexicon so a recipient — and any later reviewer — can tell who sent it.
+    #[serde(rename = "senderDid")]
+    pub sender_did: String,
+    /// Email subject line. Optional per the lexicon; defaults to a neutral
+    /// subject rather than being rejected.
+    #[serde(default)]
+    pub subject: Option<String>,
     /// Plain-text body.
     pub content: String,
+    /// Context for moderators and reviewers. Never included in the email
+    /// itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 /// Output of `admin.sendEmail`.
@@ -560,12 +594,20 @@ pub async fn send_email(
             format!("account {} has no email address", input.recipient_did),
         )
     })?;
+    // `subject` is optional per the lexicon. A message with no subject line is
+    // still a message, so supply a neutral one rather than refusing.
+    let subject = input.subject.as_deref().unwrap_or("Message from your PDS");
     state
         .email
-        .send(&to, &input.subject, &input.content)
+        .send(&to, subject, &input.content)
         .await
         .map_err(XrpcError::from)?;
-    tracing::info!(did = %input.recipient_did, subject = %input.subject, "admin sendEmail dispatched");
+    tracing::info!(
+        recipient = %input.recipient_did,
+        sender = %input.sender_did,
+        subject,
+        "admin sendEmail dispatched"
+    );
     Ok(Json(SendEmailResponse { sent: true }))
 }
 
@@ -576,8 +618,11 @@ pub async fn send_email(
 /// Inputs for `admin.updateAccountEmail`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateAccountEmailInput {
-    /// DID whose email to set.
-    pub did: String,
+    /// Handle or DID of the account. The lexicon types this `at-identifier`,
+    /// so a handle is as valid as a DID; this previously read `did` and
+    /// accepted only a DID, which made a canonical request fail to
+    /// deserialize.
+    pub account: String,
     /// New email address.
     pub email: String,
 }
@@ -603,18 +648,12 @@ pub async fn update_account_email(
             "account manager not configured",
         )
     })?;
-    // §5.4 — `manager.set_email` already dispatches
-    // backend; preserve the AccountNotFound behavior by checking that
-    // the row exists before the write so the 404 path is preserved.
-    if manager.lookup_handle(&input.did).await?.is_none() {
-        return Err(XrpcError::new(
-            StatusCode::NOT_FOUND,
-            "AccountNotFound",
-            format!("account {} not found", input.did),
-        ));
-    }
+    // `account` is an at-identifier, so resolve a handle to its DID before
+    // writing. This also preserves the 404 path: `set_email` dispatches to the
+    // backend without telling us whether a row existed.
+    let did = resolve_at_identifier(&state, &input.account).await?;
     manager
-        .set_email(&input.did, Some(&input.email))
+        .set_email(&did, Some(&input.email))
         .await
         .map_err(|e| {
             XrpcError::new(
@@ -623,7 +662,7 @@ pub async fn update_account_email(
                 format!("update email: {e}"),
             )
         })?;
-    tracing::info!(did = %input.did, new_email = %input.email, "admin override: account email updated");
+    tracing::info!(did = %did, new_email = %input.email, "admin override: account email updated");
     Ok(StatusCode::OK)
 }
 
@@ -881,14 +920,19 @@ pub async fn revoke_service_auth(
 //  §4.6 — invite toggles.
 // ---------------------------------------------------------------------------
 
-/// Inputs for `disableAccountInvites` / `enableAccountInvites`.
+/// Inputs for `com.atproto.admin.{disable,enable}AccountInvites`.
 #[derive(Debug, Deserialize)]
 pub struct InviteToggleInput {
-    /// DID whose invite-issuance flag to flip.
-    pub did: String,
+    /// DID whose invite-issuance flag to flip. Named `account` per the
+    /// lexicon; this previously read `did`.
+    pub account: String,
+    /// Optional reason, recorded in the log. Declared by
+    /// `disableAccountInvites` and accepted on both for symmetry.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
-/// Handler for `com.atproto.server.disableAccountInvites`. Admin Basic-auth
+/// Handler for `com.atproto.admin.disableAccountInvites`. Admin Basic-auth
 /// gated. Sets `account.can_issue_invites = 0` for the named DID; the
 /// `createInviteCode` handler refuses with `403 InviteIssuanceDisabled`
 /// after this.
@@ -898,10 +942,10 @@ pub async fn disable_account_invites(
     Json(input): Json<InviteToggleInput>,
 ) -> Result<StatusCode, XrpcError> {
     require_admin(&parts, &state).await?;
-    set_invite_flag(&state, &input.did, 0).await
+    set_invite_flag(&state, &input.account, 0).await
 }
 
-/// Handler for `com.atproto.server.enableAccountInvites`. Admin Basic-auth
+/// Handler for `com.atproto.admin.enableAccountInvites`. Admin Basic-auth
 /// gated. Sets `account.can_issue_invites = 1` for the named DID,
 /// reversing a prior `disableAccountInvites`.
 pub async fn enable_account_invites(
@@ -910,7 +954,7 @@ pub async fn enable_account_invites(
     Json(input): Json<InviteToggleInput>,
 ) -> Result<StatusCode, XrpcError> {
     require_admin(&parts, &state).await?;
-    set_invite_flag(&state, &input.did, 1).await
+    set_invite_flag(&state, &input.account, 1).await
 }
 
 async fn set_invite_flag(state: &HttpState, did: &str, flag: i64) -> Result<StatusCode, XrpcError> {

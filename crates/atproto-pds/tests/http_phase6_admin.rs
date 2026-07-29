@@ -107,7 +107,7 @@ async fn admin_get_account_info_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["did"], "did:plc:alice");
-    assert_eq!(body["state"], "active");
+    assert!(body["indexedAt"].is_string(), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,15 +233,18 @@ async fn admin_search_accounts_substring() {
     create_account(&app, "did:plc:bob", "bob.example").await;
     create_account(&app, "did:plc:carol", "carol.example").await;
 
-    let (status, body) =
-        get_admin(app.clone(), "/xrpc/com.atproto.admin.searchAccounts?q=ali").await;
+    let (status, body) = get_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.searchAccounts?email=ali",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let accounts = body["accounts"].as_array().unwrap();
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["did"], "did:plc:alice");
 
     // Empty match.
-    let (_, body) = get_admin(app, "/xrpc/com.atproto.admin.searchAccounts?q=zzzz").await;
+    let (_, body) = get_admin(app, "/xrpc/com.atproto.admin.searchAccounts?email=zzzz").await;
     assert_eq!(body["accounts"].as_array().unwrap().len(), 0);
 }
 
@@ -290,7 +293,7 @@ async fn admin_search_accounts_requires_basic_auth() {
     let resp = app
         .oneshot(
             Request::builder()
-                .uri("/xrpc/com.atproto.admin.searchAccounts?q=any")
+                .uri("/xrpc/com.atproto.admin.searchAccounts?email=any")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -343,7 +346,7 @@ async fn admin_send_email_to_account_with_email() {
     let (status, _) = post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateAccountEmail",
-        json!({"did": "did:plc:alice", "email": "alice@example.com"}),
+        json!({"account": "did:plc:alice", "email": "alice@example.com"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -353,6 +356,7 @@ async fn admin_send_email_to_account_with_email() {
         "/xrpc/com.atproto.admin.sendEmail",
         json!({
             "recipientDid": "did:plc:alice",
+            "senderDid": "did:web:test.example",
             "subject": "test",
             "content": "hello",
         }),
@@ -372,6 +376,7 @@ async fn admin_send_email_rejects_account_without_email() {
         "/xrpc/com.atproto.admin.sendEmail",
         json!({
             "recipientDid": "did:plc:alice",
+            "senderDid": "did:web:test.example",
             "subject": "test",
             "content": "hello",
         }),
@@ -392,7 +397,7 @@ async fn admin_update_account_email_round_trip() {
     let (status, _) = post_admin(
         app.clone(),
         "/xrpc/com.atproto.admin.updateAccountEmail",
-        json!({"did": "did:plc:alice", "email": "alice@new.example"}),
+        json!({"account": "did:plc:alice", "email": "alice@new.example"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -499,8 +504,8 @@ async fn admin_disable_account_invites_blocks_create() {
 
     let (status, _) = post_admin(
         app.clone(),
-        "/xrpc/com.atproto.server.disableAccountInvites",
-        json!({"did": "did:plc:alice"}),
+        "/xrpc/com.atproto.admin.disableAccountInvites",
+        json!({"account": "did:plc:alice"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -545,8 +550,8 @@ async fn admin_disable_account_invites_blocks_create() {
     // Re-enable.
     let (status, _) = post_admin(
         app.clone(),
-        "/xrpc/com.atproto.server.enableAccountInvites",
-        json!({"did": "did:plc:alice"}),
+        "/xrpc/com.atproto.admin.enableAccountInvites",
+        json!({"account": "did:plc:alice"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -708,4 +713,155 @@ async fn admin_auth_still_distinguishes_right_from_wrong() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Lexicon conformance for the admin surface.
+//
+//  Each assertion below is taken from the published lexicon, not from what this
+//  crate happened to emit. A canonical client validates against these schemas,
+//  so a missing required field or a renamed input is a hard failure for it even
+//  though the endpoint "works" when called by a client shaped like this server.
+// ---------------------------------------------------------------------------
+
+/// `com.atproto.admin.defs#accountView` requires `did`, `handle`, `indexedAt`.
+#[tokio::test(flavor = "multi_thread")]
+async fn account_view_carries_the_fields_the_lexicon_requires() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = get_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.getAccountInfo?did=did:plc:alice",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for field in ["did", "handle", "indexedAt"] {
+        assert!(
+            body.get(field).is_some(),
+            "accountView requires {field}: {body}"
+        );
+    }
+
+    // The same shape through the batch and search endpoints — they return
+    // `accountView` refs, so a struct that satisfies one must satisfy all.
+    let (_, batch) = get_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.getAccountInfos?dids=did:plc:alice",
+    )
+    .await;
+    assert!(
+        batch["infos"][0]["indexedAt"].is_string(),
+        "getAccountInfos returns accountView refs: {batch}"
+    );
+
+    let (_, found) = get_admin(app, "/xrpc/com.atproto.admin.searchAccounts?email=ali").await;
+    assert!(
+        found["accounts"][0]["indexedAt"].is_string(),
+        "searchAccounts returns accountView refs: {found}"
+    );
+}
+
+/// `searchAccounts` declares `email`, `limit`, `cursor` — and no `q`.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_accounts_takes_the_declared_parameter() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = get_admin(app, "/xrpc/com.atproto.admin.searchAccounts?email=ali").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["accounts"].as_array().map(Vec::len),
+        Some(1),
+        "the declared `email` parameter should drive the search: {body}"
+    );
+}
+
+/// `updateAccountEmail` names the subject `account`, an at-identifier.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_account_email_takes_an_at_identifier_named_account() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateAccountEmail",
+        json!({ "account": "did:plc:alice", "email": "new@example.com" }),
+    )
+    .await;
+    assert!(status.is_success(), "`account` should be accepted: {body}");
+
+    // `at-identifier` means a handle is equally valid.
+    let (status, body) = post_admin(
+        app,
+        "/xrpc/com.atproto.admin.updateAccountEmail",
+        json!({ "account": "alice.example", "email": "byhandle@example.com" }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "an at-identifier may be a handle: {body}"
+    );
+}
+
+/// `sendEmail` requires `senderDid` and leaves `subject` optional.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_email_takes_sender_did_and_an_optional_subject() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+    post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.updateAccountEmail",
+        json!({ "account": "did:plc:alice", "email": "alice@example.com" }),
+    )
+    .await;
+
+    let (status, body) = post_admin(
+        app,
+        "/xrpc/com.atproto.admin.sendEmail",
+        json!({
+            "recipientDid": "did:plc:alice",
+            "senderDid": "did:web:test.example",
+            "content": "hello",
+        }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "senderDid required, subject optional: {body}"
+    );
+    assert_eq!(body["sent"], true);
+}
+
+/// The invite toggles live under `com.atproto.admin.*` and name the subject
+/// `account`.
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_toggles_are_admin_namespaced() {
+    let (app, _tmp) = build_app().await;
+    create_account(&app, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.disableAccountInvites",
+        json!({ "account": "did:plc:alice", "note": "spam" }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+
+    let (status, body) = post_admin(
+        app.clone(),
+        "/xrpc/com.atproto.admin.enableAccountInvites",
+        json!({ "account": "did:plc:alice" }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+
+    // The old server-namespaced paths are gone.
+    let (status, _) = post_admin(
+        app,
+        "/xrpc/com.atproto.server.disableAccountInvites",
+        json!({ "did": "did:plc:alice" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

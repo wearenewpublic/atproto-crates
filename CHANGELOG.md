@@ -103,6 +103,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: five admin request/response shapes did not match their lexicons, so a canonical
+  client failed against every one of them. Verified against the published schemas rather than
+  against the report's summary, which surfaced two things the report does not mention.
+  - **`com.atproto.admin.defs#accountView`** requires `did`, `handle` and `indexedAt`, and declares
+    no `createdAt`. This server emitted `createdAt` and `state` and omitted `indexedAt`, so a
+    validating client rejected every account it described. There is now one `AccountView` used by
+    `getAccountInfo`, `getAccountInfos` **and `searchAccounts`** — the last returns `accountView`
+    refs too, and had its own separate struct with the same defect, which a fix aimed only at the
+    first two would have left in place.
+  - **`searchAccounts`** declares `email`, `limit` and `cursor` — and no `q`. It required an
+    undeclared `q` and ignored `email`, so a conformant caller got a 400 and an operator's `email=`
+    was silently dropped. `limit` now defaults to the declared 50 rather than 25.
+  - **`updateAccountEmail`** names the account `account`, typed `at-identifier`. This server read
+    `did` — a hard deserialization failure for a canonical request — and accepted only a DID. It now
+    reads `account` and resolves a handle as readily as a DID.
+  - **`sendEmail`** requires `senderDid` and leaves `subject` optional. This server had no
+    `senderDid` at all and required `subject`. Both corrected, and the declared `comment` field is
+    accepted; a message with no subject gets a neutral one rather than a rejection.
+  - **`disableAccountInvites` / `enableAccountInvites`** are `com.atproto.admin.*`, not
+    `com.atproto.server.*`, and name their subject `account`. Moved and renamed; the optional `note`
+    is accepted.
+
+  **These are breaking wire changes**, deliberately without aliases: the old spellings were
+  unreachable by any conformant client, so nothing standards-compliant regresses. Callers of the old
+  shapes must move to the canonical field names and the two relocated routes. The bundled
+  `atproto-pds-admin` CLI is updated with them.
+
 - `atproto-pds`: the 16 MiB blob ceiling was dead code — the real limit was axum's 2 MiB default, so
   a typical phone photo failed to upload and inbound migration failed for any non-trivial
   repository. `uploadBlob` and `importRepo` extracted `axum::body::Bytes`, which applies

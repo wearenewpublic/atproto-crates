@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
         }
         Command::Account(AccountCmd::Search { query, limit }) => {
             let path = format!(
-                "/xrpc/com.atproto.admin.searchAccounts?q={}&limit={}",
+                "/xrpc/com.atproto.admin.searchAccounts?email={}&limit={}",
                 urlencode(&query),
                 limit
             );
