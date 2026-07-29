@@ -170,6 +170,75 @@ impl RepoWriter {
         }
     }
 
+    /// Maintain the record→blob reference index for a committed batch.
+    ///
+    /// Every piece of this existed — the trait method, three backend
+    /// implementations, the free functions, unit tests — and nothing called it.
+    /// So `listMissingBlobs` answered `{"blobs": []}` forever and
+    /// `checkAccountStatus.expectedBlobs` stayed `0`: a migrating client
+    /// concluded there was nothing to transfer and activated an account with
+    /// none of its media, while every step reported success.
+    ///
+    /// Updates and deletes drop the record's existing refs first. Adding
+    /// without dropping would make the counts only ever grow, which is a
+    /// different wrong answer rather than a fix — and blob GC reads those
+    /// counts to decide what is orphaned.
+    ///
+    /// Best-effort, like the firehose publish: the commit is already durable,
+    /// and failing the write here would report a record that exists as not
+    /// written. A failure is logged at ERROR because the consequence — media
+    /// silently absent after a migration — is invisible to the client.
+    async fn maintain_blob_refs(&self, did: &str, ops: &[WriteOp]) {
+        for op in ops {
+            let uri = format!("at://{}/{}/{}", did, op.collection, op.rkey);
+            if let Err(error) = self.maintain_one(did, &uri, op).await {
+                tracing::error!(
+                    error = ?error,
+                    did,
+                    uri,
+                    "failed to update blob references; listMissingBlobs will under-report"
+                );
+            }
+        }
+    }
+
+    async fn maintain_one(&self, did: &str, uri: &str, op: &WriteOp) -> PdsResult<()> {
+        let replacing = matches!(op.action, WriteAction::Update | WriteAction::Delete);
+        let refs = match (&op.action, &op.value) {
+            (WriteAction::Delete, _) | (_, None) => Vec::new(),
+            (_, Some(value)) => crate::blob::walk_blob_refs(value),
+        };
+
+        if let Some(backend) = self.backend.as_ref() {
+            if replacing {
+                backend.blob.drop_refs_for_record(did, uri).await?;
+            }
+            for blob in &refs {
+                backend
+                    .blob
+                    .add_ref(
+                        did,
+                        &crate::actor_store::BlobRefRow {
+                            blob_cid: blob.inner.ref_.link.clone(),
+                            mime_type: blob.inner.mime_type.clone(),
+                            size: blob.inner.size,
+                            record_uri: uri.to_string(),
+                        },
+                    )
+                    .await?;
+            }
+        } else {
+            let store = SqlActorStore::open(&self.data_dir, did).await?;
+            if replacing {
+                crate::blob::drop_record_refs(&store, uri).await?;
+            }
+            for blob in &refs {
+                crate::blob::add_ref(&store, uri, blob).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Record a `#commit` on the firehose stream.
     ///
     /// Called after the repository write is durable, never inside it: the
@@ -498,6 +567,7 @@ impl RepoWriter {
         // ordering failure is a missed event rather than one announcing a
         // commit that does not exist.
         self.publish_commit(did, payload_bytes).await;
+        self.maintain_blob_refs(did, &ops).await;
 
         // Compose the per-op WriteResult from the diffs + repo_ops aligned positions.
         let mut writes = Vec::with_capacity(ops.len());
@@ -775,6 +845,7 @@ impl RepoWriter {
         // Published after the commit is durable — see the comment on the same
         // call in `apply_writes_legacy`.
         self.publish_commit(did, payload_bytes).await;
+        self.maintain_blob_refs(did, &ops).await;
 
         let mut writes = Vec::with_capacity(ops.len());
         for (op, repo_op) in ops.iter().zip(repo_ops.iter()) {

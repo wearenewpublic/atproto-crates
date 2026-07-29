@@ -69,6 +69,69 @@ pub fn blob_ref(cid: String, mime_type: String, size: u64) -> BlobRef {
     })
 }
 
+/// Collect every blob reference embedded anywhere in a record value.
+///
+/// A record carries blobs as the lexicon's typed envelope:
+///
+/// ```json
+/// { "$type": "blob", "ref": { "$link": "bafkrei…" }, "mimeType": "image/jpeg", "size": 10000 }
+/// ```
+///
+/// They appear at arbitrary depth — `embed.images[0].image`, `embed.media.video`,
+/// inside a record union — so this recurses rather than checking a fixed set of
+/// paths. A walker that knew about `embed.images` would silently miss every
+/// lexicon it had not been taught, which is the same failure mode as not
+/// walking at all: a blob referenced and never tracked.
+///
+/// The whole envelope is validated before a reference is accepted. A record may
+/// legitimately contain a map carrying `$type: "blob"` and nothing else, or a
+/// `ref` that is not a `$link`; treating those as references would write rows
+/// with an empty CID that `listMissingBlobs` would then report forever.
+#[must_use]
+pub fn walk_blob_refs(value: &serde_json::Value) -> Vec<BlobRef> {
+    let mut found = Vec::new();
+    collect_blob_refs(value, &mut found);
+    found
+}
+
+fn collect_blob_refs(value: &serde_json::Value, out: &mut Vec<BlobRef>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(blob) = parse_blob_envelope(map) {
+                out.push(blob);
+                // A blob envelope's own fields are scalars, so there is nothing
+                // below it to walk.
+                return;
+            }
+            for nested in map.values() {
+                collect_blob_refs(nested, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_blob_refs(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recognise a complete blob envelope, or `None`.
+fn parse_blob_envelope(map: &serde_json::Map<String, serde_json::Value>) -> Option<BlobRef> {
+    if map.get("$type").and_then(serde_json::Value::as_str) != Some("blob") {
+        return None;
+    }
+    let link = map
+        .get("ref")?
+        .as_object()?
+        .get("$link")?
+        .as_str()
+        .filter(|link| !link.is_empty())?;
+    let mime_type = map.get("mimeType")?.as_str()?;
+    let size = map.get("size")?.as_u64()?;
+    Some(blob_ref(link.to_string(), mime_type.to_string(), size))
+}
+
 /// Persist blob bytes to the per-actor store.
 ///
 /// Returns the blob's CID; idempotent (re-uploading the same bytes returns
@@ -432,5 +495,88 @@ mod tests {
             "`$link` must be nested under `ref`, never a top-level key"
         );
         assert_eq!(object.len(), 4, "the typed envelope has exactly four keys");
+    }
+
+    // --- the walker (F-BLOB-02) -------------------------------------------
+
+    fn envelope(cid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "$type": "blob",
+            "ref": { "$link": cid },
+            "mimeType": "image/jpeg",
+            "size": 1234,
+        })
+    }
+
+    #[test]
+    fn a_top_level_blob_is_found() {
+        let record = serde_json::json!({
+            "$type": "app.bsky.actor.profile",
+            "avatar": envelope("bafkreiavatar"),
+        });
+        let found = walk_blob_refs(&record);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].inner.ref_.link, "bafkreiavatar");
+        assert_eq!(found[0].inner.mime_type, "image/jpeg");
+        assert_eq!(found[0].inner.size, 1234);
+    }
+
+    /// Blobs sit at arbitrary depth, including inside arrays.
+    ///
+    /// A walker that knew about `embed.images` would miss every lexicon it had
+    /// not been taught — the same outcome as not walking at all.
+    #[test]
+    fn nested_and_repeated_blobs_are_all_found() {
+        let record = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "hello",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    { "alt": "one", "image": envelope("bafkreione") },
+                    { "alt": "two", "image": envelope("bafkreitwo") },
+                ],
+                "media": { "video": envelope("bafkreivideo") },
+            },
+        });
+        let mut links: Vec<String> = walk_blob_refs(&record)
+            .into_iter()
+            .map(|b| b.inner.ref_.link)
+            .collect();
+        links.sort();
+        assert_eq!(links, vec!["bafkreione", "bafkreitwo", "bafkreivideo"]);
+    }
+
+    /// A partial or malformed envelope is not a reference.
+    ///
+    /// Accepting one would write a row with an empty or nonsense CID that
+    /// `listMissingBlobs` would then report as missing forever.
+    #[test]
+    fn malformed_lookalikes_are_ignored() {
+        let record = serde_json::json!({
+            "bare_type":    { "$type": "blob" },
+            "no_link":      { "$type": "blob", "ref": {}, "mimeType": "image/png", "size": 1 },
+            "empty_link":   { "$type": "blob", "ref": { "$link": "" }, "mimeType": "image/png", "size": 1 },
+            "ref_not_map":  { "$type": "blob", "ref": "bafkrei", "mimeType": "image/png", "size": 1 },
+            "no_mime":      { "$type": "blob", "ref": { "$link": "bafkrei" }, "size": 1 },
+            "no_size":      { "$type": "blob", "ref": { "$link": "bafkrei" }, "mimeType": "image/png" },
+            "wrong_type":   { "$type": "notablob", "ref": { "$link": "bafkrei" }, "mimeType": "image/png", "size": 1 },
+            "plain_link":   { "$link": "bafkrei" },
+        });
+        assert!(
+            walk_blob_refs(&record).is_empty(),
+            "{:?}",
+            walk_blob_refs(&record)
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_blobs_yields_none() {
+        let record = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "no media here",
+            "langs": ["en"],
+        });
+        assert!(walk_blob_refs(&record).is_empty());
     }
 }

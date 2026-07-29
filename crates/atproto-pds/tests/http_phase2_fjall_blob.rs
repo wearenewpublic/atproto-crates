@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_fjall_app() -> (axum::Router, TempDir) {
+async fn build_fjall_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -59,7 +59,9 @@ async fn build_fjall_app() -> (axum::Router, TempDir) {
     (build_router(state), manager, tmp)
 }
 
-async fn create_account_session(app: &axum::Router) -> String {
+async fn create_account_session(app: &axum::Router, manager: &AccountManager) -> String {
+    let did = "did:plc:alice";
+    let handle = "alice.example";
     manager
         .create_account(CreateAccountParams::new(did, handle, "pw"))
         .await
@@ -88,13 +90,13 @@ async fn post_blob(app: axum::Router, token: &str, bytes: Vec<u8>) -> (StatusCod
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fjall_blob_upload_get_list_round_trip() {
-    let (app, _tmp) = build_fjall_app().await;
-    let token = create_account_session(&app).await;
+    let (app, manager, _tmp) = build_fjall_app().await;
+    let token = create_account_session(&app, &manager).await;
 
     // Upload.
     let (status, body) = post_blob(app.clone(), &token, b"hello fjall".to_vec()).await;
     assert_eq!(status, StatusCode::OK, "uploadBlob body: {body}");
-    let cid = body["blob"]["$link"].as_str().unwrap().to_string();
+    let cid = body["blob"]["ref"]["$link"].as_str().unwrap().to_string();
     assert!(cid.starts_with("bafkrei") || cid.starts_with("bafy"));
     assert_eq!(body["blob"]["size"], 11);
 
@@ -151,8 +153,8 @@ async fn fjall_blob_upload_get_list_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fjall_blob_get_unknown_returns_404() {
-    let (app, _tmp) = build_fjall_app().await;
-    let _ = create_account_session(&app).await;
+    let (app, manager, _tmp) = build_fjall_app().await;
+    let _ = create_account_session(&app, &manager).await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -167,13 +169,20 @@ async fn fjall_blob_get_unknown_returns_404() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fjall_blob_upload_idempotent() {
-    let (app, _tmp) = build_fjall_app().await;
-    let token = create_account_session(&app).await;
+    let (app, manager, _tmp) = build_fjall_app().await;
+    let token = create_account_session(&app, &manager).await;
     let (s1, b1) = post_blob(app.clone(), &token, b"abc".to_vec()).await;
     let (s2, b2) = post_blob(app, &token, b"abc".to_vec()).await;
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(s2, StatusCode::OK);
-    assert_eq!(b1["blob"]["$link"], b2["blob"]["$link"]);
+    // Reading the CID out of the typed envelope, not the pre-envelope shape.
+    // The old spelling compared two nulls, so this asserted nothing.
+    let link = &b1["blob"]["ref"]["$link"];
+    assert!(
+        link.is_string(),
+        "uploadBlob should return a blob ref: {b1}"
+    );
+    assert_eq!(link, &b2["blob"]["ref"]["$link"]);
 }
 
 /// Log in as a fixture account and return its access token.

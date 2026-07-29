@@ -218,6 +218,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: record→blob reference tracking was implemented, tested, and never invoked. The trait
+  method, all three backend implementations and the free functions existed with their own unit tests,
+  and nothing in the write path called any of them — despite a doc comment stating the writer did.
+
+  So `listMissingBlobs` answered `{"blobs": []}` forever and `checkAccountStatus.expectedBlobs` stayed
+  `0`. A migrating client asked what still needed transferring, was told nothing, and activated an
+  account with none of its media — while every step reported success. Blob GC also had no ref-counts
+  to consult.
+
+  The write path now walks each record for blob references and maintains the index. The walker
+  recurses rather than checking known paths like `embed.images`: blobs appear at arbitrary depth and
+  in arrays, and a walker that had to be taught each lexicon would silently miss every one it had not
+  been taught — the same outcome as not walking at all. It validates the whole envelope before
+  accepting a reference, so a map carrying `$type: "blob"` and nothing else does not produce a row
+  with an empty CID that `listMissingBlobs` would then report as missing forever.
+
+  Updates and deletes drop the record's existing references first. Adding without dropping would make
+  the counts only ever grow, which is a different wrong answer rather than a fix.
+
+  **`listMissingBlobs` now returns entries on repositories that previously reported none.** That is
+  the correction, but anything asserting an empty list will see it as a change.
+
+- `atproto-pds`: the fjall test suite did not compile, so it had not run. Once building, one test was
+  failing on a stale assertion — it read `blob.$link` from an `uploadBlob` response, a shape that
+  stopped existing when blob refs became the lexicon's typed envelope (`blob.ref.$link`). A second
+  assertion in the same file compared two of those absent values and so asserted nothing. Both
+  corrected; the fjall profile is green.
+
 - `atproto-pds`: no route sent CORS headers, so no browser client worked. A browser OAuth client runs
   on some other origin; without `Access-Control-Allow-Origin` the browser refuses to hand it the
   response body, so discovery failed before the authorization request was attempted — and had it got

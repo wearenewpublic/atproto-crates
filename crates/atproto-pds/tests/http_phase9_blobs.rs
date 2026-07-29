@@ -280,3 +280,240 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+// ---------------------------------------------------------------------------
+//  Record→blob reference tracking (F-BLOB-02).
+//
+//  Every piece of this existed and nothing called it, so `listMissingBlobs`
+//  answered `{"blobs": []}` forever. A migrating client concluded there was
+//  nothing to transfer and activated an account with none of its media, while
+//  every step reported success.
+// ---------------------------------------------------------------------------
+
+/// Write a record and return its AT-URI.
+async fn write_record_with(
+    app: &axum::Router,
+    did: &str,
+    token: &str,
+    rkey: &str,
+    record: Value,
+) -> StatusCode {
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.putRecord")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "repo": did,
+                "collection": "app.bsky.feed.post",
+                "rkey": rkey,
+                "record": record,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+async fn missing_blobs(app: &axum::Router, did: &str, token: &str) -> Vec<String> {
+    let request = Request::builder()
+        .uri(format!("/xrpc/com.atproto.repo.listMissingBlobs?did={did}"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+            .unwrap_or(Value::Null);
+    body["blobs"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|b| b["cid"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn blob_envelope(cid: &str) -> Value {
+    json!({
+        "$type": "blob",
+        "ref": { "$link": cid },
+        "mimeType": "image/jpeg",
+        "size": 1234,
+    })
+}
+
+/// A record referencing a blob that was never uploaded is reported missing.
+///
+/// This is the whole point of `listMissingBlobs`: it is how a migrating client
+/// learns what it still has to transfer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_referenced_but_absent_blob_is_reported_missing() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:refs";
+    let token = create_account(&app, &manager, did, "refs.test.example").await;
+
+    // A real CID for bytes that were never uploaded. A made-up string will not
+    // do: the record encoder reads `$link` into the data model, so an
+    // unparseable CID fails the write rather than reaching the ref index.
+    let cid = atproto_dasl::cid::compute_raw_cid(b"never uploaded").to_string();
+    let cid = cid.as_str();
+    assert_eq!(
+        write_record_with(
+            &app,
+            did,
+            &token,
+            "post1",
+            json!({
+                "$type": "app.bsky.feed.post",
+                "text": "with media",
+                "embed": { "images": [{ "alt": "a", "image": blob_envelope(cid) }] },
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        missing_blobs(&app, did, &token).await,
+        vec![cid.to_string()],
+        "a record referenced a blob that was never uploaded and nothing noticed"
+    );
+}
+
+/// An uploaded blob is not missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploaded_blob_is_not_reported_missing() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:refs2";
+    let token = create_account(&app, &manager, did, "refs2.test.example").await;
+
+    // Upload first, then reference what was uploaded.
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.uploadBlob")
+        .method("POST")
+        .header("content-type", "image/jpeg")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(b"pretend jpeg".to_vec()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let cid = body["blob"]["ref"]["$link"]
+        .as_str()
+        .or_else(|| body["blob"]["$link"].as_str())
+        .expect("uploadBlob returns a ref")
+        .to_string();
+
+    write_record_with(
+        &app,
+        did,
+        &token,
+        "post1",
+        json!({
+            "$type": "app.bsky.feed.post",
+            "text": "with media",
+            "embed": { "images": [{ "alt": "a", "image": blob_envelope(&cid) }] },
+        }),
+    )
+    .await;
+
+    assert!(
+        missing_blobs(&app, did, &token).await.is_empty(),
+        "an uploaded blob should not be reported missing"
+    );
+}
+
+/// Rewriting a record without the blob drops the reference.
+///
+/// Adding refs without ever dropping them would make the counts only grow —
+/// a different wrong answer, and blob GC reads those counts to decide what is
+/// orphaned.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_a_blob_from_a_record_drops_the_reference() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:refs3";
+    let token = create_account(&app, &manager, did, "refs3.test.example").await;
+    let cid = atproto_dasl::cid::compute_raw_cid(b"dropped blob").to_string();
+    let cid = cid.as_str();
+
+    write_record_with(
+        &app,
+        did,
+        &token,
+        "post1",
+        json!({
+            "$type": "app.bsky.feed.post",
+            "text": "with media",
+            "embed": { "images": [{ "alt": "a", "image": blob_envelope(cid) }] },
+        }),
+    )
+    .await;
+    assert_eq!(missing_blobs(&app, did, &token).await.len(), 1);
+
+    // Same record, no blob.
+    write_record_with(
+        &app,
+        did,
+        &token,
+        "post1",
+        json!({ "$type": "app.bsky.feed.post", "text": "media removed" }),
+    )
+    .await;
+
+    assert!(
+        missing_blobs(&app, did, &token).await.is_empty(),
+        "the reference survived a rewrite that removed the blob"
+    );
+}
+
+/// Deleting the record drops its references.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_record_drops_its_references() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:refs4";
+    let token = create_account(&app, &manager, did, "refs4.test.example").await;
+    let cid = atproto_dasl::cid::compute_raw_cid(b"deleted blob").to_string();
+    let cid = cid.as_str();
+
+    write_record_with(
+        &app,
+        did,
+        &token,
+        "post1",
+        json!({
+            "$type": "app.bsky.feed.post",
+            "text": "with media",
+            "embed": { "images": [{ "alt": "a", "image": blob_envelope(cid) }] },
+        }),
+    )
+    .await;
+    assert_eq!(missing_blobs(&app, did, &token).await.len(), 1);
+
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.repo.deleteRecord")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "repo": did,
+                "collection": "app.bsky.feed.post",
+                "rkey": "post1",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    assert!(
+        missing_blobs(&app, did, &token).await.is_empty(),
+        "a deleted record left its blob references behind"
+    );
+}
