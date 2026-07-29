@@ -42,7 +42,14 @@ pub enum SpaceReadAuth<'a> {
     /// check is performed here — consumers verify at sync time.
     OwnPds {
         /// DID of the local account whose per-actor store to read from.
-        account_did: &'a str,
+        ///
+        /// Owned, not borrowed. This DID is produced by `subject.sub()`
+        /// during request authentication — it is derived, not a slice of the
+        /// request — so no caller can ever supply a borrow that outlives the
+        /// call. Typing it as `&'a str` did not make the borrow possible; it
+        /// made `Box::leak` the only way to satisfy the compiler, which leaked
+        /// the DID string on every authenticated space read.
+        account_did: String,
     },
     /// Caller presented a `SpaceCredential` JWT minted by the space authority.
     /// Reads happen against the *authority's* per-actor store. The credential's
@@ -301,6 +308,48 @@ pub(crate) async fn taken_down_rkeys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `OwnPds` must own its DID.
+    ///
+    /// This is the F-SPACE-30 regression guard, and it is a *compile-time*
+    /// one: the DID is built inside a scope that ends before the value is
+    /// used, so this only compiles when `account_did` is owned. Reintroducing
+    /// `&'a str` brings back the borrow that nothing can satisfy — and with it
+    /// the `Box::leak` that leaked the caller's DID on every authenticated
+    /// space read.
+    ///
+    /// There is no runtime assertion available here: the leak was invisible
+    /// through the HTTP surface, which is why it survived. The type is the
+    /// test.
+    #[test]
+    fn own_pds_owns_its_did() {
+        let auth = {
+            let subject_did = format!("did:plc:{}", "derived-at-request-time");
+            SpaceReadAuth::OwnPds {
+                account_did: subject_did,
+            }
+        };
+        match auth {
+            SpaceReadAuth::OwnPds { account_did } => {
+                assert_eq!(account_did, "did:plc:derived-at-request-time");
+            }
+            SpaceReadAuth::SpaceCredential { .. } => unreachable!(),
+        }
+    }
+
+    /// The lifetime parameter still earns its place: a SpaceCredential really
+    /// does borrow the Authorization header, so dropping it entirely would
+    /// have meant cloning a JWT on every credential read to fix a leak on a
+    /// different variant.
+    #[test]
+    fn space_credential_still_borrows_its_token() {
+        let header = String::from("eyJhbGciOiJFUzI1NiJ9.e30.sig");
+        let auth = SpaceReadAuth::SpaceCredential { token: &header };
+        match auth {
+            SpaceReadAuth::SpaceCredential { token } => assert!(std::ptr::eq(token, &*header)),
+            SpaceReadAuth::OwnPds { .. } => unreachable!(),
+        }
+    }
     use crate::account::{AccountDirectory, AccountManager, CreateAccountParams};
     use crate::keys::{KeyStore, MemoryKeyStore};
     use crate::space::writer::{SpaceWriteAction, SpaceWriteOp, SpaceWriter};
@@ -372,7 +421,7 @@ mod tests {
             .get_record(
                 &uri,
                 SpaceReadAuth::OwnPds {
-                    account_did: "did:plc:owner",
+                    account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
                 "app.bsky.group.message",
@@ -398,7 +447,7 @@ mod tests {
             .list_records(
                 &uri,
                 SpaceReadAuth::OwnPds {
-                    account_did: "did:plc:owner",
+                    account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
                 Some("app.bsky.group.message"),
@@ -441,7 +490,7 @@ mod tests {
             .list_records(
                 &uri,
                 SpaceReadAuth::OwnPds {
-                    account_did: "did:plc:owner",
+                    account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
                 None,
@@ -610,7 +659,7 @@ mod tests {
             .get_record(
                 &uri,
                 SpaceReadAuth::OwnPds {
-                    account_did: "did:plc:owner",
+                    account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
                 "app.bsky.group.message",
@@ -656,7 +705,7 @@ mod tests {
             .get_record(
                 &uri,
                 SpaceReadAuth::OwnPds {
-                    account_did: "did:plc:owner",
+                    account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
                 "app.bsky.group.message",
@@ -671,7 +720,7 @@ mod tests {
             .list_records(
                 &uri,
                 SpaceReadAuth::OwnPds {
-                    account_did: "did:plc:owner",
+                    account_did: "did:plc:owner".to_string(),
                 },
                 "did:plc:owner",
                 Some("app.bsky.group.message"),

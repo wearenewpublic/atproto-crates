@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   believed it had a backend it did not have.
 
 ### Security
+- `atproto-pds`: every authenticated permissioned-record read leaked the caller's DID string.
+  `resolve_record_auth` called `Box::leak(sub.clone().into_boxed_str())` on the hottest authenticated
+  path in the spaces surface, so any account with a valid session could drive unbounded process
+  memory growth with ordinary reads — `getRecord`, `listRecords`, `getBlob`.
+
+  The cause was a type, not a line. `SpaceReadAuth::OwnPds` declared `account_did: &'a str`, but the
+  DID is produced by `subject.sub()` during request authentication — derived, not a slice of the
+  request — so no caller could ever supply a borrow that lived long enough. `Box::leak` was the only
+  way to satisfy the compiler. The field is now owned.
+
+  The lifetime parameter stays: `SpaceCredential` genuinely borrows the `Authorization` header, and
+  removing it would have meant cloning a JWT on every credential read to fix a leak on a different
+  variant.
+
 - `atproto-pds`: records were written with no structural checks of any kind. `repo/writer.rs`
   interpolated the record key straight into the MST path and encoded the value without inspecting
   `$type`. Neither failure is recoverable once the commit is signed and sequenced: a key containing

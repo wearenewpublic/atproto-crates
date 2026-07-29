@@ -1110,12 +1110,9 @@ async fn resolve_record_auth<'a>(
             let (htm, htu) = request_htm_htu(parts);
             let subject = require_authn(parts, state, &htm, &htu).await?;
             let sub = subject.sub().to_string();
-            let did_static: &'a str = Box::leak(sub.clone().into_boxed_str());
-            let target_repo = repo.map(|r| r.to_string()).unwrap_or(sub);
+            let target_repo = repo.map(|r| r.to_string()).unwrap_or_else(|| sub.clone());
             Ok(ResolvedRecordAuth {
-                auth: SpaceReadAuth::OwnPds {
-                    account_did: did_static,
-                },
+                auth: SpaceReadAuth::OwnPds { account_did: sub },
                 target_repo,
                 subject: Some(subject),
             })
