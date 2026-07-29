@@ -384,3 +384,237 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+// ---------------------------------------------------------------------------
+//  swapCommit (F-REC-04).
+//
+//  Declared on all four write methods and never read, so two clients that each
+//  read, decided and wrote both received HTTP 200 and the second silently
+//  discarded the first's work.
+// ---------------------------------------------------------------------------
+
+/// The repo's current commit CID.
+async fn head_commit(app: &axum::Router, did: &str, token: &str) -> String {
+    let req = Request::builder()
+        .uri(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["cid"]
+        .as_str()
+        .expect("a written repo has a head")
+        .to_string()
+}
+
+async fn post_with(
+    app: &axum::Router,
+    token: &str,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn a_post(text: &str) -> Value {
+    json!({ "$type": "app.bsky.feed.post", "text": text })
+}
+
+/// A stale `swapCommit` is refused on every write method.
+///
+/// This is the whole point: a client that read the repo, decided something, and
+/// is now writing gets told its decision was made against a state that has
+/// moved — instead of silently clobbering whoever wrote in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_swap_commit_is_refused_on_every_write_path() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:alice";
+    let token = create_account_and_token(&app, &manager, did, "alice.example").await;
+
+    // Establish a head, then move it so the captured value is stale.
+    post_with(&app, &token, "/xrpc/com.atproto.repo.createRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "seed", "record": a_post("seed")})).await;
+    let stale = head_commit(&app, did, &token).await;
+    post_with(&app, &token, "/xrpc/com.atproto.repo.createRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "moved", "record": a_post("moved")})).await;
+
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+            "repo": did, "collection": "app.bsky.feed.post", "rkey": "c",
+            "record": a_post("c"), "swapCommit": stale }),
+        ),
+        (
+            "/xrpc/com.atproto.repo.putRecord",
+            json!({
+            "repo": did, "collection": "app.bsky.feed.post", "rkey": "seed",
+            "record": a_post("p"), "swapCommit": stale }),
+        ),
+        (
+            "/xrpc/com.atproto.repo.deleteRecord",
+            json!({
+            "repo": did, "collection": "app.bsky.feed.post", "rkey": "seed",
+            "swapCommit": stale }),
+        ),
+        (
+            "/xrpc/com.atproto.repo.applyWrites",
+            json!({
+            "repo": did, "swapCommit": stale, "writes": [{
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "app.bsky.feed.post", "rkey": "b", "value": a_post("b") }] }),
+        ),
+    ];
+
+    for (path, body) in cases {
+        let (status, response) = post_with(&app, &token, path, body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path} accepted a stale swapCommit: {response}"
+        );
+        assert_eq!(response["error"], "InvalidSwap", "{path}: {response}");
+    }
+}
+
+/// A current `swapCommit` is accepted on every write method.
+///
+/// The refusal above is only correct if the guard also lets a well-behaved
+/// caller through; a check that refuses everything would pass that test too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_current_swap_commit_is_accepted_on_every_write_path() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:alice";
+    let token = create_account_and_token(&app, &manager, did, "alice.example").await;
+
+    post_with(&app, &token, "/xrpc/com.atproto.repo.createRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "seed", "record": a_post("seed")})).await;
+
+    /// Builds a request body around the caller's expected commit.
+    type BodyFor = Box<dyn Fn(&str) -> Value>;
+
+    // Each write moves the head, so the guard is re-read every time.
+    let paths: Vec<(&str, BodyFor)> = vec![
+        (
+            "/xrpc/com.atproto.repo.createRecord",
+            Box::new(|c: &str| {
+                json!({
+            "repo": "did:plc:alice", "collection": "app.bsky.feed.post", "rkey": "c",
+            "record": { "$type": "app.bsky.feed.post", "text": "c" }, "swapCommit": c })
+            }),
+        ),
+        (
+            "/xrpc/com.atproto.repo.putRecord",
+            Box::new(|c: &str| {
+                json!({
+            "repo": "did:plc:alice", "collection": "app.bsky.feed.post", "rkey": "seed",
+            "record": { "$type": "app.bsky.feed.post", "text": "p" }, "swapCommit": c })
+            }),
+        ),
+        (
+            "/xrpc/com.atproto.repo.applyWrites",
+            Box::new(|c: &str| {
+                json!({
+            "repo": "did:plc:alice", "swapCommit": c, "writes": [{
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "app.bsky.feed.post", "rkey": "b",
+                "value": { "$type": "app.bsky.feed.post", "text": "b" } }] })
+            }),
+        ),
+        (
+            "/xrpc/com.atproto.repo.deleteRecord",
+            Box::new(|c: &str| {
+                json!({
+            "repo": "did:plc:alice", "collection": "app.bsky.feed.post", "rkey": "seed",
+            "swapCommit": c })
+            }),
+        ),
+    ];
+
+    for (path, build) in paths {
+        let current = head_commit(&app, did, &token).await;
+        let (status, response) = post_with(&app, &token, path, build(&current)).await;
+        assert!(
+            status.is_success(),
+            "{path} refused a current swapCommit: {response}"
+        );
+    }
+}
+
+/// Omitting `swapCommit` still writes — the guard is opt-in.
+#[tokio::test(flavor = "multi_thread")]
+async fn omitting_swap_commit_writes_as_before() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:alice";
+    let token = create_account_and_token(&app, &manager, did, "alice.example").await;
+
+    let (status, body) = post_with(&app, &token, "/xrpc/com.atproto.repo.createRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "x", "record": a_post("x")})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The second of two writers racing on the same read loses, rather than both
+/// reporting success.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_writers_on_one_read_do_not_both_succeed() {
+    let (app, manager, _tmp) = build_app().await;
+    let did = "did:plc:alice";
+    let token = create_account_and_token(&app, &manager, did, "alice.example").await;
+
+    post_with(&app, &token, "/xrpc/com.atproto.repo.createRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "seed", "record": a_post("seed")})).await;
+
+    // Both clients read the same head and each writes against it.
+    let shared = head_commit(&app, did, &token).await;
+    let (first, _) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "seed",
+               "record": a_post("first writer"), "swapCommit": shared}),
+    )
+    .await;
+    let (second, body) = post_with(
+        &app,
+        &token,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "seed",
+               "record": a_post("second writer"), "swapCommit": shared}),
+    )
+    .await;
+
+    assert!(first.is_success(), "the first writer should win");
+    assert_eq!(
+        second,
+        StatusCode::BAD_REQUEST,
+        "the second writer clobbered the first and was told it succeeded: {body}"
+    );
+
+    // And the first writer's value is what survived.
+    let req = Request::builder()
+        .uri(format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey=seed"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["value"]["text"], "first writer");
+}

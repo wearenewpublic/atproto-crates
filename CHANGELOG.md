@@ -218,6 +218,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: `swapCommit` was accepted and never enforced, so concurrent writers clobbered each
+  other and both received HTTP 200. `createRecord` declared the field and never read it; `putRecord`,
+  `deleteRecord` and `applyWrites` did not accept it at all, though all four lexicons declare it and
+  name `InvalidSwap` as the error. Two clients that each read the repo, decided something, and wrote
+  would both be told they succeeded, and the second would silently discard the first's work.
+
+  All four now perform a real compare-and-swap. The check happens inside the per-DID write mutex,
+  after the prior commit is loaded and before anything is written, so it holds against concurrent
+  writers on this server rather than being a check-then-hope. `applyWrites` guards the whole batch,
+  as its lexicon requires — "the entire operation will fail".
+
+  A mismatch returns `InvalidSwap` with both the expected and the actual commit, so a client can see
+  what it needs to rebase onto rather than only that something went wrong. Omitting `swapCommit`
+  writes as before: the guard is opt-in, and a caller that makes no claim has nothing to check.
+
+  `swapRecord`, which was already honoured on standalone `putRecord`/`deleteRecord`, is unchanged.
+
 - `atproto-pds`: `importRepo` wrote no record index, so an imported repository was invisible to every
   record API. It persisted blocks and commit rows and stopped; `getRecord`, `listRecords` and
   `describeRepo` all resolve through `repo_record`, which nothing populated — despite the module doc

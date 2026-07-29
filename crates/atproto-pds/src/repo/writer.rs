@@ -156,6 +156,28 @@ impl RepoWriter {
     /// reads + atomic write dispatch through its trait surface. Otherwise
     /// the legacy SQLite-direct path runs.
     pub async fn apply_writes(&self, did: &str, ops: Vec<WriteOp>) -> PdsResult<CommitResult> {
+        self.apply_writes_with_swap(did, ops, None).await
+    }
+
+    /// Apply a batch, optionally guarded by a compare-and-swap on the repo's
+    /// current commit.
+    ///
+    /// `swap_commit` is the lexicons' `swapCommit`: the caller states the
+    /// commit it believes the repository is at, and the write is refused with
+    /// [`PdsError::InvalidSwap`] if it has moved. Without it, two clients that
+    /// each read, decided, and wrote would both receive HTTP 200 and the second
+    /// would silently discard the first's work.
+    ///
+    /// The comparison happens inside the per-DID write mutex, after the prior
+    /// commit is loaded and before anything is written — so it is a genuine
+    /// compare-and-swap against concurrent writers on this server, not a
+    /// check-then-hope.
+    pub async fn apply_writes_with_swap(
+        &self,
+        did: &str,
+        ops: Vec<WriteOp>,
+        swap_commit: Option<&str>,
+    ) -> PdsResult<CommitResult> {
         if ops.is_empty() {
             return Err(PdsError::NotFound {
                 what: "applyWrites called with empty ops".to_string(),
@@ -165,9 +187,31 @@ impl RepoWriter {
         let _guard = lock.lock().await;
 
         match self.backend.as_ref() {
-            Some(backend) => self.apply_writes_dispatch(did, ops, backend.clone()).await,
-            None => self.apply_writes_legacy(did, ops).await,
+            Some(backend) => {
+                self.apply_writes_dispatch(did, ops, backend.clone(), swap_commit)
+                    .await
+            }
+            None => self.apply_writes_legacy(did, ops, swap_commit).await,
         }
+    }
+
+    /// Refuse the write when the caller's expected commit is not the current
+    /// one.
+    ///
+    /// An absent `swap_commit` means the caller made no claim, so nothing to
+    /// check. A caller that names a commit for an empty repository is wrong in
+    /// a way worth reporting rather than ignoring.
+    fn check_swap(swap_commit: Option<&str>, current: Option<&str>) -> PdsResult<()> {
+        let Some(expected) = swap_commit else {
+            return Ok(());
+        };
+        if current == Some(expected) {
+            return Ok(());
+        }
+        Err(PdsError::InvalidSwap {
+            expected: expected.to_string(),
+            actual: current.unwrap_or("none").to_string(),
+        })
     }
 
     /// Maintain the record→blob reference index for a committed batch.
@@ -263,7 +307,12 @@ impl RepoWriter {
 
     /// Legacy SQLite-direct path. Kept for back-compat with tests
     /// that build `RepoWriter::new(...)` without a backend.
-    async fn apply_writes_legacy(&self, did: &str, ops: Vec<WriteOp>) -> PdsResult<CommitResult> {
+    async fn apply_writes_legacy(
+        &self,
+        did: &str,
+        ops: Vec<WriteOp>,
+        swap_commit: Option<&str>,
+    ) -> PdsResult<CommitResult> {
         let store = SqlActorStore::open(&self.data_dir, did).await?;
         let pool = store.pool();
 
@@ -279,6 +328,7 @@ impl RepoWriter {
             Some((cid, _, data)) => (Some(cid.clone()), Some(data.clone())),
             None => (None, None),
         };
+        Self::check_swap(swap_commit, prev_commit_cid.as_deref())?;
 
         // Prepare an MST over a fresh SqlBlockStorage that shares the pool.
         let block_storage =
@@ -603,6 +653,7 @@ impl RepoWriter {
         did: &str,
         ops: Vec<WriteOp>,
         backend: Arc<PublicRealmBackend>,
+        swap_commit: Option<&str>,
     ) -> PdsResult<CommitResult> {
         // Load the prior commit via trait dispatch.
         let prior = backend.commit_obj.latest(did).await?;
@@ -610,6 +661,7 @@ impl RepoWriter {
             Some(row) => (Some(row.cid.clone()), Some(row.data_cid.clone())),
             None => (None, None),
         };
+        Self::check_swap(swap_commit, prev_commit_cid.as_deref())?;
 
         // Open a per-actor block storage handle through the dispatch
         // factory. The MST builder takes ownership.

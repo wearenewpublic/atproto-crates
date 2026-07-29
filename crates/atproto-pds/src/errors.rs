@@ -79,6 +79,22 @@ pub enum PdsError {
         to: String,
     },
 
+    /// error-atproto-pds-repo-2: a compare-and-swap guard did not match.
+    ///
+    /// `swapCommit` exists so a client that read the repo, decided something,
+    /// and is now writing can be told its decision was made against a state
+    /// that has since moved — rather than silently clobbering whoever wrote in
+    /// between.
+    #[error(
+        "error-atproto-pds-repo-2 swapCommit mismatch: expected {expected}, repo is at {actual}"
+    )]
+    InvalidSwap {
+        /// The commit CID the caller expected the repo to be at.
+        expected: String,
+        /// The commit CID the repo is actually at, or `none` for an empty repo.
+        actual: String,
+    },
+
     /// error-atproto-pds-auth-2: the repository is not available to callers.
     ///
     /// Distinct from [`PdsError::AuthDenied`] because the sync and blob

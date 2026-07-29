@@ -175,7 +175,9 @@ pub struct CreateRecordInput {
     pub rkey: Option<String>,
     /// Record value (DAG-CBOR-encodable JSON).
     pub record: serde_json::Value,
-    /// Optional swap guard for `Update`-on-`Create` semantics (rejected for create).
+    /// Compare-and-swap on the repo's current commit. The write is refused
+    /// with `InvalidSwap` if the repository has moved on since the caller read
+    /// it. Declared before and never read.
     #[serde(rename = "swapCommit")]
     pub swap_commit: Option<String>,
 }
@@ -249,7 +251,7 @@ pub async fn create_record(
 
     let rkey = input.rkey.unwrap_or_else(|| Tid::new().to_string());
     let result = writer
-        .apply_writes(
+        .apply_writes_with_swap(
             &repo_did,
             vec![WriteOp {
                 action: WriteAction::Create,
@@ -258,6 +260,7 @@ pub async fn create_record(
                 value: Some(input.record),
                 swap_record: None,
             }],
+            input.swap_commit.as_deref(),
         )
         .await
         .map_err(XrpcError::from)?;
@@ -287,6 +290,9 @@ pub struct PutRecordInput {
     /// Optional swap-record guard.
     #[serde(rename = "swapRecord")]
     pub swap_record: Option<String>,
+    /// Compare-and-swap on the repo's current commit.
+    #[serde(rename = "swapCommit")]
+    pub swap_commit: Option<String>,
 }
 
 /// Handler for `com.atproto.repo.putRecord` (idempotent upsert).
@@ -306,7 +312,7 @@ pub async fn put_record(
     )?;
 
     let result = writer
-        .apply_writes(
+        .apply_writes_with_swap(
             &repo_did,
             vec![WriteOp {
                 action: WriteAction::Update,
@@ -315,6 +321,7 @@ pub async fn put_record(
                 value: Some(input.record),
                 swap_record: input.swap_record,
             }],
+            input.swap_commit.as_deref(),
         )
         .await
         .map_err(XrpcError::from)?;
@@ -342,6 +349,9 @@ pub struct DeleteRecordInput {
     /// Optional swap-record guard.
     #[serde(rename = "swapRecord")]
     pub swap_record: Option<String>,
+    /// Compare-and-swap on the repo's current commit.
+    #[serde(rename = "swapCommit")]
+    pub swap_commit: Option<String>,
 }
 
 /// Handler for `com.atproto.repo.deleteRecord`.
@@ -361,7 +371,7 @@ pub async fn delete_record(
     )?;
 
     let result = writer
-        .apply_writes(
+        .apply_writes_with_swap(
             &repo_did,
             vec![WriteOp {
                 action: WriteAction::Delete,
@@ -370,6 +380,7 @@ pub async fn delete_record(
                 value: None,
                 swap_record: input.swap_record,
             }],
+            input.swap_commit.as_deref(),
         )
         .await
         .map_err(XrpcError::from)?;
@@ -392,6 +403,10 @@ pub struct ApplyWritesInput {
     pub repo: String,
     /// Writes batch.
     pub writes: Vec<ApplyWritesEntry>,
+    /// Compare-and-swap on the repo's current commit. Guards the whole batch:
+    /// the lexicon says "the entire operation will fail".
+    #[serde(rename = "swapCommit")]
+    pub swap_commit: Option<String>,
 }
 
 /// One entry in an `applyWrites` batch.
@@ -490,6 +505,9 @@ pub async fn apply_writes(
         ));
     }
 
+    // Captured before `input.writes` is consumed below.
+    let swap_commit = input.swap_commit.clone();
+
     // Asserted per operation, not once for the batch: one `applyWrites` can
     // touch several collections with different verbs, and a token scoped to
     // create in one collection must not delete in another by riding along.
@@ -545,7 +563,7 @@ pub async fn apply_writes(
         .collect();
 
     let result = writer
-        .apply_writes(&repo_did, ops)
+        .apply_writes_with_swap(&repo_did, ops, swap_commit.as_deref())
         .await
         .map_err(XrpcError::from)?;
     publish_recent_stream_event(&state, &repo_did).await;

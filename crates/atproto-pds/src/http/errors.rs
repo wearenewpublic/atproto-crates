@@ -73,6 +73,14 @@ impl From<PdsError> for XrpcError {
                 };
                 XrpcError::new(StatusCode::BAD_REQUEST, name, format!("{did} is {state}"))
             }
+            // The lexicons declare `InvalidSwap` by name on all four write
+            // methods, and a client is expected to act on it — re-read, rebase
+            // its decision, retry. A generic 400 tells it nothing.
+            PdsError::InvalidSwap { expected, actual } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidSwap",
+                format!("swapCommit {expected} does not match the current commit {actual}"),
+            ),
             PdsError::AuthDenied { reason } => {
                 XrpcError::new(StatusCode::FORBIDDEN, "Forbidden", reason)
             }
