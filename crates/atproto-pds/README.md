@@ -108,14 +108,33 @@ Two compile-time-mutually-exclusive backends for the per-actor store:
 
 For the cross-account accounts DB:
 
-- **SQLite (default)** — one shared SQLite at
-  `PDS_DATA_DIRECTORY/accounts.sqlite`.
-- **PostgreSQL** — opt in via `--features postgres` plus the
-  `PDS_POSTGRES_URL` env var. Every accounts-DB call site routes
-  through the `AccountPool` runtime-dispatch enum, so SQLite and
-  Postgres share a single code path.
+- **SQLite** — one shared SQLite at `PDS_DATA_DIRECTORY/accounts.sqlite`.
+  This is the only supported accounts backend.
 
-Per-actor SQLite vs fjall is independent of the accounts-DB choice.
+Per-actor SQLite vs fjall is independent of the accounts DB.
+
+## Unsupported deployment modes
+
+Two backends exist in the source tree, compile behind Cargo features, and
+have tests — and are **not wired into the `pds` binary**. They are listed
+here so nobody discovers that the hard way.
+
+- **PostgreSQL accounts DB** (`postgres` feature, `PDS_POSTGRES_URL`).
+  `AccountDirectory::open_postgres` exists and 57 of 59 accounts-DB query
+  sites already dispatch per dialect, but thirteen production call sites —
+  the OAuth state store, the JTI replay guard and rate-limit SQL backend,
+  the GC loop, the notifier, the sequencer, four files of the spaces
+  subsystem, and the repository writer's signing-key lookup — take a
+  SQLite-only pool accessor that panics on a Postgres pool.
+- **S3 blob storage** (`s3` feature, `PDS_BLOB_STORE_URL`).
+  `HybridS3BlobStorage` is complete and implements `BlobStorage`; nothing
+  constructs it.
+
+**Setting `PDS_POSTGRES_URL` or `PDS_BLOB_STORE_URL` refuses at boot.**
+Previously both were parsed and silently ignored, so an operator who
+configured either believed they had it and got neither. A documented mode
+that does not work is worse than an absent one; a mode that fails loudly at
+startup is neither.
 
 ## Cargo features
 
@@ -123,16 +142,14 @@ Per-actor SQLite vs fjall is independent of the accounts-DB choice.
 |---|---|---|
 | `sqlite` | yes | Per-actor SQLite via sqlx. |
 | `fjall` | | LSM backend for the per-actor store. |
-| `postgres` | | PostgreSQL accounts adapter. Selected via `PDS_POSTGRES_URL` at boot. |
 | `http` | yes | axum router + WebSocket subscribeRepos. |
 | `clap` | | Build the `pds` and `atproto-pds-admin` binaries. |
 | `hickory-dns` | yes | Hickory resolver via `atproto-identity/hickory-dns`. |
 | `smtp` | | SMTP integration via `lettre`. When off, email-issuing endpoints fall back to dev-only INFO logging. |
 | `metrics` | | `prometheus-client` exporter at `GET /metrics` + axum request-counter middleware. |
 | `valkey` | | Valkey/Redis-backed JTI replay guard + sliding-window rate limiter. Wins over `--durability-profile` when `PDS_VALKEY_URL` is set. |
-| `s3` | | `HybridS3BlobStorage` — blob bytes go to S3, ref tracking stays relational. Selected via `PDS_BLOB_STORE_URL=s3://...`. |
 | `otel` | | OpenTelemetry OTLP HTTP/protobuf tracing exporter. Activated when `PDS_OTEL_ENDPOINT` is set. |
-| `postgres-live-tests` | | Opt in to the live-CRUD acceptance suite in `tests/feature_postgres_live.rs`. Reads the target DSN from `PDS_POSTGRES_TEST_URL`; emits an INFO skip + reports OK when the env var is unset, so CI without a Postgres instance still passes. |
+| `postgres-live-tests` | | Exercises the Postgres accounts adapter against a live instance (`tests/feature_postgres_live.rs`, DSN from `PDS_POSTGRES_TEST_URL`). Keeps the unsupported adapter compiling and correct; see **Unsupported deployment modes**. Emits an INFO skip and reports OK when the env var is unset. |
 
 ## Binaries
 

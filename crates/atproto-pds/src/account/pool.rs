@@ -3,9 +3,14 @@
 //! The accounts database stores cross-account state (`account`,
 //! `app_password`, `invite_code`, `email_token`, `notify_attempt`,
 //! `service_auth_blacklist`, `denylist`, `oauth_*`, `jti_replay`,
-//! `rate_limit_window`). Per
-//! it can run on either SQLite (default, single-node) or PostgreSQL
-//! (horizontal-scale). This module is the dispatch surface.
+//! `rate_limit_window`). This module is the dispatch surface between SQLite
+//! and PostgreSQL.
+//!
+//! **PostgreSQL is not a supported deployment mode.** The dispatch below is
+//! real and most of it works, but thirteen production call sites take the
+//! SQLite-only `pool()` accessor, which panics on a Postgres pool — see
+//! `crates/atproto-pds/README.md` § "Unsupported deployment modes". Setting
+//! `PDS_POSTGRES_URL` refuses at boot. The accounts DB is SQLite.
 //!
 //! ## How the dispatch is wired
 //!

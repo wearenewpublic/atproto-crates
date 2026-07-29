@@ -373,18 +373,24 @@ struct Args {
     #[arg(long, env = "PDS_VALKEY_KEY_PREFIX", default_value = "atproto-pds:")]
     valkey_key_prefix: String,
 
-    /// Blob-store URL — when prefixed with `s3://<bucket>` (and the
-    /// `s3` feature is compiled in), the binary uses an
-    /// AWS-SDK-backed `S3BlobStore` instead of the per-actor SQLite
-    /// blob tables. AWS credentials follow the standard SDK
-    /// resolution order (env vars, profile, IMDS).
+    /// Blob-store URL. **Unsupported** — setting this refuses at boot.
+    ///
+    /// `HybridS3BlobStorage` exists and is tested, and nothing constructs
+    /// it. The flag is still declared so that setting it produces an error
+    /// naming the gap rather than being silently ignored, which is what
+    /// used to happen: an operator configured S3 and got per-actor SQLite
+    /// with no indication.
     #[arg(long, env = "PDS_BLOB_STORE_URL")]
     blob_store_url: Option<String>,
 
-    /// PostgreSQL DSN for the accounts directory. When the `postgres` feature is compiled in and this
-    /// URL is set, the PDS routes every accounts-DB call site through
-    /// the runtime-dispatch [`atproto_pds::account::AccountPool`] enum against the supplied
-    /// pool. Per-actor stores remain SQLite-or-fjall regardless.
+    /// PostgreSQL DSN for the accounts directory. **Unsupported** —
+    /// setting this refuses at boot.
+    ///
+    /// `AccountDirectory::open_postgres` exists and most accounts-DB
+    /// queries already dispatch per dialect, but thirteen production call
+    /// sites take a SQLite-only pool accessor that panics on a Postgres
+    /// pool. Declared for the same reason as `blob_store_url`: so the
+    /// refusal is loud.
     #[arg(long, env = "PDS_POSTGRES_URL")]
     postgres_url: Option<String>,
 }
@@ -428,6 +434,23 @@ async fn main() -> anyhow::Result<()> {
     };
     validate_production_safety(&startup).map_err(|e| {
         error!(error = ?e, "startup config rejected");
+        anyhow::anyhow!("{e}")
+    })?;
+
+    // Two backends are documented in the source tree, compile behind Cargo
+    // features, and are not wired into this binary. Both flags used to parse
+    // and be ignored, so an operator who configured either believed they had
+    // it and got neither.
+    //
+    // Refusing here rather than dropping the flags: an unrecognised
+    // environment variable is also silent, and silence is the failure being
+    // fixed.
+    atproto_pds::config::validate_supported_backends(
+        args.postgres_url.as_deref(),
+        args.blob_store_url.as_deref(),
+    )
+    .map_err(|e| {
+        error!(error = ?e, "unsupported backend configured");
         anyhow::anyhow!("{e}")
     })?;
 

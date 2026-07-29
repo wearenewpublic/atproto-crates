@@ -1,11 +1,15 @@
-//! S3-compatible blob storage.
+//! S3-compatible blob storage. **Not wired into the `pds` binary.**
 //!
-//! When the `s3` feature is enabled and `PDS_BLOB_STORE_URL` is
-//! prefixed with `s3://<bucket>`, blob *bytes* are stored in the
-//! configured S3 bucket instead of the per-actor SQLite `repo_blob`
-//! table. Ref operations (`repo_blob_ref`) remain SQLite-backed —
-//! they're inherently relational and cheap to keep alongside the
-//! per-actor metadata.
+//! This module is complete and tested, and nothing constructs it. Setting
+//! `PDS_BLOB_STORE_URL` refuses at boot rather than being silently ignored —
+//! see `crates/atproto-pds/README.md` § "Unsupported deployment modes". The
+//! description below is of the design, not of a deployment mode you can
+//! select today.
+//!
+//! Blob *bytes* would be stored in the configured S3 bucket instead of the
+//! per-actor SQLite `repo_blob` table. Ref operations (`repo_blob_ref`)
+//! remain SQLite-backed — they're inherently relational and cheap to keep
+//! alongside the per-actor metadata.
 //!
 //! ## Object naming
 //!

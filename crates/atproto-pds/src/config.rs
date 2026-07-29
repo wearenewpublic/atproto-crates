@@ -115,6 +115,50 @@ pub fn validate_production_safety(config: &StartupConfig) -> Result<(), PdsError
     }
 }
 
+/// Refuse to boot when an unsupported backend is configured.
+///
+/// See `crates/atproto-pds/README.md` § "Unsupported deployment modes".
+/// PostgreSQL accounts storage and S3 blob storage both have complete,
+/// tested implementations in this crate and no construction site in the
+/// binary. Both environment variables used to parse and be ignored, so an
+/// operator who configured either believed they had it and got neither.
+///
+/// A documented deployment mode that does not work is worse than an absent
+/// one; one that fails at startup naming the reason is neither.
+///
+/// # Errors
+///
+/// [`PdsError::Config`] with one line per configured-but-unsupported
+/// backend.
+pub fn validate_supported_backends(
+    postgres_url: Option<&str>,
+    blob_store_url: Option<&str>,
+) -> Result<(), PdsError> {
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    let mut issues: Vec<String> = Vec::new();
+    if set(postgres_url) {
+        issues.push(
+            "PDS_POSTGRES_URL is set, but PostgreSQL is not a supported accounts backend on this \
+             build — thirteen production call sites take a SQLite-only pool accessor that would \
+             panic. Unset it; the accounts DB is SQLite at PDS_DATA_DIRECTORY/accounts.sqlite."
+                .to_string(),
+        );
+    }
+    if set(blob_store_url) {
+        issues.push(
+            "PDS_BLOB_STORE_URL is set, but S3 blob storage is not wired into this binary — \
+             HybridS3BlobStorage exists and nothing constructs it. Unset it; blobs are stored in \
+             the per-actor store."
+                .to_string(),
+        );
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(PdsError::Config { issues })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +224,45 @@ mod tests {
             other => panic!("expected Config, got {other:?}"),
         };
         assert!(issues.iter().any(|s| s.contains("PDS_ADMIN_PASSWORD")));
+    }
+
+    #[test]
+    fn an_unset_backend_url_is_fine() {
+        validate_supported_backends(None, None).unwrap();
+        // Empty and whitespace-only count as unset: an operator who exports
+        // the variable with no value has not configured anything.
+        validate_supported_backends(Some(""), Some("   ")).unwrap();
+    }
+
+    #[test]
+    fn a_configured_postgres_url_refuses_and_says_why() {
+        let err = validate_supported_backends(Some("postgres://localhost/pds"), None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("PDS_POSTGRES_URL"), "{msg}");
+        assert!(
+            msg.contains("not a supported accounts backend"),
+            "the refusal must name the reason, not just refuse: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_configured_blob_store_url_refuses_and_says_why() {
+        let err = validate_supported_backends(None, Some("s3://bucket")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("PDS_BLOB_STORE_URL"), "{msg}");
+        assert!(msg.contains("not wired into this binary"), "{msg}");
+    }
+
+    #[test]
+    fn both_are_reported_together() {
+        // Same rule as the production gate: an operator fixing config should
+        // see every problem in one boot, not one per attempt.
+        let err =
+            validate_supported_backends(Some("postgres://localhost/pds"), Some("s3://bucket"))
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("PDS_POSTGRES_URL"), "{msg}");
+        assert!(msg.contains("PDS_BLOB_STORE_URL"), "{msg}");
     }
 
     #[test]

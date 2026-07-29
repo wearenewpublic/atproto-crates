@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- `atproto-pds`: **PostgreSQL accounts storage and S3 blob storage are documented as unsupported,
+  and configuring either now refuses at boot.**
+
+  Both have complete, feature-gated, tested implementations in the source tree, and neither is
+  constructed by the `pds` binary. `PDS_POSTGRES_URL` and `PDS_BLOB_STORE_URL` were declared with
+  behavioural documentation and never read — so an operator who configured S3 got per-actor SQLite,
+  and one who configured Postgres got the same, with nothing to indicate it. The README advertised
+  both as selectable.
+
+  Postgres is further from working than the README implied: 57 of 59 accounts-DB query sites already
+  dispatch per dialect, but thirteen production call sites — the OAuth state store, the JTI replay
+  guard and rate-limit SQL backend, the GC loop, the notifier, the sequencer, four files of the
+  spaces subsystem, and the repository writer's signing-key lookup — take a SQLite-only pool
+  accessor that panics on a Postgres pool.
+
+  Both README rows are gone, replaced by an explicit "Unsupported deployment modes" section, and the
+  module docs on `blob_s3` and `account::pool` now say so at the top rather than describing a mode
+  you cannot select. The code stays: it compiles, it is tested, and deleting it would make wiring it
+  later harder than leaving it.
+
+  **A deployment that sets either variable will not boot.** That is the point — it previously
+  believed it had a backend it did not have.
+
 ### Security
 - `atproto-pds`: records were written with no structural checks of any kind. `repo/writer.rs`
   interpolated the record key straight into the MST path and encoded the value without inspecting
