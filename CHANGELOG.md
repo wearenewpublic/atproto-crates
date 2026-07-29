@@ -103,6 +103,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     security control that reads as working is worse than an absent one.
 
 ### Fixed
+- `atproto-pds`: no route sent CORS headers, so no browser client worked. A browser OAuth client runs
+  on some other origin; without `Access-Control-Allow-Origin` the browser refuses to hand it the
+  response body, so discovery failed before the authorization request was attempted — and had it got
+  past that, every XRPC call would have failed the same way.
+
+  `CorsLayer` now covers the whole surface: the four discovery documents, the OAuth endpoints, and
+  the XRPC routes. The finding scopes this to discovery and OAuth, but a client that completes the
+  token exchange and then cannot call a single method is still blocked, so the fix follows the
+  consequence rather than the letter.
+
+  The policy is `Allow-Origin: *` with **no** `Allow-Credentials`. That is safe precisely because
+  AT Protocol authenticates with `Authorization` and `DPoP` request headers and never with cookies:
+  a browser attaches neither cross-origin unless the calling script sets them, and a script that can
+  set them already holds the token — so the wildcard grants a hostile page nothing it could not get
+  by calling this server from its own backend. `Allow-Credentials: true` is the switch that would
+  change that, by making the browser send ambient credentials and hand over the response; combined
+  with a wildcard origin it is also forbidden by the Fetch standard. It is deliberately absent and a
+  test fails if it ever appears.
+
+  `dpop-nonce`, `WWW-Authenticate` and `atproto-repo-rev` are exposed, since a client cannot read a
+  response header it was not told about and each of those exists to be acted on.
+
 - `atproto-identity`: P-256 and P-384 signatures were not low-S normalized, and verification accepted
   the high-S form. ECDSA signatures are malleable — for every valid `(r, s)` the pair `(r, -s)`
   verifies just as well — and AT Protocol requires the canonical low-S form. `k256` normalizes inside

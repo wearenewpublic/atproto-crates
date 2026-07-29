@@ -42,6 +42,7 @@ anyhow.workspace = true
 argon2 = "0.5"
 async-trait.workspace = true
 axum = { workspace = true, features = ["ws"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 base64.workspace = true
 chrono.workspace = true
 cid.workspace = true
@@ -100,7 +101,7 @@ tower = { version = "0.5", features = ["util"] }
 [features]
 default = ["sqlite", "hickory-dns", "http"]
 sqlite = ["dep:sqlx"]
-http = ["dep:axum"]
+http = ["dep:axum", "dep:tower-http"]
 fjall = ["dep:fjall"]
 # `postgres` — adds the PostgreSQL adapter for the accounts directory.
 # Connection plumbing + `PostgresAccountStore` shim + per-table query

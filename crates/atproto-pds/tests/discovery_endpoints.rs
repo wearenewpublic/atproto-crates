@@ -252,3 +252,110 @@ async fn well_known_did_json_serves_the_service_document() {
     assert_eq!(pds["type"], "AtprotoPersonalDataServer");
     assert_eq!(pds["serviceEndpoint"], "https://test.example");
 }
+
+// ---------------------------------------------------------------------------
+//  CORS.
+//
+//  A browser OAuth client runs on some other origin. Without CORS headers the
+//  browser refuses to hand it the response body, so discovery fails before the
+//  authorization request is even attempted — and after that, every XRPC call
+//  fails the same way.
+// ---------------------------------------------------------------------------
+
+/// The routes a browser client has to reach cross-origin.
+const CROSS_ORIGIN_ROUTES: &[&str] = &[
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/did.json",
+    "/.well-known/atproto-did",
+    "/oauth/jwks",
+    "/oauth/par",
+    "/oauth/token",
+    "/oauth/revoke",
+    "/xrpc/com.atproto.server.describeServer",
+    "/xrpc/com.atproto.repo.createRecord",
+    "/xrpc/com.atproto.sync.getBlob",
+];
+
+/// A preflight must be answered, and answered without credentials.
+///
+/// `Allow-Origin: *` together with `Allow-Credentials: true` is both forbidden
+/// by the spec and the one combination that would turn this into a real
+/// vulnerability — it is what lets a hostile page make authenticated requests
+/// with the visitor's ambient credentials. AT Protocol authenticates with
+/// `Authorization` and `DPoP` headers rather than cookies, so the wildcard on
+/// its own grants a page nothing it could not get from its own server.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_is_answered_without_credentials() {
+    let (app, _mgr, _tmp) = build_app().await;
+
+    for route in CROSS_ORIGIN_ROUTES {
+        let request = Request::builder()
+            .uri(*route)
+            .method("OPTIONS")
+            .header("origin", "https://client.example")
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "authorization,dpop,content-type",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let headers = response.headers().clone();
+
+        assert!(
+            headers.get("access-control-allow-origin").is_some(),
+            "{route} answered a preflight with no Access-Control-Allow-Origin; \
+             a browser client cannot call it"
+        );
+        assert!(
+            headers.get("access-control-allow-credentials").is_none(),
+            "{route} allows credentials alongside a wildcard origin — a hostile \
+             page could then act as the visitor"
+        );
+
+        let allowed = headers
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for header in ["authorization", "dpop", "content-type"] {
+            assert!(
+                allowed.contains(header),
+                "{route} preflight does not allow `{header}`: {allowed:?}"
+            );
+        }
+    }
+}
+
+/// A real response carries the header too, and exposes what a client must read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_simple_request_carries_the_origin_header() {
+    let (app, _mgr, _tmp) = build_app().await;
+
+    let request = Request::builder()
+        .uri("/.well-known/oauth-protected-resource")
+        .header("origin", "https://client.example")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers();
+
+    assert!(
+        headers.get("access-control-allow-origin").is_some(),
+        "the protected-resource document is unreadable by a browser client"
+    );
+    let exposed = headers
+        .get("access-control-expose-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for header in ["dpop-nonce", "www-authenticate"] {
+        assert!(
+            exposed.contains(header),
+            "`{header}` is unreadable cross-origin, so a client cannot act on it: {exposed:?}"
+        );
+    }
+}

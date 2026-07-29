@@ -493,6 +493,7 @@ dependencies = [
  "tokio-util",
  "tokio-websockets",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

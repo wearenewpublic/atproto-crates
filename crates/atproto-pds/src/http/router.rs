@@ -463,7 +463,57 @@ pub fn build_router(state: HttpState) -> Router {
         // Operator HTML dashboard (Basic-auth gated, same as JSON admin API).
         .route("/admin", get(admin::dashboard_handler))
         .route("/admin/", get(admin::dashboard_handler))
+        .layer(cors_layer())
         .with_state(state)
+}
+
+/// Cross-origin policy for the whole surface.
+///
+/// A browser OAuth client runs on some other origin. Without these headers the
+/// browser refuses to hand it the response body, so discovery fails before the
+/// authorization request is attempted — and every XRPC call afterwards fails
+/// the same way.
+///
+/// # Why a wildcard origin is safe here, and why credentials are not allowed
+///
+/// AT Protocol authenticates with `Authorization` and `DPoP` request headers,
+/// never with cookies. A browser attaches neither to a cross-origin request
+/// unless the calling script sets them explicitly — and a script that can set
+/// them already holds the token. So `Allow-Origin: *` grants a hostile page
+/// nothing it could not get by calling this server from its own backend.
+///
+/// `Allow-Credentials: true` is what would change that: it is the switch that
+/// makes a browser send *ambient* credentials — cookies, cached Basic-auth —
+/// and hand the response to the page. Combined with a wildcard origin it is
+/// also forbidden outright by the Fetch standard. It is deliberately absent,
+/// and `preflight_is_answered_without_credentials` fails if it ever appears.
+///
+/// This covers the admin routes too. They are Basic-auth gated, and an
+/// operator's browser will not attach cached Basic credentials to a
+/// cross-origin request whose response it is not allowed to read.
+fn cors_layer() -> tower_http::cors::CorsLayer {
+    use axum::http::{HeaderName, Method, header};
+    use tower_http::cors::{Any, CorsLayer};
+
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("dpop"),
+            HeaderName::from_static("atproto-proxy"),
+            HeaderName::from_static("atproto-accept-labelers"),
+        ])
+        // A client cannot read a response header it was not told about, so a
+        // DPoP nonce challenge or a `WWW-Authenticate` hint would be invisible
+        // to the code that has to act on it.
+        .expose_headers([
+            HeaderName::from_static("dpop-nonce"),
+            header::WWW_AUTHENTICATE,
+            HeaderName::from_static("atproto-repo-rev"),
+        ])
+        .max_age(std::time::Duration::from_secs(86_400))
 }
 
 /// Mount the Prometheus `/metrics` route + request-counter middleware on
