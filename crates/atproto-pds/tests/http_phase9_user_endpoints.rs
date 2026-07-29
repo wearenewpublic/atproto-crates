@@ -43,6 +43,19 @@ async fn build_app() -> (axum::Router, TempDir, Arc<AccountManager>) {
     (build_router(state), tmp, manager)
 }
 
+/// GET a JSON endpoint, optionally bearing a token.
+async fn get_json(app: axum::Router, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder().uri(path).method("GET");
+    if let Some(token) = bearer {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
 async fn post_json(
     app: axum::Router,
     path: &str,
@@ -334,4 +347,134 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .as_str()
         .expect("createSession should return an access token")
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+//  Preferences (F-MIG-02).
+//
+//  These fell through the `app.bsky.*` catch-all to an AppView that implements
+//  neither, so every call failed and private state could not migrate in either
+//  direction. The lexicon names the purpose: synchronisation between devices,
+//  and import/export during account migration.
+// ---------------------------------------------------------------------------
+
+/// A fresh account has an empty preferences array, not an error.
+///
+/// `preferences` is required by the lexicon, so the field is present and empty
+/// rather than absent — a client reading `.preferences.length` must not have to
+/// special-case a first run.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_preferences_starts_empty() {
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = get_json(app, "/xrpc/app.bsky.actor.getPreferences", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["preferences"], json!([]));
+}
+
+/// Preferences round-trip verbatim, including types this build does not know.
+///
+/// `#preferences` is an array of open-union objects. A PDS that parsed them
+/// would silently drop every preference type it had not been taught, which for
+/// private state is data loss the user only discovers later.
+#[tokio::test(flavor = "multi_thread")]
+async fn preferences_round_trip_including_unknown_types() {
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let prefs = json!([
+        { "$type": "app.bsky.actor.defs#adultContentPref", "enabled": false },
+        { "$type": "app.bsky.actor.defs#mutedWordsPref",
+          "items": [{ "value": "spoilers", "targets": ["content"] }] },
+        // A type this build has never heard of, with nested structure.
+        { "$type": "com.example.someFuturePref",
+          "nested": { "deep": [1, 2, 3] }, "flag": true },
+    ]);
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/app.bsky.actor.putPreferences",
+        json!({ "preferences": prefs }),
+        Some(&token),
+    )
+    .await;
+    assert!(status.is_success(), "putPreferences: {body}");
+
+    let (status, body) = get_json(app, "/xrpc/app.bsky.actor.getPreferences", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["preferences"], prefs,
+        "preferences did not round-trip intact"
+    );
+}
+
+/// A second put replaces rather than appends.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_preferences_replaces_the_stored_set() {
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    for prefs in [
+        json!([{ "$type": "app.bsky.actor.defs#adultContentPref", "enabled": true }]),
+        json!([{ "$type": "app.bsky.actor.defs#adultContentPref", "enabled": false }]),
+    ] {
+        post_json(
+            app.clone(),
+            "/xrpc/app.bsky.actor.putPreferences",
+            json!({ "preferences": prefs }),
+            Some(&token),
+        )
+        .await;
+    }
+
+    let (_, body) = get_json(app, "/xrpc/app.bsky.actor.getPreferences", Some(&token)).await;
+    let stored = body["preferences"].as_array().expect("an array");
+    assert_eq!(
+        stored.len(),
+        1,
+        "a second put appended instead of replacing"
+    );
+    assert_eq!(stored[0]["enabled"], false);
+}
+
+/// Preferences are private state — both directions require auth.
+#[tokio::test(flavor = "multi_thread")]
+async fn preferences_require_auth() {
+    let (app, _tmp, _manager) = build_app().await;
+
+    let (status, _) = get_json(app.clone(), "/xrpc/app.bsky.actor.getPreferences", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = post_json(
+        app,
+        "/xrpc/app.bsky.actor.putPreferences",
+        json!({ "preferences": [] }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// One account's preferences are not another's.
+#[tokio::test(flavor = "multi_thread")]
+async fn preferences_are_per_account() {
+    let (app, _tmp, manager) = build_app().await;
+    let alice = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let bob = create_account(&app, &manager, "did:plc:bob", "bob.example").await;
+
+    post_json(
+        app.clone(),
+        "/xrpc/app.bsky.actor.putPreferences",
+        json!({ "preferences": [{ "$type": "app.bsky.actor.defs#adultContentPref", "enabled": true }] }),
+        Some(&alice),
+    )
+    .await;
+
+    let (_, body) = get_json(app, "/xrpc/app.bsky.actor.getPreferences", Some(&bob)).await;
+    assert_eq!(
+        body["preferences"],
+        json!([]),
+        "one account read another's private preferences"
+    );
 }

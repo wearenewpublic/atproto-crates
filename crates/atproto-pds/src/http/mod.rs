@@ -12,6 +12,7 @@ pub mod errors;
 pub mod handlers;
 pub mod identity_handlers;
 pub mod moderation_handlers;
+pub mod preference_handlers;
 pub mod proxy_handlers;
 pub mod proxy_target;
 pub mod router;

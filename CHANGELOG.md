@@ -467,6 +467,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stand-in upstream actually receives.
 
 ### Added
+- `atproto-pds`: `app.bsky.actor.getPreferences` and `putPreferences` are served locally. They were
+  not implemented at all — the `app.bsky.*` catch-all forwarded them to an AppView that implements
+  neither, so every call failed. Muted words, feed preferences and content-label settings were broken
+  for every logged-in user, and private state could not migrate in either direction, which is the one
+  thing `getPreferences`'s own lexicon says it is for.
+
+  Stored per-actor as the JSON array that arrived. `app.bsky.actor.defs#preferences` is an array of
+  open-union objects, and a PDS that parsed them would silently drop every preference type it had not
+  been taught — for private state, data loss the user discovers much later. A preference type this
+  build has never heard of round-trips intact, and a test pins that.
+
+  `putPreferences` replaces the stored array wholesale. The reference may instead merge by namespace,
+  leaving entries outside `app.bsky.*` untouched; that could not be verified here, and a merge rule
+  that is subtly wrong discards settings silently, so this does the predictable thing. A client that
+  reads, edits and writes back the whole array — the shape the lexicon invites — is unaffected either
+  way.
+
+  No scope gate: there is no lexicon-defined OAuth scope for preferences, and inventing one would
+  refuse clients for a permission the ecosystem does not define. An authenticated session is
+  required.
+
 - `atproto-pds`: `Atproto-Proxy: <did>#<service-id>` now resolves the named DID's document and
   forwards to the service carrying that fragment, instead of refusing every DID except the
   operator-pinned AppView. This is what makes labelers, feed generators, chat and Ozone reachable.

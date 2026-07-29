@@ -7,6 +7,7 @@ use crate::http::discovery_handlers;
 use crate::http::handlers;
 use crate::http::identity_handlers;
 use crate::http::moderation_handlers;
+use crate::http::preference_handlers;
 use crate::http::proxy_handlers;
 use crate::http::service_auth_handlers;
 use crate::http::space_handlers;
@@ -107,6 +108,18 @@ pub fn build_router(state: HttpState) -> Router {
         .route(
             "/xrpc/com.atproto.sync.requestCrawl",
             post(handlers::request_crawl),
+        )
+        // Private per-account state the PDS owns, not the AppView. Declared
+        // before the `app.bsky.*` catch-all below, which would otherwise proxy
+        // them to a service that implements neither — so every call failed and
+        // preferences could not migrate in either direction.
+        .route(
+            "/xrpc/app.bsky.actor.getPreferences",
+            get(preference_handlers::get_preferences),
+        )
+        .route(
+            "/xrpc/app.bsky.actor.putPreferences",
+            post(preference_handlers::put_preferences),
         )
         // Namespaces this server forwards rather than serves. The default
         // target is the configured AppView; a per-request
