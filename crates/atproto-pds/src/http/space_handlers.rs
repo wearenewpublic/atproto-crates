@@ -1317,6 +1317,21 @@ fn signed_commit_from_state(
     state: &atproto_space::RepoState,
     signing_key: &atproto_identity::key::KeyData,
 ) -> Result<Option<SignedCommitDto>, XrpcError> {
+    Ok(sign_current_commit(space, author, state, signing_key)?.map(SignedCommitDto::from_commit))
+}
+
+/// Sign the repo's current state, returning the commit itself.
+///
+/// Shared by the JSON path (which wraps it in a [`SignedCommitDto`]) and
+/// `getRepo` (which needs the DAG-CBOR block for the CAR's first root). The two
+/// must be the same commit: a CAR whose root disagreed with what
+/// `getLatestCommit` reports would send a syncer chasing a mismatch.
+fn sign_current_commit(
+    space: &SpaceUri,
+    author: &str,
+    state: &atproto_space::RepoState,
+    signing_key: &atproto_identity::key::KeyData,
+) -> Result<Option<atproto_space::Commit>, XrpcError> {
     use atproto_space::set_hash::SetHash;
     let (Some(state_bytes), Some(rev)) = (state.set_hash.as_deref(), state.rev.as_deref()) else {
         return Ok(None);
@@ -1340,7 +1355,27 @@ fn signed_commit_from_state(
             format!("sign commit: {e}"),
         )
     })?;
-    Ok(Some(SignedCommitDto::from_commit(commit)))
+    Ok(Some(commit))
+}
+
+/// The signed commit as the DAG-CBOR block that becomes the CAR's first root.
+fn signed_commit_block(
+    space: &SpaceUri,
+    author: &str,
+    state: &atproto_space::RepoState,
+    signing_key: &atproto_identity::key::KeyData,
+) -> Result<Option<Vec<u8>>, XrpcError> {
+    let Some(commit) = sign_current_commit(space, author, state, signing_key)? else {
+        return Ok(None);
+    };
+    let block = atproto_dasl::to_vec(&commit).map_err(|e| {
+        XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("encode signed commit: {e}"),
+        )
+    })?;
+    Ok(Some(block))
 }
 
 /// `GET /xrpc/com.atproto.space.getRepoState`.
@@ -1364,6 +1399,116 @@ pub async fn get_repo_state(
     let signing_key = local_signing_key(manager, &q.repo).await?;
     let commit = signed_commit_from_state(&uri, &q.repo, &st, &signing_key)?;
     Ok(Json(StateResponse { commit }))
+}
+
+/// `GET /xrpc/com.atproto.space.getRepo`.
+///
+/// The whole repo as a CAR, for full-state recovery — the only path available to
+/// a syncer that has fallen past its oplog retention. `listRepoOps` replays
+/// changes and cannot rebuild a repo whose earliest ops were pruned;
+/// `listRecords` carries no commit and no CID-addressed blocks.
+///
+/// Layout is [`crate::space::export_car`]'s: two roots (commit, then a DRISL
+/// index), the commit block, the index block, then record blocks in
+/// `{collection}/{rkey}` order. Blobs are excluded by the lexicon and fetched
+/// separately through `space.getBlob`.
+///
+/// Auth goes through the same [`resolve_record_auth`] as every other record
+/// read, so the membership check and the space gate apply unchanged.
+pub async fn get_repo(
+    State(state): State<HttpState>,
+    parts: Parts,
+    Query(q): Query<RepoStateQuery>,
+) -> Result<axum::response::Response, XrpcError> {
+    use axum::body::Body;
+    use axum::http::HeaderValue;
+    use axum::http::header;
+
+    let uri = parse_space_uri(&q.space)?;
+    let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
+    if let Some(subject) = &resolved.subject {
+        assert_space_scope(
+            &state,
+            subject,
+            &uri,
+            atproto_oauth::scopes::SpaceAction::Read,
+            None,
+        )
+        .await?;
+    }
+    space_reader(&state)?
+        .verify_read_auth(&uri, &resolved.auth)
+        .await
+        .map_err(XrpcError::from)?;
+
+    let st = space_sync(&state)?
+        .get_repo_state(&uri, &q.repo)
+        .await
+        .map_err(XrpcError::from)?;
+    let manager = account_manager(&state)?;
+    let signing_key = local_signing_key(manager, &q.repo).await?;
+
+    // A repo with no commits has no state to export. `RepoNotFound` is declared
+    // on this method and on no other in the family, which is what it is for.
+    let Some(commit_block) = signed_commit_block(&uri, &q.repo, &st, &signing_key)? else {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "RepoNotFound",
+            format!("{} has no permissioned repo in {uri}", q.repo),
+        ));
+    };
+
+    // Drain every collection a page at a time. `list_records` clamps to the
+    // lexicon's 100, and an export that issued one unbounded query would be
+    // reaching around the contract every other reader honours.
+    let reader = space_reader(&state)?;
+    let mut records = Vec::new();
+    let collections = reader
+        .list_collections(&uri, &q.repo)
+        .await
+        .map_err(XrpcError::from)?;
+    for collection in collections {
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = reader
+                .list_records(
+                    &uri,
+                    resolved.auth.clone(),
+                    &resolved.target_repo,
+                    crate::space::reader::RecordListing {
+                        collection: Some(&collection),
+                        cursor: cursor.as_deref(),
+                        limit: crate::space::export_car::EXPORT_PAGE,
+                        reverse: false,
+                    },
+                )
+                .await
+                .map_err(XrpcError::from)?;
+            let drained = page.records.len();
+            records.extend(page.records);
+            // A page shorter than the limit is the last one. Relying on the
+            // cursor going `None` would spin forever if a page were entirely
+            // filtered by a takedown.
+            if drained < crate::space::export_car::EXPORT_PAGE as usize {
+                break;
+            }
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+
+    let car = crate::space::export_car::build_repo_car(&commit_block, records)
+        .await
+        .map_err(XrpcError::from)?;
+
+    let mut resp = axum::response::Response::new(Body::from(car));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.ipld.car"),
+    );
+    Ok(resp)
 }
 
 /// Query params for `listRepoOps`.

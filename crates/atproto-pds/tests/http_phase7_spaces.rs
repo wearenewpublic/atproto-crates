@@ -2336,3 +2336,294 @@ async fn list_repo_ops_exclude_values_omits_every_value() {
     assert_eq!(excluded["ops"][0]["rkey"], "r1");
     assert!(excluded["ops"][0]["cid"].as_str().is_some());
 }
+
+// ---------------------------------------------------------------------------
+//  F-SPACE-01 / F-SPACE-02 / F-SPACE-20 — the sync recovery path.
+//
+//  `com.atproto.space.getRepo` and `getLatestCommit` were both absent from the
+//  route table, so there was no conformant path to repo state at all: a syncer
+//  past its oplog retention had nowhere to go, and a client asking for the
+//  commit by its canonical name got a 404. `getRepoState` served the same
+//  envelope under a name the draft does not define.
+// ---------------------------------------------------------------------------
+
+async fn get_car(
+    app: &axum::Router,
+    space: &str,
+    repo: &str,
+    token: &str,
+) -> (StatusCode, Vec<u8>) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/xrpc/com.atproto.space.getRepo?space={}&repo={repo}",
+                    urlencode(space)
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, bytes)
+}
+
+/// Read a CAR back into `(roots, blocks)`.
+async fn parse_car(car: &[u8]) -> (Vec<String>, Vec<(String, Vec<u8>)>) {
+    let mut reader = atproto_dasl::car::CarReader::new(std::io::Cursor::new(car.to_vec()))
+        .await
+        .expect("the response must be a readable CAR");
+    let roots = reader
+        .header()
+        .roots
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    let mut blocks = Vec::new();
+    while let Some(b) = reader.next_block().await.unwrap() {
+        blocks.push((b.cid.to_string(), b.data));
+    }
+    (roots, blocks)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_repo_exports_a_two_root_car_a_syncer_can_verify() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([
+            {"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}},
+            {"action": "create", "collection": "c.d.e", "rkey": "two", "value": {"v": 2}}
+        ]),
+    )
+    .await;
+
+    let (status, car) = get_car(&app, &uri, "did:plc:owner", &owner).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "getRepo must be routed and serve a CAR"
+    );
+
+    let (roots, blocks) = parse_car(&car).await;
+    assert_eq!(roots.len(), 2, "commit root then index root");
+    // Commit, index, two records.
+    assert_eq!(blocks.len(), 4, "commit + index + 2 records");
+
+    // Every block must hash to the CID the CAR claims, or the export is not
+    // verifiable — which is the whole purpose of shipping a CAR.
+    for (cid, data) in &blocks {
+        assert_eq!(
+            atproto_dasl::cid::compute_cid(data).to_string(),
+            *cid,
+            "block bytes must hash to their CID"
+        );
+    }
+
+    // The index (root 1) maps `{collection}/{rkey}` to the record CIDs, and
+    // those CIDs must be blocks in this CAR.
+    let index_bytes = blocks
+        .iter()
+        .find(|(c, _)| *c == roots[1])
+        .map(|(_, d)| d.clone())
+        .expect("the index root must have a block");
+    let index: Value = atproto_dasl::atproto_json::from_slice(&index_bytes).unwrap();
+    let obj = index.as_object().unwrap();
+    assert_eq!(obj.len(), 2, "one index entry per record: {index}");
+    for key in ["c.d.e/one", "c.d.e/two"] {
+        let link = obj[key]["$link"].as_str().expect("index entry is a link");
+        assert!(
+            blocks.iter().any(|(c, _)| c == link),
+            "{key} points at {link}, which is not in the CAR"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_car_root_is_the_commit_get_latest_commit_reports() {
+    // A CAR whose first root disagreed with `getLatestCommit` would send a
+    // syncer chasing a mismatch it cannot resolve.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let (_, car) = get_car(&app, &uri, "did:plc:owner", &owner).await;
+    let (roots, blocks) = parse_car(&car).await;
+    let commit_block = blocks
+        .iter()
+        .find(|(c, _)| *c == roots[0])
+        .map(|(_, d)| d.clone())
+        .expect("commit root block");
+    let from_car: Value = atproto_dasl::atproto_json::from_slice(&commit_block).unwrap();
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getLatestCommit?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // `ikm` is fresh per commit by design, so the two differ there. What must
+    // agree is the state being attested: version, rev, and the repo hash.
+    assert_eq!(from_car["ver"], body["commit"]["ver"]);
+    assert_eq!(from_car["rev"], body["commit"]["rev"]);
+    assert_eq!(from_car["hash"], body["commit"]["hash"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_latest_commit_and_get_repo_state_are_the_same_endpoint() {
+    // F-SPACE-20: the canonical name is `getLatestCommit`; `getRepoState` is the
+    // name this server shipped and is kept as an alias rather than removed.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let (s1, canonical) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getLatestCommit?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    let (s2, alias) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRepoState?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(
+        s1,
+        StatusCode::OK,
+        "canonical name must be routed: {canonical}"
+    );
+    assert_eq!(s2, StatusCode::OK, "the alias must keep working: {alias}");
+    // `ikm` and therefore `sig`/`mac` are per-call, so compare the attested state.
+    assert_eq!(canonical["commit"]["ver"], alias["commit"]["ver"]);
+    assert_eq!(canonical["commit"]["rev"], alias["commit"]["rev"]);
+    assert_eq!(canonical["commit"]["hash"], alias["commit"]["hash"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_repo_exports_every_record_across_the_page_boundary() {
+    // `list_records` clamps to 100 per page, so an export of more than 100
+    // records is where a missing paging loop would silently truncate — and a
+    // truncated recovery CAR is worse than none, because it looks complete.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let writes: Vec<Value> = (0..105)
+        .map(|i| {
+            json!({
+                "action": "create",
+                "collection": "c.d.e",
+                "rkey": format!("r{i:03}"),
+                "value": {"i": i}
+            })
+        })
+        .collect();
+    space_write(&app, &uri, &owner, json!(writes)).await;
+
+    let (status, car) = get_car(&app, &uri, "did:plc:owner", &owner).await;
+    assert_eq!(status, StatusCode::OK);
+    let (roots, blocks) = parse_car(&car).await;
+    let index_bytes = blocks
+        .iter()
+        .find(|(c, _)| *c == roots[1])
+        .map(|(_, d)| d.clone())
+        .unwrap();
+    let index: Value = atproto_dasl::atproto_json::from_slice(&index_bytes).unwrap();
+    assert_eq!(
+        index.as_object().unwrap().len(),
+        105,
+        "every record must be exported, not just the first page"
+    );
+    assert_eq!(blocks.len(), 107, "commit + index + 105 records");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_repo_refuses_a_non_member() {
+    // Auth goes through the same resolver as every other record read, so the
+    // membership check applies — an export is the largest possible read.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let mallory =
+        create_account_and_token(&app, &manager, "did:plc:mallory", "mallory.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    space_write(
+        &app,
+        &uri,
+        &owner,
+        json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let (status, _) = get_car(&app, &uri, "did:plc:owner", &mallory).await;
+    // The specific status matters: an unrouted endpoint also fails, so
+    // `!= OK` would pass against a server that never served getRepo at all.
+    // 400 `SpaceNotFound` is the membership refusal.
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-member must be refused by the membership gate, not by a missing route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_repo_reports_repo_not_found_for_an_empty_repo() {
+    // `RepoNotFound` is declared on getRepo and on no sibling — a repo with no
+    // commits has no state to export, and that is a different answer from an
+    // empty CAR.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRepo?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "RepoNotFound");
+}

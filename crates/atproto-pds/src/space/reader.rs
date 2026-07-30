@@ -138,6 +138,30 @@ impl SpaceReader {
             .map_err(PdsError::Space)
     }
 
+    /// Every collection with at least one record in this repo's slice of the
+    /// space.
+    ///
+    /// Used by `getRepo` to enumerate what to export. Auth is the caller's
+    /// responsibility — `getRepo` has already resolved and verified it, and
+    /// re-checking here would mean threading a second auth argument for no
+    /// additional guarantee.
+    ///
+    /// # Errors
+    ///
+    /// Storage failures, or [`PdsError::SpaceNotFound`] for a tombstoned space.
+    pub async fn list_collections(
+        &self,
+        space: &SpaceUri,
+        target_repo: &str,
+    ) -> PdsResult<Vec<String>> {
+        self.ensure_space_live(space).await?;
+        let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
+        let storage = SqlSpaceRepoStorage::new(store.pool().clone());
+        let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
+            SpaceRepo::new(space.clone(), storage);
+        repo.list_collections().await.map_err(PdsError::Space)
+    }
+
     /// `listRecords` — paginated listing within a collection, or across all
     /// collections when `collection` is `None`.
     ///

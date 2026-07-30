@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `atproto-pds`: `com.atproto.space.getRepo` — the whole permissioned repo as a CAR, for full-state
+  recovery. This was the only missing recovery path: `listRepoOps` replays *changes* and cannot rebuild
+  a repo whose earliest ops have been pruned, and `listRecords` carries no commit and no CID-addressed
+  blocks. A syncer past its oplog retention had nowhere to go.
+
+  Layout follows the draft lexicon exactly: two roots (the signed commit, then a DRISL index mapping
+  `{collection}/{rkey}` to record CID), the commit block, the index block, then record blocks in
+  lexicographic key order. Blobs are excluded and fetched through `space.getBlob`.
+
+  Record blocks are copied verbatim with their stored CIDs rather than re-encoded, so every block
+  hashes to the CID the CAR claims and the index, `getRecord` and the commit all agree. The export
+  pages through `listRecords` at the lexicon's 100 per page rather than issuing one unbounded query.
+
+- `atproto-pds`: `com.atproto.space.getLatestCommit` — the canonical name for the endpoint this server
+  shipped as `getRepoState`. Both now route to the same handler; a conformant client was 404ing on the
+  only name it knows. `getRepoState` is kept as an alias rather than removed.
+
 ### Fixed
 - `atproto-pds`: `com.atproto.space.listRecords` and `listRepoOps` returned no record values, so a
   syncer had to issue one `getRecord` per record with no bulk path — initial backfill was unusable and

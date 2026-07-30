@@ -370,6 +370,20 @@ pub fn build_router(state: HttpState) -> Router {
             "/xrpc/com.atproto.space.listRepos",
             get(space_handlers::list_repos),
         )
+        // Full-state recovery: the whole repo as a CAR. The only path open to a
+        // syncer past its oplog retention.
+        .route(
+            "/xrpc/com.atproto.space.getRepo",
+            get(space_handlers::get_repo),
+        )
+        // `getLatestCommit` is the canonical name; `getRepoState` is the name
+        // this server shipped before the draft settled and is kept as an alias
+        // to the same handler, which is what HappyView does. A conformant client
+        // was 404ing on the only name it knows.
+        .route(
+            "/xrpc/com.atproto.space.getLatestCommit",
+            get(space_handlers::get_repo_state),
+        )
         .route(
             "/xrpc/com.atproto.space.getRepoState",
             get(space_handlers::get_repo_state),

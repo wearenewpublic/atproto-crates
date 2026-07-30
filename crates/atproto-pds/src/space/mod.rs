@@ -18,6 +18,7 @@
 pub mod blob_ref;
 pub mod config;
 pub mod declaration;
+pub mod export_car;
 pub mod inbound;
 pub mod mint_authz;
 pub mod notify;
