@@ -267,6 +267,64 @@ async fn refresh_with_access_jwt_rejected() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// A conflicting handle or email is caught before PLC genesis, not after.
+///
+/// Minting a `did:plc` publishes an operation to the directory's append-only
+/// log and nothing can withdraw it, so discovering the conflict afterwards
+/// stranded a fresh identity there on every duplicate signup.
+///
+/// This harness attaches no `PlcService`, which makes the ordering observable
+/// without a directory: reaching genesis at all answers `503 PlcUnavailable`,
+/// so a `400` naming the conflict can only mean the check ran first.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_account_conflict_is_reported_before_plc_genesis() {
+    let (app, manager, _tmp) = build_app(false).await;
+    manager
+        .create_account(
+            CreateAccountParams::new("did:plc:alice", "alice.example", "pw")
+                .with_email(Some("alice@example.com")),
+        )
+        .await
+        .expect("fixture account");
+
+    // Taken email, free handle, no DID supplied — the genesis path.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.createAccount",
+        json!({
+            "handle": "bob.example",
+            "email": "alice@example.com",
+            "password": "correct horse battery staple",
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest", "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("alice@example.com"),
+        "body: {body}"
+    );
+
+    // Taken handle, free email, no DID supplied.
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.createAccount",
+        json!({
+            "handle": "alice.example",
+            "email": "bob@example.com",
+            "password": "correct horse battery staple",
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "HandleNotAvailable", "body: {body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_required_blocks_creation_without_code() {
     let (app, _manager, _tmp) = build_app(true).await;

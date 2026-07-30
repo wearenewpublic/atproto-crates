@@ -160,6 +160,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies. This is why the change is not a JSON cosmetic — it moves the identifier too.
 
   The tombstone variant is unaffected; its `prev` was never optional.
+
+- `atproto-pds`: `com.atproto.server.createAccount` reported both of its uniqueness conflicts with an
+  error a client cannot act on. A duplicate email was never checked before the INSERT, so the `UNIQUE`
+  constraint on `account.email` fired and came back as `500 InternalError` — a client mistake reported
+  as a server fault, with SQLite's own `(code: 2067) UNIQUE constraint failed` text in the log as the
+  only explanation. A duplicate handle returned `403 Forbidden`, a name the lexicon does not declare
+  among `InvalidHandle`, `InvalidPassword`, `InvalidInviteCode`, `HandleNotAvailable`,
+  `UnsupportedDomain`, `UnresolvableDid` and `IncompatibleDidDoc`; clients switch on the name, so the
+  one case with a declared error was the one case that did not produce it.
+
+  The pre-flight check in `AccountManager::create_account` conflated the columns — it selected `did`,
+  tested `did OR handle`, and never looked at `email` — so it could not have named the collision even
+  where it caught one. It now reads all three columns and reports `AccountAlreadyExists`,
+  `HandleNotAvailable` or `EmailNotAvailable` in that precedence: a DID already hosted here subsumes
+  the other two, since telling that caller to pick another handle points them at the wrong remedy
+  entirely. All three are 400. The handle case maps to `HandleNotAvailable`; the other two map to
+  `InvalidRequest`, because `createAccount` declares no error for either and a name absent from the
+  lexicon is no more useful to a client than `Forbidden` was.
+
+  The pre-flight is a read followed by a write with nothing holding the gap, so two concurrent signups
+  can both pass it and one still reach the INSERT. A unique-constraint violation there is now
+  classified by the column that collided rather than becoming a storage fault, matching on the column
+  name that SQLite's `UNIQUE constraint failed: account.email` and Postgres's `account_email_key`
+  both carry. Anything that is not a uniqueness violation still reports as a backend fault, as does a
+  violation naming the email column on a request that carried no email — an inconsistency the caller
+  cannot have caused and should not be told to fix.
+
+  **Operators should know that this discloses email registration.** `createAccount` is unauthenticated,
+  so anyone who can reach it can now learn whether a given address holds an account here, by submitting
+  it and reading *"the email address `<addr>` is already registered"* — where the opaque `500` disclosed
+  nothing on the wire. Handles are public (`resolveHandle` answers for them); email addresses are not,
+  so this is a real change in what an anonymous caller can observe. It is deliberate: the reference
+  `@atproto/pds` returns `Email already taken: <email>` for the same case, so a signup form written
+  against upstream expects an actionable conflict here, and refusing to give one — while still failing
+  the request — tells the honest user nothing and the prober only that they must try the address twice.
+  What remains is rate limiting: `createAccount` is limited per handle and by the global per-client-IP
+  tier (`http/rate_limit.rs`, not per email address), which bounds enumeration rather than preventing
+  it. An operator who needs this closed has to
+  turn signup off or put it behind an invite, which gates the endpoint before the check runs.
+
+  The check now also runs once in the handler **before PLC genesis**. Minting a `did:plc` publishes an
+  operation to the directory's append-only log and nothing can withdraw it, so a duplicate signup used
+  to strand a fresh identity there before being rejected a moment later. A conflict is reported ahead
+  of `PlcUnavailable` too: a PDS with no PLC service configured now answers 400 naming the conflict
+  rather than 503, for a request that could not have succeeded either way.
+
+  Not closed: the race that still reaches the INSERT, and any failure after genesis inside
+  `create_account`, can still leave a published DID with no account behind it. Closing that means
+  minting the DID last, which restructures the handler rather than fixing an error report, and is left
+  as follow-up work.
+
 - `atproto-identity`: the PLC directory client built every request URL as `https://{configured}/{did}`,
   so a directory configured with a scheme produced `https://http://127.0.0.1:2582/…` and no directory
   that does not speak HTTPS could be reached at all. `query`, `fetch_audit_log` and `submit` now share

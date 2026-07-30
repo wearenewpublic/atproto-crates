@@ -73,6 +73,21 @@ impl From<PdsError> for XrpcError {
                 "HandleNotAvailable",
                 format!("the handle {handle} is not available"),
             ),
+            // `createAccount` declares no error for either of these, so they
+            // report as `InvalidRequest` rather than as a name a client cannot
+            // find in the lexicon. Both are still 400: the request conflicts
+            // with state this server already holds, which is the caller's to
+            // resolve, not a fault on our side.
+            PdsError::AccountAlreadyExists { did } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("an account for {did} already exists on this server"),
+            ),
+            PdsError::EmailNotAvailable { email } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("the email address {email} is already registered"),
+            ),
             PdsError::HandleOwnershipUnproven {
                 handle,
                 did,
@@ -190,5 +205,52 @@ impl From<PdsError> for XrpcError {
 impl IntoResponse for PdsError {
     fn into_response(self) -> Response {
         XrpcError::from(self).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names a signup conflict can produce are contractual: a client
+    /// switches on `error`, and `com.atproto.server.createAccount` declares
+    /// `HandleNotAvailable` but nothing for a DID or an email collision. All
+    /// three are 400 — a conflict with state the server already holds is the
+    /// caller's to resolve.
+    #[test]
+    fn account_conflicts_report_as_declared_client_errors() {
+        let handle = XrpcError::from(PdsError::HandleNotAvailable {
+            handle: "alice.example".to_string(),
+        });
+        assert_eq!(handle.status, StatusCode::BAD_REQUEST);
+        assert_eq!(handle.name, "HandleNotAvailable");
+        assert!(handle.message.contains("alice.example"));
+
+        let did = XrpcError::from(PdsError::AccountAlreadyExists {
+            did: "did:plc:alice".to_string(),
+        });
+        assert_eq!(did.status, StatusCode::BAD_REQUEST);
+        assert_eq!(did.name, "InvalidRequest");
+        assert!(did.message.contains("did:plc:alice"));
+
+        let email = XrpcError::from(PdsError::EmailNotAvailable {
+            email: "alice@example.com".to_string(),
+        });
+        assert_eq!(email.status, StatusCode::BAD_REQUEST);
+        assert_eq!(email.name, "InvalidRequest");
+        assert!(email.message.contains("alice@example.com"));
+    }
+
+    /// The email collision reached clients as `500 InternalError` carrying
+    /// SQLite's own constraint text. Neither may come back.
+    #[test]
+    fn email_conflict_is_not_a_server_fault() {
+        let err = XrpcError::from(PdsError::EmailNotAvailable {
+            email: "alice@example.com".to_string(),
+        });
+        assert_ne!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(err.name, "InternalError");
+        assert!(!err.message.to_lowercase().contains("constraint"));
+        assert!(!err.message.to_lowercase().contains("sqlite"));
     }
 }

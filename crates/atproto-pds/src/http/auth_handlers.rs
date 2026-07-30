@@ -280,6 +280,24 @@ pub async fn create_account(
             verify_inbound_did_claim(&state, &parts, &d).await?;
             (d, None, None, true)
         } else {
+            // Uniqueness is checked here as well as inside `create_account`,
+            // because genesis is not free and not reversible: it publishes an
+            // operation to the PLC directory's append-only log, and a DID
+            // abandoned a moment later when the INSERT hits a taken handle or
+            // email stays in that log forever. Checking after minting means one
+            // orphaned identity per duplicate signup attempt.
+            //
+            // The conflict is reported ahead of `PlcUnavailable` because it
+            // does not depend on how this server is configured: the request
+            // cannot succeed either way, and a 400 tells the caller something
+            // they can act on where a 503 invites a pointless retry.
+            //
+            // The DID is passed as `None` — there is nothing to check until
+            // genesis mints one. `create_account` covers that column.
+            manager
+                .ensure_available(None, &input.handle, input.email.as_deref())
+                .await
+                .map_err(XrpcError::from)?;
             let plc_service = state.plc_service.as_ref().ok_or_else(|| {
                 XrpcError::new(
                     StatusCode::SERVICE_UNAVAILABLE,

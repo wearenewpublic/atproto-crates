@@ -79,6 +79,31 @@ pub enum PdsError {
         to: String,
     },
 
+    /// error-atproto-pds-account-2: an account with this DID is already
+    /// hosted here.
+    ///
+    /// Separate from [`PdsError::HandleNotAvailable`] because the remedies do
+    /// not overlap: a taken handle is fixed by choosing another, whereas a
+    /// taken DID means the identity is already here and the caller wanted
+    /// `activateAccount` or a session, not a second signup.
+    #[error("error-atproto-pds-account-2 account already exists: {did}")]
+    AccountAlreadyExists {
+        /// The DID that is already present in the account table.
+        did: String,
+    },
+
+    /// error-atproto-pds-account-3: the email address belongs to another
+    /// account.
+    ///
+    /// `account.email` is `UNIQUE`, so this is a client error even though no
+    /// lexicon names it; without the variant the collision only surfaced as
+    /// the storage engine's own constraint text.
+    #[error("error-atproto-pds-account-3 email not available: {email}")]
+    EmailNotAvailable {
+        /// The address that could not be registered.
+        email: String,
+    },
+
     /// error-atproto-pds-repo-2: a compare-and-swap guard did not match.
     ///
     /// `swapCommit` exists so a client that read the repo, decided something,

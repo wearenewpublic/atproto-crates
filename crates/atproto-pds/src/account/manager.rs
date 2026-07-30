@@ -69,6 +69,112 @@ impl AccountManager {
         }
     }
 
+    /// Reject a signup whose DID, handle or email already belongs to an
+    /// account here, naming the column that collided.
+    ///
+    /// `create_account` runs this itself, so a caller that only creates
+    /// accounts need not. The `com.atproto.server.createAccount` handler runs
+    /// it a second time, *before* PLC genesis, because minting a `did:plc`
+    /// publishes an operation to the directory's append-only log and nothing
+    /// can withdraw it: discovering the conflict afterwards would strand a
+    /// fresh identity in a permanent public log on every duplicate signup.
+    ///
+    /// Pass `None` for `did` when the identifier has not been minted yet. A
+    /// NULL bind makes `did = ?` evaluate to NULL rather than true, so no row
+    /// matches on that column and the handle and email are checked alone; the
+    /// same is true of a `None` email, which is why an account created without
+    /// one never collides.
+    ///
+    /// This is a read with nothing holding it against the later INSERT, so it
+    /// narrows the window rather than closing it. `account_insert_conflict`
+    /// classifies whatever still reaches the constraint.
+    ///
+    /// # Errors
+    ///
+    /// One error per unique column, because the remedies differ and
+    /// `com.atproto.server.createAccount` maps them to different names:
+    ///
+    /// - [`PdsError::AccountAlreadyExists`] if the DID is already hosted here.
+    /// - [`PdsError::HandleNotAvailable`] if the handle is taken.
+    /// - [`PdsError::EmailNotAvailable`] if the email belongs to another account.
+    /// - [`PdsError::Storage`] if the read itself fails.
+    pub async fn ensure_available(
+        &self,
+        did: Option<&str>,
+        handle: &str,
+        email: Option<&str>,
+    ) -> PdsResult<()> {
+        // `did`, `handle` and `email` each carry their own UNIQUE constraint,
+        // and the caller has to be told which one it collided with: they map to
+        // three different XRPC errors and three different remedies. The old
+        // query selected only `did`, tested `did OR handle`, and reported both
+        // as one message — and never looked at `email` at all, so an email
+        // collision escaped as a constraint violation from the INSERT.
+        //
+        // `LIMIT 3` bounds the read while still allowing each of the three
+        // columns to be reported by a distinct existing row.
+        let existing: Vec<(String, String, Option<String>)> = match self.accounts_pool.kind() {
+            #[cfg(feature = "sqlite")]
+            AccountPoolKind::Sqlite => sqlx::query_as(
+                "SELECT did, handle, email FROM account WHERE did = ? OR handle = ? OR email = ? LIMIT 3",
+            )
+            .bind(did)
+            .bind(handle)
+            .bind(email)
+            .fetch_all(self.accounts_pool.as_sqlite())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("uniqueness check: {e}"),
+            })?,
+            #[cfg(feature = "postgres")]
+            AccountPoolKind::Postgres => sqlx::query_as(
+                "SELECT did, handle, email FROM account WHERE did = $1 OR handle = $2 OR email = $3 LIMIT 3",
+            )
+            .bind(did)
+            .bind(handle)
+            .bind(email)
+            .fetch_all(self.accounts_pool.as_postgres())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("uniqueness check: {e}"),
+            })?,
+            #[cfg(not(feature = "sqlite"))]
+            AccountPoolKind::Sqlite => {
+                unreachable!("AccountPool::Sqlite without `sqlite` feature")
+            }
+            #[cfg(not(feature = "postgres"))]
+            AccountPoolKind::Postgres => {
+                unreachable!("AccountPool::Postgres without `postgres` feature")
+            }
+        };
+        // Precedence runs did → handle → email. A DID collision subsumes the
+        // other two: the identity is already hosted here, so reporting a
+        // taken handle would send the caller off to rename an account they
+        // already own.
+        if let Some(did) = did
+            && existing.iter().any(|(taken, _, _)| taken == did)
+        {
+            return Err(PdsError::AccountAlreadyExists {
+                did: did.to_string(),
+            });
+        }
+        if existing.iter().any(|(_, taken, _)| taken == handle) {
+            return Err(PdsError::HandleNotAvailable {
+                handle: handle.to_string(),
+            });
+        }
+        if let Some(email) = email
+            && existing
+                .iter()
+                .any(|(_, _, taken)| taken.as_deref() == Some(email))
+        {
+            return Err(PdsError::EmailNotAvailable {
+                email: email.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Create a new account.
     ///
     /// Pipeline:
@@ -80,47 +186,18 @@ impl AccountManager {
     ///
     /// # Errors
     ///
-    /// - [`PdsError::AuthDenied`] if the handle or DID is already taken.
+    /// One error per unique column, because the remedies differ and
+    /// `com.atproto.server.createAccount` maps them to different names:
+    ///
+    /// - [`PdsError::AccountAlreadyExists`] if the DID is already hosted here.
+    /// - [`PdsError::HandleNotAvailable`] if the handle is taken.
+    /// - [`PdsError::EmailNotAvailable`] if the email belongs to another account.
     /// - [`PdsError::Storage`] for any backend failure.
     pub async fn create_account(&self, params: CreateAccountParams<'_>) -> PdsResult<AccountRow> {
-        // 0. Pre-flight uniqueness checks (handle + did).
-        let existing: Option<(String,)> = match self.accounts_pool.kind() {
-            #[cfg(feature = "sqlite")]
-            AccountPoolKind::Sqlite => {
-                sqlx::query_as("SELECT did FROM account WHERE did = ? OR handle = ? LIMIT 1")
-                    .bind(params.did)
-                    .bind(params.handle)
-                    .fetch_optional(self.accounts_pool.as_sqlite())
-                    .await
-                    .map_err(|e| PdsError::Storage {
-                        reason: format!("uniqueness check: {e}"),
-                    })?
-            }
-            #[cfg(feature = "postgres")]
-            AccountPoolKind::Postgres => {
-                sqlx::query_as("SELECT did FROM account WHERE did = $1 OR handle = $2 LIMIT 1")
-                    .bind(params.did)
-                    .bind(params.handle)
-                    .fetch_optional(self.accounts_pool.as_postgres())
-                    .await
-                    .map_err(|e| PdsError::Storage {
-                        reason: format!("uniqueness check: {e}"),
-                    })?
-            }
-            #[cfg(not(feature = "sqlite"))]
-            AccountPoolKind::Sqlite => {
-                unreachable!("AccountPool::Sqlite without `sqlite` feature")
-            }
-            #[cfg(not(feature = "postgres"))]
-            AccountPoolKind::Postgres => {
-                unreachable!("AccountPool::Postgres without `postgres` feature")
-            }
-        };
-        if existing.is_some() {
-            return Err(PdsError::AuthDenied {
-                reason: format!("did or handle already exists: {}", params.handle),
-            });
-        }
+        // 0. Pre-flight uniqueness checks. See `ensure_available` — the DID is
+        //    known here, so all three columns are checked.
+        self.ensure_available(Some(params.did), params.handle, params.email)
+            .await?;
 
         // 1. Resolve signing-key ref: reuse what the caller pre-allocated
         //    (PLC-genesis path) or generate + persist a fresh one.
@@ -161,7 +238,8 @@ impl AccountManager {
                 .bind(params.rotation_key_ref)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| PdsError::Storage { reason: format!("insert account: {e}") })?;
+                .map_err(|e| account_insert_conflict(&e, &params)
+                    .unwrap_or_else(|| PdsError::Storage { reason: format!("insert account: {e}") }))?;
 
                 sqlx::query(
                     "INSERT INTO signing_key (id, did, algorithm, key_ref, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -201,7 +279,8 @@ impl AccountManager {
                 .bind(params.rotation_key_ref)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| PdsError::Storage { reason: format!("insert account: {e}") })?;
+                .map_err(|e| account_insert_conflict(&e, &params)
+                    .unwrap_or_else(|| PdsError::Storage { reason: format!("insert account: {e}") }))?;
 
                 sqlx::query(
                     "INSERT INTO signing_key (id, did, algorithm, key_ref, created_at) VALUES ($1, $2, $3, $4, $5)",
@@ -1096,6 +1175,60 @@ impl AccountManager {
     }
 }
 
+/// Classify a failed `INSERT INTO account` as a uniqueness conflict, naming
+/// the column that collided.
+///
+/// The pre-flight check in `create_account` is a read followed by a write with
+/// nothing holding the gap, so two concurrent signups for the same handle or
+/// email can both pass it and one of them still reaches this INSERT. Left
+/// alone that loser becomes [`PdsError::Storage`] — a 500 carrying the storage
+/// engine's own wording — for what is squarely a client-side conflict.
+///
+/// Returns `None` for anything this function cannot name as a client-side
+/// conflict, so the caller keeps reporting genuine backend faults as backend
+/// faults.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn account_insert_conflict(
+    error: &sqlx::Error,
+    params: &CreateAccountParams<'_>,
+) -> Option<PdsError> {
+    let db = error.as_database_error()?;
+    if !db.is_unique_violation() {
+        return None;
+    }
+    // SQLite reports `UNIQUE constraint failed: account.email`; Postgres
+    // reports `duplicate key value violates unique constraint
+    // "account_email_key"` and also exposes the constraint name directly.
+    // The column name is the one token both spellings share, so match on it
+    // rather than on either backend's phrasing.
+    let detail = format!("{} {}", db.constraint().unwrap_or_default(), db.message());
+    if detail.contains("email") {
+        // The message names a column, never a value, so the address has to come
+        // from the request — and only a request that carried one can have
+        // collided, since a NULL email violates a UNIQUE index on neither
+        // engine. `map` rather than `unwrap_or_default` because the alternative
+        // renders as "the email address  is already registered": if the request
+        // had no email this is not the conflict it claims to be, and `None`
+        // keeps the engine's own wording on the way to a backend fault where it
+        // can be diagnosed.
+        return params.email.map(|email| PdsError::EmailNotAvailable {
+            email: email.to_string(),
+        });
+    }
+    if detail.contains("handle") {
+        return Some(PdsError::HandleNotAvailable {
+            handle: params.handle.to_string(),
+        });
+    }
+    // The remaining unique column is the primary key on `did`, whose
+    // violation Postgres names `account_pkey` and SQLite names
+    // `account.did` — neither mentions a column this function can match, so
+    // it is the fallback rather than a third arm.
+    Some(PdsError::AccountAlreadyExists {
+        did: params.did.to_string(),
+    })
+}
+
 /// Inputs for `create_account`.
 ///
 /// Use the builder-style accessors: `CreateAccountParams::new(did, handle,
@@ -1282,6 +1415,10 @@ mod tests {
         assert!(actor_path.exists());
     }
 
+    /// A taken handle has to arrive as `HandleNotAvailable`: it is the name
+    /// `com.atproto.server.createAccount` declares, and clients switch on the
+    /// name. This asserted `AuthDenied` before, which reached the wire as a
+    /// 403 `Forbidden` that the lexicon does not list.
     #[tokio::test(flavor = "multi_thread")]
     async fn create_account_duplicate_handle_rejected() {
         let (manager, _dir, _tmp) = fresh_manager().await;
@@ -1289,7 +1426,41 @@ mod tests {
             .create_account(CreateAccountParams {
                 did: "did:plc:alice",
                 handle: "alice.example",
-                email: None,
+                email: Some("alice@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A fresh DID and a fresh email, so only the handle can be the
+        // conflict being reported.
+        let result = manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:bob",
+                handle: "alice.example",
+                email: Some("bob@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(PdsError::HandleNotAvailable { ref handle }) if handle == "alice.example"),
+            "got {result:?}"
+        );
+    }
+
+    /// A taken email used to reach the INSERT and come back as a storage
+    /// fault — a 500 quoting SQLite's constraint text at the caller.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_account_duplicate_email_rejected() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: Some("shared@example.com"),
                 password: "pw",
                 pds_managed_rotation: true,
                 ..Default::default()
@@ -1299,14 +1470,234 @@ mod tests {
         let result = manager
             .create_account(CreateAccountParams {
                 did: "did:plc:bob",
-                handle: "alice.example",
-                email: None,
+                handle: "bob.example",
+                email: Some("shared@example.com"),
                 password: "pw",
                 pds_managed_rotation: true,
                 ..Default::default()
             })
             .await;
-        assert!(matches!(result, Err(PdsError::AuthDenied { .. })));
+        assert!(
+            matches!(result, Err(PdsError::EmailNotAvailable { ref email }) if email == "shared@example.com"),
+            "got {result:?}"
+        );
+        let Err(err) = result else { unreachable!() };
+        assert!(
+            !err.to_string().contains("UNIQUE constraint"),
+            "storage-engine wording escaped: {err}"
+        );
+    }
+
+    /// Accounts without an email do not collide with each other: `NULL = ?`
+    /// is not true, so the pre-flight check must not treat two `NULL` emails
+    /// as a match.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_account_without_email_does_not_collide() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        for (did, handle) in [
+            ("did:plc:alice", "alice.example"),
+            ("did:plc:bob", "bob.example"),
+        ] {
+            manager
+                .create_account(CreateAccountParams {
+                    did,
+                    handle,
+                    email: None,
+                    password: "pw",
+                    pds_managed_rotation: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("emailless accounts must not collide");
+        }
+    }
+
+    /// A DID already hosted here is its own case: the handle and the email
+    /// may both be free, and telling the caller to pick another handle would
+    /// point them at the wrong remedy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_account_duplicate_did_rejected() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: Some("alice@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice-again.example",
+                email: Some("alice-again@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(PdsError::AccountAlreadyExists { ref did }) if did == "did:plc:alice"),
+            "got {result:?}"
+        );
+    }
+
+    /// The pre-flight check is a read followed by a write, so a concurrent
+    /// signup can still reach the INSERT. Drive the table directly to produce
+    /// the constraint violation that race produces and assert it is
+    /// classified rather than reported as a backend fault.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_unique_violations_are_classified_by_column() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: Some("alice@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pool = manager.accounts_pool.as_sqlite();
+
+        for (did, handle, email) in [
+            ("did:plc:bob", "bob.example", "alice@example.com"),
+            ("did:plc:bob", "alice.example", "bob@example.com"),
+            ("did:plc:alice", "bob.example", "bob@example.com"),
+        ] {
+            let err = sqlx::query(
+                "INSERT INTO account (did, handle, email, password_hash, created_at, state, signing_key_ref, pds_managed_rotation)
+                 VALUES (?, ?, ?, 'x', 'x', 'active', 'x', 1)",
+            )
+            .bind(did)
+            .bind(handle)
+            .bind(email)
+            .execute(pool)
+            .await
+            .expect_err("the UNIQUE constraint must reject this row");
+
+            let params = CreateAccountParams::new(did, handle, "pw").with_email(Some(email));
+            let classified = account_insert_conflict(&err, &params);
+            match (did, handle) {
+                ("did:plc:bob", "bob.example") => assert!(
+                    matches!(classified, Some(PdsError::EmailNotAvailable { .. })),
+                    "got {classified:?}"
+                ),
+                ("did:plc:bob", _) => assert!(
+                    matches!(classified, Some(PdsError::HandleNotAvailable { .. })),
+                    "got {classified:?}"
+                ),
+                _ => assert!(
+                    matches!(classified, Some(PdsError::AccountAlreadyExists { .. })),
+                    "got {classified:?}"
+                ),
+            }
+        }
+    }
+
+    /// A failure that is not a uniqueness violation must keep reporting as
+    /// one: silently reclassifying every insert error would hide real backend
+    /// faults behind a 400.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_unique_insert_failures_are_not_reclassified() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        let err = sqlx::query("INSERT INTO account (did) VALUES (?)")
+            .bind("did:plc:alice")
+            .execute(manager.accounts_pool.as_sqlite())
+            .await
+            .expect_err("NOT NULL columns have no defaults");
+        let params = CreateAccountParams::new("did:plc:alice", "alice.example", "pw");
+        assert!(account_insert_conflict(&err, &params).is_none());
+    }
+
+    /// A violation naming the email column cannot arise from a request that
+    /// carried no email — `NULL` violates a UNIQUE index on neither engine —
+    /// so pairing the two is the only way to reach that arm. It must decline
+    /// rather than render *"the email address  is already registered"* with the
+    /// address missing and a double space where it should have been.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn email_conflict_without_an_email_in_the_request_is_declined() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: Some("alice@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let err = sqlx::query(
+            "INSERT INTO account (did, handle, email, password_hash, created_at, state, signing_key_ref, pds_managed_rotation)
+             VALUES (?, ?, ?, 'x', 'x', 'active', 'x', 1)",
+        )
+        .bind("did:plc:bob")
+        .bind("bob.example")
+        .bind("alice@example.com")
+        .execute(manager.accounts_pool.as_sqlite())
+        .await
+        .expect_err("the UNIQUE constraint on account.email must reject this row");
+
+        // The same error, attributed to a request that carried no email.
+        let params = CreateAccountParams::new("did:plc:bob", "bob.example", "pw");
+        let classified = account_insert_conflict(&err, &params);
+        assert!(
+            classified.is_none(),
+            "an email conflict with no email to name must stay a backend fault: {classified:?}"
+        );
+    }
+
+    /// `createAccount` runs the check before PLC genesis, when no DID exists
+    /// yet. A `None` DID must match no row — not even the one whose handle and
+    /// email are being tested against — while the other two columns are still
+    /// enforced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_available_without_a_did_checks_handle_and_email() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: Some("alice@example.com"),
+                password: "pw",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let taken_handle = manager
+            .ensure_available(None, "alice.example", Some("bob@example.com"))
+            .await;
+        assert!(
+            matches!(taken_handle, Err(PdsError::HandleNotAvailable { ref handle }) if handle == "alice.example"),
+            "got {taken_handle:?}"
+        );
+        let taken_email = manager
+            .ensure_available(None, "bob.example", Some("alice@example.com"))
+            .await;
+        assert!(
+            matches!(taken_email, Err(PdsError::EmailNotAvailable { ref email }) if email == "alice@example.com"),
+            "got {taken_email:?}"
+        );
+        manager
+            .ensure_available(None, "bob.example", Some("bob@example.com"))
+            .await
+            .expect("a free handle and a free email are available");
+        manager
+            .ensure_available(None, "bob.example", None)
+            .await
+            .expect("a signup with no email collides on nothing");
     }
 
     #[tokio::test(flavor = "multi_thread")]
