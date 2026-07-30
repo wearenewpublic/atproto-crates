@@ -20,6 +20,7 @@ pub mod config;
 pub mod declaration;
 pub mod export_car;
 pub mod inbound;
+pub mod lex_bytes;
 pub mod mint_authz;
 pub mod notify;
 pub mod reader;

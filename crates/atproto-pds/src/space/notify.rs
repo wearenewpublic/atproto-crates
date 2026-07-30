@@ -43,8 +43,9 @@ use sqlx::SqlitePool;
 pub const NOTIFY_WRITE_NSID: &str = "com.atproto.space.notifyWrite";
 
 /// Wire-shape of `com.atproto.space.notifyWrite` request body
-/// (`application/json`). Contentless: it announces that `repo` advanced to
-/// `rev` within `space`; consumers PULL the ops via `listRepoOps`.
+/// (`application/json`). Near-contentless: it announces that `repo` advanced to
+/// `rev` within `space`, and carries the resulting commit hash; consumers PULL
+/// the ops via `listRepoOps`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotifyWritePayload {
     /// Space URI.
@@ -53,6 +54,20 @@ pub struct NotifyWritePayload {
     pub repo: String,
     /// The revision of the write.
     pub rev: String,
+    /// The repo's commit hash (sha256 of the LtHash state) after the write.
+    ///
+    /// The lexicon requires this, and it exists so *"the space host can
+    /// maintain each repo's hash for listRepos"* — without it the authority has
+    /// no way to tell a syncer which repos actually changed, and the
+    /// hash-propagation loop from repo host to space host does not close.
+    ///
+    /// **Optional on the way in, always sent on the way out.** `notifyWrite` is
+    /// declared best-effort, this is the only implementation that emits a hash
+    /// at all, and rejecting a payload without one would drop write
+    /// notifications from every peer running older code — including this
+    /// server's own previous releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<crate::space::lex_bytes::BytesValue>,
 }
 
 /// One subscription row from `space_credential_recipient` for a given space.
@@ -320,6 +335,7 @@ mod tests {
             .await
             .unwrap();
         let payload = NotifyWritePayload {
+            hash: None,
             space: test_space().to_string(),
             repo: "did:plc:alice".to_string(),
             rev: "rev".to_string(),
@@ -361,6 +377,7 @@ mod tests {
             .await
             .unwrap();
         let payload = NotifyWritePayload {
+            hash: None,
             space: uri.to_string(),
             repo: "did:plc:alice".to_string(),
             rev: "3kmev".to_string(),

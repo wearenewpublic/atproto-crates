@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `atproto-pds`: `com.atproto.space.notifyWrite` carries the repo's commit `hash`, and
+  `listRepos#repo` reports it. The lexicon marks `hash` required on `notifyWrite` and says why —
+  *"Lets the space host maintain each repo's hash for listRepos"* — and without it a syncer could not
+  tell which repos had actually changed without fetching every one. The hash-propagation loop from
+  repo host to space host now closes.
+
+  Everything needed was already present and unused: `space_received_op` has always had a `set_hash`
+  column that the inbound handler filled with an empty blob, and the writer built the signed commit
+  and discarded it.
+
+  `listRepos` reports the hash belonging to the **latest** rev, via a correlated subquery rather than
+  a bare column beside `MAX(rev)` — SQLite would give the right row there, but nothing else would, and
+  a hash paired with the wrong rev is a wrong answer rather than a missing one.
+
+  **Sent always, optional on receipt.** `notifyWrite` is declared best-effort and this is the only
+  implementation that emits a hash at all, so a payload without one is accepted and logged rather than
+  rejected — refusing would drop write notifications from every peer running older code. A repo whose
+  host reported no hash is listed without one, never with an empty one.
+
 - `atproto-pds`: `com.atproto.space.getRepo` — the whole permissioned repo as a CAR, for full-state
   recovery. This was the only missing recovery path: `listRepoOps` replays *changes* and cannot rebuild
   a repo whose earliest ops have been pruned, and `listRecords` carries no commit and no CID-addressed

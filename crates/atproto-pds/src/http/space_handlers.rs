@@ -1256,23 +1256,12 @@ pub struct SignedCommitDto {
     pub rev: String,
 }
 
-/// atproto lex-data `bytes` value — serializes as `{"$bytes": "<base64>"}`
-/// (standard alphabet, unpadded).
-#[derive(Debug)]
-pub struct BytesValue(Vec<u8>);
-
-impl Serialize for BytesValue {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.0);
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry("$bytes", &b64)?;
-        map.end()
-    }
-}
+/// atproto lex-data `bytes` value, `{"$bytes": "<base64>"}`.
+///
+/// Defined in [`crate::space::lex_bytes`] so the writer can build one without
+/// reaching into the HTTP layer — `notifyWrite` carries a `$bytes` field and is
+/// sent by domain code.
+pub use crate::space::lex_bytes::BytesValue;
 
 impl SignedCommitDto {
     /// Convert an [`atproto_space::Commit`] into its `$bytes`-encoded wire DTO.
@@ -2595,6 +2584,12 @@ pub struct RepoRef {
     /// The repo's current `rev` (the latest observed in this space's
     /// write-receipt log for that issuer).
     pub rev: String,
+    /// The repo's commit hash at that rev, as last reported by its host.
+    ///
+    /// Absent when the reporting peer sent none. This is what lets a syncer see
+    /// which repos actually changed without fetching each one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<BytesValue>,
 }
 
 /// Output of `listRepos`.
@@ -2656,11 +2651,21 @@ pub async fn list_repos(
     }
 
     let cursor = q.cursor.clone().unwrap_or_default();
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT issuer_did, MAX(rev) FROM space_received_op
-         WHERE space = ? AND issuer_did > ?
-         GROUP BY issuer_did
-         ORDER BY issuer_did ASC
+    // The hash has to come from the row that produced the max rev. SQLite would
+    // in fact give that with a bare `set_hash` alongside `MAX(rev)`, but that is
+    // a SQLite-specific guarantee — anywhere else it would silently pair a rev
+    // with some other row's hash, which is a wrong answer rather than a missing
+    // one. The correlated subquery says what is meant.
+    let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT o.issuer_did, o.rev, o.set_hash
+         FROM space_received_op o
+         WHERE o.space = ? AND o.issuer_did > ?
+           AND o.rev = (
+             SELECT MAX(i.rev) FROM space_received_op i
+             WHERE i.space = o.space AND i.issuer_did = o.issuer_did
+           )
+         GROUP BY o.issuer_did
+         ORDER BY o.issuer_did ASC
          LIMIT ?",
     )
     .bind(space.to_string())
@@ -2678,7 +2683,13 @@ pub async fn list_repos(
 
     let repos: Vec<RepoRef> = rows
         .into_iter()
-        .map(|(did, rev)| RepoRef { did, rev })
+        .map(|(did, rev, set_hash)| RepoRef {
+            did,
+            rev,
+            // An empty blob means the reporting peer sent no hash. Reporting
+            // `{"$bytes": ""}` would claim a hash that is not one.
+            hash: set_hash.filter(|h| !h.is_empty()).map(BytesValue),
+        })
         .collect();
     let next_cursor = if repos.len() as u32 == limit {
         repos.last().map(|r| r.did.clone())

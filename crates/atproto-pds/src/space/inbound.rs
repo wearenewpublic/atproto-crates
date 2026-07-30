@@ -34,6 +34,21 @@ pub async fn receive_write(
             reason: format!("decode notifyWrite payload: {e}"),
         })?;
     let space = SpaceUri::parse(&payload.space).map_err(PdsError::Space)?;
+    // The commit hash the writer reported. Empty when the peer sent none —
+    // `notifyWrite` is best-effort and older peers do not carry it — in which
+    // case `listRepos` reports no hash for that repo rather than a wrong one.
+    let set_hash = payload
+        .hash
+        .as_ref()
+        .map(|h| h.as_slice().to_vec())
+        .unwrap_or_default();
+    if set_hash.is_empty() {
+        tracing::debug!(
+            space = %space,
+            repo = %payload.repo,
+            "notifyWrite carried no hash; listRepos will report none for this repo"
+        );
+    }
     persist_receipt(
         data_dir,
         recipient_did,
@@ -41,7 +56,7 @@ pub async fn receive_write(
         &payload.rev,
         "notifyWrite",
         &payload.repo,
-        &[],
+        &set_hash,
     )
     .await
 }
@@ -125,6 +140,7 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let space = test_space();
         let payload = NotifyWritePayload {
+            hash: None,
             space: space.to_string(),
             repo: "did:plc:alice".to_string(),
             rev: "3kmev1".to_string(),

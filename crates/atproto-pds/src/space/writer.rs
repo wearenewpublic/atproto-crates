@@ -73,6 +73,30 @@ pub struct SpaceWriter {
     plc_directory: Option<String>,
 }
 
+/// Build the `notifyWrite` body a repo host sends to a space host.
+///
+/// Extracted so the payload can be tested without a network hop: the send path
+/// resolves the owner's `#atproto_pds` endpoint from their DID document, which
+/// a test harness has no way to provide.
+///
+/// `hash` is the commit hash after the write. The lexicon requires it and says
+/// why — *"Lets the space host maintain each repo's hash for listRepos"* —
+/// which is the loop that lets a syncer see which repos actually changed.
+#[must_use]
+pub fn build_notify_payload(
+    space: &SpaceUri,
+    writer_did: &str,
+    rev: &str,
+    commit_hash: &[u8],
+) -> NotifyWritePayload {
+    NotifyWritePayload {
+        space: space.to_string(),
+        repo: writer_did.to_string(),
+        rev: rev.to_string(),
+        hash: Some(crate::space::lex_bytes::BytesValue(commit_hash.to_vec())),
+    }
+}
+
 impl SpaceWriter {
     /// Construct.
     pub fn new(accounts: Arc<crate::account::AccountManager>, data_dir: PathBuf) -> Self {
@@ -346,11 +370,14 @@ impl SpaceWriter {
             .0;
         let signing_key = self.accounts.key_store().get(&key_ref).await?;
 
-        // Sign the commit so the repo's signed state is persisted. The commit
-        // is no longer broadcast — `notifyWrite` is contentless per the
-        // published spec; consumers PULL ops via `listRepoOps`.
-        let _signed_commit =
+        // Sign the commit so the repo's signed state is persisted. The ops
+        // themselves are not broadcast — consumers PULL them via
+        // `listRepoOps` — but the commit's `hash` travels on `notifyWrite`, so
+        // the space host can maintain each repo's hash for `listRepos`. This
+        // commit used to be built and discarded.
+        let signed_commit =
             create_commit(&prepared.set_hash, &context, &signing_key).map_err(space_err)?;
+        let commit_hash = signed_commit.hash.clone();
 
         repo.apply_commit(prepared).await.map_err(space_err)?;
 
@@ -365,7 +392,7 @@ impl SpaceWriter {
         // permissioned blob from a public one.
         self.maintain_blob_refs(space, member_did, &ref_work).await;
 
-        self.fire_notify_write(space, member_did, &rev, &signing_key)
+        self.fire_notify_write(space, member_did, &rev, &commit_hash, &signing_key)
             .await;
 
         Ok(SpaceCommitResult {
@@ -445,6 +472,7 @@ impl SpaceWriter {
         space: &SpaceUri,
         writer_did: &str,
         rev: &str,
+        commit_hash: &[u8],
         writer_signing_key: &KeyData,
     ) {
         let owner_did = space.space_did.clone();
@@ -500,11 +528,7 @@ impl SpaceWriter {
             }
         };
 
-        let payload = NotifyWritePayload {
-            space: space.to_string(),
-            repo: writer_did.to_string(),
-            rev: rev.to_string(),
-        };
+        let payload = build_notify_payload(space, writer_did, rev, commit_hash);
         let url = format!(
             "{}/xrpc/{}",
             owner_pds.trim_end_matches('/'),

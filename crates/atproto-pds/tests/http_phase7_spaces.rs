@@ -2627,3 +2627,176 @@ async fn get_repo_reports_repo_not_found_for_an_empty_repo() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body["error"], "RepoNotFound");
 }
+
+// ---------------------------------------------------------------------------
+//  F-SPACE-05 — the hash-propagation loop from repo host to space host.
+//
+//  `notifyWrite` carried `{space, repo, rev}` with no `hash`, though the
+//  lexicon marks it required and says why: *"Lets the space host maintain each
+//  repo's hash for listRepos."* `listRepos#repo` had no `hash` either, so a
+//  syncer could not tell which repos had actually changed without fetching
+//  every one.
+//
+//  Everything needed was already present and unused: `space_received_op` has a
+//  `set_hash` column that `receive_write` filled with an empty blob, and the
+//  writer built the signed commit and discarded it.
+// ---------------------------------------------------------------------------
+
+/// Drive the inbound half directly.
+///
+/// The writer's `notifyWrite` hop resolves the owner's `#atproto_pds` endpoint
+/// from their DID document, which this harness cannot provide — so the send and
+/// receive halves are exercised separately rather than through a hop that never
+/// fires. `build_notify_payload` covers what is sent; this covers what a space
+/// host does with it.
+async fn deliver_notify_write(manager: &Arc<AccountManager>, owner_did: &str, payload: &Value) {
+    let http = reqwest::Client::new();
+    atproto_pds::space::inbound::receive_write(
+        &http,
+        None,
+        manager.data_dir(),
+        owner_did,
+        serde_json::to_vec(payload).unwrap().as_ref(),
+    )
+    .await
+    .expect("receive_write");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_payload_a_writer_sends_carries_the_commit_hash() {
+    // The send half. Previously `{space, repo, rev}` with no hash, though the
+    // lexicon marks it required.
+    let space: atproto_space::SpaceUri = "at://did:plc:owner/space/app.bsky.group/default"
+        .parse()
+        .unwrap();
+    let hash = vec![0xABu8; 32];
+    let payload =
+        atproto_pds::space::writer::build_notify_payload(&space, "did:plc:alice", "3jui", &hash);
+
+    let wire = serde_json::to_value(&payload).unwrap();
+    assert_eq!(wire["space"], space.to_string());
+    assert_eq!(wire["repo"], "did:plc:alice");
+    assert_eq!(wire["rev"], "3jui");
+    assert_eq!(
+        wire["hash"]["$bytes"],
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(&hash),
+        "hash must travel in the lexicon's `bytes` wire form"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inbound_hash_is_stored_on_the_receipt() {
+    // The receive half. `space_received_op` has always had a `set_hash` column;
+    // `receive_write` filled it with an empty blob.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let hash = vec![0x11u8; 32];
+    deliver_notify_write(
+        &manager,
+        "did:plc:owner",
+        &json!({
+            "space": uri,
+            "repo": "did:plc:alice",
+            "rev": "3aaa",
+            "hash": {"$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&hash)},
+        }),
+    )
+    .await;
+
+    let store =
+        atproto_pds::actor_store::sql::SqlActorStore::open(manager.data_dir(), "did:plc:owner")
+            .await
+            .unwrap();
+    let stored: Vec<u8> = sqlx::query_scalar(
+        "SELECT set_hash FROM space_received_op WHERE space = ? AND issuer_did = ?",
+    )
+    .bind(&uri)
+    .bind("did:plc:alice")
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, hash, "the receipt must carry the reported hash");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_repos_reports_the_hash_belonging_to_the_latest_rev() {
+    // The report half, and the aggregate-correctness case. Pairing `MAX(rev)`
+    // with another row's hash is a wrong answer rather than a missing one, and
+    // a syncer acting on it would skip a repo that had in fact changed.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let older = vec![0x11u8; 32];
+    let newer = vec![0x22u8; 32];
+    for (rev, hash) in [("3aaa", &older), ("3bbb", &newer)] {
+        deliver_notify_write(
+            &manager,
+            "did:plc:owner",
+            &json!({
+                "space": uri,
+                "repo": "did:plc:alice",
+                "rev": rev,
+                "hash": {"$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash)},
+            }),
+        )
+        .await;
+    }
+
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let (status, listed) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRepos?space={}",
+            urlencode(&uri)
+        ),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listRepos: {listed}");
+    let repo = &listed["repos"][0];
+    assert_eq!(repo["did"], "did:plc:alice");
+    assert_eq!(repo["rev"], "3bbb");
+    assert_eq!(
+        repo["hash"]["$bytes"],
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(&newer),
+        "the hash must belong to the latest rev, not another row: {listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notify_write_without_a_hash_is_accepted_and_reports_none() {
+    // `notifyWrite` is declared best-effort and this is the only implementation
+    // that emits a hash at all, so rejecting a payload without one would drop
+    // write notifications from every peer running older code. It must also not
+    // report `{"$bytes": ""}`, which would claim a hash that is not one.
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    deliver_notify_write(
+        &manager,
+        "did:plc:owner",
+        &json!({"space": uri, "repo": "did:plc:alice", "rev": "3aaa"}),
+    )
+    .await;
+
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let (status, listed) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRepos?space={}",
+            urlencode(&uri)
+        ),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listRepos: {listed}");
+    assert_eq!(listed["repos"][0]["did"], "did:plc:alice");
+    assert!(
+        listed["repos"][0].get("hash").is_none(),
+        "no hash reported is better than an empty one: {listed}"
+    );
+}
