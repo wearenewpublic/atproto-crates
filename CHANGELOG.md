@@ -75,6 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Identifiers minted before this change are wrong and cannot be reconciled — the operation that
   produced one hashes to a different DID. Any such DID has to be recreated.
+- `atproto-identity`: genesis operations omitted `prev` instead of sending `prev: null`. did:plc
+  declares the field required and nullable, and the reference directory validates operations against
+  a strict schema, so a genesis op without the key was rejected before any signature or hash was
+  considered — `createAccount` could not mint a DID against a conformant directory.
+
+  `skip_serializing_if = "Option::is_none"` is dropped from `prev` on both `Operation::PlcOperation`
+  and `UnsignedOperation::PlcOperation`. The two have to agree: the unsigned form is what gets
+  DAG-CBOR encoded and signed, and the signed form is what gets hashed for the DID, so a field that
+  appears in one and not the other means the signature covers different bytes than the directory
+  verifies. This is why the change is not a JSON cosmetic — it moves the identifier too.
+
+  The tombstone variant is unaffected; its `prev` was never optional.
 
 
   against the lexicon alone could not page the oplog at all. The lexicon calls `since` *"operations

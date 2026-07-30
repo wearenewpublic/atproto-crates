@@ -35,8 +35,13 @@ pub enum Operation {
         /// Service endpoints.
         services: HashMap<String, ServiceEndpoint>,
 
-        /// Previous operation CID (null for genesis).
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Previous operation CID, `null` for a genesis operation.
+        ///
+        /// Always serialized, including when `None`. did:plc defines `prev` as
+        /// a required nullable field, and the reference directory validates
+        /// with a strict schema that rejects the key being absent. Omitting it
+        /// also changes the DAG-CBOR that is hashed for the DID and covered by
+        /// the signature, so a skipped `prev` is not a JSON cosmetic.
         prev: Option<String>,
 
         /// Base64url-encoded signature.
@@ -248,8 +253,12 @@ pub enum UnsignedOperation {
         /// Service endpoints.
         services: HashMap<String, ServiceEndpoint>,
 
-        /// CID of previous operation (None for genesis).
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// CID of previous operation, `null` for a genesis operation.
+        ///
+        /// Always serialized — see the note on [`Operation::PlcOperation`].
+        /// This is the form that is DAG-CBOR encoded and signed, so the two
+        /// must agree or the signature covers different bytes than the
+        /// directory verifies.
         prev: Option<String>,
     },
 
@@ -359,6 +368,35 @@ mod tests {
         let signed = unsigned.sign(&private_key_data).unwrap();
         assert!(signed.is_genesis());
         assert_eq!(signed.prev(), None);
+    }
+
+    /// did:plc declares `prev` required and nullable, so a genesis operation
+    /// carries `prev: null` rather than omitting the key. The reference
+    /// directory validates with a strict schema and rejects the operation
+    /// outright when it is absent — and because the same shape is DAG-CBOR
+    /// encoded for signing and for the DID hash, omitting it changes the
+    /// identifier as well as the JSON.
+    #[test]
+    fn genesis_serializes_prev_as_null() {
+        let private_key_data = generate_key(KeyType::P256Private).unwrap();
+        let did_key = format!("{}", private_key_data);
+
+        let unsigned =
+            Operation::new_genesis(vec![did_key], HashMap::new(), vec![], HashMap::new());
+        let unsigned_json = serde_json::to_value(&unsigned).unwrap();
+        assert_eq!(
+            unsigned_json.get("prev"),
+            Some(&serde_json::Value::Null),
+            "unsigned genesis op must carry prev: null, got {unsigned_json}"
+        );
+
+        let signed = unsigned.sign(&private_key_data).unwrap();
+        let signed_json = serde_json::to_value(&signed).unwrap();
+        assert_eq!(
+            signed_json.get("prev"),
+            Some(&serde_json::Value::Null),
+            "signed genesis op must carry prev: null, got {signed_json}"
+        );
     }
 
     #[test]
