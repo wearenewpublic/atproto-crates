@@ -16,10 +16,10 @@
 
 use crate::http::auth::{request_htm_htu, require_authn_sub};
 use crate::http::errors::XrpcError;
+use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::state::HttpState;
 use atproto_identity::resolve::{resolve_handle as identity_resolve_handle, resolve_handle_http};
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use base64::Engine as _;

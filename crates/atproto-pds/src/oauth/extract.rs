@@ -54,7 +54,7 @@ where
                 XrpcError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
-                    format!("malformed JSON request body: {err}"),
+                    format!("malformed JSON request body: {}", decoder_detail(&err)),
                 )
             })?;
             return Ok(Self(value));
@@ -64,11 +64,28 @@ where
             XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                format!("malformed form-encoded request body: {err}"),
+                format!(
+                    "malformed form-encoded request body: {}",
+                    decoder_detail(&err)
+                ),
             )
         })?;
         Ok(Self(value))
     }
+}
+
+/// The part of an axum rejection that is safe to relay.
+///
+/// axum's own wrapper text names the Rust type the body was being decoded into
+/// — *"Failed to deserialize the JSON body into the target type: …"* — which is
+/// this server's private detail: it is in no specification, a client cannot
+/// look it up, and renaming the struct would change the message without
+/// changing the wire contract. The decoder's explanation one level below is the
+/// actionable half, so prefer it, and fall back to the rejection's own text for
+/// the variants that carry no source (a wrong `Content-Type`, which names no
+/// type and explains itself).
+fn decoder_detail(err: &(dyn std::error::Error + 'static)) -> String {
+    crate::http::extract::source_detail(err).unwrap_or_else(|| err.to_string())
 }
 
 #[cfg(test)]
@@ -139,5 +156,32 @@ mod tests {
             .expect_err("malformed JSON should be rejected");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.name, "invalid_request");
+    }
+
+    /// The OAuth endpoints are not XRPC, but the type name is no more a client's
+    /// business here than it is there.
+    #[tokio::test]
+    async fn rejection_never_names_a_rust_type() {
+        let err = extract(Some("application/json"), "[]")
+            .await
+            .expect_err("an array body should be rejected");
+        assert!(!err.message.contains("Sample"), "{}", err.message);
+        assert!(!err.message.contains("target type"), "{}", err.message);
+    }
+
+    /// The rejections that carry no source still have to say something: a form
+    /// body sent with no content type is the common client mistake here and
+    /// the explanation is the whole value of the reply.
+    #[tokio::test]
+    async fn wrong_content_type_keeps_its_explanation() {
+        let err = extract(Some("text/plain"), "client_id=x")
+            .await
+            .expect_err("a non-form, non-JSON body should be rejected");
+        assert_eq!(err.name, "invalid_request");
+        assert!(
+            err.message.contains("x-www-form-urlencoded"),
+            "{}",
+            err.message
+        );
     }
 }

@@ -107,6 +107,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Identifiers minted before this change are wrong and cannot be reconciled — the operation that
   produced one hashes to a different DID. Any such DID has to be recreated.
+- `atproto-pds`: a request the HTTP layer could not decode never reached the XRPC error envelope.
+  `POST /xrpc/com.atproto.server.createAccount` with `{}` answered HTTP 422 and the `text/plain` body
+  *"Failed to deserialize the JSON body into the target type: missing field `handle` at line 1
+  column 2"* — axum's default `Json` rejection, written before any handler ran. 422 is not one of the
+  statuses XRPC defines, and a client that parses `{"error", "message"}` has nothing to report when
+  the body is not JSON at all. The same held for every query-string rejection (HTTP 400, plain text)
+  and for a body sent without `Content-Type: application/json` (HTTP 415, plain text).
+
+  `XrpcJson` and `XrpcQuery` in `http::extract` now wrap axum's extractors and translate the
+  rejection into the envelope: HTTP 400, `error: "InvalidRequest"`, message. Every handler module
+  imports them under the axum names, so `Json` and `Query` in a handler signature are the XRPC ones
+  and a handler added later inherits the behaviour instead of having to remember it. That covers all
+  47 body-extractor sites and all 30 query-extractor sites across the `/xrpc/*` surface and the admin
+  API. `XrpcJson` is a response as well as an extractor, and derefs like axum's, so the substitution
+  is an import line per module rather than a signature change per handler.
+
+  Every rejection that means *undecodable* becomes 400 `InvalidRequest`; only the wording differs,
+  and that is what tells the caller whether to fix its serializer, its payload or its headers. The
+  decoder's own explanation is kept — *"missing field `handle` at line 1 column 2"*, and serde's
+  field path for a nested failure — since that is what makes the error actionable. What is dropped is
+  the Rust type name serde emits when the top level has the wrong shape (`expected struct
+  CreateAccountInput` becomes `expected an object`): the name is in no lexicon, a caller cannot look
+  it up, and a refactor changes it while the wire contract stands still.
+
+  The one rejection that does not mean *undecodable* keeps its status. axum wraps every request body
+  in `http_body_util::Limited` and this server installs no `DefaultBodyLimit`, so the 2 MiB default
+  is live on all 47 endpoints: a `com.atproto.repo.applyWrites` batch past it is refused before any
+  byte reaches serde. That is HTTP 413, and it stays 413, now with the named error
+  `RequestTooLarge` inside the envelope — the sibling of the `BlobTooLarge` and `RepoTooLarge` this
+  server already answers 413 with on `uploadBlob` and `importRepo`. Collapsing it into 400 would have
+  left a client unable to tell "split the batch" from "fix the encoder".
+
+  Decoding itself is unchanged — these types accept exactly what axum accepted — so no handler's
+  semantics move.
+
+  The OAuth endpoints keep their own error vocabulary, since RFC 6749 clients are specified to read
+  `invalid_request` rather than `InvalidRequest`. Two of the five (`POST /oauth/token`, `POST
+  /oauth/par`) go through `JsonOrForm`, which already answered in that shape and now also strips the
+  Rust type name axum's wrapper text carried. The other three — `POST /oauth/authorize`, `POST
+  /oauth/revoke` and `GET /oauth/authorize` — still use axum's own `Json`, `Form` and `Query`, and
+  still reject with plain text naming a Rust struct. That is unfixed, not fixed.
 - `atproto-identity`: genesis operations omitted `prev` instead of sending `prev: null`. did:plc
   declares the field required and nullable, and the reference directory validates operations against
   a strict schema, so a genesis op without the key was rejected before any signature or hash was

@@ -16,11 +16,11 @@
 //! repo handoff between PDSes.
 
 use crate::http::errors::XrpcError;
+use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::space_auth::local_signing_key;
 use crate::http::state::HttpState;
 use atproto_identity::key::{jws_alg, sign as identity_sign};
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use base64::{Engine as _, engine::general_purpose};

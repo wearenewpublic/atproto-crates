@@ -13,9 +13,10 @@
 
 use crate::actor_store::sql::SqlActorStore;
 use crate::http::errors::XrpcError;
+use crate::http::extract::XrpcQuery as Query;
 use crate::http::state::HttpState;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};

@@ -15,8 +15,8 @@ use crate::account::{
 };
 use crate::errors::PdsError;
 use crate::http::errors::XrpcError;
+use crate::http::extract::XrpcJson as Json;
 use crate::http::state::HttpState;
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;

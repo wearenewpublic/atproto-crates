@@ -11,10 +11,10 @@
 
 use crate::BUILD_REV;
 use crate::http::errors::XrpcError;
+use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::state::HttpState;
 use crate::repo::{DescribeRepoResponse, ListRecordsResponse, RecordResponse, RepoStatusResponse};
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};

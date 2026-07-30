@@ -20,8 +20,8 @@
 use crate::actor_store::sql::SqlActorStore;
 use crate::http::auth::{request_htm_htu, require_authn_sub};
 use crate::http::errors::XrpcError;
+use crate::http::extract::XrpcJson as Json;
 use crate::http::state::HttpState;
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;

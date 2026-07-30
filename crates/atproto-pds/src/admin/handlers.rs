@@ -21,10 +21,9 @@
 use crate::account::{AccountState, hash_password};
 use crate::admin::subject::{StatusAttr, SubjectRef};
 use crate::http::errors::XrpcError;
-use crate::http::extract::XrpcJson;
+use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::state::HttpState;
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -240,10 +239,9 @@ pub struct UpdateSubjectStatusResponse {
 pub async fn update_subject_status(
     State(state): State<HttpState>,
     parts: Parts,
-    // `XrpcJson` rather than `Json`: `subject` is an open union, and a
-    // moderation service naming a type this build has not been taught must get
-    // an XRPC error it can read rather than axum's plain-text 422.
-    XrpcJson(input): XrpcJson<UpdateSubjectStatusInput>,
+    // `subject` is an open union, so a moderation service naming a type this
+    // build has not been taught is the likeliest rejection on this endpoint.
+    Json(input): Json<UpdateSubjectStatusInput>,
 ) -> Result<Json<UpdateSubjectStatusResponse>, XrpcError> {
     require_admin(&parts, &state).await?;
     let manager = state.account_manager.as_deref().ok_or_else(|| {

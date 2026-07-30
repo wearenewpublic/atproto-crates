@@ -16,8 +16,8 @@
 //! - `/.well-known/did.json` — this server's own `did:web` document, needed by
 //!   spaces and service-auth peers that must resolve it.
 
-use axum::Json;
-use axum::extract::{Query, State};
+use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};

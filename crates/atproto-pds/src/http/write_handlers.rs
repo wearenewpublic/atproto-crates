@@ -4,12 +4,12 @@
 use crate::actor_store::sql::SqlActorStore;
 use crate::http::auth::{AuthSubject, request_htm_htu, require_authn};
 use crate::http::errors::XrpcError;
+use crate::http::extract::XrpcJson as Json;
 use crate::http::state::HttpState;
 use crate::repo::{RepoWriter, WriteAction, WriteOp};
 use crate::sequencer::SubscribeEvent;
 use atproto_record::tid::Tid;
 use atproto_repo::mst::RepoOpAction;
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
@@ -674,7 +674,7 @@ pub struct ListMissingBlobsResponse {
 pub async fn list_missing_blobs(
     State(state): State<HttpState>,
     parts: Parts,
-    axum::extract::Query(q): axum::extract::Query<ListMissingBlobsQuery>,
+    crate::http::extract::XrpcQuery(q): crate::http::extract::XrpcQuery<ListMissingBlobsQuery>,
 ) -> Result<Json<ListMissingBlobsResponse>, XrpcError> {
     let claims = require_migration_session(&parts, &state).await?;
     let limit = q.limit.unwrap_or(500);

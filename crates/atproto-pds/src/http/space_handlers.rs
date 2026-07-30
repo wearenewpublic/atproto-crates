@@ -32,6 +32,7 @@ use crate::account::AccountManager;
 use crate::actor_store::sql::SqlActorStore;
 use crate::http::auth::{bearer_token, request_htm_htu, require_authn, require_authn_sub};
 use crate::http::errors::XrpcError;
+use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::space_auth::{
     SpaceTokenKind, classify, local_signing_key, peek_delegation_token,
     verify_local_delegation_token,
@@ -46,8 +47,7 @@ use atproto_space::credential::{
 };
 use atproto_space::storage::OplogCursor;
 use atproto_space::types::SpaceUri;
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use base64::Engine as _;

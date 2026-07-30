@@ -48,7 +48,7 @@ pub async fn subscribe_repos(
     ws: WebSocketUpgrade,
     State(state): State<HttpState>,
     headers: HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<SubscribeReposParams>,
+    crate::http::extract::XrpcQuery(params): crate::http::extract::XrpcQuery<SubscribeReposParams>,
 ) -> axum::response::Response {
     let accept = headers
         .get(axum::http::header::ACCEPT)
