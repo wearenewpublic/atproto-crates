@@ -390,39 +390,43 @@ impl SpaceService {
         Ok(row.is_some())
     }
 
-    /// `listSpaces` — paginated listing for a viewer DID. `filter` is one of
-    /// `"owned"`, `"member"`, or `"all"`.
+    /// `listSpaces` — paginated listing for a viewer DID.
+    ///
+    /// `space_type` and `authority_did` are the lexicon's optional `type` and
+    /// `did` filters. Neither is a column: the space table is keyed by URI, so
+    /// both are matched as a `LIKE` prefix over `at://{did}/space/{type}/…`.
+    ///
+    /// Returns a page and, when the page is full, a cursor to resume from.
     pub async fn list_spaces(
         &self,
         viewer_did: &str,
-        filter: &str,
+        space_type: Option<&str>,
+        authority_did: Option<&str>,
         cursor: Option<&str>,
         limit: u32,
-    ) -> PdsResult<Vec<SpaceInfo>> {
+    ) -> PdsResult<SpacePage> {
         let store = SqlActorStore::open(&self.data_dir, viewer_did).await?;
         let limit = limit.clamp(1, 100);
         // Tombstoned spaces are never listed.
         let mut clauses: Vec<String> = vec!["deleted_at IS NULL".to_string()];
-        match filter {
-            "owned" => clauses.push("is_owner = 1".to_string()),
-            "member" => clauses.push("is_member = 1".to_string()),
-            "all" | "" => {}
-            other => {
-                return Err(PdsError::Storage {
-                    reason: format!("invalid filter {other}"),
-                });
-            }
-        }
         let mut bindings: Vec<String> = Vec::new();
+        if space_type.is_some() || authority_did.is_some() {
+            // `_` and `%` in a DID or NSID would otherwise act as wildcards
+            // and widen the filter rather than narrow it.
+            let did_pat = authority_did.map_or_else(|| "%".to_string(), like_escape);
+            let type_pat = space_type.map_or_else(|| "%".to_string(), like_escape);
+            clauses.push("uri LIKE ? ESCAPE '\\'".to_string());
+            bindings.push(format!(
+                "{}{did_pat}/{}/{type_pat}/%",
+                atproto_space::types::AT_SCHEME,
+                atproto_space::types::SPACE_MARKER
+            ));
+        }
         if let Some(cur) = cursor {
             clauses.push("uri > ?".to_string());
             bindings.push(cur.to_string());
         }
-        let where_clause = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", clauses.join(" AND "))
-        };
+        let where_clause = format!("WHERE {}", clauses.join(" AND "));
         let sql = format!(
             "SELECT uri, is_owner, is_member, created_at FROM space {where_clause}
              ORDER BY uri ASC LIMIT ?"
@@ -438,7 +442,14 @@ impl SpaceService {
             .map_err(|e| PdsError::Storage {
                 reason: format!("listSpaces: {e}"),
             })?;
-        Ok(rows
+        // A short page is the last page. Emitting a cursor there would invite
+        // a request that can only ever come back empty.
+        let cursor = if rows.len() as u32 == limit {
+            rows.last().map(|(uri, ..)| uri.clone())
+        } else {
+            None
+        };
+        let spaces = rows
             .into_iter()
             .map(|(uri, is_owner, is_member, created_at)| SpaceInfo {
                 uri,
@@ -446,7 +457,8 @@ impl SpaceService {
                 is_member: is_member != 0,
                 created_at,
             })
-            .collect())
+            .collect();
+        Ok(SpacePage { spaces, cursor })
     }
 
     /// `addMember` — owner-side. Atomic via `SpaceMembers::format_commit` +
@@ -543,6 +555,29 @@ impl SpaceService {
     }
 }
 
+/// Escape SQL `LIKE` metacharacters so a filter value matches literally.
+///
+/// Paired with `ESCAPE '\\'` on the clause.
+fn like_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// One page of [`SpaceInfo`] from `listSpaces`, with the resume cursor.
+#[derive(Debug, Clone)]
+pub struct SpacePage {
+    /// Spaces in this page, ordered by URI.
+    pub spaces: Vec<SpaceInfo>,
+    /// Cursor for the next page. `None` when this is the last page.
+    pub cursor: Option<String>,
+}
+
 /// Internal view of a space row for `createSpace` / `listSpaces` (viewer
 /// relationship + creation time). Not the `getSpace` wire shape — see
 /// [`GetSpaceOutput`] for that.
@@ -619,7 +654,7 @@ mod tests {
         let got = svc.get_space(&uri).await.unwrap();
         assert_eq!(got.uri, info.uri);
         // Defaults surface as member-list + #open.
-        assert_eq!(got.config["mintPolicy"], "member-list");
+        assert_eq!(got.config["policy"], "member-list");
         assert_eq!(
             got.config["appAccess"]["$type"],
             crate::space::config::APP_ACCESS_OPEN_TYPE
@@ -652,7 +687,7 @@ mod tests {
             .unwrap();
 
         let got = svc.get_space(&uri).await.unwrap();
-        assert_eq!(got.config["mintPolicy"], "public");
+        assert_eq!(got.config["policy"], "public");
         assert_eq!(got.config["managingApp"], "did:web:m.example#svc");
         assert_eq!(
             got.config["appAccess"]["$type"],
@@ -840,10 +875,10 @@ mod tests {
         ));
         // listSpaces excludes the tombstoned space.
         let owned = svc
-            .list_spaces("did:plc:owner", "owned", None, 10)
+            .list_spaces("did:plc:owner", None, None, None, 10)
             .await
             .unwrap();
-        assert!(owned.is_empty());
+        assert!(owned.spaces.is_empty());
         // Re-deleting is idempotent.
         svc.delete_space("did:plc:owner", &uri).await.unwrap();
     }
@@ -959,11 +994,11 @@ mod tests {
         .await
         .unwrap();
         let owned = svc
-            .list_spaces("did:plc:owner", "owned", None, 10)
+            .list_spaces("did:plc:owner", None, None, None, 10)
             .await
             .unwrap();
-        assert_eq!(owned.len(), 2);
-        for s in &owned {
+        assert_eq!(owned.spaces.len(), 2);
+        for s in &owned.spaces {
             assert!(s.is_owner);
         }
     }

@@ -290,7 +290,10 @@ struct Args {
         long,
         env = "PDS_SPACE_CREDENTIAL_TTL_SECONDS",
         default_value_t = atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
-        value_parser = clap::value_parser!(u64).range(60..=86_400),
+        value_parser = clap::value_parser!(u64).range(
+            atproto_space::credential::SPACE_CREDENTIAL_TTL_MIN_SECS
+                ..=atproto_space::credential::SPACE_CREDENTIAL_TTL_MAX_SECS,
+        ),
     )]
     space_credential_ttl_seconds: u64,
 

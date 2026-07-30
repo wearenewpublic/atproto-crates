@@ -54,6 +54,24 @@ pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60;
 /// SpaceCredential default TTL: 2 hours / 7200 seconds (spec line 223).
 pub const SPACE_CREDENTIAL_TTL_SECS: u64 = 7200;
 
+/// Shortest SpaceCredential TTL a host may configure, in seconds.
+///
+/// Below this a credential expires inside the round trip that fetched it,
+/// which reads to a client as an unreliable server rather than as a policy.
+pub const SPACE_CREDENTIAL_TTL_MIN_SECS: u64 = 60;
+
+/// Longest SpaceCredential TTL a host may configure, in seconds (24 hours).
+///
+/// A SpaceCredential is a bearer token with no revocation path — removing a
+/// member does not invalidate one already minted. The ceiling bounds how long
+/// a revoked member keeps access.
+pub const SPACE_CREDENTIAL_TTL_MAX_SECS: u64 = 86_400;
+
+// The default must sit inside the configurable range, or the host's own
+// out-of-the-box setting would be clamped away.
+const _: () = assert!(SPACE_CREDENTIAL_TTL_MIN_SECS <= SPACE_CREDENTIAL_TTL_SECS);
+const _: () = assert!(SPACE_CREDENTIAL_TTL_SECS <= SPACE_CREDENTIAL_TTL_MAX_SECS);
+
 /// The `aud` of a delegation token: the space host service fragment of the
 /// authority DID (`<spaceDid>#atproto_space_host`, spec line 166).
 #[must_use]
@@ -252,10 +270,27 @@ fn verify_jwt<P: for<'de> Deserialize<'de>>(
     Ok(payload)
 }
 
-fn check_exp(exp: u64) -> SpaceResult<()> {
+/// Clock skew tolerated when checking `iat` and `exp`, in seconds.
+///
+/// Delegation tokens live 60 seconds and are minted by a *different* host from
+/// the one verifying them. Without tolerance, two servers a few seconds apart
+/// reject each other's freshly minted tokens — a distributed protocol cannot
+/// assume synchronised clocks.
+pub const CLOCK_SKEW_SECS: u64 = 60;
+
+/// Check `iat`/`exp` against the wall clock, allowing [`CLOCK_SKEW_SECS`] of
+/// drift in either direction.
+///
+/// A token whose `iat` is further ahead than the tolerance is refused: an
+/// issuer that can date tokens forward can extend their life without bound,
+/// which is the same as having no expiry at all.
+fn check_time_claims(iat: u64, exp: u64) -> SpaceResult<()> {
     let now = now_secs();
-    if exp <= now {
+    if exp.saturating_add(CLOCK_SKEW_SECS) <= now {
         return Err(SpaceError::JwtExpired { exp, now });
+    }
+    if iat > now.saturating_add(CLOCK_SKEW_SECS) {
+        return Err(SpaceError::JwtIssuedInFuture { iat, now });
     }
     Ok(())
 }
@@ -333,7 +368,7 @@ pub fn verify_delegation_token(
             actual: payload.sub,
         });
     }
-    check_exp(payload.exp)?;
+    check_time_claims(payload.iat, payload.exp)?;
     Ok(payload)
 }
 
@@ -410,7 +445,7 @@ pub fn verify_space_credential(
             actual: payload.sub,
         });
     }
-    check_exp(payload.exp)?;
+    check_time_claims(payload.iat, payload.exp)?;
     Ok(payload)
 }
 
@@ -529,8 +564,25 @@ mod tests {
     fn delegation_token_expired_rejected() {
         let (member_priv, member_pub) = keypair();
         let space = test_space();
-        let token = create_delegation_token("did:plc:alice", &space, &member_priv, 0).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Dated well past the skew window. `create_delegation_token` can only
+        // mint `exp = now + ttl`, so the payload is built directly; a
+        // zero-TTL token plus a short sleep now lands inside the tolerance.
+        let now = now_secs();
+        let payload = DelegationToken {
+            iss: "did:plc:alice".to_string(),
+            aud: space_host_audience(&space.space_did),
+            sub: space.to_string(),
+            iat: now - 600,
+            exp: now - 600 + DELEGATION_TOKEN_TTL_SECS,
+            jti: random_jti(),
+        };
+        let token = mint_jwt(
+            TYP_DELEGATION_TOKEN,
+            KID_DELEGATION_TOKEN,
+            &payload,
+            &member_priv,
+        )
+        .unwrap();
         let result = verify_delegation_token(&token, "did:plc:owner", &space, &member_pub);
         assert!(matches!(result, Err(SpaceError::JwtExpired { .. })));
     }
@@ -652,5 +704,37 @@ mod tests {
         .unwrap();
         let result = verify_space_credential(&token, "did:plc:owner", &other_space, &owner_pub);
         assert!(matches!(result, Err(SpaceError::JwtClaimMismatch { .. })));
+    }
+
+    #[test]
+    fn a_token_expired_inside_the_skew_window_is_still_accepted() {
+        // The minting host and the verifying host are different machines.
+        // Without tolerance, a few seconds of clock drift rejects a token that
+        // was valid when it was issued.
+        let now = now_secs();
+        assert!(check_time_claims(now - 10, now - 5).is_ok());
+        assert!(check_time_claims(now - 10, now - CLOCK_SKEW_SECS + 5).is_ok());
+    }
+
+    #[test]
+    fn a_token_expired_beyond_the_skew_window_is_rejected() {
+        let now = now_secs();
+        let result = check_time_claims(now - 600, now - CLOCK_SKEW_SECS - 5);
+        assert!(matches!(result, Err(SpaceError::JwtExpired { .. })));
+    }
+
+    #[test]
+    fn an_iat_far_in_the_future_is_rejected() {
+        // An issuer that can date tokens forward can extend their life
+        // without bound, which is the same as having no expiry at all.
+        let now = now_secs();
+        let result = check_time_claims(now + CLOCK_SKEW_SECS + 60, now + 7200);
+        assert!(matches!(result, Err(SpaceError::JwtIssuedInFuture { .. })));
+    }
+
+    #[test]
+    fn an_iat_slightly_ahead_is_tolerated() {
+        let now = now_secs();
+        assert!(check_time_claims(now + 5, now + 7200).is_ok());
     }
 }

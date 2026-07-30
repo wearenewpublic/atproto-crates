@@ -44,6 +44,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only name it knows. `getRepoState` is kept as an alias rather than removed.
 
 ### Fixed
+- `atproto-pds`: six `com.atproto.space.*` / `com.atproto.simplespace.*` wire shapes did not match
+  the lexicons they implement.
+
+  - **`spaceConfig`'s policy field is `policy`, not `mintPolicy`.** A conformant client's `policy`
+    was silently dropped and the default `member-list` applied in its place — the request looked
+    like it worked. Both names are now accepted on input (`policy` wins) and only `policy` is
+    emitted, on `getSpace` and `updateSpace` alike. HappyView carries the same divergence, so an
+    upstream issue is owed.
+  - **`applyWrites` required a `repo` and returned `{results}`.** It took only `{space, writes}` and
+    returned the internal commit result (`{rev, setHash, uris, cids}`), a shape the lexicon does not
+    describe. It now takes the lexicon's `repo` — which, as on the single-record writes, must name
+    the authenticated subject — accepts `validate`, and returns one `$type`-tagged
+    `#createResult` / `#updateResult` / `#deleteResult` per write, in request order. The variant
+    follows the *action*, not whether a CID came back. `rev` and `setHash` are no longer returned;
+    `getLatestCommit` reports them.
+  - **`listSpaces` took a `filter` the lexicon does not declare, and never returned a cursor.** It
+    now takes `type` and `did`, and emits a cursor when the page is full — a caller with more spaces
+    than one page had no way to reach the rest.
+  - **`getRecord` returned a URI that does not parse.** It was built with a format string that
+    dropped the author segment, so the URI this server reported failed this workspace's own
+    `RecordUri::parse`. It is now built through `RecordUri`, and `repo` is required as the lexicon
+    declares — there is no implicit form, because a record URI names its author even when that
+    author is the caller.
+  - **`limit` was unclamped on `listRepoOps`, `listSpaces` and `listMembers`.** One request could
+    demand an entire collection in a single page. All four listing endpoints now resolve `limit`
+    through one helper carrying each lexicon's own default and ceiling; they are not the same bound.
+  - **`SpaceNotFound` answered 400 on most handlers and 404 on three** — `getSpaceCredential`,
+    `listRepos` and `registerNotify` — so a client switching on the status saw one condition two
+    ways. All are 400 now.
+
+  `getRecord`'s `repo`, `applyWrites`' input and output, `listSpaces`' parameters and the three
+  statuses are **breaking wire changes** for clients written against this server rather than against
+  the lexicons.
+
 - `atproto-pds`: `com.atproto.space.listRecords` and `listRepoOps` returned no record values, so a
   syncer had to issue one `getRecord` per record with no bulk path — initial backfill was unusable and
   the pull design became quadratic. Both lexicons inline the value **by default**; the in-code comment
@@ -133,6 +167,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   believed it had a backend it did not have.
 
 ### Security
+- `atproto-space` / `atproto-pds`: **delegation tokens and space credentials had no clock-skew
+  tolerance and no `iat` sanity check, and the SpaceCredential TTL was unbounded.**
+
+  A delegation token lives 60 seconds and is minted by one host and verified by another, so a few
+  seconds of drift between two machines rejected a token that was valid when issued. `exp` now
+  tolerates 60 seconds either way.
+
+  The other half is the security-relevant one: `iat` was never checked, so an issuer could date a
+  token forward and extend its life without bound — the same as having no expiry at all. An `iat`
+  further ahead than the tolerance is now refused.
+
+  `PDS_SPACE_CREDENTIAL_TTL_SECONDS` was already range-checked by the CLI, but the library builder
+  `with_space_credential_ttl` took any `u64`. A SpaceCredential has no revocation path — removing a
+  member does not invalidate one already minted — so the ceiling bounds how long a removed member
+  keeps access. Both paths now share one 60s–24h range, and the builder clamps and warns rather than
+  accepting a value it will not honour.
+
 - `atproto-pds`: **permissioned blobs were served to anyone holding the CID, with no credential at
   all.** There is no `com.atproto.space.uploadBlob`: permissioned blobs are uploaded through the
   ordinary `com.atproto.repo.uploadBlob` and land in the same `repo_blob` table as public ones.

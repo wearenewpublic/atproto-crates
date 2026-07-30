@@ -1,7 +1,7 @@
 //! Simplespace configuration model.
 //!
 //! Persists and surfaces the `com.atproto.simplespace.defs#spaceConfig`
-//! shape: a `mintPolicy` (how the authority decides whether to authorize a
+//! shape: a `policy` (how the authority decides whether to authorize a
 //! requesting *user*), an `appAccess` open union (how it decides whether to
 //! authorize a requesting *app*), and an optional `managingApp` service
 //! identifier.
@@ -64,7 +64,7 @@ impl MintPolicy {
             "member-list" => Ok(Self::MemberList),
             "managing-app" => Ok(Self::ManagingApp),
             other => Err(PdsError::Storage {
-                reason: format!("invalid mintPolicy {other}"),
+                reason: format!("invalid policy {other}"),
             }),
         }
     }
@@ -201,9 +201,10 @@ impl SpaceConfig {
 
     /// Parse the `config` ref carried on a `createSpace` input. Missing fields
     /// fall back to the host defaults (`member-list` / `#open` / no managing
-    /// app). The `appAccess` union is in wire form (`$type`-tagged).
+    /// app), as `#spaceConfig` documents `member-list` as the default policy.
+    /// The `appAccess` union is in wire form (`$type`-tagged).
     pub fn from_create_input(value: &serde_json::Value) -> Result<Self, PdsError> {
-        let mint_policy = match value.get("mintPolicy").and_then(serde_json::Value::as_str) {
+        let mint_policy = match policy_field(value) {
             Some(s) => MintPolicy::from_str_value(s)?,
             None => MintPolicy::default(),
         };
@@ -229,7 +230,7 @@ impl SpaceConfig {
     pub fn to_wire(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({
             "$type": SPACE_CONFIG_TYPE,
-            "mintPolicy": self.mint_policy.as_str(),
+            "policy": self.mint_policy.as_str(),
             "appAccess": self.app_access.to_wire(),
         });
         if let Some(ref app) = self.managing_app {
@@ -237,6 +238,20 @@ impl SpaceConfig {
         }
         obj
     }
+}
+
+/// Read the user-authorization policy from a `#spaceConfig` or `updateSpace`
+/// input object.
+///
+/// The lexicon names this field `policy`. This server previously read and wrote
+/// `mintPolicy`, so a conformant client's `policy` was silently ignored and the
+/// default applied instead. Both names are accepted on input — `policy` wins —
+/// and only `policy` is emitted.
+fn policy_field(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("policy")
+        .or_else(|| value.get("mintPolicy"))
+        .and_then(serde_json::Value::as_str)
 }
 
 /// A field-level patch applied by `updateSpace`. Each `Option::None` leaves
@@ -257,7 +272,7 @@ impl SpaceConfigPatch {
     /// Parse an `updateSpace` input object into a patch. The `space` field is
     /// handled by the caller; only the config fields are read here.
     pub fn from_update_input(value: &serde_json::Value) -> Result<Self, PdsError> {
-        let mint_policy = match value.get("mintPolicy").and_then(serde_json::Value::as_str) {
+        let mint_policy = match policy_field(value) {
             Some(s) => Some(MintPolicy::from_str_value(s)?),
             None => None,
         };
@@ -393,7 +408,7 @@ mod tests {
         };
         let wire = cfg.to_wire();
         assert_eq!(wire["$type"], SPACE_CONFIG_TYPE);
-        assert_eq!(wire["mintPolicy"], "public");
+        assert_eq!(wire["policy"], "public");
         assert_eq!(wire["managingApp"], "did:web:example.com#forum");
         assert_eq!(wire["appAccess"]["$type"], APP_ACCESS_OPEN_TYPE);
     }
@@ -404,6 +419,8 @@ mod tests {
         assert_eq!(cfg, SpaceConfig::default());
     }
 
+    /// The pre-conformance spelling stays accepted so clients written against
+    /// this server's older releases keep working.
     #[test]
     fn config_from_create_input_full() {
         let cfg = SpaceConfig::from_create_input(&serde_json::json!({
@@ -427,6 +444,31 @@ mod tests {
         let cfg =
             SpaceConfig::from_create_input(&serde_json::json!({ "managingApp": "" })).unwrap();
         assert!(cfg.managing_app.is_none());
+    }
+
+    #[test]
+    fn the_lexicon_policy_field_is_read_and_wins_over_the_legacy_name() {
+        let cfg = SpaceConfig::from_create_input(&serde_json::json!({
+            "policy": "public",
+            "appAccess": { "$type": APP_ACCESS_OPEN_TYPE },
+        }))
+        .unwrap();
+        assert_eq!(cfg.mint_policy, MintPolicy::Public);
+
+        // Both present is a client mid-migration; the lexicon name decides.
+        let cfg = SpaceConfig::from_create_input(&serde_json::json!({
+            "policy": "public",
+            "mintPolicy": "managing-app",
+        }))
+        .unwrap();
+        assert_eq!(cfg.mint_policy, MintPolicy::Public);
+
+        let patch = SpaceConfigPatch::from_update_input(&serde_json::json!({
+            "space": "ignored",
+            "policy": "managing-app",
+        }))
+        .unwrap();
+        assert_eq!(patch.mint_policy, Some(MintPolicy::ManagingApp));
     }
 
     #[test]

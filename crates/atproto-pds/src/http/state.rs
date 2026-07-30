@@ -393,9 +393,27 @@ impl HttpState {
     }
 
     /// Override the SpaceCredential TTL.
+    ///
+    /// Clamped to
+    /// [`SPACE_CREDENTIAL_TTL_MIN_SECS`](atproto_space::credential::SPACE_CREDENTIAL_TTL_MIN_SECS)
+    /// ..=[`SPACE_CREDENTIAL_TTL_MAX_SECS`](atproto_space::credential::SPACE_CREDENTIAL_TTL_MAX_SECS).
+    /// A SpaceCredential cannot be revoked once minted, so an unbounded TTL
+    /// here would silently become an unbounded grant; a zero TTL would mint
+    /// credentials that are already expired.
     #[must_use]
     pub fn with_space_credential_ttl(mut self, ttl_secs: u64) -> Self {
-        self.space_credential_ttl_secs = ttl_secs;
+        let clamped = ttl_secs.clamp(
+            atproto_space::credential::SPACE_CREDENTIAL_TTL_MIN_SECS,
+            atproto_space::credential::SPACE_CREDENTIAL_TTL_MAX_SECS,
+        );
+        if clamped != ttl_secs {
+            tracing::warn!(
+                requested = ttl_secs,
+                applied = clamped,
+                "space credential ttl outside the permitted range; clamped"
+            );
+        }
+        self.space_credential_ttl_secs = clamped;
         self
     }
 

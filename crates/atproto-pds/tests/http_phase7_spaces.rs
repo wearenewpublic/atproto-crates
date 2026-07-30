@@ -310,7 +310,7 @@ async fn create_space_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {info}");
     assert_eq!(info["uri"], uri);
-    assert_eq!(info["config"]["mintPolicy"], "member-list");
+    assert_eq!(info["config"]["policy"], "member-list");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -367,7 +367,7 @@ async fn update_space_reflects_in_get_space() {
     let (status, _) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.updateSpace",
-        json!({"space": uri, "mintPolicy": "public"}),
+        json!({"space": uri, "policy": "public"}),
         Some(&token),
     )
     .await;
@@ -380,7 +380,7 @@ async fn update_space_reflects_in_get_space() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {info}");
-    assert_eq!(info["config"]["mintPolicy"], "public");
+    assert_eq!(info["config"]["policy"], "public");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -421,6 +421,7 @@ async fn delete_space_then_get_space_fails() {
         app,
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": uri,
             "writes": [{
                 "action": "create",
@@ -570,6 +571,7 @@ async fn apply_writes_then_read_back() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:alice",
             "space": uri,
             "writes": [{
                 "action": "create",
@@ -582,14 +584,20 @@ async fn apply_writes_then_read_back() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert!(!body["rev"].as_str().unwrap().is_empty());
-    assert!(!body["setHash"].as_str().unwrap().is_empty());
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["$type"], "com.atproto.space.applyWrites#createResult",
+        "body: {body}"
+    );
+    assert!(results[0]["uri"].as_str().is_some());
+    assert!(results[0]["cid"].as_str().is_some());
 
     // getRecord returns {uri, cid, value}.
     let (status, body) = get_json(
         app,
         &format!(
-            "/xrpc/com.atproto.space.getRecord?space={}&collection=app.bsky.group.message&rkey=first",
+            "/xrpc/com.atproto.space.getRecord?space={}&repo=did:plc:alice&collection=app.bsky.group.message&rkey=first",
             urlencode(&uri)
         ),
         Some(&alice_token),
@@ -615,7 +623,7 @@ async fn apply_writes_empty_batch_rejected() {
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.space.applyWrites",
-        json!({"space": uri, "writes": []}),
+        json!({"space": uri, "repo": "did:plc:owner", "writes": []}),
         Some(&owner_token),
     )
     .await;
@@ -671,7 +679,7 @@ async fn create_put_delete_record_single_ops() {
     let (status, body) = get_json(
         app.clone(),
         &format!(
-            "/xrpc/com.atproto.space.getRecord?space={}&collection=app.bsky.group.message&rkey=r1",
+            "/xrpc/com.atproto.space.getRecord?space={}&repo=did:plc:owner&collection=app.bsky.group.message&rkey=r1",
             urlencode(&uri)
         ),
         Some(&owner_token),
@@ -698,7 +706,7 @@ async fn create_put_delete_record_single_ops() {
     let (status, _) = get_json(
         app,
         &format!(
-            "/xrpc/com.atproto.space.getRecord?space={}&collection=app.bsky.group.message&rkey=r1",
+            "/xrpc/com.atproto.space.getRecord?space={}&repo=did:plc:owner&collection=app.bsky.group.message&rkey=r1",
             urlencode(&uri)
         ),
         Some(&owner_token),
@@ -740,6 +748,7 @@ async fn list_records_keys_only_paginated() {
             app.clone(),
             "/xrpc/com.atproto.space.applyWrites",
             json!({
+            "repo": "did:plc:owner",
                 "space": uri,
                 "writes": [{"action": "create", "collection": "c", "rkey": r, "value": {"k": r}}]
             }),
@@ -788,6 +797,7 @@ async fn list_records_across_all_collections() {
             app.clone(),
             "/xrpc/com.atproto.space.applyWrites",
             json!({
+            "repo": "did:plc:owner",
                 "space": uri,
                 "writes": [{"action": "create", "collection": collection, "rkey": rkey, "value": {}}]
             }),
@@ -830,6 +840,7 @@ async fn get_record_oauth_with_repo_override() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:alice",
             "space": uri,
             "writes": [{"action": "create", "collection": "c", "rkey": "alice-1", "value": {"who": "alice"}}]
         }),
@@ -850,7 +861,8 @@ async fn get_record_oauth_with_repo_override() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["value"]["who"], "alice");
 
-    // Without repo, the owner's own store has no such record.
+    // `repo` is required by the lexicon, so omitting it is a bad request
+    // rather than a lookup against the caller's own store.
     let (status, _) = get_json(
         app,
         &format!(
@@ -860,7 +872,7 @@ async fn get_record_oauth_with_repo_override() {
         Some(&owner_token),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +904,7 @@ async fn get_repo_state_signed_commit() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": uri,
             "writes": [{"action": "create", "collection": "c", "rkey": "k", "value": {"v": 1}}]
         }),
@@ -1499,6 +1512,7 @@ async fn space_with_alices_record(
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:alice",
             "space": uri,
             "writes": [{"action": "create", "collection": "c", "rkey": "alice-1", "value": {"who": "alice"}}]
         }),
@@ -1625,7 +1639,9 @@ async fn members_can_still_read_each_other() {
     assert_eq!(status, StatusCode::OK, "alice → alice explicit: {body}");
     assert_eq!(body["value"]["who"], "alice");
 
-    let (status, body) = get_json(
+    // There is no implicit form: `repo` names the record's author and the
+    // lexicon requires it, even when that author is the caller.
+    let (status, _) = get_json(
         app.clone(),
         &format!(
             "/xrpc/com.atproto.space.getRecord?space={}&collection=c&rkey=alice-1",
@@ -1634,7 +1650,7 @@ async fn members_can_still_read_each_other() {
         Some(&alice),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "alice → alice implicit: {body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "alice → alice implicit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1763,6 +1779,7 @@ async fn a_permissioned_blob_is_not_served_by_the_public_endpoint() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": uri,
             "writes": [{
                 "action": "create", "collection": "c", "rkey": "r1",
@@ -1814,6 +1831,7 @@ async fn the_same_blob_is_served_to_a_member_through_the_space_endpoint() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": uri,
             "writes": [{
                 "action": "create", "collection": "c", "rkey": "r1",
@@ -1889,6 +1907,7 @@ async fn the_space_parameter_reaches_the_blob_lookup() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": space_a,
             "writes": [{
                 "action": "create", "collection": "c", "rkey": "r1",
@@ -1925,6 +1944,7 @@ async fn deleting_the_last_referencing_record_revokes_the_blob() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": uri,
             "writes": [{
                 "action": "create", "collection": "c", "rkey": "r1",
@@ -1943,6 +1963,7 @@ async fn deleting_the_last_referencing_record_revokes_the_blob() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:owner",
             "space": uri,
             "writes": [{"action": "delete", "collection": "c", "rkey": "r1"}]
         }),
@@ -2029,7 +2050,7 @@ async fn the_authoritys_config_is_reported_not_the_callers_defaults() {
             "type": "app.bsky.group",
             "skey": "restricted",
             "config": {
-                "mintPolicy": "public",
+                "policy": "public",
                 "appAccess": {
                     "$type": "com.atproto.simplespace.defs#allowList",
                     "allowed": ["did:web:trusted.example"]
@@ -2055,6 +2076,7 @@ async fn the_authoritys_config_is_reported_not_the_callers_defaults() {
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
         json!({
+            "repo": "did:plc:alice",
             "space": uri,
             "writes": [{"action": "create", "collection": "c", "rkey": "r1", "value": {"v": 1}}]
         }),
@@ -2067,7 +2089,7 @@ async fn the_authoritys_config_is_reported_not_the_callers_defaults() {
     let (status, body) = get_space(&app, &uri, &alice).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
-        body["config"]["mintPolicy"], "public",
+        body["config"]["policy"], "public",
         "the caller's defaulted row must not be the answer: {body}"
     );
     assert_eq!(
@@ -2145,11 +2167,11 @@ async fn list_ops(app: &axum::Router, uri: &str, repo: &str, token: &str, extra:
     body
 }
 
-async fn space_write(app: &axum::Router, uri: &str, token: &str, writes: Value) {
+async fn space_write(app: &axum::Router, uri: &str, repo: &str, token: &str, writes: Value) {
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.space.applyWrites",
-        json!({"space": uri, "writes": writes}),
+        json!({"space": uri, "repo": repo, "writes": writes}),
         Some(token),
     )
     .await;
@@ -2167,6 +2189,7 @@ async fn list_records_inlines_values_by_default() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{
             "action": "create", "collection": "c", "rkey": "r1",
@@ -2199,6 +2222,7 @@ async fn list_records_honours_reverse() {
         space_write(
             &app,
             &uri,
+            "did:plc:owner",
             &owner,
             json!([{"action": "create", "collection": "c", "rkey": r, "value": {"k": r}}]),
         )
@@ -2259,6 +2283,7 @@ async fn list_repo_ops_inlines_values_and_omits_superseded_ones() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "create", "collection": "c", "rkey": "r1", "value": {"v": "first"}}]),
     )
@@ -2266,6 +2291,7 @@ async fn list_repo_ops_inlines_values_and_omits_superseded_ones() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "update", "collection": "c", "rkey": "r1", "value": {"v": "second"}}]),
     )
@@ -2273,6 +2299,7 @@ async fn list_repo_ops_inlines_values_and_omits_superseded_ones() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "create", "collection": "c", "rkey": "r2", "value": {"v": "kept"}}]),
     )
@@ -2280,6 +2307,7 @@ async fn list_repo_ops_inlines_values_and_omits_superseded_ones() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "delete", "collection": "c", "rkey": "r2"}]),
     )
@@ -2316,6 +2344,7 @@ async fn list_repo_ops_exclude_values_omits_every_value() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "create", "collection": "c", "rkey": "r1", "value": {"v": 1}}]),
     )
@@ -2404,6 +2433,7 @@ async fn get_repo_exports_a_two_root_car_a_syncer_can_verify() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([
             {"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}},
@@ -2463,6 +2493,7 @@ async fn the_car_root_is_the_commit_get_latest_commit_reports() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
     )
@@ -2505,6 +2536,7 @@ async fn get_latest_commit_and_get_repo_state_are_the_same_endpoint() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
     )
@@ -2559,7 +2591,7 @@ async fn get_repo_exports_every_record_across_the_page_boundary() {
             })
         })
         .collect();
-    space_write(&app, &uri, &owner, json!(writes)).await;
+    space_write(&app, &uri, "did:plc:owner", &owner, json!(writes)).await;
 
     let (status, car) = get_car(&app, &uri, "did:plc:owner", &owner).await;
     assert_eq!(status, StatusCode::OK);
@@ -2590,6 +2622,7 @@ async fn get_repo_refuses_a_non_member() {
     space_write(
         &app,
         &uri,
+        "did:plc:owner",
         &owner,
         json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
     )
@@ -2799,4 +2832,365 @@ async fn a_notify_write_without_a_hash_is_accepted_and_reports_none() {
         listed["repos"][0].get("hash").is_none(),
         "no hash reported is better than an empty one: {listed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+//  Wire-shape conformance (F-SPACE-16/17/22/23/24/26).
+// ---------------------------------------------------------------------------
+
+/// The lexicon names the user-authorization policy `policy`. This server used
+/// to read and write `mintPolicy`, so a conformant client's `policy` was
+/// silently dropped and the default applied in its place.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_honours_the_lexicon_policy_field() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({
+            "type": "app.bsky.group",
+            "skey": "policied",
+            "config": {
+                "$type": "com.atproto.simplespace.defs#spaceConfig",
+                "policy": "public",
+                "appAccess": {"$type": "com.atproto.simplespace.defs#open"}
+            }
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createSpace: {body}");
+    let uri = body["uri"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(
+        app,
+        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getSpace: {body}");
+    assert_eq!(
+        body["config"]["policy"], "public",
+        "the lexicon's `policy` must round-trip: {body}"
+    );
+    assert!(
+        body["config"].get("mintPolicy").is_none(),
+        "the non-lexicon name must not be emitted: {body}"
+    );
+}
+
+/// `updateSpace` takes the same field name.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_space_honours_the_lexicon_policy_field() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "updatable").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.updateSpace",
+        json!({"space": uri, "policy": "public"}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "updateSpace: {body}");
+
+    let (status, body) = get_json(
+        app,
+        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["config"]["policy"], "public", "{body}");
+}
+
+/// `applyWrites` returns a `results` array of `$type`-tagged union members,
+/// one per write, in request order.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_returns_one_typed_result_per_write() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "results").await;
+
+    space_write(
+        &app,
+        &uri,
+        "did:plc:owner",
+        &owner,
+        json!([{"action": "create", "collection": "app.t.rec", "rkey": "keep", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "repo": "did:plc:owner",
+            "writes": [
+                {"action": "create", "collection": "app.t.rec", "rkey": "fresh", "value": {"v": 2}},
+                {"action": "update", "collection": "app.t.rec", "rkey": "keep", "value": {"v": 3}},
+                {"action": "delete", "collection": "app.t.rec", "rkey": "keep"}
+            ]
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "applyWrites: {body}");
+
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3, "{body}");
+    assert_eq!(
+        results[0]["$type"],
+        "com.atproto.space.applyWrites#createResult"
+    );
+    assert!(results[0]["cid"].as_str().is_some());
+    assert_eq!(
+        results[1]["$type"],
+        "com.atproto.space.applyWrites#updateResult"
+    );
+    assert!(results[1]["cid"].as_str().is_some());
+    // A delete result declares no properties at all.
+    assert_eq!(
+        results[2],
+        json!({"$type": "com.atproto.space.applyWrites#deleteResult"})
+    );
+}
+
+/// `repo` is required on `applyWrites` and, as on the single-record writes,
+/// must name the authenticated subject.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_requires_a_repo_naming_the_caller() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "repogate").await;
+
+    let write =
+        json!([{"action": "create", "collection": "app.t.rec", "rkey": "x", "value": {"v": 1}}]);
+
+    // Omitted entirely.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({"space": uri, "writes": write}),
+        Some(&owner),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "a missing repo must be refused");
+
+    // Present but naming someone else.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({"space": uri, "repo": "did:plc:someone-else", "writes": write}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The URI `getRecord` reports must parse as a space record URI — it names the
+/// author. Built with a format string it dropped that segment, so the URI this
+/// server returned did not parse with this workspace's own parser.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_record_reports_a_uri_that_parses_back() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "uris").await;
+
+    space_write(
+        &app,
+        &uri,
+        "did:plc:owner",
+        &owner,
+        json!([{"action": "create", "collection": "app.t.rec", "rkey": "r1", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let (status, body) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&repo=did:plc:owner&collection=app.t.rec&rkey=r1",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getRecord: {body}");
+
+    let reported = body["uri"].as_str().expect("uri");
+    let parsed = atproto_space::RecordUri::parse(reported).expect("reported uri must parse");
+    assert_eq!(parsed.author_did, "did:plc:owner");
+    assert_eq!(parsed.collection, "app.t.rec");
+    assert_eq!(parsed.rkey, "r1");
+    assert_eq!(parsed.space.to_string(), uri);
+}
+
+/// `listSpaces` takes the lexicon's `type` and `did` filters and returns a
+/// cursor when the page is full.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_spaces_filters_by_type_and_did_and_pages() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    for skey in ["a", "b", "c"] {
+        create_space(&app, &owner, skey).await;
+    }
+
+    // Unfiltered.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.listSpaces",
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listSpaces: {body}");
+    assert_eq!(body["spaces"].as_array().unwrap().len(), 3, "{body}");
+    assert!(
+        body.get("cursor").is_none(),
+        "a short page must not carry a cursor: {body}"
+    );
+
+    // `type` matches.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.listSpaces?type=app.bsky.group",
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["spaces"].as_array().unwrap().len(), 3, "{body}");
+
+    // `type` does not match.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.listSpaces?type=app.other.kind",
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["spaces"].as_array().unwrap().is_empty(), "{body}");
+
+    // `did` does not match.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.listSpaces?did=did:plc:someone-else",
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["spaces"].as_array().unwrap().is_empty(), "{body}");
+
+    // A full page carries a cursor that resumes where it left off.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.listSpaces?limit=2",
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first = body["spaces"].as_array().unwrap().clone();
+    assert_eq!(first.len(), 2, "{body}");
+    let cursor = body["cursor"].as_str().expect("cursor on a full page");
+
+    let (status, body) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.space.listSpaces?limit=2&cursor={}",
+            urlencode(cursor)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = body["spaces"].as_array().unwrap();
+    assert_eq!(second.len(), 1, "{body}");
+    assert!(
+        !first.iter().any(|s| s["uri"] == second[0]["uri"]),
+        "the cursor must not re-serve a space: {body}"
+    );
+}
+
+/// `SpaceNotFound` is declared with one status. Three handlers answered 404
+/// while every sibling answered 400, so a client switching on the status saw
+/// the same condition two different ways.
+#[tokio::test(flavor = "multi_thread")]
+async fn space_not_found_uses_one_status_everywhere() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let real = create_space(&app, &owner, "default").await;
+    let missing = "at://did:plc:owner/space/app.bsky.group/nope";
+
+    // A sibling handler, for the baseline every other one already used.
+    let (baseline, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getSpace?space={}",
+            urlencode(missing)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(baseline, StatusCode::BAD_REQUEST, "getSpace: {body}");
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+
+    // getSpaceCredential — reached with a valid delegation token whose `sub`
+    // names a space that does not exist.
+    let oauth = mint_oauth_access(
+        "did:plc:owner",
+        "atproto space:app.bsky.group?did=did:plc:owner&skey=nope&action=read",
+    );
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencode(missing)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
+    let grant = body["token"].as_str().unwrap().to_string();
+    let (status, body) = exchange_credential(&app, &grant, missing, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "getSpaceCredential must match its siblings: {body}"
+    );
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+
+    // listRepos and registerNotify are space-credential-only, so reaching
+    // their lookup needs a credential minted while the space still existed.
+    let credential = mint_space_credential(&app, "did:plc:owner", &real).await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.deleteSpace",
+        json!({"space": real}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "deleteSpace: {body}");
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRepos?space={}",
+            urlencode(&real)
+        ),
+        Some(&credential),
+    )
+    .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "listRepos: {body}");
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": real}),
+        Some(&credential),
+    )
+    .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "registerNotify: {body}");
 }

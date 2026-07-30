@@ -116,6 +116,15 @@ pub enum SpaceError {
         actual: String,
     },
 
+    /// error-atproto-space-credential-7: JWT was issued too far in the future.
+    #[error("error-atproto-space-credential-7 JWT issued in the future (iat={iat}, now={now})")]
+    JwtIssuedInFuture {
+        /// `iat` claim value (seconds since epoch).
+        iat: u64,
+        /// Current time (seconds since epoch).
+        now: u64,
+    },
+
     /// error-atproto-space-credential-6: JWT missing required claim.
     #[error("error-atproto-space-credential-6 JWT missing claim: {field}")]
     JwtMissingClaim {

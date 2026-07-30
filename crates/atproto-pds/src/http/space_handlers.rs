@@ -228,7 +228,11 @@ pub async fn create_space(
 pub struct UpdateSpaceInput {
     /// Space URI to update.
     pub space: String,
-    /// New mint policy, if provided.
+    /// New user-authorization policy, if provided. The lexicon names this
+    /// `policy`; `mintPolicy` is accepted as the name this server used to
+    /// require.
+    pub policy: Option<String>,
+    /// Deprecated spelling of [`UpdateSpaceInput::policy`].
     #[serde(rename = "mintPolicy")]
     pub mint_policy: Option<String>,
     /// New managing-app identifier. Empty string clears to NULL.
@@ -255,8 +259,8 @@ pub async fn update_space(
     )?;
     // Reassemble the config-field object the patch parser expects.
     let mut obj = serde_json::Map::new();
-    if let Some(p) = input.mint_policy {
-        obj.insert("mintPolicy".to_string(), serde_json::Value::String(p));
+    if let Some(p) = input.policy.or(input.mint_policy) {
+        obj.insert("policy".to_string(), serde_json::Value::String(p));
     }
     if let Some(a) = input.managing_app {
         obj.insert("managingApp".to_string(), serde_json::Value::String(a));
@@ -431,17 +435,15 @@ pub async fn get_space(
 /// Query params for `listSpaces`.
 #[derive(Debug, Deserialize)]
 pub struct ListSpacesQuery {
-    /// `"owned"` | `"member"` | `"all"`.
-    #[serde(default = "default_filter")]
-    pub filter: String,
+    /// Filter to spaces of this type (NSID). The lexicon names this `type`.
+    #[serde(rename = "type")]
+    pub space_type: Option<String>,
+    /// Filter to spaces under this authority DID.
+    pub did: Option<String>,
     /// Cursor (last `uri` from prior page).
     pub cursor: Option<String>,
-    /// Page size.
+    /// Page size, 1..=100, default 50.
     pub limit: Option<u32>,
-}
-
-fn default_filter() -> String {
-    "all".to_string()
 }
 
 /// Output of `listSpaces`.
@@ -449,6 +451,9 @@ fn default_filter() -> String {
 pub struct ListSpacesResponse {
     /// Page of spaces.
     pub spaces: Vec<SpaceInfo>,
+    /// Cursor for the next page, absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// `GET /xrpc/com.atproto.space.listSpaces`.
@@ -459,16 +464,20 @@ pub async fn list_spaces(
 ) -> Result<Json<ListSpacesResponse>, XrpcError> {
     let viewer = require_session_subject(&parts, &state).await?;
     let svc = space_service(&state)?;
-    let spaces = svc
+    let page = svc
         .list_spaces(
             &viewer,
-            &q.filter,
+            q.space_type.as_deref(),
+            q.did.as_deref(),
             q.cursor.as_deref(),
-            q.limit.unwrap_or(50),
+            page_limit(q.limit, 50, 100),
         )
         .await
         .map_err(XrpcError::from)?;
-    Ok(Json(ListSpacesResponse { spaces }))
+    Ok(Json(ListSpacesResponse {
+        spaces: page.spaces,
+        cursor: page.cursor,
+    }))
 }
 
 /// Inputs for `addMember` / `removeMember`.
@@ -574,7 +583,12 @@ pub async fn get_members(
     )
     .await?;
     let page = space_service(&state)?
-        .list_members(&owner, &uri, q.cursor.as_deref(), q.limit.unwrap_or(50))
+        .list_members(
+            &owner,
+            &uri,
+            q.cursor.as_deref(),
+            page_limit(q.limit, 100, 1000),
+        )
         .await
         .map_err(XrpcError::from)?;
     Ok(Json(GetMembersResponse {
@@ -614,21 +628,122 @@ pub struct ApplyWritesOp {
 pub struct ApplyWritesInput {
     /// Space URI.
     pub space: String,
+    /// DID of the repo to write to (the authenticated member).
+    pub repo: String,
+    /// Lexicon validation toggle (reserved; not yet enforced, matching
+    /// `createRecord` and `putRecord`).
+    #[allow(dead_code)]
+    pub validate: Option<bool>,
     /// Write batch.
     pub writes: Vec<ApplyWritesOp>,
 }
 
-/// Output of `applyWrites` / `createRecord` / `putRecord` / `deleteRecord`.
-pub use crate::space::writer::SpaceCommitResult as ApplyWritesResponse;
+/// One entry in the `applyWrites` results array.
+///
+/// The lexicon declares a closed union of `#createResult` / `#updateResult` /
+/// `#deleteResult`, so each entry carries its `$type` and the variant decides
+/// which fields are present — a delete result is an empty object.
+#[derive(Debug, Serialize)]
+#[serde(tag = "$type")]
+pub enum ApplyWritesResult {
+    /// `com.atproto.space.applyWrites#createResult`.
+    #[serde(rename = "com.atproto.space.applyWrites#createResult")]
+    Create {
+        /// URI of the created record.
+        uri: String,
+        /// CID of the record value.
+        cid: String,
+        /// Validation status when known.
+        #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
+        validation_status: Option<String>,
+    },
+    /// `com.atproto.space.applyWrites#updateResult`.
+    #[serde(rename = "com.atproto.space.applyWrites#updateResult")]
+    Update {
+        /// URI of the written record.
+        uri: String,
+        /// CID of the record value.
+        cid: String,
+        /// Validation status when known.
+        #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
+        validation_status: Option<String>,
+    },
+    /// `com.atproto.space.applyWrites#deleteResult` — an empty object.
+    #[serde(rename = "com.atproto.space.applyWrites#deleteResult")]
+    Delete {},
+}
+
+/// Output of `applyWrites`.
+///
+/// The lexicon declares `{results}` and nothing else. The commit `rev` and
+/// `setHash` this server used to return here are not part of the shape; a
+/// caller that needs them reads `getLatestCommit`.
+#[derive(Debug, Serialize)]
+pub struct ApplyWritesResponse {
+    /// One result per write, in request order.
+    pub results: Vec<ApplyWritesResult>,
+}
+
+/// Project a [`SpaceCommitResult`] into the lexicon's results array.
+///
+/// `actions` is the batch in request order; the writer returns `uris` and
+/// `cids` parallel to it, so the variant of each result is decided by the
+/// action that produced it rather than by whether a CID came back.
+fn apply_writes_results(
+    actions: &[SpaceWriteAction],
+    result: SpaceCommitResult,
+) -> Result<Vec<ApplyWritesResult>, XrpcError> {
+    if result.uris.len() != actions.len() || result.cids.len() != actions.len() {
+        return Err(XrpcError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "commit returned a different number of results than writes",
+        ));
+    }
+    let mut out = Vec::with_capacity(actions.len());
+    for ((action, uri), cid) in actions
+        .iter()
+        .zip(result.uris.into_iter())
+        .zip(result.cids.into_iter())
+    {
+        match action {
+            SpaceWriteAction::Delete => out.push(ApplyWritesResult::Delete {}),
+            SpaceWriteAction::Create | SpaceWriteAction::Update => {
+                let cid = cid.ok_or_else(|| {
+                    XrpcError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "write produced no record CID",
+                    )
+                })?;
+                if matches!(action, SpaceWriteAction::Create) {
+                    out.push(ApplyWritesResult::Create {
+                        uri,
+                        cid,
+                        validation_status: None,
+                    });
+                } else {
+                    out.push(ApplyWritesResult::Update {
+                        uri,
+                        cid,
+                        validation_status: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// `POST /xrpc/com.atproto.space.applyWrites`.
 pub async fn apply_writes(
     State(state): State<HttpState>,
     parts: Parts,
     Json(input): Json<ApplyWritesInput>,
-) -> Result<Json<SpaceCommitResult>, XrpcError> {
+) -> Result<Json<ApplyWritesResponse>, XrpcError> {
     let auth = require_session_auth(&parts, &state).await?;
     let member_did = auth.sub().to_string();
+    require_repo_matches_subject(&input.repo, &member_did)?;
     let uri = parse_space_uri(&input.space)?;
     let writer = space_writer(&state)?;
 
@@ -641,6 +756,7 @@ pub async fn apply_writes(
     }
 
     let mut ops = Vec::with_capacity(input.writes.len());
+    let mut actions = Vec::with_capacity(input.writes.len());
     for w in input.writes {
         let (action, scope_action) = match w.action.as_str() {
             "create" => (
@@ -666,6 +782,7 @@ pub async fn apply_writes(
         // OAuth `space:` scope gate — each op's action must be covered for
         // its collection (no-op for app-password sessions).
         assert_space_scope(&state, &auth, &uri, scope_action, Some(&w.collection)).await?;
+        actions.push(action.clone());
         ops.push(SpaceWriteOp {
             action,
             collection: w.collection,
@@ -674,11 +791,13 @@ pub async fn apply_writes(
         });
     }
 
-    writer
+    let result = writer
         .apply_writes(&member_did, &uri, ops)
         .await
-        .map(Json)
-        .map_err(XrpcError::from)
+        .map_err(XrpcError::from)?;
+    Ok(Json(ApplyWritesResponse {
+        results: apply_writes_results(&actions, result)?,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -893,10 +1012,13 @@ pub struct GetSpaceRecordQuery {
     pub collection: String,
     /// Record key.
     pub rkey: String,
-    /// DID of the member whose repo to read from. If omitted, defaults to
-    /// the authenticated subject (OAuth auth). Required when using
-    /// space-credential auth.
-    pub repo: Option<String>,
+    /// DID of the member whose repo to read from.
+    ///
+    /// Required by the lexicon. It used to be optional, defaulting to the
+    /// authenticated subject — but a record URI names its author, so a caller
+    /// that omitted it got back a URI missing the segment that identifies whose
+    /// record it is.
+    pub repo: String,
 }
 
 /// Output of `getRecord`.
@@ -917,7 +1039,7 @@ pub async fn get_record(
     Query(q): Query<GetSpaceRecordQuery>,
 ) -> Result<Json<GetSpaceRecordResponse>, XrpcError> {
     let uri = parse_space_uri(&q.space)?;
-    let resolved = resolve_record_auth(&parts, &state, &uri, q.repo.as_deref()).await?;
+    let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
         assert_space_record_read(
             &state,
@@ -953,7 +1075,17 @@ pub async fn get_record(
         )
     })?;
     Ok(Json(GetSpaceRecordResponse {
-        uri: format!("{}/{}/{}", uri, q.collection, q.rkey),
+        // Built through `RecordUri` rather than a format string. The old
+        // version omitted the author segment, so the URI this endpoint returned
+        // did not parse with this crate's own `RecordUri::parse` — a client
+        // that fed it back got a syntax error.
+        uri: atproto_space::RecordUri::new(
+            uri.clone(),
+            resolved.target_repo.clone(),
+            q.collection.clone(),
+            q.rkey.clone(),
+        )
+        .to_string(),
         cid: row.cid,
         value,
     }))
@@ -1047,7 +1179,7 @@ pub async fn list_records(
             crate::space::reader::RecordListing {
                 collection: q.collection.as_deref(),
                 cursor: q.cursor.as_deref(),
-                limit: q.limit.unwrap_or(50).clamp(1, 100),
+                limit: page_limit(q.limit, 50, 100),
                 reverse: q.reverse,
             },
         )
@@ -1578,7 +1710,7 @@ pub async fn list_repo_ops(
     let uri = parse_space_uri(&q.space)?;
     let subject = require_any_authn(&parts, &state, &uri).await?;
     assert_space_read_opt(&state, &subject, &uri).await?;
-    let limit = q.limit.unwrap_or(100);
+    let limit = page_limit(q.limit, 100, 1000);
     let since = match q.since.as_deref() {
         Some(token) => Some(OplogCursor::from_token(token).map_err(|_| {
             XrpcError::new(
@@ -1802,7 +1934,7 @@ pub async fn get_space_credential(
     let owner_signing = local_signing_key(manager, &space.space_did).await?;
 
     // ── Mint-time authorization (defs.json: a credential is minted only when
-    //    the user is authorized by `mintPolicy` AND their app by `appAccess`).
+    //    the user is authorized by `policy` AND their app by `appAccess`).
     //
     // The requesting member is the delegation token's issuer. App identity is
     // established solely by the optional client attestation: when one is
@@ -1836,7 +1968,7 @@ pub async fn get_space_credential(
         .map_err(XrpcError::from)?;
     if !inputs.found {
         return Err(XrpcError::new(
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             "SpaceNotFound",
             format!("space not found: {space}"),
         ));
@@ -1849,7 +1981,7 @@ pub async fn get_space_credential(
         ));
     }
 
-    // USER axis (mintPolicy).
+    // USER axis (`policy`).
     match crate::space::mint_authz::user_axis_local(inputs.config.mint_policy, inputs.is_member)
         .map_err(mint_denial_to_xrpc)?
     {
@@ -1860,7 +1992,7 @@ pub async fn get_space_credential(
                 XrpcError::new(
                     StatusCode::FORBIDDEN,
                     "NotAuthorized",
-                    "mintPolicy is managing-app but no managingApp is configured",
+                    "policy is managing-app but no managingApp is configured",
                 )
             })?;
             let plc_dir = state.plc_service.as_ref().map(|p| p.directory_hostname());
@@ -1996,6 +2128,16 @@ pub async fn get_space_credential(
 // ---------------------------------------------------------------------------
 //  Helpers.
 // ---------------------------------------------------------------------------
+
+/// Resolve a paginated endpoint's `limit` parameter.
+///
+/// Every listing lexicon declares a `default` and a `maximum`, and they are not
+/// the same across endpoints — `listRecords` and `listSpaces` cap at 100,
+/// `listRepoOps` and `listMembers` at 1000. An unclamped `limit` lets one
+/// request demand an entire collection in a single page.
+fn page_limit(requested: Option<u32>, default: u32, max: u32) -> u32 {
+    requested.unwrap_or(default).clamp(1, max)
+}
 
 fn parse_space_uri(s: &str) -> Result<SpaceUri, XrpcError> {
     SpaceUri::parse(s).map_err(|e| {
@@ -2624,7 +2766,7 @@ pub async fn list_repos(
     require_space_credential(&parts, &state, &space).await?;
     let manager = account_manager(&state)?;
     let _ = space_service(&state)?; // gate on Spaces being enabled
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let limit = page_limit(q.limit, 100, 1000);
 
     let store = SqlActorStore::open(manager.data_dir(), &space.space_did)
         .await
@@ -2644,7 +2786,7 @@ pub async fn list_repos(
         })?;
     if space_exists.is_none() {
         return Err(XrpcError::new(
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             "SpaceNotFound",
             format!("space not found: {space}"),
         ));
@@ -2771,7 +2913,7 @@ pub async fn register_notify(
         })?;
     if space_exists.is_none() {
         return Err(XrpcError::new(
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             "SpaceNotFound",
             format!("space not found: {space}"),
         ));
@@ -3288,5 +3430,113 @@ mod scope_gate_tests {
         .await
         .unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod wire_shape_tests {
+    use super::*;
+
+    #[test]
+    fn a_limit_above_the_lexicon_maximum_is_clamped_not_honoured() {
+        // Each listing lexicon carries its own ceiling; an unclamped `limit`
+        // lets one request pull a whole collection in a single page.
+        assert_eq!(page_limit(Some(5_000), 50, 100), 100);
+        assert_eq!(page_limit(Some(5_000), 100, 1000), 1000);
+    }
+
+    #[test]
+    fn a_zero_or_absent_limit_falls_back_rather_than_returning_nothing() {
+        assert_eq!(page_limit(Some(0), 50, 100), 1);
+        assert_eq!(page_limit(None, 50, 100), 50);
+        assert_eq!(page_limit(None, 100, 1000), 100);
+        assert_eq!(page_limit(Some(25), 50, 100), 25);
+    }
+
+    #[test]
+    fn a_delete_result_serialises_as_a_bare_typed_object() {
+        // `#deleteResult` declares no properties. A delete that reported a
+        // null `uri`/`cid` would not validate against the closed union.
+        let v = serde_json::to_value(ApplyWritesResult::Delete {}).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"$type": "com.atproto.space.applyWrites#deleteResult"})
+        );
+    }
+
+    #[test]
+    fn create_and_update_results_carry_distinct_types() {
+        let create = serde_json::to_value(ApplyWritesResult::Create {
+            uri: "at://did:plc:owner/space/app.t/s/did:plc:alice/app.c/r".to_string(),
+            cid: "bafyreigh2akiscaildc".to_string(),
+            validation_status: None,
+        })
+        .unwrap();
+        let update = serde_json::to_value(ApplyWritesResult::Update {
+            uri: "at://did:plc:owner/space/app.t/s/did:plc:alice/app.c/r".to_string(),
+            cid: "bafyreigh2akiscaildc".to_string(),
+            validation_status: None,
+        })
+        .unwrap();
+        assert_eq!(
+            create["$type"],
+            "com.atproto.space.applyWrites#createResult"
+        );
+        assert_eq!(
+            update["$type"],
+            "com.atproto.space.applyWrites#updateResult"
+        );
+        // `validationStatus` is optional and omitted rather than null.
+        assert!(create.get("validationStatus").is_none());
+    }
+
+    #[test]
+    fn results_follow_the_actions_not_the_presence_of_a_cid() {
+        let actions = vec![
+            SpaceWriteAction::Create,
+            SpaceWriteAction::Delete,
+            SpaceWriteAction::Update,
+        ];
+        let commit = SpaceCommitResult {
+            rev: "3lb".to_string(),
+            set_hash: "00".to_string(),
+            uris: vec![
+                "at://a".to_string(),
+                "at://b".to_string(),
+                "at://c".to_string(),
+            ],
+            cids: vec![Some("cid1".to_string()), None, Some("cid3".to_string())],
+        };
+        let results = apply_writes_results(&actions, commit).unwrap();
+        let types: Vec<String> = results
+            .iter()
+            .map(|r| {
+                serde_json::to_value(r).unwrap()["$type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "com.atproto.space.applyWrites#createResult",
+                "com.atproto.space.applyWrites#deleteResult",
+                "com.atproto.space.applyWrites#updateResult",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_results_array_is_an_internal_error_not_a_silent_truncation() {
+        let actions = vec![SpaceWriteAction::Create, SpaceWriteAction::Create];
+        let commit = SpaceCommitResult {
+            rev: "3lb".to_string(),
+            set_hash: "00".to_string(),
+            uris: vec!["at://a".to_string()],
+            cids: vec![Some("cid1".to_string())],
+        };
+        let err = apply_writes_results(&actions, commit).unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
