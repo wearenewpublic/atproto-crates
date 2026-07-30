@@ -62,7 +62,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
-- `atproto-pds`: `com.atproto.space.listRepoOps` refused a bare rev on `since`, so a client written
+- `atproto-identity`: `DidBuilder` derived the `did:plc` identifier by hashing the signed genesis
+  operation's **JSON** serialization. did:plc specifies SHA-256 over the **DAG-CBOR** encoding,
+  base32-lower, first 24 characters, which is what the reference implementation computes. JSON and
+  DAG-CBOR are different byte strings, so every DID this produced disagreed with the one every other
+  implementation derives from the same operation, and a directory refused the submission with
+  *"Hash of genesis operation does not match DID identifier"*.
+
+  `derive_did` now encodes with `atproto_dasl::to_vec`, the same DAG-CBOR encoder already used to
+  produce the bytes that get signed and the operation's CID. The error variant was always
+  `DagCborEncodeFailed`, which suggests DAG-CBOR was the intent and JSON the slip.
+
+  Identifiers minted before this change are wrong and cannot be reconciled — the operation that
+  produced one hashes to a different DID. Any such DID has to be recreated.
+
+
   against the lexicon alone could not page the oplog at all. The lexicon calls `since` *"operations
   after this revision"* and declares no separate `cursor` **input** — the `cursor` the response
   carries has nowhere to go except back into `since` — and this server accepted only its own

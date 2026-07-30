@@ -184,12 +184,15 @@ impl DidBuilder {
 
     /// Derive a DID from a signed genesis operation.
     ///
-    /// The DID is derived by hashing the signed operation's JSON serialization
-    /// with SHA-256, base32-encoding the result, and taking the first 24 characters.
+    /// Per did:plc the identifier is the first 24 characters of the lowercase
+    /// base32 encoding of SHA-256 over the **DAG-CBOR** serialization of the
+    /// signed genesis operation. JSON and DAG-CBOR are different byte strings,
+    /// so hashing the wrong one yields an identifier that no other
+    /// implementation derives from the same operation.
     fn derive_did(operation: &Operation) -> Result<Did, PLCDIDError> {
         let serialized =
-            serde_json::to_vec(operation).map_err(|e| PLCDIDError::DagCborEncodeFailed {
-                details: format!("JSON serialization failed: {}", e),
+            atproto_dasl::to_vec(operation).map_err(|e| PLCDIDError::DagCborEncodeFailed {
+                details: format!("DAG-CBOR serialization failed: {}", e),
             })?;
 
         let hash = sha256(&serialized);
@@ -273,6 +276,48 @@ mod tests {
                 "{key_type} private key leaked into the genesis operation"
             );
         }
+    }
+
+    /// The identifier must come from the DAG-CBOR encoding of the signed
+    /// genesis operation, which is what every other did:plc implementation
+    /// hashes. Asserting only "it equals the DAG-CBOR hash" would restate the
+    /// implementation, so this also pins the negative: the JSON encoding of the
+    /// same operation is a different byte string and must not be what produced
+    /// the DID.
+    #[test]
+    fn did_is_derived_from_dag_cbor_not_json() {
+        let rotation_key = generate_key(KeyType::P256Private).unwrap();
+        let (did, operation, _keys) = DidBuilder::new()
+            .add_rotation_key(rotation_key)
+            .add_also_known_as("at://alice.example.com".to_string())
+            .build()
+            .unwrap();
+
+        let from_cbor = {
+            let bytes = atproto_dasl::to_vec(&operation).unwrap();
+            let encoded = base32_encode(&sha256(&bytes));
+            encoded[..24].to_string()
+        };
+        let from_json = {
+            let bytes = serde_json::to_vec(&operation).unwrap();
+            let encoded = base32_encode(&sha256(&bytes));
+            encoded[..24].to_string()
+        };
+
+        assert_ne!(
+            from_cbor, from_json,
+            "test is meaningless if the two encodings hash alike"
+        );
+        assert_eq!(
+            did.identifier(),
+            from_cbor,
+            "DID must hash the DAG-CBOR form"
+        );
+        assert_ne!(
+            did.identifier(),
+            from_json,
+            "DID was derived from the JSON encoding"
+        );
     }
 
     #[test]
