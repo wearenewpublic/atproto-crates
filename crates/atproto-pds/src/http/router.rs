@@ -490,8 +490,77 @@ pub fn build_router(state: HttpState) -> Router {
         // Operator HTML dashboard (Basic-auth gated, same as JSON admin API).
         .route("/admin", get(admin::dashboard_handler))
         .route("/admin/", get(admin::dashboard_handler))
+        .fallback(unmatched)
         .layer(cors_layer())
         .with_state(state)
+}
+
+/// Answer a request that matched no route.
+///
+/// An XRPC path gets `MethodNotImplemented` (501) in a JSON error envelope;
+/// everything else gets the bare 404 axum would have produced on its own.
+///
+/// # Why an unrouted XRPC method is 501 and not 404
+///
+/// XRPC requires every error response to carry `{"error", "message"}`, and a
+/// client parses that body to decide what happened. A bodiless 404 is
+/// indistinguishable from a misconfigured proxy or a wrong hostname, so a
+/// client cannot tell "this server does not implement that method" from "this
+/// is not a PDS". The reference server routes `/xrpc/:methodId` to a single
+/// handler and raises `MethodNotImplementedError` when the method id is not in
+/// its lexicon catalogue, and `ResponseType.MethodNotImplemented` is 501.
+///
+/// # Why this is scoped by path prefix rather than a `/xrpc/{*rest}` route
+///
+/// The XRPC envelope is a claim about which protocol a path speaks, and it is
+/// only true under `/xrpc/`. A missing `/.well-known/oauth-protected-resource`,
+/// `/oauth/callback` or `/metrics` is an ordinary HTTP 404 and answering it
+/// with an XRPC error name would misdescribe it — an OAuth client reading a 501
+/// there would conclude the authorization server is broken rather than absent.
+/// Testing the prefix inside the fallback keeps the routing table untouched, so
+/// no existing route can be shadowed by a new wildcard and the proxy prefixes
+/// (`/xrpc/app.bsky.{*nsid}` and friends) keep matching first and forwarding
+/// methods this server does not itself implement.
+///
+/// # Why only a single path segment counts as a method id
+///
+/// An NSID is one path segment: it has no `/` in it. The reference route is
+/// `/xrpc/:methodId` and an express `:param` does not match across slashes, so
+/// `/xrpc/`, `/xrpc/a/b/c` and `/xrpc//bar` reach no XRPC handler there and are
+/// ordinary 404s. A path that cannot name a method has no method to report as
+/// unimplemented, so requiring a non-empty segment containing no `/` keeps the
+/// 501 to the paths that route actually reaches.
+///
+/// A trailing slash — `/xrpc/foo/` — is the one case where this is stricter
+/// than the reference, whose router has `strict routing` off and so reads it as
+/// `foo`. Matching that would mean normalizing trailing slashes, and this
+/// server does not: `/xrpc/com.atproto.repo.createRecord/` matches no route
+/// either, so treating the same path as a named method here would contradict
+/// the routing table one line above. Trailing-slash normalization is a separate
+/// decision for the whole surface, not something to smuggle in via the
+/// fallback.
+async fn unmatched(uri: axum::http::Uri) -> axum::response::Response {
+    use crate::http::errors::XrpcError;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let nsid = uri
+        .path()
+        .strip_prefix("/xrpc/")
+        .filter(|nsid| !nsid.is_empty() && !nsid.contains('/'));
+
+    match nsid {
+        Some(nsid) => {
+            tracing::debug!(nsid = %nsid, "unrouted XRPC method");
+            XrpcError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "MethodNotImplemented",
+                "Method Not Implemented",
+            )
+            .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Cross-origin policy for the whole surface.

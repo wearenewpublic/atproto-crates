@@ -869,14 +869,18 @@ async fn invite_toggles_are_admin_namespaced() {
     .await;
     assert!(status.is_success(), "{body}");
 
-    // The old server-namespaced paths are gone.
-    let (status, _) = post_admin(
+    // The old server-namespaced paths are gone. Which the router now reports as
+    // `MethodNotImplemented` rather than a bodiless 404 — this assertion read
+    // 404 while that was what an unrouted XRPC path returned, and the subject
+    // of the assertion is that the path is not served, not which status says so.
+    let (status, body) = post_admin(
         app,
         "/xrpc/com.atproto.server.disableAccountInvites",
         json!({ "did": "did:plc:alice" }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body["error"], "MethodNotImplemented", "{body}");
 }
 
 // ---------------------------------------------------------------------------

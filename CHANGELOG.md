@@ -62,6 +62,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-pds`: a request to an `/xrpc/` path the router does not serve answered a bare HTTP 404 with
+  no body at all. XRPC requires every error response to carry `{"error", "message"}`, and the reference
+  server maps an unrouted method id to `MethodNotImplementedError` — `ResponseType.MethodNotImplemented`,
+  501. A bodiless 404 is indistinguishable from a wrong hostname or an intercepting proxy, so a client
+  could not tell "this server does not implement that method" from "this is not a PDS", and a
+  conformance harness reads it as no error envelope rather than as a named error.
+
+  The router now installs a fallback that answers 501 `MethodNotImplemented` for any path under
+  `/xrpc/` that names a method. It is scoped by testing that prefix inside the fallback rather than by
+  adding an `/xrpc/{*rest}` route: the envelope is a claim about which protocol a path speaks and it is
+  only true under `/xrpc/`, so `/.well-known/*`, `/oauth/*`, `/metrics` and every other miss keep the
+  bare 404 they had — an OAuth client reading a 501 there would conclude the authorization server is
+  broken rather than absent. Keeping the routing table untouched also means no existing route can be
+  shadowed and the proxy prefixes (`app.bsky.`, `chat.bsky.`, `tools.ozone.`, `com.atproto.label.`)
+  still match first, so a method this server forwards is still forwarded rather than declared missing.
+
+  Only a single path segment counts as a method id, because an NSID has no `/` in it. `/xrpc/`,
+  `/xrpc//bar` and `/xrpc/a/b/c` name no method and stay bare 404s — the reference route
+  `/xrpc/:methodId` reaches no handler for them either, since an express `:param` does not span a
+  slash. `/xrpc/foo/` is the one deliberate divergence: express with strict routing off reads it as
+  `foo` and would route it, while this server normalizes no trailing slashes anywhere and so leaves
+  it a bare 404. Answering 501 there would claim a method id the router never accepted. A routed
+  method called with the wrong
+  HTTP verb is unchanged — axum decides that while routing and answers 405 without reaching the
+  fallback, so a wrong-verb call is not relabelled as unimplemented. The reference server answers that
+  case with 400 `InvalidRequest`; aligning it is a separate change and is deliberately not made here.
+
+  **Operational note.** Unrouted `/xrpc/` traffic moves from the 4xx bucket to the 5xx bucket of
+  `atproto_pds_http_responses_total`, which labels by raw status code. Endpoint scanning and clients
+  calling methods this server does not implement now count as server errors, so a 5xx-rate alert or an
+  SLO burn-rate rule may fire on traffic it previously ignored. This is inherent to matching the
+  reference server's 501; alerts that need to exclude it should filter on the status label.
 - `atproto-identity`: `DidBuilder` derived the `did:plc` identifier by hashing the signed genesis
   operation's **JSON** serialization. did:plc specifies SHA-256 over the **DAG-CBOR** encoding,
   base32-lower, first 24 characters, which is what the reference implementation computes. JSON and
