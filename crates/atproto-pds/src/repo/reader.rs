@@ -143,6 +143,14 @@ impl RepoReader {
     }
 
     /// Implementation of `com.atproto.repo.getRecord`.
+    ///
+    /// # Errors
+    ///
+    /// [`PdsError::RecordNotFound`] when the record is absent, superseded or
+    /// taken down — the one error the lexicon declares. [`PdsError::NotFound`]
+    /// when the *repository* is not hosted here, which is a different
+    /// condition the lexicon does not name. [`PdsError::RepoUnavailable`] when
+    /// the account exists but disallows public reads.
     pub async fn get_record(
         &self,
         repo: &str,
@@ -166,9 +174,7 @@ impl RepoReader {
         let uri = format!("at://{}/{}/{}", account.did, collection, rkey);
         let store = self.open_actor(&account.did).await?;
         if crate::takedown::get_record(&store, &uri).await?.is_some() {
-            return Err(PdsError::NotFound {
-                what: format!("record {collection}/{rkey} not found"),
-            });
+            return Err(PdsError::RecordNotFound { uri });
         }
 
         // Resolve the record CID through the trait surface when a backend
@@ -178,14 +184,15 @@ impl RepoReader {
                 .repo_record
                 .get_by_uri(&account.did, &uri)
                 .await?
-                .ok_or_else(|| PdsError::NotFound {
-                    what: format!("record {collection}/{rkey} not found"),
-                })?;
+                .ok_or_else(|| PdsError::RecordNotFound { uri: uri.clone() })?;
+            // A `cid` that does not match the current version asks for a
+            // version this repository no longer holds, which is the same
+            // answer as "no such record" — the lexicon has one name for both.
             if let Some(c) = cid
                 && c != row.cid
             {
-                return Err(PdsError::NotFound {
-                    what: format!("record {collection}/{rkey} cid mismatch"),
+                return Err(PdsError::RecordNotFound {
+                    uri: format!("{uri} at cid {c}"),
                 });
             }
             row.cid
@@ -211,10 +218,8 @@ impl RepoReader {
             .map_err(|e| PdsError::Storage {
                 reason: format!("get_record query: {e}"),
             })?;
-            row.ok_or_else(|| PdsError::NotFound {
-                what: format!("record {collection}/{rkey} not found"),
-            })?
-            .0
+            row.ok_or_else(|| PdsError::RecordNotFound { uri: uri.clone() })?
+                .0
         };
 
         // Fetch the block bytes through the dispatch factory (when
@@ -241,8 +246,27 @@ impl RepoReader {
                     reason: format!("get_record block fetch: {e}"),
                 })?
         }
-        .ok_or_else(|| PdsError::NotFound {
-            what: format!("block {cid_str} not present"),
+        .ok_or_else(|| PdsError::Storage {
+            // The index says this record exists and the block store disagrees:
+            // a `repo_record` row pointing at a block nobody holds. Reported as
+            // the server's own error and logged rather than as "no such
+            // record", because a 400 here reads as routine and buries the
+            // inconsistency.
+            //
+            // This is not unreachable. `com.atproto.repo.importRepo` can
+            // produce it: `verify_inductive` accepts blocks missing from the
+            // CAR whenever `prev_data` is `Some` (i.e. for every non-genesis
+            // commit), and the MST walk that builds the index only loads node
+            // blocks, never record leaves — so a multi-commit CAR that omits
+            // record leaves indexes rows whose blocks were never stored.
+            //
+            // An operator who sees this in the log should treat it as a
+            // damaged actor store for that DID, not as a bad request: check
+            // whether the account recently ran `importRepo`, and repair by
+            // re-importing a complete CAR for the DID or deleting the orphaned
+            // `repo_record` rows. Tightening `importRepo` so it cannot create
+            // the state is tracked separately.
+            reason: format!("record {uri} indexed at block {cid_str}, which is not in the store"),
         })?;
         // Render back into the JSON representation: links stored as tag 42
         // become `$link` objects again, so a record reads out in the shape it
@@ -665,9 +689,8 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
 
-    async fn fresh_reader() -> (RepoReader, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
+    /// Open an accounts directory under `dir` holding one active account.
+    async fn seed_accounts(dir: &std::path::Path) -> AccountDirectory {
         let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
             .await
             .unwrap();
@@ -685,7 +708,29 @@ mod tests {
             })
             .await
             .unwrap();
+        accounts
+    }
+
+    async fn fresh_reader() -> (RepoReader, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let accounts = seed_accounts(&dir).await;
         let reader = RepoReader::new(accounts, dir);
+        (reader, tmp)
+    }
+
+    /// Build the reader the way `bin/pds.rs` builds it: through
+    /// [`RepoReader::with_backend`], so reads resolve across the
+    /// `PublicRealmBackend` trait surface instead of the legacy SQLite-direct
+    /// branch that [`fresh_reader`] exercises. The backend is rooted at the
+    /// same `data_dir` as the reader so `seed_record` writes to the per-actor
+    /// store the backend reads from.
+    async fn fresh_reader_with_backend() -> (RepoReader, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let accounts = seed_accounts(&dir).await;
+        let backend = Arc::new(PublicRealmBackend::sql(dir.clone()));
+        let reader = RepoReader::with_backend(accounts, dir, backend);
         (reader, tmp)
     }
 
@@ -744,14 +789,120 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_record_missing_returns_not_found() {
+    async fn get_record_missing_returns_record_not_found() {
         let (reader, _tmp) = fresh_reader().await;
         let result = reader
             .get_record("did:plc:alice", "app.bsky.feed.post", "absent", None)
             .await;
-        assert!(matches!(result, Err(PdsError::NotFound { .. })));
+        assert!(matches!(result, Err(PdsError::RecordNotFound { .. })));
     }
 
+    /// A record that was written and then removed must read back as the
+    /// lexicon's `RecordNotFound`, not as the repository being unknown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_record_after_delete_returns_record_not_found() {
+        let (reader, _tmp) = fresh_reader().await;
+        let store = reader.open_actor("did:plc:alice").await.unwrap();
+        seed_record(
+            &store,
+            "app.bsky.feed.post",
+            "gone",
+            serde_json::json!({"text": "bye"}),
+        )
+        .await;
+        sqlx::query("DELETE FROM repo_record WHERE collection = ? AND rkey = ?")
+            .bind("app.bsky.feed.post")
+            .bind("gone")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        drop(store);
+
+        let result = reader
+            .get_record("did:plc:alice", "app.bsky.feed.post", "gone", None)
+            .await;
+        assert!(matches!(result, Err(PdsError::RecordNotFound { uri }) if uri.contains("gone")));
+    }
+
+    /// Asking for a `cid` the record is no longer at is the same answer as the
+    /// record being gone: the lexicon names only `RecordNotFound`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_record_with_stale_cid_returns_record_not_found() {
+        let (reader, _tmp) = fresh_reader().await;
+        let store = reader.open_actor("did:plc:alice").await.unwrap();
+        seed_record(
+            &store,
+            "app.bsky.feed.post",
+            "abc",
+            serde_json::json!({"text": "hello"}),
+        )
+        .await;
+        drop(store);
+
+        let result = reader
+            .get_record(
+                "did:plc:alice",
+                "app.bsky.feed.post",
+                "abc",
+                Some("bafyreib2rxk3rh6kzwq5oaczjqpygxpk4vt6zdgxc2iaskgm2wlpxzsuwm"),
+            )
+            .await;
+        assert!(matches!(result, Err(PdsError::RecordNotFound { .. })));
+    }
+
+    /// The same two outcomes over the wiring the running server actually uses.
+    ///
+    /// Every other test here builds the reader with [`RepoReader::new`], which
+    /// takes the legacy SQLite-direct branch; `bin/pds.rs` builds it with
+    /// [`RepoReader::with_backend`], which resolves records through
+    /// `PublicRealmBackend::repo_record`. Without this test both
+    /// `RecordNotFound` sites on the backend branch are unexecuted, and the
+    /// `at cid <cid>` message is reachable *only* from that branch — the legacy
+    /// one filters on `cid` in SQL and cannot say which CID was asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_record_reports_record_not_found_through_backend_wiring() {
+        let (reader, _tmp) = fresh_reader_with_backend().await;
+        assert!(
+            reader.backend().is_some(),
+            "this test proves nothing if the reader falls back to the legacy branch"
+        );
+        let store = reader.open_actor("did:plc:alice").await.unwrap();
+        let value = serde_json::json!({"text": "hello"});
+        let cid = seed_record(&store, "app.bsky.feed.post", "abc", value.clone()).await;
+        drop(store);
+
+        // Positive control: the seeded record does resolve through the trait
+        // surface, so the assertions below are about absence rather than about
+        // a harness that never finds anything.
+        let found = reader
+            .get_record("did:plc:alice", "app.bsky.feed.post", "abc", None)
+            .await
+            .unwrap();
+        assert_eq!(found.cid, cid);
+        assert_eq!(found.value, value);
+
+        let missing = reader
+            .get_record("did:plc:alice", "app.bsky.feed.post", "absent", None)
+            .await;
+        assert!(
+            matches!(&missing, Err(PdsError::RecordNotFound { uri }) if uri.ends_with("/absent")),
+            "expected RecordNotFound, got {missing:?}"
+        );
+
+        let stale = "bafyreib2rxk3rh6kzwq5oaczjqpygxpk4vt6zdgxc2iaskgm2wlpxzsuwm";
+        let result = reader
+            .get_record("did:plc:alice", "app.bsky.feed.post", "abc", Some(stale))
+            .await;
+        let Err(PdsError::RecordNotFound { uri }) = result else {
+            panic!("expected RecordNotFound, got {result:?}")
+        };
+        assert!(uri.contains("at cid"), "uri: {uri}");
+        assert!(uri.contains(stale), "uri: {uri}");
+    }
+
+    /// A repository this server does not host is a different condition, and
+    /// `getRecord` has no lexicon name for it — it stays [`PdsError::NotFound`]
+    /// so the HTTP layer can report the generic `InvalidRequest`.
     #[tokio::test(flavor = "multi_thread")]
     async fn get_record_unknown_repo_returns_not_found() {
         let (reader, _tmp) = fresh_reader().await;

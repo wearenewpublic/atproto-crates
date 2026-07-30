@@ -6,6 +6,7 @@
 use atproto_dasl::cid::compute_cid;
 use atproto_dasl::storage::BlockStorage;
 use atproto_pds::account::{AccountDirectory, AccountRow, AccountState};
+use atproto_pds::actor_store::PublicRealmBackend;
 use atproto_pds::actor_store::sql::{SqlActorStore, SqlBlockStorage};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::repo::RepoReader;
@@ -16,9 +17,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-async fn build_app() -> (axum::Router, TempDir) {
-    let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().to_path_buf();
+/// Open an accounts directory under `dir` holding one active account.
+async fn seed_accounts(dir: &std::path::Path) -> AccountDirectory {
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
         .await
         .unwrap();
@@ -36,8 +36,30 @@ async fn build_app() -> (axum::Router, TempDir) {
         })
         .await
         .unwrap();
+    accounts
+}
+
+async fn build_app() -> (axum::Router, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = seed_accounts(&dir).await;
 
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let state = HttpState::new(reader);
+    let app = build_router(state);
+    (app, tmp)
+}
+
+/// Build the router with the reader wired the way `bin/pds.rs` wires it —
+/// [`RepoReader::with_backend`] over a `PublicRealmBackend` — rather than the
+/// legacy `RepoReader::new` branch every other test in this file uses.
+async fn build_app_with_backend() -> (axum::Router, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = seed_accounts(&dir).await;
+
+    let backend = Arc::new(PublicRealmBackend::sql(dir.clone()));
+    let reader = Arc::new(RepoReader::with_backend(accounts, dir.clone(), backend));
     let state = HttpState::new(reader);
     let app = build_router(state);
     (app, tmp)
@@ -145,6 +167,9 @@ async fn get_record_round_trip_over_http() {
     assert_eq!(body["uri"], "at://did:plc:alice/app.bsky.feed.post/abc");
 }
 
+/// `com.atproto.repo.getRecord` declares exactly one error, `RecordNotFound`.
+/// It used to answer with `NotFound`, a name that appears in no lexicon, so a
+/// client matching on the declared name matched nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_record_missing_returns_400() {
     let (app, _tmp) = build_app().await;
@@ -154,7 +179,100 @@ async fn get_record_missing_returns_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "NotFound");
+    assert_eq!(body["error"], "RecordNotFound", "body: {body}");
+}
+
+/// A record that existed and was removed reads back the same way as one that
+/// never existed: the lexicon has one name for both.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_record_after_delete_returns_record_not_found() {
+    let (app, tmp) = build_app().await;
+    seed_record(
+        tmp.path(),
+        "did:plc:alice",
+        "app.bsky.feed.post",
+        "gone",
+        serde_json::json!({"text": "bye"}),
+    )
+    .await;
+    let store = SqlActorStore::open(tmp.path(), "did:plc:alice")
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM repo_record WHERE collection = ? AND rkey = ?")
+        .bind("app.bsky.feed.post")
+        .bind("gone")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    drop(store);
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=app.bsky.feed.post&rkey=gone",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "RecordNotFound", "body: {body}");
+}
+
+/// The same answer over the wiring the running server uses. `bin/pds.rs`
+/// builds the reader with `RepoReader::with_backend`, so the missing-record
+/// path there goes through `PublicRealmBackend::repo_record`, not the SQL
+/// branch the tests above take. This pins the name end to end on the
+/// production constructor, so refactoring it cannot bypass the fix and still
+/// leave the suite green.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_record_missing_returns_record_not_found_through_backend_wiring() {
+    let (app, tmp) = build_app_with_backend().await;
+    seed_record(
+        tmp.path(),
+        "did:plc:alice",
+        "app.bsky.feed.post",
+        "here",
+        serde_json::json!({"text": "hi"}),
+    )
+    .await;
+
+    // Positive control: reads do resolve through this wiring, so the 400 below
+    // is about the record being absent rather than the backend being inert.
+    let (ok_status, ok_body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=app.bsky.feed.post&rkey=here",
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK, "body: {ok_body}");
+    assert_eq!(ok_body["value"]["text"], "hi", "body: {ok_body}");
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=app.bsky.feed.post&rkey=absent",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "RecordNotFound", "body: {body}");
+}
+
+/// A repository this server does not host is not `RecordNotFound` — claiming
+/// it would say the repo is here and the record is not. `getRecord` names no
+/// error for it, so it degrades to the generic `InvalidRequest`, which is what
+/// the reference implementation returns for the same case.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_record_unknown_repo_returns_invalid_request() {
+    let (app, _tmp) = build_app().await;
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:doesnotexist&collection=x.y.z&rkey=k",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InvalidRequest", "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("did:plc:doesnotexist"),
+        "body: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

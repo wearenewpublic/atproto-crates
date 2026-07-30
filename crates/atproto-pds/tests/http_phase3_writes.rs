@@ -211,14 +211,16 @@ async fn put_then_delete_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Verify gone.
-    let (status, _) = get_json(
+    // Verify gone — and gone under the one error name the `getRecord`
+    // lexicon declares, so a client can branch on it.
+    let (status, body) = get_json(
         app,
         "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=com.example.record&rkey=k",
         None,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "RecordNotFound", "body: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

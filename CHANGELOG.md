@@ -241,6 +241,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   latent in the draft itself — HappyView pages by bare rev and has it — so this server reads `since`
   in the way that can only duplicate, never lose. A malformed token is still a 400.
 
+- `atproto-pds`: `com.atproto.repo.getRecord` reported missing records under the error name
+  `NotFound`, which no lexicon declares. `getRecord` declares exactly one error and calls it
+  `RecordNotFound`, so a client branching on the declared name — the entire reason errors are named
+  rather than numbered — matched nothing and fell through to whatever it does with an unrecognised
+  400. A record that was deleted, one hidden by a record-level takedown, and a `cid` the record is no
+  longer at now all answer `RecordNotFound`. The status was already right and is unchanged: the
+  reference implementation raises this as an `InvalidRequestError`, so 400 rather than 404.
+
+  **A repository this server does not host is a different condition and does not get that name.** The
+  lexicon has no error for it, and answering `RecordNotFound` would assert the repo is here and the
+  record is not. It answers the generic `InvalidRequest` instead — the one name every XRPC client
+  understands without consulting a lexicon — which is what the reference PDS returns when it can
+  locate neither the account nor an AppView to forward to. The message still names the identifier
+  that did not resolve.
+
+  The rename is made at the `getRecord` call sites, not in the shared `PdsError` → XRPC conversion.
+  `PdsError::NotFound` is raised from roughly two dozen places across the sync, blob, key, space and
+  account paths; renaming it there would have quietly changed endpoints whose lexicons declare a
+  different error or declare none, and no test in this crate would have noticed. The new
+  `PdsError::RecordNotFound` carries the AT-URI and is raised only on the repo read path.
+
+  One condition moved rather than being renamed: a record indexed against a block the block store
+  does not hold used to report as not-found as well. It is now a logged `InternalError`, because a
+  `repo_record` row pointing at a block nobody holds is a damaged actor store, and a routine 400
+  buries that. An operator seeing it should check whether that DID recently ran
+  `com.atproto.repo.importRepo` and repair by re-importing a complete CAR or deleting the orphaned
+  rows — `importRepo` is how the state is reachable: inductive verification accepts blocks missing
+  from the CAR for every non-genesis commit, and the MST walk that builds the index loads node
+  blocks but never record leaves, so a multi-commit CAR that omits record leaves indexes rows whose
+  blocks were never stored. Closing that gap in `importRepo` is follow-up work, as is
+  `com.atproto.space.getRecord`, which still answers a missing record with 404 `RecordNotFound`
+  where this endpoint now answers 400 — one error name under two statuses on the same server.
+
 - `atproto-pds`: six `com.atproto.space.*` / `com.atproto.simplespace.*` wire shapes did not match
   the lexicons they implement.
 

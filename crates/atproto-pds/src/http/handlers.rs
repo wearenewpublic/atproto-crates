@@ -10,6 +10,7 @@
 //! - `GET /_alive`, `GET /_ready`
 
 use crate::BUILD_REV;
+use crate::errors::PdsError;
 use crate::http::errors::XrpcError;
 use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::state::HttpState;
@@ -78,7 +79,22 @@ pub async fn get_record(
             &params.rkey,
             params.cid.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(|err| match err {
+            // The only `NotFound` this call can still raise is an unhosted
+            // repository, and `getRecord` declares no name for that: its one
+            // declared error is `RecordNotFound`, which would claim this server
+            // holds the repo and not the record. The reference implementation
+            // answers a repo it cannot locate with a bare `InvalidRequestError`,
+            // so report the generic `InvalidRequest` every XRPC client already
+            // understands rather than a name no lexicon mentions. Mapped here,
+            // at the one endpoint that needs it, rather than in the shared
+            // `PdsError` conversion that a dozen other methods depend on.
+            PdsError::NotFound { what } => {
+                XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRequest", what)
+            }
+            other => XrpcError::from(other),
+        })?;
     Ok(Json(response))
 }
 

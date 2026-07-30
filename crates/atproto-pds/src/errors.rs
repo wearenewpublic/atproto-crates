@@ -53,6 +53,21 @@ pub enum PdsError {
         what: String,
     },
 
+    /// error-atproto-pds-repo-5: the addressed record is not there — never
+    /// written, deleted, or hidden by a record-level takedown.
+    ///
+    /// Split out of [`PdsError::NotFound`] because `com.atproto.repo.getRecord`
+    /// declares exactly one error and calls it `RecordNotFound`. A client that
+    /// branches on the error name cannot branch on a name that appears in no
+    /// lexicon. A repository this server does not host stays
+    /// [`PdsError::NotFound`]: that is a different condition, and the lexicon
+    /// has no name for it.
+    #[error("error-atproto-pds-repo-5 record not found: {uri}")]
+    RecordNotFound {
+        /// AT-URI of the record that could not be served.
+        uri: String,
+    },
+
     /// error-atproto-pds-space-2: the referenced space does not exist or has
     /// been tombstoned (`deleted_at IS NOT NULL`). Surfaced to clients as the
     /// `SpaceNotFound` XRPC error.

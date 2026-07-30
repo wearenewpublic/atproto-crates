@@ -50,6 +50,15 @@ impl From<PdsError> for XrpcError {
             PdsError::NotFound { what } => {
                 XrpcError::new(StatusCode::BAD_REQUEST, "NotFound", what)
             }
+            // `com.atproto.repo.getRecord` declares this name and no other, and
+            // the reference implementation raises it as an `InvalidRequestError`
+            // — hence 400 rather than 404, matching every other named XRPC
+            // error on the repo surface.
+            PdsError::RecordNotFound { uri } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "RecordNotFound",
+                format!("could not locate record: {uri}"),
+            ),
             // The identity lexicons name these, and a client acts on which one
             // it got: correct the handle, pick another, or go fix DNS.
             PdsError::InvalidRecord { reason } => {
