@@ -87,6 +87,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies. This is why the change is not a JSON cosmetic — it moves the identifier too.
 
   The tombstone variant is unaffected; its `prev` was never optional.
+- `atproto-identity`: the PLC directory client built every request URL as `https://{configured}/{did}`,
+  so a directory configured with a scheme produced `https://http://127.0.0.1:2582/…` and no directory
+  that does not speak HTTPS could be reached at all. `query`, `fetch_audit_log` and `submit` now share
+  a `directory_base` helper that keeps an explicit scheme and prepends `https://` only to a bare
+  hostname — the convention `crate::url::build_url` has always followed and the PLC client never used.
+
+  This is what makes a local network possible. `atproto-pds` compiles `reqwest` with `rustls-tls`,
+  whose roots are the bundled webpki set, so a private CA cannot be trusted and a loopback directory
+  cannot be fronted with TLS either; without an addressable `http://` directory there was no way to
+  run PLC genesis outside the public internet, and so no way to exercise `createAccount` in a test
+  network.
+
+  Production configuration is unchanged: `plc.directory` still resolves to `https://plc.directory`.
 
 
   against the lexicon alone could not page the oplog at all. The lexicon calls `since` *"operations

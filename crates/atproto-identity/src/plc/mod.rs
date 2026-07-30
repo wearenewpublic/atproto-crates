@@ -53,6 +53,25 @@ pub struct AuditLogEntry {
     pub nullified: bool,
 }
 
+/// Base URL for a configured PLC directory.
+///
+/// The configuration value is a bare hostname (`plc.directory`) in the common
+/// case, and HTTPS is assumed for it. A value that already carries a scheme is
+/// taken verbatim, which is the only way to address a directory that does not
+/// speak HTTPS — a loopback instance in a development or integration-test
+/// network.
+///
+/// This mirrors the convention in [`crate::url::build_url`], which has always
+/// honoured an explicit scheme; the PLC client simply never used it.
+fn directory_base(plc_hostname: &str) -> String {
+    let trimmed = plc_hostname.trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed)
+    }
+}
+
 /// Queries a PLC directory for a DID document.
 /// Fetches the complete DID document from the specified PLC hostname.
 #[instrument(skip(http_client), err)]
@@ -61,7 +80,7 @@ pub async fn query(
     plc_hostname: &str,
     did: &str,
 ) -> Result<Document, PLCDIDError> {
-    let url = format!("https://{}/{}", plc_hostname, did);
+    let url = format!("{}/{}", directory_base(plc_hostname), did);
 
     http_client
         .get(&url)
@@ -84,7 +103,7 @@ pub async fn fetch_audit_log(
     plc_hostname: &str,
     did: &str,
 ) -> Result<Vec<AuditLogEntry>, PLCDIDError> {
-    let url = format!("https://{}/{}/log/audit", plc_hostname, did);
+    let url = format!("{}/{}/log/audit", directory_base(plc_hostname), did);
 
     let response = http_client
         .get(&url)
@@ -110,7 +129,7 @@ pub async fn submit(
     did: &str,
     operation: &Operation,
 ) -> Result<(), PLCDIDError> {
-    let url = format!("https://{}/{}", plc_hostname, did);
+    let url = format!("{}/{}", directory_base(plc_hostname), did);
 
     let response = http_client
         .post(&url)
@@ -130,4 +149,44 @@ pub async fn submit(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::directory_base;
+
+    #[test]
+    fn bare_hostname_assumes_https() {
+        assert_eq!(directory_base("plc.directory"), "https://plc.directory");
+    }
+
+    #[test]
+    fn explicit_scheme_is_preserved() {
+        // The case that matters: a loopback directory speaking plain HTTP.
+        assert_eq!(
+            directory_base("http://127.0.0.1:2582"),
+            "http://127.0.0.1:2582"
+        );
+        assert_eq!(
+            directory_base("https://plc.directory"),
+            "https://plc.directory"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_does_not_double_up() {
+        assert_eq!(
+            directory_base("http://127.0.0.1:2582/"),
+            "http://127.0.0.1:2582"
+        );
+        assert_eq!(directory_base("plc.directory/"), "https://plc.directory");
+    }
+
+    #[test]
+    fn host_with_port_still_gets_a_scheme() {
+        assert_eq!(
+            directory_base("plc.internal:2582"),
+            "https://plc.internal:2582"
+        );
+    }
 }
