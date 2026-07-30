@@ -39,15 +39,39 @@ impl OplogCursor {
         format!("{}__{}", self.rev, self.idx)
     }
 
-    /// Decode an opaque wire token `"<rev>__<idx>"`.
+    /// Decode a `since` token: either the composite `"<rev>__<idx>"` this
+    /// server emits, or a bare rev.
+    ///
+    /// `com.atproto.space.listRepoOps` declares `since` as *"operations after
+    /// this revision"* and declares no separate `cursor` **input**, so the
+    /// `cursor` its output carries has nowhere to go except back into `since`.
+    /// A conformant client therefore sends both forms, and refusing the bare
+    /// one made this server unreachable from a client that had only ever read
+    /// the lexicon.
+    ///
+    /// A bare rev decodes to `(rev, 0)`, not to "everything strictly after
+    /// `rev`". The two differ only for an atomic batch that spans a page
+    /// boundary: `(rev, 0)` re-delivers that batch's remaining ops, where the
+    /// stricter reading would skip them. Re-delivery is safe — a syncer
+    /// applies ops by `(collection, rkey, cid)` — and a dropped tail is the
+    /// batch-tail-drop bug latent in the draft itself.
+    ///
+    /// The two forms are unambiguous: a rev is a TID, thirteen
+    /// base32-sortable characters, and cannot contain `__`.
     ///
     /// Returns [`SpaceError::InvalidCursor`] if the token is malformed.
     pub fn from_token(token: &str) -> SpaceResult<Self> {
-        let (rev, idx) = token
-            .rsplit_once("__")
-            .ok_or_else(|| SpaceError::InvalidCursor {
-                token: token.to_string(),
-            })?;
+        let Some((rev, idx)) = token.rsplit_once("__") else {
+            if token.is_empty() {
+                return Err(SpaceError::InvalidCursor {
+                    token: token.to_string(),
+                });
+            }
+            return Ok(Self {
+                rev: token.to_string(),
+                idx: 0,
+            });
+        };
         let idx: u32 = idx.parse().map_err(|_| SpaceError::InvalidCursor {
             token: token.to_string(),
         })?;
@@ -344,11 +368,44 @@ mod tests {
         assert_eq!(OplogCursor::from_token(&cur.to_token()).unwrap(), cur);
     }
 
+    /// The lexicon describes `since` as "operations after this revision" and
+    /// declares no separate `cursor` input, so a bare rev is what a client
+    /// written against the lexicon alone will send. Refusing it made this
+    /// endpoint unreachable from such a client.
+    #[test]
+    fn a_bare_rev_is_accepted_as_the_start_of_its_batch() {
+        assert_eq!(
+            OplogCursor::from_token("3kabc").unwrap(),
+            OplogCursor::new("3kabc".to_string(), 0)
+        );
+    }
+
+    /// `(rev, 0)` rather than "strictly after rev": the two differ only for a
+    /// batch spanning a page boundary, where `(rev, 0)` re-delivers the tail
+    /// and the stricter reading drops it. Re-delivery is safe; loss is not.
+    #[test]
+    fn a_bare_rev_resolves_to_index_zero_not_past_the_batch() {
+        let cur = OplogCursor::from_token("3kabc").unwrap();
+        assert_eq!(cur.idx, 0);
+        // Which is to say it decodes to exactly the composite form's `__0`.
+        assert_eq!(cur, OplogCursor::from_token("3kabc__0").unwrap());
+    }
+
+    /// A rev is a TID — thirteen base32-sortable characters — so it can never
+    /// contain the separator, and the two forms cannot be confused.
+    #[test]
+    fn the_composite_form_still_wins_when_a_separator_is_present() {
+        assert_eq!(
+            OplogCursor::from_token("3kabc__7").unwrap(),
+            OplogCursor::new("3kabc".to_string(), 7)
+        );
+    }
+
     #[test]
     fn oplog_cursor_rejects_malformed() {
-        // Missing separator.
+        // Empty.
         assert!(matches!(
-            OplogCursor::from_token("3kabc"),
+            OplogCursor::from_token(""),
             Err(SpaceError::InvalidCursor { .. })
         ));
         // Non-numeric idx.

@@ -44,6 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only name it knows. `getRepoState` is kept as an alias rather than removed.
 
 ### Fixed
+- `atproto-pds`: `com.atproto.space.listRepoOps` refused a bare rev on `since`, so a client written
+  against the lexicon alone could not page the oplog at all. The lexicon calls `since` *"operations
+  after this revision"* and declares no separate `cursor` **input** — the `cursor` the response
+  carries has nowhere to go except back into `since` — and this server accepted only its own
+  composite `"<rev>__<idx>"` token, 400ing on anything else.
+
+  A bare rev is now accepted and resolves to `(rev, 0)`. Emission is unchanged: the composite token
+  is still what the response returns, because it is the form that survives a page boundary inside an
+  atomic batch.
+
+  `(rev, 0)` rather than "strictly after `rev`" is the point. The two readings differ only for a
+  batch larger than one page: `(rev, 0)` re-delivers that batch's remaining ops, which a syncer
+  applies idempotently, where the stricter reading drops them silently. That tail-drop is a bug
+  latent in the draft itself — HappyView pages by bare rev and has it — so this server reads `since`
+  in the way that can only duplicate, never lose. A malformed token is still a 400.
+
 - `atproto-pds`: six `com.atproto.space.*` / `com.atproto.simplespace.*` wire shapes did not match
   the lexicons they implement.
 

@@ -1639,9 +1639,10 @@ pub struct RepoOplogQuery {
     pub space: String,
     /// DID of the account whose oplog to retrieve.
     pub repo: String,
-    /// Opaque `(rev, idx)` cursor (`"<rev>__<idx>"`) to start *after*
-    /// (exclusive). Carries the last op delivered on the prior page so that an
-    /// atomic batch larger than `limit` is not skipped across paging.
+    /// Resume point, exclusive. Either the composite `"<rev>__<idx>"` cursor
+    /// this endpoint emits — which names the last op delivered, so an atomic
+    /// batch larger than `limit` is not skipped across paging — or a bare rev,
+    /// which the lexicon's wording implies and which resolves to `(rev, 0)`.
     pub since: Option<String>,
     /// Page size.
     pub limit: Option<u32>,

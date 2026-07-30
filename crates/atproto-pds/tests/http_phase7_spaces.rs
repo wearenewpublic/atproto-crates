@@ -3194,3 +3194,116 @@ async fn space_not_found_uses_one_status_everywhere() {
     .await;
     assert_ne!(status, StatusCode::NOT_FOUND, "registerNotify: {body}");
 }
+
+// ---------------------------------------------------------------------------
+//  `listRepoOps.since` accepts a bare rev (F-SPACE-21).
+// ---------------------------------------------------------------------------
+
+/// The lexicon calls `since` "operations after this revision" and declares no
+/// separate `cursor` **input** — so the `cursor` the response carries has
+/// nowhere to go except back into `since`, and a client written against the
+/// lexicon alone sends a bare rev. This server required its composite
+/// `"<rev>__<idx>"` token and 400'd on anything else, which made the endpoint
+/// unreachable from such a client.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_repo_ops_accepts_a_bare_rev_as_since() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    space_write(
+        &app,
+        &uri,
+        "did:plc:owner",
+        &owner,
+        json!([{"action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let body = list_ops(&app, &uri, "did:plc:owner", &owner, "").await;
+    let rev = body["ops"][0]["rev"].as_str().expect("rev").to_string();
+    // A TID carries no underscore, so a bare rev can never be mistaken for the
+    // composite form.
+    assert!(
+        !rev.contains("__"),
+        "rev must not contain the separator: {rev}"
+    );
+
+    let body = list_ops(
+        &app,
+        &uri,
+        "did:plc:owner",
+        &owner,
+        &format!("&since={}", urlencode(&rev)),
+    )
+    .await;
+    // `(rev, 0)` is exclusive of index 0, so the single-op batch is caught up.
+    assert!(body["ops"].as_array().unwrap().is_empty(), "{body}");
+}
+
+/// The reason a bare rev resolves to `(rev, 0)` rather than to "everything
+/// strictly after `rev`": an atomic batch larger than one page. Resuming from
+/// a bare rev re-delivers the whole batch, which a syncer applies idempotently
+/// — where the stricter reading would silently drop everything after the page
+/// boundary. That is the batch-tail-drop bug latent in the draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_rev_recovers_a_batch_tail_rather_than_skipping_it() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    // One atomic batch of five ops: all five share a single rev.
+    let writes: Vec<Value> = (0..5)
+        .map(|i| json!({"action": "create", "collection": "c.d.e", "rkey": format!("k{i}"), "value": {"v": i}}))
+        .collect();
+    space_write(&app, &uri, "did:plc:owner", &owner, json!(writes)).await;
+
+    // Page one stops inside the batch.
+    let body = list_ops(&app, &uri, "did:plc:owner", &owner, "&limit=2").await;
+    let first = body["ops"].as_array().unwrap().clone();
+    assert_eq!(first.len(), 2, "{body}");
+    let rev = first[0]["rev"].as_str().unwrap().to_string();
+    assert!(
+        first.iter().all(|o| o["rev"] == rev.as_str()),
+        "the whole batch must share one rev: {body}"
+    );
+
+    // Resuming from the bare rev returns the batch's remaining ops. Under the
+    // "strictly after this revision" reading this would come back empty and
+    // three writes would be lost with nothing to indicate it.
+    let body = list_ops(
+        &app,
+        &uri,
+        "did:plc:owner",
+        &owner,
+        &format!("&since={}&limit=10", urlencode(&rev)),
+    )
+    .await;
+    let rest = body["ops"].as_array().unwrap();
+    assert_eq!(rest.len(), 4, "the batch tail must survive: {body}");
+    let rkeys: Vec<&str> = rest.iter().map(|o| o["rkey"].as_str().unwrap()).collect();
+    assert_eq!(rkeys, vec!["k1", "k2", "k3", "k4"], "{body}");
+}
+
+/// Widening `since` must not widen it to anything: a genuinely malformed token
+/// is still a bad request rather than a silently-ignored resume point.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_since_is_still_refused() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    for token in ["3kabc__x", "__3"] {
+        let (status, body) = get_json(
+            app.clone(),
+            &format!(
+                "/xrpc/com.atproto.space.listRepoOps?space={}&repo=did:plc:owner&since={}",
+                urlencode(&uri),
+                urlencode(token)
+            ),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{token}: {body}");
+    }
+}
