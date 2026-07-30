@@ -43,6 +43,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shipped as `getRepoState`. Both now route to the same handler; a conformant client was 404ing on the
   only name it knows. `getRepoState` is kept as an alias rather than removed.
 
+### Security
+- `atproto-identity`: `DidBuilder::build` published rotation keys in **private** form. Verification
+  methods were converted with `key::to_public` before serialization; rotation keys were formatted
+  straight from the `KeyData`, which emits the private multicodec (`P256Private` → `0x1306`) followed
+  by the raw 32-byte scalar. Every genesis operation therefore carried the account's PLC rotation
+  private key to the directory, and a PLC directory is a public, permanent, append-only log: anyone
+  reading the audit log could rotate the DID away from its owner, irreversibly.
+
+  `add_rotation_key` takes the private key deliberately — `build` signs the genesis operation with
+  `rotation_keys[0]` — so the public conversion has to happen on the way out, and now does. A key
+  whose public form cannot be derived is a hard error rather than a fallback to the value as given,
+  because that fallback is exactly how the private key reached the wire.
+
+  **Exposure.** The reference directory rejects these operations: `did:key` parsing there accepts
+  only the public multicodecs, so a submission carrying `0x1306` fails validation and is never
+  recorded. Any DID created against a directory that validated `did:key` less strictly should be
+  treated as compromised and rotated using a key generated after this change.
+
 ### Fixed
 - `atproto-pds`: `com.atproto.space.listRepoOps` refused a bare rev on `since`, so a client written
   against the lexicon alone could not page the oplog at all. The lexicon calls `since` *"operations

@@ -91,12 +91,29 @@ impl DidBuilder {
             });
         }
 
-        // Convert keys to did:key format strings
+        // Convert keys to did:key format strings.
+        //
+        // Rotation keys are held privately here because `build` signs the
+        // genesis operation with `rotation_keys[0]`, but the operation itself
+        // must publish only the PUBLIC form. Formatting the `KeyData` directly
+        // emitted the private multicodec (`P256Private` -> 0x1306) followed by
+        // the raw 32-byte scalar, so the genesis op carried the account's
+        // rotation private key into the PLC directory — a public, permanent,
+        // append-only log.
+        //
+        // A failed conversion is fatal rather than a fallback to `k`: falling
+        // back is precisely how the private key would reach the wire.
         let rotation_key_strings: Vec<String> = self
             .rotation_keys
             .iter()
-            .map(|k| format!("{}", k))
-            .collect();
+            .map(|k| {
+                key::to_public(k)
+                    .map(|public_key_data| format!("{}", public_key_data))
+                    .map_err(|e| PLCDIDError::InvalidRotationKeys {
+                        details: format!("cannot derive the public form of a rotation key: {e}"),
+                    })
+            })
+            .collect::<Result<Vec<String>, PLCDIDError>>()?;
 
         let verification_method_strings: HashMap<String, String> = self
             .verification_methods
@@ -224,6 +241,39 @@ impl BuilderKeys {
 mod tests {
     use super::*;
     use crate::key::{KeyType, generate_key};
+
+    /// A genesis operation must never carry private key material. The operation
+    /// is submitted to a PLC directory, which is a public, permanent,
+    /// append-only log: a rotation key published in private form hands anyone
+    /// who reads the audit log the ability to rotate the DID away from its
+    /// owner. `add_rotation_key` takes the private key because `build` signs
+    /// with it, so the public conversion has to happen on the way out.
+    #[test]
+    fn rotation_keys_are_published_in_public_form() {
+        for key_type in [KeyType::P256Private, KeyType::K256Private] {
+            let rotation_key = generate_key(key_type.clone()).unwrap();
+            let expected_public = format!("{}", key::to_public(&rotation_key).unwrap());
+            let private_form = format!("{}", rotation_key);
+
+            let (_did, operation, _keys) = DidBuilder::new()
+                .add_rotation_key(rotation_key)
+                .build()
+                .unwrap();
+
+            let Operation::PlcOperation { rotation_keys, .. } = operation else {
+                panic!("expected a plc_operation");
+            };
+            assert_eq!(
+                rotation_keys,
+                vec![expected_public],
+                "{key_type} rotation key was not published in public form"
+            );
+            assert!(
+                !rotation_keys.contains(&private_form),
+                "{key_type} private key leaked into the genesis operation"
+            );
+        }
+    }
 
     #[test]
     fn test_builder_basic() {
