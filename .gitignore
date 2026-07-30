@@ -6,3 +6,6 @@
 # already existing elements were commented out
 
 #/target
+
+# Local remediation notes and agent worktrees.
+/.claude/
