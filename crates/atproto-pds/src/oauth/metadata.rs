@@ -37,6 +37,14 @@ pub struct AuthorizationServerMetadata {
     pub require_dpop_bound_access_tokens: bool,
     /// Supported client authentication methods.
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// Whether a `client_id` may be the URL of a client metadata document.
+    ///
+    /// Not advisory in AT Protocol: clients are identified by the URL their
+    /// metadata lives at rather than by pre-registration, so a client library
+    /// reads this flag to decide whether it can use the server at all.
+    /// `@atproto/oauth-client` throws when it is not `true`, before issuing any
+    /// request.
+    pub client_id_metadata_document_supported: bool,
 }
 
 /// RFC 9728 Protected Resource Metadata.
@@ -78,6 +86,9 @@ pub async fn oauth_authorization_server(
             "none".to_string(),
             "private_key_jwt".to_string(),
         ],
+        // AT Protocol has no client pre-registration; the client_id IS the
+        // metadata URL, and this is how a client discovers that.
+        client_id_metadata_document_supported: true,
     })
 }
 

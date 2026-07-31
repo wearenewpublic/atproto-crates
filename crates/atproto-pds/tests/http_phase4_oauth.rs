@@ -275,6 +275,12 @@ async fn metadata_documents_published() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["issuer"], "https://test.example");
     assert_eq!(body["require_pushed_authorization_requests"], true);
+    // AT Protocol identifies a client by the URL of its metadata document, and
+    // `@atproto/oauth-client` refuses any server that does not say so:
+    // `Authorization server "..." does not support client_id_metadata_document`
+    // is thrown before a single request is made. Without this field no client
+    // built on the official library can authenticate here at all.
+    assert_eq!(body["client_id_metadata_document_supported"], true);
     assert!(
         body["scopes_supported"]
             .as_array()

@@ -78,6 +78,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   high-S and all 9 were refused beforehand; afterwards all 14 verified. The failure looked
   intermittent, which is what made it hard to attribute — the same client, unchanged, succeeded or
   failed depending only on a bit of the signature.
+- `atproto-pds`: the authorization-server metadata omitted
+  `client_id_metadata_document_supported`, so no client built on `@atproto/oauth-client` could
+  authenticate. AT Protocol has no client pre-registration — a `client_id` *is* the URL its metadata
+  document lives at — and the official client resolver throws
+  `Authorization server "…" does not support client_id_metadata_document` when the flag is anything
+  other than `true`, before issuing any request. The reference provider sets it unconditionally.
+
+  Everything else about the OAuth surface was already correct: PAR required, S256-only PKCE, DPoP
+  algorithms advertised, `redirect_uri` validated against the fetched document. One absent boolean
+  made all of it unreachable.
 
 - `atproto-pds`: a request to an `/xrpc/` path the router does not serve answered a bare HTTP 404 with
   no body at all. XRPC requires every error response to carry `{"error", "message"}`, and the reference
