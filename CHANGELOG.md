@@ -87,6 +87,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_uri` accepted raw whitespace, so `https://example.com/path gap` and
+  `https://example.com/trailing-whitespace  ` both validated. RFC 3986 has no production admitting a
+  raw space — it must be percent-encoded. The scheme-specific part is now `\S+` rather than `.+`.
+
+  Trailing whitespace is the case worth naming: it survives a careless copy-paste and produces a URI
+  that looks correct in every log line it appears in.
+
+  The scheme grammar is deliberately left as this crate had it — `[a-zA-Z][a-zA-Z0-9+.-]*`, which is
+  RFC 3986 §3.1 — rather than ported from the reference's `\w+`. `\w` is wrong in both directions:
+  it admits `_` and a leading digit, which RFC 3986 does not, and refuses `+`, `-` and `.`, which it
+  does. Checked against the corpus: the reference's own regex fails three of its vectors,
+  `content-type:text/plan` and `microsoft.windows.camera:thing` among them.
+
+  Closes 2 of the pinned cases. 527 of 536 now assert.
+
 - `atproto-record`: `Tid::decode` tested the wrong bit, so it rejected valid TIDs and accepted
   invalid ones that **aliased onto valid ones**.
 

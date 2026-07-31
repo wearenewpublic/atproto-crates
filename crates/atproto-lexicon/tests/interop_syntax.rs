@@ -119,20 +119,6 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "0000-01-01T00:00:00+01:00",
         "normalizes below the representable range",
     ),
-    // -- URI --------------------------------------------------------------
-    // A raw space is never legal in a URI; it must be percent-encoded.
-    // Trailing whitespace is the same defect, and is the more dangerous one
-    // because it survives a careless copy-paste.
-    (
-        "syntax/uri_syntax_invalid.txt",
-        "https://example.com/path gap",
-        "raw space",
-    ),
-    (
-        "syntax/uri_syntax_invalid.txt",
-        "https://example.com/trailing-whitespace  ",
-        "trailing whitespace",
-    ),
 ];
 
 fn is_known_failure(file: &str, case: &str) -> bool {

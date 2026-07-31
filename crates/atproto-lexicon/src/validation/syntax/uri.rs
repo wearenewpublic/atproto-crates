@@ -11,9 +11,22 @@ use crate::validation::data_errors::DataValidationError;
 /// Regex for validating URI syntax
 ///
 /// A URI must have a scheme followed by ":" and scheme-specific content.
-/// Scheme: letter followed by letters, digits, plus, hyphen, or dot.
+/// Scheme: letter followed by letters, digits, plus, hyphen, or dot
+/// (RFC 3986 §3.1).
+///
+/// The content is `\S+` rather than `.+`: RFC 3986 has no production that
+/// admits a raw space, so a space must be percent-encoded. `.+` accepted
+/// `https://example.com/path gap`, and — the case that actually bites —
+/// trailing whitespace, which survives a careless copy-paste and produces a
+/// URI that looks right in every log line it appears in.
+///
+/// The scheme class is deliberately not the reference's `\w+`
+/// (`packages/syntax/src/uri.ts:4`). RFC 3986 allows `+`, `-` and `.` in a
+/// scheme and does not allow `_` or a leading digit, so `\w+` is wrong in
+/// both directions: it refuses `content-type:text/plan` and
+/// `microsoft.windows.camera:thing`, both of which the corpus lists as valid.
 static URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-zA-Z][a-zA-Z0-9+.-]*:.+$").expect("URI regex should compile")
+    Regex::new(r"^[a-zA-Z][a-zA-Z0-9+.-]*:\S+$").expect("URI regex should compile")
 });
 
 /// Validate a URI string
@@ -82,5 +95,38 @@ mod tests {
         for uri in invalid {
             assert!(validate_uri(uri).is_err(), "should be invalid: {}", uri);
         }
+    }
+
+    /// A URI contains no raw whitespace; RFC 3986 has no production for it.
+    ///
+    /// Trailing whitespace is the case worth naming: it survives a careless
+    /// copy-paste and produces a URI that looks correct everywhere it is
+    /// printed.
+    #[test]
+    fn whitespace_is_refused_anywhere_in_the_uri() {
+        for uri in [
+            "https://example.com/path gap",
+            "https://example.com/trailing-whitespace  ",
+            "  https://example.com/path",
+            "https://example.com/\tpath",
+            "https://example.com/path\n",
+        ] {
+            assert!(validate_uri(uri).is_err(), "should be invalid: {uri:?}");
+        }
+    }
+
+    /// The scheme grammar is RFC 3986's, which is wider than `\w` in one
+    /// direction and narrower in another.
+    ///
+    /// `+`, `-` and `.` are legal in a scheme; `_` and a leading digit are
+    /// not. Porting the reference's `\w+` would have refused two corpus
+    /// vectors while accepting schemes RFC 3986 does not define.
+    #[test]
+    fn the_scheme_follows_rfc_3986_not_word_characters() {
+        assert!(validate_uri("content-type:text/plan").is_ok());
+        assert!(validate_uri("microsoft.windows.camera:thing").is_ok());
+        assert!(validate_uri("a+b:thing").is_ok());
+        assert!(validate_uri("under_score:thing").is_err());
+        assert!(validate_uri("123:invalid-scheme").is_err());
     }
 }
