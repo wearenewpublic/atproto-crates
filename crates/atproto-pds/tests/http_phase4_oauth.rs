@@ -189,6 +189,10 @@ async fn token_with_scope(app: &axum::Router, key: &KeyData, scope: &str) -> Str
 }
 
 /// Attempt a record write with `token`, returning the status.
+/// The token these tests mint is `cnf.jkt`-bound, so it is presented under the
+/// `DPoP` scheme (RFC 9449 §7.1) rather than `Bearer`. The scheme is
+/// incidental to what the scope tests assert, but sending the wrong one now
+/// fails authentication before scope is ever reached.
 async fn write_with_token(
     app: &axum::Router,
     key: &KeyData,
@@ -202,7 +206,7 @@ async fn write_with_token(
         .uri(uri)
         .method("POST")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
+        .header("authorization", format!("DPoP {token}"))
         .header("host", "test.example")
         .header("DPoP", dpop)
         .body(Body::from(
@@ -1154,7 +1158,7 @@ async fn a_scope_refusal_says_what_was_needed() {
         .uri(uri)
         .method("POST")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
+        .header("authorization", format!("DPoP {token}"))
         .header("host", "test.example")
         .header("DPoP", dpop)
         .body(Body::from(

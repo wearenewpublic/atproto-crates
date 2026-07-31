@@ -62,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-pds`: a DPoP-bound OAuth access token could not be presented correctly. The server issues
+  tokens with `token_type: DPoP` and a `cnf.jkt` binding, which RFC 9449 §7.1 requires be sent as
+  `Authorization: DPoP <token>` — but every authenticated XRPC read the header with
+  `strip_prefix("Bearer ")` and answered `DPoP` with 401 `expected Bearer scheme`. The whole OAuth
+  flow worked up to the token and stopped there: no conforming client could spend one.
+
+  The `DPoP` scheme is now accepted, and the scheme must agree with the token's binding in both
+  directions — a `cnf.jkt`-bound token presented as `Bearer` is refused even when a valid proof is
+  attached (the downgrade the binding exists to prevent, which the server previously accepted), and an
+  unbound token presented as `DPoP` is refused too. `bearer_token` stays Bearer-only for credentials
+  that are Bearer by definition — service auth, space credentials, delegation grants.
+
+  Found end-to-end: the harness could not exercise this while the authorization-code leg was skipped
+  as "needs a human at a consent screen". `POST /oauth/authorize` accepts the same JSON the consent
+  page's own script posts, so no browser was required — the skip was an assumption about the endpoint
+  rather than a fact about it, and it hid the defect that made every preceding fix unusable.
+
 - `atproto-pds`: the `FutureCursor` refusal on `subscribeRepos` was sent in an `#info`-shaped frame
   rather than an XRPC error frame, so a conforming client could not read it. An error frame carries
   `op = -1`, **no** `t`, and a body of `{error, message}` — the error *name* is what a client switches

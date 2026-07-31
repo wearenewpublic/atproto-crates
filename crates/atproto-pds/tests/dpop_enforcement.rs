@@ -4,11 +4,17 @@
 //! Strategy:
 //! 1. Mint an OAuth access token (HS256, `typ=at-oauth-access`) with
 //!    `cnf.jkt` set to a thumbprint we control.
-//! 2. Hit a write endpoint (`com.atproto.repo.createRecord`) with three
+//! 2. Hit a write endpoint (`com.atproto.repo.createRecord`) with four
 //!    scenarios:
 //!    - **No DPoP header**: expect 401 `InvalidDpopProof`.
 //!    - **Fresh DPoP proof**: expect 200.
 //!    - **Replay of the same proof**: expect 401 `InvalidDpopProof: replay`.
+//!    - **Presented as `Bearer`**: expect 401, proof or no proof. A bound
+//!      token offered under the unbound scheme is a downgrade.
+//!
+//! The token is presented as `DPoP` throughout, per RFC 9449 §7.1. These
+//! tests previously sent `Bearer`, which the server accepted — the reason
+//! the scheme went unimplemented for as long as it did.
 
 use atproto_identity::key::{KeyType, generate_key};
 use atproto_oauth::dpop::{extract_jwk_thumbprint, request_dpop};
@@ -103,12 +109,26 @@ fn mint_oauth_access(sub: &str, jkt: &str) -> String {
     )
 }
 
-async fn write_with(app: &axum::Router, bearer: &str, dpop: Option<&str>) -> (StatusCode, Value) {
+async fn write_with(app: &axum::Router, token: &str, dpop: Option<&str>) -> (StatusCode, Value) {
+    write_with_scheme(app, "DPoP", token, dpop).await
+}
+
+/// Same, with the `Authorization` scheme spelled explicitly.
+///
+/// A `cnf.jkt`-bound token is presented as `DPoP` (RFC 9449 §7.1), which is
+/// what [`write_with`] sends. The scheme is a parameter here so the downgrade
+/// — the same bound token offered as `Bearer` — can be exercised too.
+async fn write_with_scheme(
+    app: &axum::Router,
+    scheme: &str,
+    token: &str,
+    dpop: Option<&str>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder()
         .uri("/xrpc/com.atproto.repo.createRecord")
         .method("POST")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {bearer}"))
+        .header("authorization", format!("{scheme} {token}"))
         .header("host", "test.example");
     if let Some(d) = dpop {
         req = req.header("DPoP", d);
@@ -228,5 +248,61 @@ async fn dpop_replay_rejected() {
     assert!(
         msg.contains("replay"),
         "expected replay message, got: {msg}"
+    );
+}
+
+/// A `cnf.jkt`-bound token presented as `Bearer` is refused — with a valid
+/// proof attached, and without one.
+///
+/// Both directions matter. Without a proof the request is unauthenticated by
+/// any reading, so refusing it proves little. *With* a valid proof the client
+/// has demonstrated possession of the bound key and the only thing wrong is
+/// the scheme it claimed — which is the case that says the check is aimed at
+/// the downgrade rather than at a missing proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn dpop_bound_token_rejected_under_bearer_scheme() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let key = generate_key(KeyType::P256Private).unwrap();
+    // `ath` binds the proof to the access token it accompanies, so a proof
+    // has to be built against the real token — a placeholder is only good
+    // enough to read the thumbprint off.
+    let fresh_proof = |access_token: &str| {
+        let (p, _, _) = request_dpop(
+            &key,
+            "POST",
+            "http://test.example/xrpc/com.atproto.repo.createRecord",
+            access_token,
+        )
+        .unwrap();
+        p
+    };
+    let jkt = extract_jwk_thumbprint(&fresh_proof("unused")).unwrap();
+    let token = mint_oauth_access("did:plc:alice", &jkt);
+
+    let (status, body) = write_with_scheme(&app, "Bearer", &token, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "bound token under Bearer, no proof: {body}"
+    );
+
+    let (status, body) =
+        write_with_scheme(&app, "Bearer", &token, Some(&fresh_proof(&token))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "bound token under Bearer with a valid proof should still be refused: {body}"
+    );
+
+    // An equally fresh proof under the correct scheme succeeds, so the
+    // refusals above are about the scheme rather than about the proof being
+    // unusable.
+    let (status, body) = write_with_scheme(&app, "DPoP", &token, Some(&fresh_proof(&token))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "same proof shape, correct scheme: {body}"
     );
 }

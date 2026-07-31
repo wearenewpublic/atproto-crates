@@ -1,8 +1,11 @@
-//! Unified bearer-token authentication for XRPC handlers.
+//! Unified access-token authentication for XRPC handlers.
 //!
 //! every authenticated XRPC must:
 //!
-//! 1. Verify the `Authorization: Bearer <jwt>` header.
+//! 1. Verify the `Authorization: <scheme> <jwt>` header, where `<scheme>` is
+//!    `Bearer` (RFC 6750) or `DPoP` (RFC 9449 §7.1). The scheme is not
+//!    cosmetic: it declares whether the token is proof-of-possession bound,
+//!    and it must agree with the token's own `cnf.jkt` claim.
 //! 2. Accept either an app-password session (`typ=at-pp-access`) or an OAuth
 //!    access token (`typ=at-oauth-access`). The two flavors are HS256-signed
 //!    with the same shared secret; the `typ` distinguishes them.
@@ -118,8 +121,81 @@ impl AuthSubject {
     }
 }
 
+/// The scheme a request presented its access token under.
+///
+/// RFC 9449 §7.1 makes this load-bearing rather than decorative: a
+/// DPoP-bound token is presented as `DPoP`, an unbound one as `Bearer`, and
+/// the two are not interchangeable. Presenting a bound token as `Bearer`
+/// asks the server to accept it without proof of possession, which is
+/// exactly the downgrade the binding exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// RFC 6750 — an unbound token.
+    Bearer,
+    /// RFC 9449 §7.1 — a token bound to a proof-of-possession key.
+    Dpop,
+}
+
+impl AuthScheme {
+    /// The scheme name as it appears in the `Authorization` header.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthScheme::Bearer => "Bearer",
+            AuthScheme::Dpop => "DPoP",
+        }
+    }
+}
+
+/// Read an `Authorization: Bearer <token>` **or** `Authorization: DPoP
+/// <token>` header, returning the scheme and the raw token.
+///
+/// This is the extractor for *access tokens*, whose scheme varies. Tokens
+/// that are Bearer by definition — service auth, space credentials,
+/// delegation grants — use [`bearer_token`] instead.
+///
+/// The scheme is matched case-sensitively against the names RFC 6750 and
+/// RFC 9449 register. Failure is a 401 `AuthenticationRequired`.
+pub fn authorization_token(parts: &Parts) -> Result<(AuthScheme, &str), XrpcError> {
+    let raw = authorization_header(parts)?;
+
+    if let Some(token) = raw.strip_prefix("Bearer ") {
+        return Ok((AuthScheme::Bearer, token));
+    }
+    if let Some(token) = raw.strip_prefix("DPoP ") {
+        return Ok((AuthScheme::Dpop, token));
+    }
+
+    Err(XrpcError::new(
+        StatusCode::UNAUTHORIZED,
+        "AuthenticationRequired",
+        "expected Bearer or DPoP scheme",
+    ))
+}
+
+/// Shared header read: present, and valid UTF-8.
+fn authorization_header(parts: &Parts) -> Result<&str, XrpcError> {
+    let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "no Authorization header",
+        )
+    })?;
+    header.to_str().map_err(|_| {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Authorization header is not valid UTF-8",
+        )
+    })
+}
+
 /// Read the `Authorization: Bearer <token>` header. Returns the raw token
 /// (no `Bearer ` prefix). Failure is a 401 `AuthenticationRequired`.
+///
+/// For credentials that are Bearer by definition. Access tokens go through
+/// [`authorization_token`], which also accepts `DPoP`.
 pub fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
     let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
         XrpcError::new(
@@ -157,10 +233,18 @@ pub async fn require_authn(
     htm: &str,
     htu: &str,
 ) -> Result<AuthSubject, XrpcError> {
-    let raw = bearer_token(parts)?;
+    let (scheme, raw) = authorization_token(parts)?;
 
-    // Try app-password first — that's the dominant path today.
+    // Try app-password first — that's the dominant path today. A session
+    // token is never proof-of-possession bound, so it is a Bearer token and
+    // presenting it as `DPoP` is a category error rather than a stricter
+    // request.
     if let Ok(claims) = session::verify_access(raw, &state.jwt_secret) {
+        require_scheme(
+            scheme,
+            AuthScheme::Bearer,
+            "an app-password session token is not bound",
+        )?;
         return Ok(AuthSubject::AppPassword(claims));
     }
 
@@ -174,13 +258,49 @@ pub async fn require_authn(
         )
     })?;
 
-    // DPoP enforcement: when `cnf.jkt` is bound, the request MUST carry a
-    // valid DPoP proof keyed to the same thumbprint.
+    // DPoP enforcement: when `cnf.jkt` is bound, the request MUST be made
+    // under the `DPoP` scheme and MUST carry a valid proof keyed to the same
+    // thumbprint. The scheme is checked first because it is the client's
+    // declaration of what it thinks it holds — a bound token offered as
+    // `Bearer` is a downgrade attempt whether or not a proof happens to
+    // accompany it.
     if claims.cnf.is_some() {
+        require_scheme(
+            scheme,
+            AuthScheme::Dpop,
+            "this access token is bound to a DPoP key",
+        )?;
         verify_dpop_proof(&parts.headers, &claims, htm, htu, raw, &state.jti_guard).await?;
+    } else {
+        require_scheme(
+            scheme,
+            AuthScheme::Bearer,
+            "this access token is not bound to a DPoP key",
+        )?;
     }
 
     Ok(AuthSubject::OAuth(claims))
+}
+
+/// Require that the presented scheme matches the one the token's binding
+/// implies, with `why` naming the property that decided it.
+///
+/// Split out so both directions read the same way: a bound token under
+/// `Bearer` and an unbound token under `DPoP` are both mismatches, and
+/// neither is more acceptable than the other.
+fn require_scheme(got: AuthScheme, want: AuthScheme, why: &str) -> Result<(), XrpcError> {
+    if got == want {
+        return Ok(());
+    }
+    Err(XrpcError::new(
+        StatusCode::UNAUTHORIZED,
+        "AuthenticationRequired",
+        format!(
+            "{why}, so it must be presented with the {} scheme, not {}",
+            want.as_str(),
+            got.as_str()
+        ),
+    ))
 }
 
 /// Convenience wrapper: same as [`require_authn`] but discards the full

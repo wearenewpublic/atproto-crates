@@ -30,7 +30,9 @@
 
 use crate::account::AccountManager;
 use crate::actor_store::sql::SqlActorStore;
-use crate::http::auth::{bearer_token, request_htm_htu, require_authn, require_authn_sub};
+use crate::http::auth::{
+    authorization_token, bearer_token, request_htm_htu, require_authn, require_authn_sub,
+};
 use crate::http::errors::XrpcError;
 use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
 use crate::http::space_auth::{
@@ -1310,7 +1312,11 @@ async fn resolve_record_auth<'a>(
     space: &SpaceUri,
     repo: Option<&str>,
 ) -> Result<ResolvedRecordAuth<'a>, XrpcError> {
-    let raw = bearer_token(parts)?;
+    // Scheme-tolerant: a space credential is a Bearer token, but the
+    // fall-through below is `require_authn`, which also accepts a DPoP-bound
+    // OAuth token. Extracting Bearer-only here would refuse that token before
+    // it ever reached the branch that handles it.
+    let (_, raw) = authorization_token(parts)?;
     match classify(raw) {
         Some(SpaceTokenKind::SpaceCredential) => {
             let repo = repo.ok_or_else(|| {
@@ -2169,7 +2175,8 @@ async fn require_any_authn(
     state: &HttpState,
     space: &SpaceUri,
 ) -> Result<Option<crate::http::auth::AuthSubject>, XrpcError> {
-    let raw = bearer_token(parts)?;
+    // Scheme-tolerant for the same reason as `resolve_record_auth`.
+    let (_, raw) = authorization_token(parts)?;
     if let Some(SpaceTokenKind::SpaceCredential) = classify(raw) {
         space_reader(state)?
             .verify_space_credential_for(space, raw)
