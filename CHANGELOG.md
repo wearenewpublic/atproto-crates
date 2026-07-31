@@ -87,6 +87,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_cid` refused base58btc CIDs, which **both** reference implementations
+  accept. A record carrying a `zdj7…` CID in a `format: cid` string field was rejected on write.
+
+  The cause was a category error rather than a wrong rule: the validator delegated to
+  `atproto_dasl::Cid`, which requires base32lower because *the DASL spec* requires it. That is
+  correct for a CID used as a DAG-CBOR link and is a different question from what may appear in a
+  record's string field. The link constraint had been borrowed for the lexicon check.
+
+  Base32lower and base58btc are now accepted and still fully decoded — multibase, multicodec and
+  multihash — and CIDv1 is still required. Base16, base64 and base10 stay refused: the corpus calls
+  them valid but the TypeScript lexicon's `CID.parse` refuses them too, so they are contested between
+  the references rather than a defect here, and `interop_syntax.rs` now records them as such.
+
+  Closes 2 of the pinned cases. Not 3: `z7x3CtScH765HvShXT` is base58btc and in the corpus's *valid*
+  file, but its multihash does not decode — indigo accepts it because indigo's helper does no
+  decoding at all. It stays refused, with a test saying why.
+
+### Added
+- `atproto-dasl`: `CidVersion` is re-exported alongside `CidCore`, so callers can check a CID's
+  version without taking their own dependency on the `cid` crate.
+
 - `atproto-lexicon`: `validate_nsid` refused NSIDs whose domain authority contains a segment
   beginning with a digit — `org.4chan.lex.getThing`, `cn.8.lex.stuff`, and any name under an onion
   address, which is digit-leading by construction. These are ordinary NSIDs for ordinary domains: DNS

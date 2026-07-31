@@ -57,9 +57,21 @@ use std::path::PathBuf;
 /// regress one.
 const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
     // -- CID --------------------------------------------------------------
-    // A CID is multibase-prefixed and base32 (`b`) is only the common case.
-    // The corpus carries base58btc (`z`), base64 (`m`), base16 (`f`) and
-    // base10 (`7`) — all legal, all rejected here.
+    // These four are a disagreement *between the references*, not a defect
+    // here, and are pinned to record that rather than to track a fix.
+    //
+    // The corpus is indigo's, whose `syntax.ParseCID` is documented as "an
+    // informal/incomplete helper ... without parsing": a character regex, a
+    // length bound, and a `Qmb` check. It therefore accepts every multibase
+    // and also accepts strings that are not decodable CIDs at all. The
+    // TypeScript lexicon calls `CID.parse`, which auto-detects only base32,
+    // base36 and base58btc — so it refuses base16, base64 and base10 exactly
+    // as this crate does.
+    //
+    // base58btc was the one both references accepted and this crate did not;
+    // that was a real defect and is fixed (F-CID-24). What is left is
+    // genuinely contested, so it is left refused rather than decided by
+    // whichever corpus happens to be vendored.
     (
         "syntax/cid_syntax_valid.txt",
         "7134036155352661643226414134664076",
@@ -79,16 +91,6 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "syntax/cid_syntax_valid.txt",
         "z7x3CtScH765HvShXT",
         "base58btc multibase",
-    ),
-    (
-        "syntax/cid_syntax_valid.txt",
-        "zdj7WhuEjrB52m1BisYCtmjH1hSKa7yZ3jEZ9JcXaFRD51wVz",
-        "base58btc multibase (CIDv0-style)",
-    ),
-    (
-        "syntax/cid_syntax_valid.txt",
-        "zdj7WWeQ43G6JJvLWQWZpyHuAMq6uYWRjkBXFad11vE2LHhQ7",
-        "base58btc multibase (CIDv0-style)",
     ),
     // -- language ---------------------------------------------------------
     // Grandfathered irregular tags (RFC 5646 §2.2.8) are valid and are not

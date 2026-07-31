@@ -5,6 +5,9 @@
 
 use crate::errors::{DaslCidError, DecodeError};
 pub use cid::Cid as CidCore;
+/// CID version, re-exported alongside [`CidCore`] so callers can check it
+/// without taking their own dependency on the `cid` crate.
+pub use cid::Version as CidVersion;
 use serde::{Deserialize, Serialize, de, ser};
 use std::fmt;
 use std::str::FromStr;
