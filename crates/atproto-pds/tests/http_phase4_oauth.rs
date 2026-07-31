@@ -1220,3 +1220,227 @@ async fn an_app_password_session_is_not_scope_checked() {
         StatusCode::OK
     );
 }
+
+// ---------------------------------------------------------------------------
+//  F-OAUTH-17 — endpoints that accept an OAuth token, and those that do not.
+//
+//  Before this, every endpoint in `auth_handlers` verified an app-password
+//  session and nothing else, so a valid OAuth token was answered
+//  `expected typ at-pp-access, got at-oauth-access`. That is right for the
+//  endpoints the reference puts out of OAuth's reach and wrong for the five it
+//  does not — including `getSession`, which is the first call most clients make
+//  after authorizing.
+// ---------------------------------------------------------------------------
+
+/// GET an endpoint with a DPoP-bound OAuth token.
+async fn get_with_token(
+    app: &axum::Router,
+    key: &KeyData,
+    token: &str,
+    path: &str,
+) -> (StatusCode, Value) {
+    let (dpop, _, _) = request_dpop(key, "GET", &format!("http://test.example{path}"), token)
+        .expect("mint DPoP proof");
+    let request = Request::builder()
+        .uri(path)
+        .method("GET")
+        .header("authorization", format!("DPoP {token}"))
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+            .unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// POST an endpoint with a DPoP-bound OAuth token.
+async fn post_with_token(
+    app: &axum::Router,
+    key: &KeyData,
+    token: &str,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let (dpop, _, _) = request_dpop(key, "POST", &format!("http://test.example{path}"), token)
+        .expect("mint DPoP proof");
+    let request = Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("DPoP {token}"))
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+            .unwrap_or(Value::Null);
+    (status, body)
+}
+
+/// `getSession` takes any OAuth token. It is the first call most clients make,
+/// and refusing it made every token look broken at the first hop.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_accepts_an_oauth_token() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // Deliberately the narrowest scope there is: `atproto` alone grants no
+    // repo, blob or rpc access, and getSession must still work — the policy is
+    // "any token", not "a broadly scoped one".
+    let token = token_with_scope(&app, &key, "atproto").await;
+    let (status, body) =
+        get_with_token(&app, &key, &token, "/xrpc/com.atproto.server.getSession").await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "getSession refused an OAuth token: {body}"
+    );
+    assert_eq!(body["did"], "did:plc:alice");
+}
+
+/// `checkAccountStatus` likewise.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_account_status_accepts_an_oauth_token() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let token = token_with_scope(&app, &key, "atproto").await;
+    let (status, body) = get_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.server.checkAccountStatus",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "checkAccountStatus refused an OAuth token: {body}"
+    );
+}
+
+/// `signPlcOperation` needs `identity:*`, not merely a token.
+///
+/// The two halves matter together: a bare token is refused and a token holding
+/// the scope gets past authentication. Without the second, the test would pass
+/// against a handler that refused everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_plc_operation_requires_identity_all() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let path = "/xrpc/com.atproto.identity.signPlcOperation";
+
+    let bare = token_with_scope(&app, &key, "atproto").await;
+    let (status, body) = post_with_token(&app, &key, &bare, path, json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a bare token reached signPlcOperation: {body}"
+    );
+    assert_eq!(body["error"], "InsufficientScope");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("identity:*"),
+        "the refusal should name the scope that would work, got {body}"
+    );
+
+    // `identity:handle` is not enough either — a PLC operation can rewrite
+    // rotation keys, not just the handle.
+    let handle_only = token_with_scope(&app, &key, "atproto identity:handle").await;
+    let (status, body) = post_with_token(&app, &key, &handle_only, path, json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "identity:handle should not authorise a PLC operation: {body}"
+    );
+
+    // With `identity:*` the scope check passes; the request then fails on its
+    // own merits (no signing key reserved), which is a different error.
+    let full = token_with_scope(&app, &key, "atproto identity:*").await;
+    let (status, body) = post_with_token(&app, &key, &full, path, json!({})).await;
+    assert_ne!(
+        body["error"], "InsufficientScope",
+        "identity:* should satisfy the scope check, got {status} {body}"
+    );
+}
+
+/// `requestEmailConfirmation` needs `account:email?action=manage`.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_email_confirmation_requires_email_manage() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let path = "/xrpc/com.atproto.server.requestEmailConfirmation";
+
+    let bare = token_with_scope(&app, &key, "atproto").await;
+    let (status, body) = post_with_token(&app, &key, &bare, path, json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a bare token reached it: {body}"
+    );
+    assert_eq!(body["error"], "InsufficientScope");
+
+    let granted = token_with_scope(&app, &key, "atproto account:email?action=manage").await;
+    let (status, body) = post_with_token(&app, &key, &granted, path, json!({})).await;
+    assert_ne!(
+        body["error"], "InsufficientScope",
+        "account:email?action=manage should satisfy it, got {status} {body}"
+    );
+}
+
+/// The endpoints the reference puts out of OAuth's reach stay refused — and
+/// say so, rather than reporting a JWT `typ` mismatch that sends client
+/// authors looking for a bug in their token.
+#[tokio::test(flavor = "multi_thread")]
+async fn account_lifecycle_endpoints_refuse_oauth_and_say_why() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // The broadest scope obtainable, to show the refusal is categorical rather
+    // than a scope shortfall that a wider grant could fix.
+    let token = token_with_scope(&app, &key, "atproto transition:generic identity:*").await;
+
+    // Each body is valid for its endpoint. Axum runs body extraction before
+    // the handler runs, so a malformed body would be answered 400 without the
+    // auth check ever being reached — and the test would prove nothing.
+    for (path, body) in [
+        (
+            "/xrpc/com.atproto.server.createAppPassword",
+            json!({"name": "x"}),
+        ),
+        ("/xrpc/com.atproto.server.requestAccountDelete", json!({})),
+        (
+            "/xrpc/com.atproto.server.requestEmailUpdate",
+            json!({"email": "new@example.invalid"}),
+        ),
+        ("/xrpc/com.atproto.server.deactivateAccount", json!({})),
+    ] {
+        let (status, body) = post_with_token(&app, &key, &token, path, body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{path} should refuse OAuth: {body}"
+        );
+        assert_eq!(
+            body["message"], "OAuth credentials are not supported for this endpoint",
+            "{path} should say OAuth is not accepted, not leak the JWT typ"
+        );
+    }
+}

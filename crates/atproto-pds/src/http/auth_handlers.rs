@@ -14,9 +14,11 @@ use crate::account::{
     self, AccountState, CreateAccountParams, SessionTokens, app_password, invite, session,
 };
 use crate::errors::PdsError;
+use crate::http::auth::{authorization_token, request_htm_htu, require_authn};
 use crate::http::errors::XrpcError;
 use crate::http::extract::XrpcJson as Json;
 use crate::http::state::HttpState;
+use crate::oauth::token::{TYP_ACCESS as OAUTH_TYP_ACCESS, verify_oauth_jwt};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
@@ -489,10 +491,15 @@ pub async fn get_session(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Json<GetSessionResponse>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    // Always allowed for OAuth. The reference says as much in so many words
+    // (`authorize: () => { /* Always allowed */ }`); "email" access is
+    // decided in the handler, not here. This is the first call most
+    // clients make after authorizing, and refusing it made every OAuth
+    // token look broken at the first hop.
+    let did = require_session_or_oauth(&parts, &state, &OAuthScope::Any).await?;
     let directory = state.reader.accounts();
     let account = directory
-        .lookup_did(&claims.sub)
+        .lookup_did(&did)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
@@ -910,30 +917,31 @@ pub async fn check_account_status(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Json<CheckAccountStatusResponse>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    // Always allowed for OAuth, matching the reference. It reports the
+    // account's own state to the account's own client.
+    let did = require_session_or_oauth(&parts, &state, &OAuthScope::Any).await?;
     let manager = account_manager(&state)?;
     let directory = state.reader.accounts();
     let account = directory
-        .lookup_did(&claims.sub)
+        .lookup_did(&did)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
             XrpcError::new(
                 StatusCode::NOT_FOUND,
                 "AccountNotFound",
-                format!("no account {}", claims.sub),
+                format!("no account {}", did),
             )
         })?;
 
     // Per-actor counts (best-effort; on storage error we report 0 + log).
-    let store =
-        match crate::actor_store::sql::SqlActorStore::open(manager.data_dir(), &claims.sub).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(did = %claims.sub, error = ?e, "checkAccountStatus: open store");
-                None
-            }
-        };
+    let store = match crate::actor_store::sql::SqlActorStore::open(manager.data_dir(), &did).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(did = %did, error = ?e, "checkAccountStatus: open store");
+            None
+        }
+    };
 
     let (repo_commit, repo_rev, repo_blocks, indexed_records, expected_blobs, imported_blobs) =
         if let Some(store) = store.as_ref() {
@@ -980,7 +988,7 @@ pub async fn check_account_status(
     // Account-level state count: app passwords belong to the calling DID.
     // §5.4 — dispatches per backend; failure-open behavior
     // matches the historical `unwrap_or((0,))`.
-    let private_state_values = app_password::count_for_did(&manager.account_pool(), &claims.sub)
+    let private_state_values = app_password::count_for_did(&manager.account_pool(), &did)
         .await
         .unwrap_or(0);
 
@@ -1449,19 +1457,21 @@ pub async fn request_email_confirmation(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<axum::http::StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    // Sending mail to the address is managing it, not reading it, so
+    // `transition:email` (read-only) is not enough.
+    let did = require_session_or_oauth(&parts, &state, &OAuthScope::AccountEmailManage).await?;
     let manager = account_manager(&state)?;
 
     let directory = state.reader.accounts();
     let row = directory
-        .lookup_did(&claims.sub)
+        .lookup_did(&did)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
             XrpcError::new(
                 StatusCode::NOT_FOUND,
                 "AccountNotFound",
-                format!("no account {}", claims.sub),
+                format!("no account {}", did),
             )
         })?;
     if row.email_confirmed_at.is_some() {
@@ -1491,7 +1501,7 @@ pub async fn request_email_confirmation(
     crate::account::email_token::insert(
         &manager.account_pool(),
         &token,
-        &claims.sub,
+        &did,
         EMAIL_TOKEN_PURPOSE_CONFIRM,
         &expires_at,
         None,
@@ -1507,7 +1517,7 @@ pub async fn request_email_confirmation(
         .send(&to_email, "Confirm your email address", &body)
         .await
     {
-        tracing::warn!(error = ?e, did = %claims.sub, "email send failed; token still valid");
+        tracing::warn!(error = ?e, did = %did, "email send failed; token still valid");
     }
     Ok(axum::http::StatusCode::OK)
 }
@@ -1896,7 +1906,9 @@ pub async fn sign_plc_operation(
     parts: Parts,
     Json(input): Json<SignPlcOperationInput>,
 ) -> Result<Json<SignPlcOperationResponse>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    // `identity:*`, not `identity:handle`: a PLC operation can rewrite
+    // rotation keys and verification methods, not just the handle.
+    let did = require_session_or_oauth(&parts, &state, &OAuthScope::IdentityAll).await?;
     let manager = account_manager(&state)?;
 
     let token = input.token.as_deref().ok_or_else(|| {
@@ -1910,7 +1922,7 @@ pub async fn sign_plc_operation(
         &manager.account_pool(),
         token,
         crate::account::email_token::PURPOSE_PLC_OPERATION,
-        &claims.sub,
+        &did,
     )
     .await
     .map_err(XrpcError::from)?;
@@ -1921,7 +1933,7 @@ pub async fn sign_plc_operation(
     // means (e.g. an externally-held rotation key submitted directly to PLC).
     // §5.4 — dispatch helper picks the right SQL flavor.
     let rotation_key_ref = manager
-        .lookup_rotation_key_ref(&claims.sub)
+        .lookup_rotation_key_ref(&did)
         .await
         .map_err(|e| {
             XrpcError::new(
@@ -1963,7 +1975,7 @@ pub async fn sign_plc_operation(
                 format!("build http client: {e}"),
             )
         })?;
-    let log = atproto_identity::plc::fetch_audit_log(&http, plc.directory_hostname(), &claims.sub)
+    let log = atproto_identity::plc::fetch_audit_log(&http, plc.directory_hostname(), &did)
         .await
         .map_err(|e| {
             XrpcError::new(
@@ -2109,7 +2121,8 @@ pub async fn submit_plc_operation(
     parts: Parts,
     Json(input): Json<SubmitPlcOperationInput>,
 ) -> Result<axum::http::StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    // Same authority as signing — submitting is what makes it take effect.
+    let did = require_session_or_oauth(&parts, &state, &OAuthScope::IdentityAll).await?;
     let manager = account_manager(&state)?;
     let plc = state.plc_service.as_ref().ok_or_else(|| {
         XrpcError::new(
@@ -2130,14 +2143,14 @@ pub async fn submit_plc_operation(
     let account = state
         .reader
         .accounts()
-        .lookup_did(&claims.sub)
+        .lookup_did(&did)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
             XrpcError::new(StatusCode::NOT_FOUND, "AccountNotFound", "no such account")
         })?;
     let rotation_key_ref = manager
-        .lookup_rotation_key_ref(&claims.sub)
+        .lookup_rotation_key_ref(&did)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
@@ -2189,7 +2202,7 @@ pub async fn submit_plc_operation(
     )
     .map_err(XrpcError::from)?;
 
-    plc.submit_operation(&claims.sub, &signed)
+    plc.submit_operation(&did, &signed)
         .await
         .map_err(XrpcError::from)?;
 
@@ -2198,12 +2211,12 @@ pub async fn submit_plc_operation(
     // would report a completed change as an error.
     if let Err(e) = crate::http::identity_handlers::emit_identity_event(
         &manager.sequencer(),
-        &claims.sub,
+        &did,
         Some(&account.handle),
     )
     .await
     {
-        tracing::error!(did = %claims.sub, error = ?e, "failed to sequence #identity after submitPlcOperation");
+        tracing::error!(did = %did, error = ?e, "failed to sequence #identity after submitPlcOperation");
     }
     Ok(StatusCode::OK)
 }
@@ -2250,12 +2263,83 @@ fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
     })
 }
 
+/// Authenticate an endpoint that app-password sessions alone may reach.
+///
+/// Some account-lifecycle operations are deliberately outside what any OAuth
+/// client can do, however broadly scoped — minting app passwords, deleting
+/// the account, changing the email address. The reference refuses those with
+/// `ForbiddenError('OAuth credentials are not supported for this endpoint')`
+/// rather than by scope, and so does this.
+///
+/// The distinction is worth making in the error: a well-formed OAuth token is
+/// not a malformed session token, and reporting it as one sent client authors
+/// looking for a bug in their JWT.
 fn require_access_jwt(
     parts: &Parts,
     state: &HttpState,
 ) -> Result<account::SessionClaims, XrpcError> {
-    let raw = bearer_token(parts)?;
+    let (_, raw) = authorization_token(parts)?;
+
+    if let Ok(claims) = session::verify_access(raw, &state.jwt_secret) {
+        return Ok(claims);
+    }
+
+    // Name the actual situation when the caller presented a perfectly valid
+    // OAuth token at an endpoint that does not take one.
+    if verify_oauth_jwt(raw, OAUTH_TYP_ACCESS, &state.jwt_secret).is_ok() {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "OAuth credentials are not supported for this endpoint",
+        ));
+    }
+
     session::verify_access(raw, &state.jwt_secret).map_err(XrpcError::from)
+}
+
+/// What an OAuth token must carry to reach an endpoint that accepts one.
+///
+/// App-password sessions carry no scopes and are full-authority, so the
+/// policy applies to OAuth tokens only. Spelled out per endpoint rather than
+/// inferred, because "which scope does this need" is the question that has to
+/// be answered deliberately for each one.
+enum OAuthScope {
+    /// Any valid OAuth token. The endpoint exposes nothing a client holding
+    /// a token should not already be able to see.
+    Any,
+    /// `account:email?action=manage`.
+    AccountEmailManage,
+    /// `identity:*`.
+    IdentityAll,
+}
+
+/// Authenticate an endpoint that accepts an app-password session **or** an
+/// OAuth token satisfying `policy`, returning the subject DID.
+async fn require_session_or_oauth(
+    parts: &Parts,
+    state: &HttpState,
+    policy: &OAuthScope,
+) -> Result<String, XrpcError> {
+    let (htm, htu) = request_htm_htu(parts);
+    let subject = require_authn(parts, state, &htm, &htu).await?;
+
+    if subject.is_oauth() {
+        let scopes = subject.scopes();
+        let result = match policy {
+            OAuthScope::Any => Ok(()),
+            OAuthScope::AccountEmailManage => scopes.assert_account_email_manage(),
+            OAuthScope::IdentityAll => scopes.assert_identity_all(),
+        };
+        result.map_err(|missing| {
+            XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "InsufficientScope",
+                format!("this token does not grant {}", missing.scope),
+            )
+        })?;
+    }
+
+    Ok(subject.sub().to_string())
 }
 
 #[cfg(test)]

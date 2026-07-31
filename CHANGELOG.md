@@ -62,6 +62,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-pds`: fifteen endpoints in `auth_handlers` verified an app-password session and nothing
+  else, so a valid OAuth token was answered `expected typ at-pp-access, got at-oauth-access`. Five of
+  them should take one, per the reference's per-endpoint `authorize:` callback:
+
+  | endpoint | policy |
+  |---|---|
+  | `com.atproto.server.getSession` | any OAuth token |
+  | `com.atproto.server.checkAccountStatus` | any OAuth token |
+  | `com.atproto.server.requestEmailConfirmation` | `account:email?action=manage` |
+  | `com.atproto.identity.signPlcOperation` | `identity:*` |
+  | `com.atproto.identity.submitPlcOperation` | `identity:*` |
+
+  `getSession` mattered most: it is the first call most clients make after authorizing, so every
+  OAuth token appeared broken at the first hop even once the rest of the flow was correct.
+
+  `signPlcOperation` takes `identity:*` rather than `identity:handle` because a PLC operation can
+  rewrite rotation keys and verification methods, not only the handle.
+
+  The other ten are **correctly** closed to OAuth — the reference refuses them with
+  `ForbiddenError('OAuth credentials are not supported for this endpoint')` rather than by scope, and
+  no scope widens into them. Only the message changes: reporting a well-formed OAuth token as a
+  malformed session token sent client authors looking for a bug in their JWT.
+
 - `atproto-oauth`: `transition:generic` granted two things it must not. It is the legacy blanket
   scope every client still requests (`scope: 'atproto transition:generic'` in the reference's own
   README), so both were reachable by any client a user had ever authorized.

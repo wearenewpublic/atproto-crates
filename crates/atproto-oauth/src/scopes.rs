@@ -1251,6 +1251,68 @@ impl ScopesSet {
         }
     }
 
+    /// Returns `true` if `identity:*` was granted.
+    ///
+    /// Distinct from [`allows_identity_handle`](Self::allows_identity_handle):
+    /// signing or submitting a PLC operation can rewrite rotation keys and
+    /// verification methods, not just the handle, so `identity:handle` is not
+    /// enough. `transition:generic` confers nothing here — see
+    /// [`allows_identity_handle`](Self::allows_identity_handle).
+    pub fn allows_identity_all(&self) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| matches!(Scope::parse(scope), Ok(Scope::Identity(IdentityScope::All))))
+    }
+
+    /// Asserts that `identity:*` was granted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// `identity:*`.
+    pub fn assert_identity_all(&self) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_identity_all() {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new("identity:*"))
+        }
+    }
+
+    /// Returns `true` if some granted `account:` scope permits *managing* the
+    /// email address, as opposed to reading it.
+    ///
+    /// `transition:email` grants read only, matching the reference — it is the
+    /// legacy scope for surfacing the address, not for changing what it is or
+    /// triggering mail to it.
+    pub fn allows_account_email_manage(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(
+                Scope::parse(scope),
+                Ok(Scope::Account(AccountScope {
+                    resource: AccountResource::Email,
+                    action: AccountAction::Manage,
+                }))
+            )
+        })
+    }
+
+    /// Asserts that some granted `account:` scope permits managing the email
+    /// address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// `account:email?action=manage`.
+    pub fn assert_account_email_manage(&self) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_account_email_manage() {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(
+                "account:email?action=manage",
+            ))
+        }
+    }
+
     /// Returns `true` if some granted `identity:` scope permits changing the
     /// account handle.
     /// `transition:generic` deliberately does **not** satisfy this. The legacy
