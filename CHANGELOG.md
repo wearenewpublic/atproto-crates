@@ -87,6 +87,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_language` matched `^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{1,8})*$`, which is not
+  the BCP 47 grammar. It was wrong in both directions at once:
+
+  - **Refused valid tags.** Grandfathered irregular tags (RFC 5646 §2.2.8) such as `i-default` and
+    `i-navajo` have a one-letter primary subtag and are not produced by any grammar rule — they have
+    to be listed. Private-use-only tags (`X-fr-CH`) likewise never match, and the singleton is
+    case-insensitive per §2.1.1.
+  - **Accepted invalid ones.** Every subtag after the first was `[a-zA-Z0-9]{1,8}`, so subtags were
+    interchangeable when the grammar makes them positional: a 4-letter subtag is a script, a 2-letter
+    or 3-digit one is a region. Strings no consumer can interpret passed.
+
+  The RFC 5646 `Language-Tag` grammar is now used, ported from the reference, plus the rule that the
+  primary subtag is two or three **lowercase** letters. That second rule is what refuses `JA` and the
+  bare four-letter run `jaja`, both of which the grammar alone admits — §2.1.1 only *recommends*
+  lowercase, and the grammar reserves `[A-Za-z]{4}` for future use.
+
+  A repeated variant subtag (`de-DE-1901-1901`) is deliberately **accepted**: it is well-formed, and
+  the reference draws the line in the same place — `isValidLanguage` returns true and only
+  `parseLanguageString` returns null. This is the syntax check, so it answers the syntax question.
+
+  Closes 4 of the pinned cases. 523 of 536 now assert.
+
 - `atproto-lexicon`: `validate_cid` refused base58btc CIDs, which **both** reference implementations
   accept. A record carrying a `zdj7…` CID in a `format: cid` string field was rejected on write.
 
