@@ -62,6 +62,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-pds`: the `FutureCursor` refusal on `subscribeRepos` was sent in an `#info`-shaped frame
+  rather than an XRPC error frame, so a conforming client could not read it. An error frame carries
+  `op = -1`, **no** `t`, and a body of `{error, message}` — the error *name* is what a client switches
+  on. The frame sent instead carried `t: "#info"` and spelled the name `name`, which no client looks
+  for.
+
+  `encode_info` was the only frame helper available and conflated the two shapes: it emitted the error
+  opcode with an `#info` type tag and body. It is now what its name says — an `#info` **message**,
+  `op = 1`, which is what `OutdatedCursor` is: the stream continues after it. `FrameType.Message = 1`
+  and `FrameType.Error = -1`, and the reference yields `OutdatedCursor` through the ordinary message
+  path.
+
+  A new `encode_error` produces the error shape. Two tests pinned the old opcode — one unit, one
+  interop constant spelling the header bytes — and asserted the encoder's behaviour rather than the
+  wire contract; both now assert `op = 1` for `#info`, with new tests covering the error frame.
+
 - `atproto-repo` / `atproto-pds`: `#commit` frames carried only the blocks a commit wrote, not the
   Sync 1.1 covering proof, so an inductive consumer could not verify them. A consumer checks a frame
   from the previous root and the frame's blocks alone; to check an operation on a key it needs the

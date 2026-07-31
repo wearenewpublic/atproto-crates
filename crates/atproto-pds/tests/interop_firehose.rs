@@ -96,17 +96,24 @@ const COMMIT_HEADER_CBOR: &[u8] = &[
     0xa2, 0x61, 0x74, 0x67, 0x23, 0x63, 0x6f, 0x6d, 0x6d, 0x69, 0x74, 0x62, 0x6f, 0x70, 0x01,
 ];
 
-/// Canonical DAG-CBOR encoding of the `#info` frame header, `{op: -1, t: "#info"}`.
+/// Canonical DAG-CBOR encoding of the `#info` frame header, `{op: 1, t: "#info"}`.
+///
+/// `op` is 1, not -1: `#info` is a **message**, and the stream continues after
+/// it. `FrameType.Message = 1` and `FrameType.Error = -1`
+/// (`packages/xrpc-server/src/stream/types.ts:3-6`), and the reference yields
+/// `OutdatedCursor` through the ordinary message path
+/// (`subscribeRepos.ts:33-36`). This constant previously spelled `-1`, pinning
+/// the encoder's bug rather than the wire contract.
 ///
 /// ```text
 /// a2                    map(2)
 ///   61 74               text(1) "t"
 ///   65 23 69 6e 66 6f   text(5) "#info"
 ///   62 6f 70            text(2) "op"
-///   20                  negative(-1)
+///   01                  unsigned(1)
 /// ```
 const INFO_HEADER_CBOR: &[u8] = &[
-    0xa2, 0x61, 0x74, 0x65, 0x23, 0x69, 0x6e, 0x66, 0x6f, 0x62, 0x6f, 0x70, 0x20,
+    0xa2, 0x61, 0x74, 0x65, 0x23, 0x69, 0x6e, 0x66, 0x6f, 0x62, 0x6f, 0x70, 0x01,
 ];
 
 /// Required fields of `com.atproto.sync.subscribeRepos#commit`.
@@ -189,7 +196,7 @@ fn interop_info_header_bytes() {
     );
     assert!(
         frame.starts_with(INFO_HEADER_CBOR),
-        "info frame header is not the canonical DAG-CBOR of {{op: -1, t: \"#info\"}}\n  \
+        "info frame header is not the canonical DAG-CBOR of {{op: 1, t: \"#info\"}}\n  \
          expected prefix: {}\n  got frame start:  {}",
         hex::encode(INFO_HEADER_CBOR),
         hex::encode(&frame[..frame.len().min(INFO_HEADER_CBOR.len())])

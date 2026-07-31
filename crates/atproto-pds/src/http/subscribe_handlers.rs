@@ -21,7 +21,7 @@
 //! the `Accept: application/json` header. CBOR is the production default.
 
 use crate::http::state::HttpState;
-use crate::sequencer::frame::{Encoding, encode_event, encode_info};
+use crate::sequencer::frame::{Encoding, encode_error, encode_event};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -96,7 +96,8 @@ async fn run_subscriber(
     if let Some(requested) = params.cursor
         && requested > head.unwrap_or(0)
     {
-        let (bytes, is_text) = encode_info(
+        // An error frame, not an #info message: the subscription ends here.
+        let (bytes, is_text) = encode_error(
             encoding,
             "FutureCursor",
             "cursor is ahead of the stream head",

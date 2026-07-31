@@ -106,8 +106,17 @@ pub fn encode_event(
     }
 }
 
-/// Encode an `#info`-style error frame (`op = -1`). Used to send
-/// `OutdatedCursor` / `InternalError` notices.
+/// Encode an `#info` **message** frame. Used for `OutdatedCursor` notices.
+///
+/// `#info` is a message, not an error: the stream continues after it. The
+/// reference yields it through the ordinary message path
+/// (`subscribeRepos.ts:33-36`), so it carries `op = 1` and `t = "#info"`, and
+/// its body is `{name, message}`.
+///
+/// This previously emitted `op = -1` — the error opcode — while keeping the
+/// `#info` type tag and body. That frame is neither shape: a consumer matching
+/// on the opcode reads it as a fatal error and disconnects, and one matching on
+/// `t` finds a type tag the error frame is not supposed to carry.
 pub fn encode_info(encoding: Encoding, name: &str, message: &str) -> (Vec<u8>, bool) {
     match encoding {
         Encoding::Json => {
@@ -120,7 +129,7 @@ pub fn encode_info(encoding: Encoding, name: &str, message: &str) -> (Vec<u8>, b
         }
         Encoding::Cbor => {
             let header = FrameHeader {
-                op: -1,
+                op: 1,
                 t: "#info".to_string(),
             };
             let mut out = atproto_dasl::to_vec(&header).unwrap_or_default();
@@ -128,6 +137,32 @@ pub fn encode_info(encoding: Encoding, name: &str, message: &str) -> (Vec<u8>, b
                 "name": name,
                 "message": message,
             });
+            if let Ok(body_bytes) = atproto_dasl::to_vec(&body) {
+                out.extend_from_slice(&body_bytes);
+            }
+            (out, false)
+        }
+    }
+}
+
+/// Encode an XRPC error frame (`op = -1`).
+///
+/// The shape is fixed by the XRPC stream contract: the header carries the
+/// opcode and **no** `t`, and the body is `{error, message}` — the error name is
+/// what a client switches on (`packages/xrpc-server/src/stream/types.ts:14-20`).
+/// An error frame terminates the subscription.
+pub fn encode_error(encoding: Encoding, error: &str, message: &str) -> (Vec<u8>, bool) {
+    match encoding {
+        Encoding::Json => {
+            let frame = serde_json::json!({ "error": error, "message": message });
+            (frame.to_string().into_bytes(), true)
+        }
+        Encoding::Cbor => {
+            // `FrameHeader` always serializes `t`, which an error frame must not
+            // carry, so the header is built directly here.
+            let header = serde_json::json!({ "op": -1 });
+            let mut out = atproto_dasl::to_vec(&header).unwrap_or_default();
+            let body = serde_json::json!({ "error": error, "message": message });
             if let Ok(body_bytes) = atproto_dasl::to_vec(&body) {
                 out.extend_from_slice(&body_bytes);
             }
@@ -264,12 +299,19 @@ mod tests {
         assert!(!body.contains_key("payload"), "{body:?}");
     }
 
+    /// `#info` is a message frame, so `op = 1`.
+    ///
+    /// This test previously asserted `op = -1`, pinning the bug rather than the
+    /// contract: `FrameType.Message = 1` and `FrameType.Error = -1`
+    /// (`packages/xrpc-server/src/stream/types.ts:3-6`), and the reference
+    /// yields `OutdatedCursor` through the ordinary message path
+    /// (`subscribeRepos.ts:33-36`) because the stream continues after it.
     #[test]
-    fn cbor_info_frame_uses_op_minus_one() {
+    fn cbor_info_frame_is_a_message_frame() {
         let (bytes, is_text) = encode_info(Encoding::Cbor, "OutdatedCursor", "see ya");
         assert!(!is_text);
         let expected_header = FrameHeader {
-            op: -1,
+            op: 1,
             t: "#info".to_string(),
         };
         let header_bytes = atproto_dasl::to_vec(&expected_header).unwrap();
@@ -278,5 +320,44 @@ mod tests {
         let body: serde_json::Value = atproto_dasl::from_slice(body_bytes).unwrap();
         assert_eq!(body["name"], "OutdatedCursor");
         assert_eq!(body["message"], "see ya");
+    }
+
+    /// An error frame carries `op = -1`, no `t`, and `{error, message}`.
+    ///
+    /// The error *name* is what a client switches on, so a frame that spells it
+    /// `name` — as the `#info` body does — is unreadable to a conforming client
+    /// even though it looks similar.
+    #[test]
+    fn cbor_error_frame_has_no_type_tag_and_names_the_error() {
+        let (bytes, is_text) = encode_error(Encoding::Cbor, "FutureCursor", "too far");
+        assert!(!is_text);
+
+        // A frame is two concatenated CBOR objects, so each is decoded from its
+        // own slice rather than the buffer as a whole.
+        let header_bytes = atproto_dasl::to_vec(&serde_json::json!({ "op": -1 })).unwrap();
+        assert!(
+            bytes.starts_with(&header_bytes),
+            "error frame header should be exactly {{op: -1}}"
+        );
+        let header: serde_json::Value = atproto_dasl::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["op"], -1, "error frames use the error opcode");
+        assert!(
+            header.get("t").is_none(),
+            "an error frame must not carry a type tag: {header}"
+        );
+
+        let body: serde_json::Value =
+            atproto_dasl::from_slice(&bytes[header_bytes.len()..]).unwrap();
+        assert_eq!(body["error"], "FutureCursor");
+        assert_eq!(body["message"], "too far");
+    }
+
+    #[test]
+    fn json_error_frame_names_the_error() {
+        let (bytes, is_text) = encode_error(Encoding::Json, "FutureCursor", "too far");
+        assert!(is_text);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"], "FutureCursor");
+        assert!(value.get("t").is_none());
     }
 }
