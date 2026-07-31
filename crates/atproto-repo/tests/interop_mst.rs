@@ -150,6 +150,58 @@ fn interop_key_heights() {
     );
 }
 
+/// `mst/example_keys.txt` carries its oracle inside each key.
+///
+/// The second character of every line is that key's expected MST height:
+/// `R2/359107` is height 2. That is not a coincidence of the sample — it is
+/// how the file was generated, and indigo reads it the same way
+/// (`atproto/repo/mst/util_interop_test.go`, `TestExampleKeyHeights`), with
+/// `HeightForKey("R2/359107") == 2` also asserted literally a few lines above
+/// as a cross-check.
+///
+/// 156 keys, which is an order of magnitude more than `key_heights.json`
+/// carries, and drawn across the whole height range rather than chosen to
+/// illustrate it.
+#[test]
+fn interop_example_key_heights() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/interop")
+        .join("mst/example_keys.txt");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for line in raw.lines() {
+        // indigo's filter, matched exactly: comments and anything too short to
+        // carry a height digit.
+        if line.len() < 3 || line.starts_with('#') {
+            continue;
+        }
+        let expected: u32 = line[1..2]
+            .parse()
+            .unwrap_or_else(|_| panic!("key {line:?} has no height digit in position 1"));
+        let actual = key_height(line);
+        checked += 1;
+        if actual != expected {
+            failures.push(format!(
+                "key {line:?}: expected height {expected}, got {actual}"
+            ));
+        }
+    }
+
+    assert_eq!(
+        checked, 156,
+        "expected 156 example keys; a corpus bump changed the count"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} example-key heights failed:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
 #[test]
 fn interop_common_prefix_len() {
     let vectors: Vec<CommonPrefixVector> = load("mst/common_prefix.json");

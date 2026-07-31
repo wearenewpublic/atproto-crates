@@ -24,6 +24,22 @@ use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Vectors this crate does not yet satisfy, each mapped to the finding that
+/// explains it. Empty: all twelve pass.
+///
+/// Declared even though nothing in Rust reads it. The conformance harness
+/// parses this table out of every `interop_*.rs` file, and a harness with no
+/// table cannot be told apart from one whose table the parser failed on — so
+/// the empty table is the statement that there is nothing pinned here.
+///
+/// Not asserted in a test: `KNOWN_FAILURES.is_empty()` on a `const` is true by
+/// construction and would only look like a check.
+#[allow(
+    dead_code,
+    reason = "read by the external conformance harness, not by Rust"
+)]
+const KNOWN_FAILURES: &[(&str, &str)] = &[];
+
 /// Read and deserialize a vendored interop vector file.
 fn load<T: for<'de> Deserialize<'de>>(relative: &str) -> T {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -137,6 +137,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   else in this workspace enforces it: `include:` scopes parse but are never resolved into concrete
   permissions.
 
+### Added
+- `atproto-repo`: `mst/example_keys.txt` is now asserted — 156 keys, the last unconsumed file in the
+  vendored corpus. **Every vendored vector file now reaches a harness.**
+
+  The file had been described, here and in the corpus README, as carrying no expected answers and
+  being tree-building input only. That was wrong: the **second character of each key is its expected
+  MST height** — `R2/359107` is height 2 — which is how indigo reads it (`TestExampleKeyHeights`),
+  with `HeightForKey("R2/359107") == 2` also asserted literally as a cross-check. The oracle is
+  inside the data rather than beside it, which is easy to miss, and was missed.
+
+  It is an order of magnitude more coverage than `key_heights.json`, and drawn across the whole
+  height range rather than chosen to illustrate it. Confirmed load-bearing: stubbing `key_height` to
+  return 0 fails 130 of the 156.
+
+  `interop_crypto.rs` gains an empty `KNOWN_FAILURES` table. Nothing in Rust reads it — the
+  conformance harness parses it out of every `interop_*.rs`, and a harness with no table cannot be
+  told apart from one whose table the parser failed on.
+
 ### Fixed
 - `atproto-lexicon`: `ref`, `union` and `params` were accepted as top-level definitions. None is a
   definition type — each describes how a field relates to something else, so none says anything
