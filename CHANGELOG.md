@@ -110,6 +110,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against `publicKeyDid` with `expect(uint8arrays.equals(a, b))` and no matcher attached, so it
   passes whatever the comparison returns. It is a real assertion here.
 
+### Added
+- `atproto-lexicon`: `tests/interop_lexicon.rs` runs the vendored lexicon corpus — 68 cases across 9
+  files — against record validation and schema parsing. **63 pass; 5 are pinned in
+  `KNOWN_FAILURES`**, each a real disagreement rather than a corpus quirk.
+
+  | case | disagreement |
+  |---|---|
+  | `record-data-valid: full` | `$bytes` is base64 **without** padding; decoded with the padded `STANDARD` engine |
+  | `record-data-invalid: open union missing $type` | an open-union member with no `$type` is accepted |
+  | `lexicon-invalid: defined unknown` | a top-level def of type `unknown` is accepted |
+  | `lexicon-invalid: defined ref` | a top-level def of type `ref` is accepted |
+  | `lexicon-valid: basic permission-set` | namespace authority enforced at schema-parse time |
+
+  The `$bytes` one has an edge inside the workspace. `atproto-dasl` — which passes the data-model
+  corpus — **encodes** `$bytes` with `STANDARD_NO_PAD` and decodes either form. So this crate refuses
+  exactly what that one emits, and a record that round-trips through the data model fails lexicon
+  validation. Two crates spelling one rule differently, the same shape as the TID first-character
+  bug.
+
+  The permission-set case is a design question rather than a defect, and is written up in the test
+  that pins it. The Namespace Authority rule is real, but the reference checks nothing of the kind
+  when parsing a lexicon document — its `lexPermissionSet` has no namespace logic at all — and the
+  document in question is in the corpus's own catalog. Authority is a question about whether a grant
+  may be *made*, not about whether a document is well-formed. It is left enforced because nothing
+  else in this workspace enforces it: `include:` scopes parse but are never resolved into concrete
+  permissions.
+
 ### Fixed
 - `atproto-lexicon`: `validate_datetime` accepted `-00:00` as a UTC offset and checked the year
   before the offset was applied.
