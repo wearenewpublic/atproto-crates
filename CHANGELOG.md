@@ -138,6 +138,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permissions.
 
 ### Fixed
+- `atproto-lexicon`: the Namespace Authority rule for permission sets had a hole shaped like its
+  recursive case. `include` — the spec's "meta" resource, which pulls in another permission set —
+  was not a recognised resource at all, so a set referencing another set was refused outright, and
+  the rule that should bind it was never written.
+
+  That is the resource the rule most needs. An `include` grant is **transitive**: whatever the
+  referenced set contains is inherited. A set naming one under an unrelated authority would inherit
+  permissions its own namespace does not cover, and the rule would be gone in one hop. `include` is
+  now modelled (`nsid`, plus `aud`) and bound by the same check as `repo` collections, `rpc` methods
+  and `space` types.
+
+  Wildcards inside a permission set are now refused *as wildcards*. They were already refused —
+  `*` is not a valid NSID — but reported as a malformed NSID, which sends a reader looking for a typo
+  instead of at the rule. The spec is explicit: "Wildcards are not supported in permissions within a
+  permission set." Partial wildcards (`app.example.*`) are refused too.
+
+  The dispatch no longer falls through on unrecognised resources. `PERMISSION_RESOURCES` is now
+  paired with `PERMISSION_RESOURCES_WITHOUT_NSIDS`, and a test asserts every resource is either
+  namespace-checked or explicitly listed as naming no NSID. Adding a resource without deciding which
+  it is now fails a test rather than silently exempting it.
+
+  **No exceptions were added.** The spec computes authority "without \"siblings\" or special
+  namespaces", and its own worked example — now a test, verbatim — needs none. The exemption list is
+  three resources that carry no NSID (`blob`, `identity`, `account`), which is a statement about
+  their shape, not a carve-out for any name.
+
 - `atproto-lexicon`: `validate_datetime` accepted `-00:00` as a UTC offset and checked the year
   before the offset was applied.
 

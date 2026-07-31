@@ -522,6 +522,39 @@ pub enum DataValidationError {
         namespace: String,
     },
 
+    /// A permission set uses a wildcard where a concrete NSID is required.
+    ///
+    /// Wildcards are legal in an OAuth scope *string*, where the user is
+    /// granting them directly. Inside a permission set they are not: the set
+    /// is published under one authority and read by everyone, so a wildcard
+    /// would let it grant what its namespace does not cover.
+    #[error(
+        "error-atproto-lexicon-data-validation-91 Wildcard '{value}' is not allowed in a permission set ({resource} permission); name a concrete NSID"
+    )]
+    PermissionWildcardInSet {
+        /// The resource type the wildcard appeared under.
+        resource: String,
+        /// The wildcard value as written.
+        value: String,
+    },
+
+    /// An `include` permission is missing its `nsid` parameter.
+    #[error(
+        "error-atproto-lexicon-data-validation-92 Permission with resource 'include' requires an 'nsid' naming the permission set to include"
+    )]
+    PermissionMissingNsid,
+
+    /// An `include` permission names an NSID that is not syntactically valid.
+    #[error(
+        "error-atproto-lexicon-data-validation-93 Permission include NSID '{nsid}' is not a valid NSID: {reason}"
+    )]
+    PermissionInvalidIncludeNsid {
+        /// The offending NSID.
+        nsid: String,
+        /// Description of why the NSID is invalid.
+        reason: String,
+    },
+
     /// A space definition has a `name` whose length is outside the 1..=64 range.
     #[error(
         "error-atproto-lexicon-data-validation-56 Space name length out of range: expected 1..=64, got {length}"

@@ -70,7 +70,7 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
     (
         "lexicon/lexicon-valid.json",
         "basic permission-set",
-        "namespace authority enforced at parse time",
+        "grants across authorities; refused by the Namespace Authority rule",
     ),
 ];
 
@@ -186,20 +186,20 @@ fn interop_lexicon_catalog_parses() {
 /// The one catalog schema this crate refuses, and exactly why.
 ///
 /// `permission-set.json` grants over `com.example.calendar.*` while living at
-/// `example.lexicon.permissionset`, and `SchemaFile::parse` enforces the
-/// Namespace Authority rule — a permission set may only name NSIDs under its
-/// own authority — at parse time.
+/// `example.lexicon.permissionset`. That crosses to an unrelated authority,
+/// which the [Namespace Authority](https://atproto.com/specs/permission#namespace-authority)
+/// rule forbids: a set may address its own NSID group and children, never
+/// siblings or parents.
 ///
-/// The rule is real. Enforcing it *here* is what the corpus disagrees with:
-/// the reference's `lexPermissionSet` schema does no namespace check at all,
-/// and this document is in the corpus's own catalog and in its `valid` file.
-/// Authority is a question about whether a grant may be *made*, not about
-/// whether a document is well-formed, and this workspace has no other place
-/// that asks it — `include:` scopes parse but are never resolved into
-/// concrete permissions.
+/// So the vector is not conformant, and the refusal is correct. The
+/// reference's `lexPermissionSet` schema does no namespace check at all —
+/// its Zod type accepts any `resource` with arbitrary fields — so the corpus
+/// records what that parser accepts rather than what the specification
+/// permits, and the two differ here.
 ///
-/// Pinned rather than removed: deleting the check would drop the only
-/// enforcement that exists.
+/// Pinned rather than "fixed": there is nothing to fix. The rule is enforced
+/// deliberately, and the spec is explicit that it admits no exceptions —
+/// authority is computed "without \"siblings\" or special namespaces".
 #[test]
 fn permission_set_namespace_authority_is_enforced_at_parse_time() {
     let (_, failed) = catalog_with_failures();

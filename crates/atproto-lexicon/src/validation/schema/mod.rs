@@ -342,10 +342,44 @@ pub struct Permission {
     /// wildcard to match any space key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skey: Option<String>,
+
+    /// The permission set NSID an `include` permission references.
+    ///
+    /// `include` is the spec's "meta" resource: it pulls in another
+    /// permission set. The NSID is the resource's positional parameter — the
+    /// string form is `include:<nsid>[?aud=<did>]` — and it is subject to the
+    /// same Namespace Authority rule as every other named resource. That
+    /// matters more here than anywhere else: without it a set could name a
+    /// set under another authority and inherit permissions its own namespace
+    /// does not cover, which is the rule's whole purpose defeated in one hop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsid: Option<String>,
+
+    /// Audience DID for `include` and `rpc` permissions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
 }
 
-/// Valid resource types for permissions
-pub const PERMISSION_RESOURCES: &[&str] = &["repo", "rpc", "blob", "identity", "account", "space"];
+/// Valid resource types for permissions.
+///
+/// Every entry is either checked by a validator that applies the Namespace
+/// Authority rule, or listed in [`PERMISSION_RESOURCES_WITHOUT_NSIDS`] because
+/// it names no NSID. `permission_resources_are_all_accounted_for` asserts the
+/// two sets cover this one, so a resource added here cannot silently skip the
+/// rule.
+pub const PERMISSION_RESOURCES: &[&str] = &[
+    "repo", "rpc", "blob", "identity", "account", "space", "include",
+];
+
+/// Resources that name no NSID, and so have nothing for the Namespace
+/// Authority rule to constrain.
+///
+/// This is the complete list of exemptions, and it is a list of *shapes*
+/// rather than of special cases: `blob` is parameterised by MIME type,
+/// `identity` and `account` by an attribute name. The spec is explicit that
+/// authority works "without 'siblings' or special namespaces", so there are no
+/// exempted NSIDs — only resources that have none.
+pub const PERMISSION_RESOURCES_WITHOUT_NSIDS: &[&str] = &["blob", "identity", "account"];
 
 /// Valid actions for repo permissions
 pub const REPO_ACTIONS: &[&str] = &["create", "update", "delete"];

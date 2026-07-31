@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::validation::data_errors::DataValidationError;
 use crate::validation::schema::{
-    PERMISSION_RESOURCES, Permission, PermissionSetSchema, REPO_ACTIONS, SchemaDef, SpaceSchema,
+    PERMISSION_RESOURCES, PERMISSION_RESOURCES_WITHOUT_NSIDS, Permission, PermissionSetSchema,
+    REPO_ACTIONS, SchemaDef, SpaceSchema,
 };
 use crate::validation::syntax::validate_nsid;
 
@@ -209,8 +210,77 @@ fn validate_permission(
         "space" => {
             validate_space_permission(permission, namespace)?;
         }
-        _ => {}
+        "include" => {
+            validate_include_permission(permission, namespace)?;
+        }
+        // Only resources that name no NSID reach here, and they are named
+        // rather than defaulted: `PERMISSION_RESOURCES_WITHOUT_NSIDS` is
+        // asserted to be exactly this set, so adding a resource without
+        // deciding how the Namespace Authority rule applies to it fails a
+        // test instead of silently exempting it.
+        other => debug_assert!(
+            PERMISSION_RESOURCES_WITHOUT_NSIDS.contains(&other),
+            "permission resource {other:?} names no validator and is not listed as NSID-free"
+        ),
     }
+    Ok(())
+}
+
+/// Refuse a wildcard where a permission set requires a concrete NSID.
+///
+/// `*` is legal in an OAuth scope *string* — there the user is granting it
+/// directly and can see what they are granting. A permission set is published
+/// under one authority and read by everyone, so a wildcard inside one would
+/// grant beyond that authority, which is precisely what the Namespace
+/// Authority rule exists to prevent. The spec says so outright: "Wildcards are
+/// not supported in permissions within a permission set."
+///
+/// Checked before the NSID syntax check so `*` is reported as a wildcard
+/// rather than as a malformed NSID, which is a different problem with a
+/// different fix.
+fn reject_wildcard(value: &str, resource: &str) -> Result<(), DataValidationError> {
+    if value == "*" || value.contains('*') {
+        return Err(DataValidationError::PermissionWildcardInSet {
+            resource: resource.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate an `include` permission entry.
+///
+/// `include` references another permission set, and is the one resource whose
+/// grant is *transitive*: whatever the referenced set contains is inherited.
+/// The Namespace Authority rule therefore matters more here than anywhere
+/// else. Without it, a set could name a set under an unrelated authority and
+/// inherit permissions its own namespace does not cover — one hop, and the
+/// rule is gone.
+fn validate_include_permission(
+    permission: &Permission,
+    namespace: &str,
+) -> Result<(), DataValidationError> {
+    let nsid = permission
+        .nsid
+        .as_ref()
+        .ok_or(DataValidationError::PermissionMissingNsid)?;
+
+    reject_wildcard(nsid, "include")?;
+
+    if let Err(e) = validate_nsid(nsid) {
+        return Err(DataValidationError::PermissionInvalidIncludeNsid {
+            nsid: nsid.clone(),
+            reason: e.to_string(),
+        });
+    }
+
+    if !nsid_in_namespace(nsid, namespace) {
+        return Err(DataValidationError::PermissionNsidOutsideNamespace {
+            nsid: nsid.clone(),
+            namespace: namespace.to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -287,6 +357,7 @@ fn validate_repo_permission(
         return Err(DataValidationError::PermissionEmptyCollection);
     }
     for nsid in collection {
+        reject_wildcard(nsid, "repo")?;
         if let Err(e) = validate_nsid(nsid) {
             return Err(DataValidationError::PermissionInvalidCollectionNsid {
                 nsid: nsid.clone(),
@@ -315,6 +386,7 @@ fn validate_rpc_permission(
         return Err(DataValidationError::PermissionEmptyLxm);
     }
     for nsid in lxm {
+        reject_wildcard(nsid, "rpc")?;
         if let Err(e) = validate_nsid(nsid) {
             return Err(DataValidationError::PermissionInvalidLxmNsid {
                 nsid: nsid.clone(),
@@ -921,5 +993,141 @@ mod tests {
         // authority than the space and the permission set (spec line 465).
         let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "com.example.lexicon.group", "collection": ["org.other.note"], "action": ["read", "create"]}]}}}"#;
         assert!(SchemaFile::parse(json).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod namespace_authority {
+    use super::*;
+    use crate::validation::schema::{PERMISSION_RESOURCES, PERMISSION_RESOURCES_WITHOUT_NSIDS};
+
+    fn permission_set(id: &str, permissions: &str) -> Result<SchemaFile, DataValidationError> {
+        SchemaFile::parse(&format!(
+            r#"{{"lexicon":1,"id":"{id}","defs":{{"main":{{"type":"permission-set",
+               "title":"t","detail":"d","permissions":[{permissions}]}}}}}}"#
+        ))
+    }
+
+    fn repo(collection: &str) -> String {
+        format!(r#"{{"type":"permission","resource":"repo","collection":["{collection}"]}}"#)
+    }
+
+    fn rpc(lxm: &str) -> String {
+        format!(r#"{{"type":"permission","resource":"rpc","lxm":["{lxm}"]}}"#)
+    }
+
+    fn include(nsid: &str) -> String {
+        format!(r#"{{"type":"permission","resource":"include","nsid":"{nsid}"}}"#)
+    }
+
+    /// The worked example from the specification, verbatim.
+    ///
+    /// > the set `app.example.feed.authOnlyPost` could include permissions to
+    /// > `app.example.feed.post` records and making `app.example.feed.getPostThread`
+    /// > API endpoint requests to remote services. But it could not grant
+    /// > permissions to `app.example.actor.profile`. A permission set
+    /// > `app.example.authFull`, which is a level up in the hierarchy, could
+    /// > include permissions to all these resources, or even further down.
+    #[test]
+    fn the_specs_worked_example() {
+        let post = "app.example.feed.authOnlyPost";
+        let full = "app.example.authFull";
+
+        assert!(permission_set(post, &repo("app.example.feed.post")).is_ok());
+        assert!(permission_set(post, &rpc("app.example.feed.getPostThread")).is_ok());
+        assert!(
+            permission_set(post, &repo("app.example.actor.profile")).is_err(),
+            "a sibling group must not be reachable"
+        );
+
+        assert!(permission_set(full, &repo("app.example.feed.post")).is_ok());
+        assert!(permission_set(full, &repo("app.example.actor.profile")).is_ok());
+        assert!(permission_set(full, &rpc("app.example.feed.getPostThread")).is_ok());
+    }
+
+    /// Authority runs downward only: children yes, parents and siblings no.
+    #[test]
+    fn parents_and_siblings_are_refused_children_are_not() {
+        let set = "app.example.feed.authOnlyPost";
+        // Same group.
+        assert!(permission_set(set, &repo("app.example.feed.post")).is_ok());
+        // Children, recursively deep.
+        assert!(permission_set(set, &repo("app.example.feed.thread.reply")).is_ok());
+        // A parent.
+        assert!(permission_set(set, &repo("app.example.post")).is_err());
+        // An unrelated authority.
+        assert!(permission_set(set, &repo("com.other.thing")).is_err());
+        // A name that merely shares a prefix without a segment boundary — the
+        // check must not be a bare `starts_with`.
+        assert!(permission_set(set, &repo("app.examplefeed.post")).is_err());
+    }
+
+    /// `include` is transitive, so the rule binds it too.
+    ///
+    /// This is the case the rule most needs: a set that could name a set under
+    /// another authority would inherit permissions its own namespace does not
+    /// cover, in one hop.
+    #[test]
+    fn include_is_bound_by_the_same_rule() {
+        let set = "app.example.authFull";
+        assert!(permission_set(set, &include("app.example.feed.authOnlyPost")).is_ok());
+        assert!(
+            permission_set(set, &include("com.other.authFull")).is_err(),
+            "including a set under another authority would inherit its permissions"
+        );
+        assert!(
+            permission_set(set, r#"{"type":"permission","resource":"include"}"#).is_err(),
+            "include without an nsid names nothing"
+        );
+    }
+
+    /// Wildcards are refused, and reported as wildcards.
+    ///
+    /// The refusal already happened — `*` is not a valid NSID — but it was
+    /// reported as a malformed NSID, which sends a reader looking for a typo
+    /// instead of at the rule.
+    #[test]
+    fn wildcards_are_refused_by_name() {
+        let set = "app.example.feed.authOnlyPost";
+        for (permission, resource) in [
+            (repo("*"), "repo"),
+            (rpc("*"), "rpc"),
+            (include("*"), "include"),
+            (repo("app.example.*"), "repo"),
+        ] {
+            let err = permission_set(set, &permission).unwrap_err();
+            let DataValidationError::PermissionWildcardInSet { resource: got, .. } = &err else {
+                panic!("expected a wildcard refusal for {resource}, got {err:?}");
+            };
+            assert_eq!(got, resource);
+        }
+    }
+
+    /// Every resource is either checked or explicitly exempt.
+    ///
+    /// The exemptions are resources that name no NSID at all, not NSIDs that
+    /// are allowed to escape: the spec says authority works "without
+    /// 'siblings' or special namespaces", so there is no such thing as an
+    /// exempt name. Adding a resource without deciding which side it falls on
+    /// fails here.
+    #[test]
+    fn permission_resources_are_all_accounted_for() {
+        let checked = ["repo", "rpc", "space", "include"];
+        for resource in PERMISSION_RESOURCES {
+            assert!(
+                checked.contains(resource) || PERMISSION_RESOURCES_WITHOUT_NSIDS.contains(resource),
+                "resource {resource:?} is neither namespace-checked nor listed as NSID-free"
+            );
+        }
+        for resource in PERMISSION_RESOURCES_WITHOUT_NSIDS {
+            assert!(
+                PERMISSION_RESOURCES.contains(resource),
+                "{resource:?} is listed as NSID-free but is not a valid resource"
+            );
+            assert!(
+                !checked.contains(resource),
+                "{resource:?} cannot be both checked and exempt"
+            );
+        }
     }
 }
