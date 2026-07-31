@@ -138,6 +138,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permissions.
 
 ### Fixed
+- `atproto-lexicon` / `atproto-dasl`: a `$bytes` value meant two different things in one workspace.
+
+  `atproto-lexicon` decoded with the padded `STANDARD` engine while `atproto-dasl` emits **unpadded**
+  — so a record written through the data model failed lexicon validation. Both also rejected
+  non-canonical trailing bits, which the reference accepts: `{"$bytes": "123"}` decodes to two bytes
+  in JavaScript and is listed as a **valid** record in the interop corpus.
+
+  There is now one decoder. `atproto_dasl::atproto_json::decode_bytes` is the `$bytes` codec —
+  standard alphabet, padding optional, trailing bits tolerated — and `atproto-lexicon` delegates to
+  it. Encoding is unchanged and still canonical and unpadded, so nothing this workspace *emits*
+  depends on the tolerance; the leniency applies only to what it is willing to *read*, which is where
+  a validator stricter than the network does damage.
+
+  Two decoders that had to agree and nothing making them was the actual defect. The padding half was
+  caught by the lexicon interop corpus; the trailing-bits half was not caught by either crate's
+  corpus, because every `$bytes` value in the data-model vectors happens to be canonical.
+
 - `atproto-lexicon`: the Namespace Authority rule for permission sets had a hole shaped like its
   recursive case. `include` — the spec's "meta" resource, which pulls in another permission set —
   was not a recognised resource at all, so a set referencing another set was refused outright, and

@@ -77,10 +77,19 @@ impl Bytes {
         }
     }
 
-    /// Decode the base64 bytes
-    pub fn decode(&self) -> Result<Vec<u8>, base64::DecodeError> {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.decode(&self.bytes)
+    /// Decode the base64 bytes.
+    ///
+    /// Delegates to `atproto_dasl::atproto_json::decode_bytes` so that a
+    /// `$bytes` value means one thing across the workspace. It did not
+    /// before: this decoder required padding while the data-model layer emits
+    /// unpadded, so a record written through the data model failed lexicon
+    /// validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`atproto_dasl::EncodeError`] when the value is not base64.
+    pub fn decode(&self) -> Result<Vec<u8>, atproto_dasl::EncodeError> {
+        atproto_dasl::atproto_json::decode_bytes(&self.bytes)
     }
 
     /// Get the length of decoded bytes
@@ -340,6 +349,40 @@ mod tests {
         let decoded = bytes.decode().unwrap();
         assert_eq!(decoded, b"Hello World");
         assert_eq!(bytes.decoded_len(), Some(11));
+    }
+
+    /// `$bytes` is unpadded base64, and the padded form is accepted too.
+    ///
+    /// The unpadded case is not academic: `atproto-dasl` emits it, and the
+    /// data-model interop vectors are 43-character unpadded values. Decoding
+    /// with the padded engine alone meant this crate refused records the rest
+    /// of the workspace produces.
+    #[test]
+    fn bytes_decode_unpadded_and_padded_base64() {
+        // 3 characters is a valid unpadded encoding of 2 bytes.
+        assert_eq!(Bytes::new("123").decoded_len(), Some(2));
+        // A 43-character value, the shape the data-model vectors carry.
+        let vector = "iE+sPoHobU9tSIqGI+309LLCcWQIRmEXwxcoDt19tas";
+        assert_eq!(vector.len(), 43);
+        assert_eq!(Bytes::new(vector).decoded_len(), Some(32));
+        // The padded spelling of the same bytes still decodes.
+        assert_eq!(Bytes::new("aGk=").decoded_len(), Some(2));
+        assert_eq!(Bytes::new("aGk").decoded_len(), Some(2));
+        assert_eq!(
+            Bytes::new("aGk=").decode().unwrap(),
+            Bytes::new("aGk").decode().unwrap()
+        );
+    }
+
+    /// Widening the accepted padding did not make the decoder accept anything.
+    #[test]
+    fn bytes_reject_values_that_decode_under_neither_alphabet() {
+        for value in ["!!!!", "a", "abcde!", "_-_-"] {
+            assert!(
+                Bytes::new(value).decoded_len().is_none(),
+                "should not decode: {value:?}"
+            );
+        }
     }
 
     #[test]

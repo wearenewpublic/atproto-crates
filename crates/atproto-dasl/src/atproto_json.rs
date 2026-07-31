@@ -183,16 +183,50 @@ fn number_to_ipld(number: &serde_json::Number) -> Result<Ipld, EncodeError> {
 
 /// Decode the base64 body of a `$bytes` object.
 ///
-/// Accepts the unpadded standard alphabet the specification uses, and tolerates
-/// padding, since encoders differ on whether to emit it.
-fn decode_base64(text: &str) -> Result<Vec<u8>, EncodeError> {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+/// The `$bytes` decoder, shared so that every layer agrees on what a `$bytes`
+/// value is.
+///
+/// Standard alphabet, padding optional, and **trailing bits tolerated**.
+///
+/// The first two are uncontroversial: the specification's encoding is
+/// unpadded, and encoders differ on whether to emit padding. The third is the
+/// one worth explaining. A base64 value whose length is not a multiple of four
+/// carries a few bits beyond the bytes it encodes, and those bits are not
+/// necessarily zero — `"123"` decodes to two bytes with two bits left over.
+/// The `base64` crate rejects that as non-canonical by default; JavaScript
+/// does not, and neither does the interop corpus, which lists
+/// `{"$bytes": "123"}` as a **valid** record.
+///
+/// A validator stricter than the network refuses records every other
+/// implementation accepts, and that is the failure mode worth avoiding here.
+/// Encoding remains canonical and unpadded, so nothing this workspace emits
+/// depends on the tolerance.
+static BYTES_ENGINE: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true),
+);
 
-    STANDARD_NO_PAD
-        .decode(text.trim_end_matches('='))
-        .or_else(|_| STANDARD.decode(text))
+/// Decode a `$bytes` value.
+///
+/// See [`BYTES_ENGINE`] for what is accepted and why. Exposed so that
+/// `atproto-lexicon` validates the same values this module can convert —
+/// previously each had its own decoder and they disagreed, so a record could
+/// pass validation and fail conversion, or the reverse.
+///
+/// # Errors
+///
+/// Returns [`EncodeError::InvalidValue`] when the value is not base64 at all.
+pub fn decode_bytes(text: &str) -> Result<Vec<u8>, EncodeError> {
+    use base64::Engine as _;
+    BYTES_ENGINE
+        .decode(text)
         .map_err(|err| invalid(&format!("$bytes value is not base64: {err}")))
+}
+
+fn decode_base64(text: &str) -> Result<Vec<u8>, EncodeError> {
+    decode_bytes(text)
 }
 
 fn invalid(reason: &str) -> EncodeError {

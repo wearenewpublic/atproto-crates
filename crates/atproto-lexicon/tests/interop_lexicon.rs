@@ -26,23 +26,11 @@ use std::path::PathBuf;
 
 /// Cases that do not pass yet, as `(file, case name, why)`.
 ///
-/// Four, out of 63. Each was read against the vector and the reference before
+/// Three, out of 63. Each was read against the vector and the reference before
 /// being recorded; none is a corpus quirk. They are pinned rather than fixed
 /// here because the harness is what makes them visible, and landing it first
 /// turns the other 59 into a gate immediately.
 const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
-    // `$bytes` is base64 **without** padding, and this crate decodes it with
-    // the padded `STANDARD` engine, so `{"$bytes": "123"}` is refused.
-    //
-    // The sharp edge is internal: `atproto-dasl` — which passes the data-model
-    // corpus — *encodes* `$bytes` with `STANDARD_NO_PAD` and decodes either
-    // form. So this crate rejects exactly what the other one emits, and a
-    // record that round-trips through the data model fails lexicon validation.
-    (
-        "lexicon/record-data-valid.json",
-        "full",
-        "unpadded $bytes refused; atproto-dasl emits unpadded",
-    ),
     // A member of an open union must carry `$type` naming which variant it is.
     // Without it a consumer cannot tell which branch to validate against, so
     // accepting it means accepting a value nothing can interpret.
