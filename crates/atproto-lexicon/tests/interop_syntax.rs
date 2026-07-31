@@ -92,16 +92,6 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "z7x3CtScH765HvShXT",
         "base58btc multibase",
     ),
-    (
-        "syntax/tid_syntax_invalid.txt",
-        "kjzfcijpj2z2a",
-        "first character out of range",
-    ),
-    (
-        "syntax/tid_syntax_invalid.txt",
-        "zzzzzzzzzzzzz",
-        "first character out of range",
-    ),
     // -- DID / at-identifier ----------------------------------------------
     // A `%` in the method-specific id must introduce a two-digit hex escape.
     // A bare trailing `%` is an incomplete escape.

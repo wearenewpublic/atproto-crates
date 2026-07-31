@@ -87,6 +87,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-record`: `Tid::decode` tested the wrong bit, so it rejected valid TIDs and accepted
+  invalid ones that **aliased onto valid ones**.
+
+  Thirteen base32-sortable characters carry 65 bits and a TID is 64, so the first character's high
+  bit falls off the top of `value` during decoding. Testing `value & (1 << 63)` therefore tested the
+  first character's *second* bit. TIDs beginning `c`-`j` were refused, and TIDs beginning `k`-`r`
+  were accepted — the dangerous half, because the discarded bit meant `k222222222222` and
+  `2222222222222` decoded to the same `Tid` and both re-encoded to the second. Two distinct record
+  keys collapsed into one, silently, and round-tripping did not preserve the string.
+
+  The first character is now checked before it is shifted away.
+
+- `atproto-lexicon`: `validate_tid` never implemented its first-character rule, so `zzzzzzzzzzzzz`
+  and `kjzfcijpj2z2a` validated. The rule was in the module's own doc comment, and stated wrongly
+  there too — as `[2-b]`, the first *eight* characters, where a TID's first character carries four
+  usable bits and so ranges over the first sixteen, `234567abcdefghij`. Both reference
+  implementations spell it as one regex:
+  `^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$`.
+
+  Closes 2 of the pinned cases. 525 of 536 now assert.
+
 - `atproto-lexicon`: `validate_language` matched `^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{1,8})*$`, which is not
   the BCP 47 grammar. It was wrong in both directions at once:
 

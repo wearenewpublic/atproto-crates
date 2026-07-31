@@ -47,6 +47,13 @@ use crate::errors::TidError;
 /// are compared as strings, ensuring timestamp ordering is preserved.
 const BASE32_SORTABLE: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 
+/// The characters a TID may begin with.
+///
+/// A TID is 64 bits and 13 base32-sortable characters carry 65, so the first
+/// character contributes only four usable bits — the first sixteen of the
+/// alphabet.
+const FIRST_CHARS: &str = "234567abcdefghij";
+
 /// Reverse lookup table for base32-sortable decoding.
 ///
 /// Maps ASCII character values to their corresponding 5-bit values.
@@ -303,10 +310,24 @@ impl Tid {
             value = (value << 5) | (decoded as u64);
         }
 
-        // Verify top bit is 0
-        if value & (1u64 << 63) != 0 {
+        // The top bit is checked on the *first character*, before it is
+        // shifted away.
+        //
+        // 13 characters carry 65 bits and a TID is 64, so the first
+        // character's high bit falls off the top of `value` during decoding.
+        // Testing `value & (1 << 63)` therefore tests the first character's
+        // *second* bit, which is a different question with a different answer:
+        // it rejected valid TIDs beginning `c`-`j` and accepted invalid ones
+        // beginning `k`-`r`. The latter is the dangerous half — `k2222222222 22`
+        // and `2222222222222` decoded to the same `Tid` and re-encoded to the
+        // second, so two distinct record keys collapsed into one.
+        let first = BASE32_DECODE[bytes[0] as usize];
+        if first >= 16 {
             return Err(TidError::InvalidFormat {
-                reason: "Top bit must be 0".to_string(),
+                reason: format!(
+                    "first character '{}' sets the top bit; a TID's first character must be one of {}",
+                    bytes[0] as char, FIRST_CHARS,
+                ),
             });
         }
 
