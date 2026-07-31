@@ -83,6 +83,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Several existing tests read the whole stream and assumed the first row was the commit. They now
   select by event type, which is what each was actually asserting.
+- `atproto-pds`: `com.atproto.sync.subscribeRepos` replayed the entire retained history to any
+  subscriber that supplied no cursor, and held the socket open on a cursor past the head instead of
+  refusing it.
+
+  `read_after(None, ..)` reads from the start of the log, so a cursor-less subscriber was served
+  everything. Every reconnect re-read the whole stream and a fresh consumer inherited a backlog it
+  had no way to decline; on a busy repository that is unbounded work on each connect. A missing
+  cursor now starts at the current head, matching the reference, which leaves its outbox cursor unset
+  and streams live events only. An explicit `cursor=0` still backfills — that is how a consumer asks
+  for history, and a regression test pins it so the fix cannot be widened into "never replay".
+
+  A cursor greater than the head now answers a `FutureCursor` info frame. The lexicon declares the
+  error and the reference PDS raises it; waiting instead leaves a consumer that mangled its cursor
+  unable to distinguish "caught up" from "asking for something that does not exist".
 
 - `atproto-identity` / `atproto-oauth`: JWS signature verification rejected the high-S form, so
   roughly half of all DPoP proofs from a conforming OAuth client failed at random with

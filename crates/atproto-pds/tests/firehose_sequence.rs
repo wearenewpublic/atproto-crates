@@ -408,3 +408,102 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+/// A subscriber that supplies no cursor is served live events only.
+///
+/// `read_after(None, ..)` treats a missing cursor as the start of the log, so a
+/// cursor-less subscriber used to receive the entire retained history. Every
+/// reconnect then re-read everything, and a fresh consumer inherited a backlog
+/// it had no way to decline. The reference leaves its outbox cursor unset here
+/// and streams only what arrives next.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_cursor_streams_only_new_events() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:tailalice";
+    let token = create_account(&app, &manager, alice, "alice.tail.example").await;
+
+    // History the subscriber must NOT be sent.
+    write_record(&app, alice, &token, "before the subscriber existed").await;
+    write_record(&app, alice, &token, "also before").await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor")
+        .parse()
+        .unwrap();
+    let (mut socket, response) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    // Nothing should arrive until something new happens. A short window is
+    // enough: the backlog was delivered immediately on connect.
+    let early = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next()).await;
+    assert!(
+        early.is_err(),
+        "a cursor-less subscriber was sent history it did not ask for"
+    );
+
+    write_record(&app, alice, &token, "after the subscriber connected").await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+        .await
+        .expect("the new write should arrive")
+        .expect("the socket should stay open")
+        .expect("the frame should not be a protocol error");
+    assert!(message.is_binary(), "expected a CBOR frame");
+}
+
+/// An explicit cursor still backfills.
+///
+/// The guard above must not be implemented by refusing to read history at all —
+/// `cursor=0` is how a consumer legitimately asks for everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_cursor_still_backfills() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:backfillalice";
+    let token = create_account(&app, &manager, alice, "alice.backfill.example").await;
+    write_record(&app, alice, &token, "historic").await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri =
+        format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor&cursor=0")
+            .parse()
+            .unwrap();
+    let (mut socket, _) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+        .await
+        .expect("cursor=0 must replay the log")
+        .expect("the socket should stay open")
+        .expect("the frame should not be a protocol error");
+    assert!(message.is_binary(), "expected a replayed CBOR frame");
+}
+
+/// A cursor beyond the head is refused with `FutureCursor` rather than waited
+/// out.
+///
+/// Holding the socket open leaves a consumer that mangled its cursor believing
+/// it is caught up and idle, with no way to tell that apart from a quiet
+/// server. The lexicon declares the error and the reference raises it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursor_past_the_head_is_refused() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:futurealice";
+    let token = create_account(&app, &manager, alice, "alice.future.example").await;
+    write_record(&app, alice, &token, "one event").await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri =
+        format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=json&cursor=999999")
+            .parse()
+            .unwrap();
+    let (mut socket, _) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+        .await
+        .expect("an error frame should arrive promptly")
+        .expect("the socket should stay open long enough to deliver it")
+        .expect("the frame should not be a protocol error");
+    let text = String::from_utf8_lossy(message.as_payload()).to_string();
+    assert!(
+        text.contains("FutureCursor"),
+        "expected a FutureCursor frame, got: {text}"
+    );
+}

@@ -21,7 +21,7 @@
 //! the `Accept: application/json` header. CBOR is the production default.
 
 use crate::http::state::HttpState;
-use crate::sequencer::frame::{Encoding, encode_event};
+use crate::sequencer::frame::{Encoding, encode_event, encode_info};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -80,7 +80,38 @@ async fn run_subscriber(
     // stream's, so its cursor stays valid against the unfiltered stream.
     let did_filter = params.did.clone();
     let sequencer = state.reader.sequencer();
-    let mut cursor = params.cursor;
+
+    // A cursor past the head is a client error, not something to wait out. The
+    // lexicon declares `FutureCursor` for it and the reference PDS raises it
+    // (packages/pds/src/api/com/atproto/sync/subscribeRepos.ts:29-30); holding
+    // the socket open instead leaves a consumer that mangled its cursor
+    // believing it is caught up and idle forever.
+    let head = match sequencer.latest_seq().await {
+        Ok(seq) => seq,
+        Err(e) => {
+            tracing::warn!(error = %e, "subscribeRepos: could not read the stream head");
+            None
+        }
+    };
+    if let Some(requested) = params.cursor
+        && requested > head.unwrap_or(0)
+    {
+        let (bytes, is_text) = encode_info(
+            encoding,
+            "FutureCursor",
+            "cursor is ahead of the stream head",
+        );
+        let _ = send_frame(&mut socket, bytes, is_text).await;
+        return;
+    }
+
+    // No cursor means "from here on", not "from the beginning". `read_after`
+    // treats `None` as the start of the log, so a cursor-less subscriber was
+    // served the whole retained history — every reconnect re-read everything,
+    // and a new consumer inherited a backlog it had no way to ask not to
+    // receive. The reference leaves its outbox cursor unset in this case and
+    // streams live events only (subscribeRepos.ts:23-24).
+    let mut cursor = params.cursor.or(head);
 
     // Poll fallback runs at a longer interval since the broadcast covers most
     // wakeups; we still poll occasionally to backfill anything the broadcast
