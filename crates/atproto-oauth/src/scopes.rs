@@ -103,6 +103,12 @@ pub enum TransitionScope {
     Generic,
     /// Email transition operations
     Email,
+    /// Chat (`chat.bsky.*`) transition operations.
+    ///
+    /// Deliberately *not* implied by [`Generic`](Self::Generic): direct
+    /// messages are carved out of the legacy blanket grant and need their own
+    /// scope.
+    ChatBsky,
 }
 
 /// Include scope for referencing permission sets by NSID
@@ -607,6 +613,7 @@ impl Scope {
         let scope = match suffix {
             Some("generic") => TransitionScope::Generic,
             Some("email") => TransitionScope::Email,
+            Some("chat.bsky") => TransitionScope::ChatBsky,
             Some(other) => return Err(ParseError::InvalidResource(other.to_string())),
             None => return Err(ParseError::MissingResource),
         };
@@ -798,6 +805,7 @@ impl Scope {
             Scope::Transition(scope) => match scope {
                 TransitionScope::Generic => "transition:generic".to_string(),
                 TransitionScope::Email => "transition:email".to_string(),
+                TransitionScope::ChatBsky => "transition:chat.bsky".to_string(),
             },
             Scope::Include(scope) => {
                 if let Some(ref aud) = scope.aud {
@@ -1106,6 +1114,17 @@ impl ScopesSet {
     ///
     /// It is deliberately *not* a wildcard for `space:` — spaces post-date it,
     /// so nothing granted it expecting space access.
+    /// Whether `transition:chat.bsky` was granted — the only scope that
+    /// confers `chat.bsky.*` RPC access.
+    fn has_legacy_chat(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(
+                Scope::parse(scope),
+                Ok(Scope::Transition(TransitionScope::ChatBsky))
+            )
+        })
+    }
+
     fn has_legacy_generic(&self) -> bool {
         self.scopes.iter().any(|scope| {
             matches!(
@@ -1187,21 +1206,33 @@ impl ScopesSet {
     /// Returns `true` if some granted `rpc:` scope permits calling `lxm` at
     /// `aud`.
     pub fn allows_rpc(&self, lxm: &str, aud: &str) -> bool {
-        self.has_legacy_generic()
-            || self.scopes.iter().any(|scope| match Scope::parse(scope) {
-                Ok(Scope::Rpc(rpc)) => {
-                    let lxm_ok = rpc.lxm.iter().any(|granted| match granted {
-                        RpcLexicon::All => true,
-                        RpcLexicon::Nsid(nsid) => nsid == lxm,
-                    });
-                    let aud_ok = rpc.aud.iter().any(|granted| match granted {
-                        RpcAudience::All => true,
-                        RpcAudience::Did(did) => did == aud,
-                    });
-                    lxm_ok && aud_ok
-                }
-                _ => false,
-            })
+        let is_chat = lxm.starts_with("chat.bsky.");
+
+        // `transition:generic` is the legacy blanket grant, but chat is carved
+        // out of it: direct messages need `transition:chat.bsky`. A request for
+        // the `*` wildcard is still satisfied by `generic` alone — asking for
+        // "whatever this token has" is not the same as asking for chat.
+        if self.has_legacy_generic() && (lxm == "*" || !is_chat) {
+            return true;
+        }
+        if is_chat && self.has_legacy_chat() {
+            return true;
+        }
+
+        self.scopes.iter().any(|scope| match Scope::parse(scope) {
+            Ok(Scope::Rpc(rpc)) => {
+                let lxm_ok = rpc.lxm.iter().any(|granted| match granted {
+                    RpcLexicon::All => true,
+                    RpcLexicon::Nsid(nsid) => nsid == lxm,
+                });
+                let aud_ok = rpc.aud.iter().any(|granted| match granted {
+                    RpcAudience::All => true,
+                    RpcAudience::Did(did) => did == aud,
+                });
+                lxm_ok && aud_ok
+            }
+            _ => false,
+        })
     }
 
     /// Asserts that some granted `rpc:` scope permits calling `lxm` at `aud`.
@@ -1222,14 +1253,18 @@ impl ScopesSet {
 
     /// Returns `true` if some granted `identity:` scope permits changing the
     /// account handle.
+    /// `transition:generic` deliberately does **not** satisfy this. The legacy
+    /// blanket covers repo, blob and non-chat RPC; identity is outside it, so
+    /// rotating a handle needs `identity:handle` or `identity:*` explicitly.
+    /// Treating the blanket as covering identity let every client holding the
+    /// standard legacy scope change the account's handle in PLC.
     pub fn allows_identity_handle(&self) -> bool {
-        self.has_legacy_generic()
-            || self.scopes.iter().any(|scope| {
-                matches!(
-                    Scope::parse(scope),
-                    Ok(Scope::Identity(IdentityScope::Handle | IdentityScope::All))
-                )
-            })
+        self.scopes.iter().any(|scope| {
+            matches!(
+                Scope::parse(scope),
+                Ok(Scope::Identity(IdentityScope::Handle | IdentityScope::All))
+            )
+        })
     }
 
     /// Asserts that some granted `identity:` scope permits changing the handle.
@@ -2734,15 +2769,53 @@ mod tests {
     }
 
     /// `transition:generic` is the legacy full-access scope most clients still
-    /// request. Enforcing the granular axes without honouring it would refuse
-    /// every one of them.
+    /// request, and it covers the axes that existed when it was minted:
+    /// repo, blob, and non-chat RPC.
     #[test]
-    fn transition_generic_satisfies_every_granular_axis() {
+    fn transition_generic_satisfies_the_axes_it_covers() {
         let s = set("atproto transition:generic");
         assert!(s.allows_repo("app.bsky.feed.post", &RepoAction::Create));
         assert!(s.allows_blob("text/html"));
-        assert!(s.allows_rpc("chat.bsky.convo.sendMessage", "did:web:anywhere.example"));
-        assert!(s.allows_identity_handle());
+        assert!(s.allows_rpc("app.bsky.feed.getTimeline", "did:web:appview.example"));
+        // Asking for "whatever this token has" is satisfied by the blanket
+        // itself, which is why the wildcard is not treated as a chat request.
+        assert!(s.allows_rpc("*", "did:web:appview.example"));
+    }
+
+    /// It does **not** reach chat. Direct messages are carved out of the legacy
+    /// blanket and need `transition:chat.bsky`, which is a separate grant a
+    /// user consents to separately.
+    ///
+    /// This previously passed: `transition:generic` — the scope in every
+    /// client's README — conferred the ability to read and send DMs.
+    #[test]
+    fn transition_generic_does_not_confer_chat_access() {
+        let generic = set("atproto transition:generic");
+        assert!(
+            !generic.allows_rpc("chat.bsky.convo.sendMessage", "did:web:anywhere.example"),
+            "transition:generic must not reach chat.bsky.*"
+        );
+
+        let chat = set("atproto transition:chat.bsky");
+        assert!(
+            chat.allows_rpc("chat.bsky.convo.sendMessage", "did:web:anywhere.example"),
+            "transition:chat.bsky is what grants it"
+        );
+        // And chat alone does not re-open the rest.
+        assert!(!chat.allows_repo("app.bsky.feed.post", &RepoAction::Create));
+    }
+
+    /// It does **not** confer identity permissions. Rotating a handle rewrites
+    /// the account's PLC document, which is outside anything the legacy
+    /// blanket was granted for; it needs `identity:handle` or `identity:*`.
+    ///
+    /// This previously passed, so any client holding the standard legacy scope
+    /// could change the account's handle.
+    #[test]
+    fn transition_generic_does_not_confer_identity_access() {
+        assert!(!set("atproto transition:generic").allows_identity_handle());
+        assert!(set("atproto identity:handle").allows_identity_handle());
+        assert!(set("atproto identity:*").allows_identity_handle());
     }
 
     /// It is not a wildcard for spaces: spaces post-date it, so nothing was

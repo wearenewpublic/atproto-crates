@@ -62,6 +62,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-oauth`: `transition:generic` granted two things it must not. It is the legacy blanket
+  scope every client still requests (`scope: 'atproto transition:generic'` in the reference's own
+  README), so both were reachable by any client a user had ever authorized.
+
+  **Identity.** `allows_identity_handle` treated the blanket as covering identity, so a
+  `transition:generic` token could rotate the account's handle — rewriting its PLC document.
+  Confirmed live against a real PDS: the call returned 200. The reference gates `updateHandle` on
+  `assertIdentity({attr:'handle'})` and does not override `allowsIdentity` for transitional scopes,
+  so the blanket confers nothing there. `identity:handle` or `identity:*` is now required.
+
+  **Chat.** `allows_rpc` returned true for every method under the blanket, including `chat.bsky.*` —
+  direct messages. The reference carves chat out explicitly and requires `transition:chat.bsky`,
+  which this crate did not model at all. `TransitionScope::ChatBsky` is added and parses
+  `transition:chat.bsky`. A request for the `*` wildcard is still satisfied by `generic` alone,
+  matching the reference: asking for "whatever this token has" is not a chat request.
+
+  A test asserted both over-grants — `transition_generic_satisfies_every_granular_axis`, reasoning
+  that "enforcing the granular axes without honouring it would refuse every one of them". True of
+  repo and blob, not of identity or chat. It is replaced by three tests that draw the boundary where
+  the reference draws it.
+
 - `atproto-pds`: a DPoP-bound OAuth access token could not be presented correctly. The server issues
   tokens with `token_type: DPoP` and a `cnf.jkt` binding, which RFC 9449 §7.1 requires be sent as
   `Authorization: DPoP <token>` — but every authenticated XRPC read the header with
