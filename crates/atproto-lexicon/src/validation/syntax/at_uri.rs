@@ -52,8 +52,50 @@ pub fn validate_at_uri(value: &str) -> Result<(), DataValidationError> {
         });
     }
 
-    // Split into path segments
-    let segments: Vec<&str> = rest.splitn(3, '/').collect();
+    // A space is never part of an AT-URI. Checked before the structural rules
+    // so trailing whitespace is reported as such rather than as an invalid
+    // record key.
+    if value.contains(' ') {
+        return Err(DataValidationError::StringFormatInvalid {
+            format: "at-uri".to_string(),
+            value: value.to_string(),
+            reason: "AT-URI must not contain spaces".to_string(),
+        });
+    }
+
+    // An empty path segment is a distinct string denoting the same thing, and
+    // that is the problem: `at://alice//c` and `at://alice/c` would both be
+    // accepted and would not compare equal. Anything that dedupes or indexes
+    // by AT-URI then sees two records where there is one.
+    if rest.contains("//") {
+        return Err(DataValidationError::StringFormatInvalid {
+            format: "at-uri".to_string(),
+            value: value.to_string(),
+            reason: "AT-URI must not have empty path segments".to_string(),
+        });
+    }
+
+    // Same reasoning for a trailing slash: `at://alice/c/` and `at://alice/c`
+    // denote one record.
+    if rest.ends_with('/') {
+        return Err(DataValidationError::StringFormatInvalid {
+            format: "at-uri".to_string(),
+            value: value.to_string(),
+            reason: "AT-URI must not have a trailing slash".to_string(),
+        });
+    }
+
+    // Split into path segments. Four parts means a third path segment, which
+    // the grammar does not define — splitting into three would silently fold
+    // it into the record key.
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments.len() > 3 {
+        return Err(DataValidationError::StringFormatInvalid {
+            format: "at-uri".to_string(),
+            value: value.to_string(),
+            reason: "AT-URI must not have more than two path segments".to_string(),
+        });
+    }
 
     // Validate authority (first segment)
     let authority = segments[0];
@@ -63,18 +105,17 @@ pub fn validate_at_uri(value: &str) -> Result<(), DataValidationError> {
         reason: format!("invalid authority: {}", authority),
     })?;
 
-    // If there's a collection, validate it
-    if segments.len() > 1 && !segments[1].is_empty() {
-        let collection = segments[1];
+    // Every remaining segment is non-empty by the checks above, so each is
+    // validated rather than skipped. The previous `!is_empty()` guards meant an
+    // empty collection segment silently skipped the record key too.
+    if let Some(collection) = segments.get(1) {
         validate_nsid(collection).map_err(|_| DataValidationError::StringFormatInvalid {
             format: "at-uri".to_string(),
             value: value.to_string(),
             reason: format!("invalid collection NSID: {}", collection),
         })?;
 
-        // If there's a record key, validate it
-        if segments.len() > 2 && !segments[2].is_empty() {
-            let rkey = segments[2];
+        if let Some(rkey) = segments.get(2) {
             validate_record_key(rkey).map_err(|_| DataValidationError::StringFormatInvalid {
                 format: "at-uri".to_string(),
                 value: value.to_string(),
@@ -125,6 +166,64 @@ mod tests {
         ];
         for uri in invalid {
             assert!(validate_at_uri(uri).is_err(), "should be invalid: {}", uri);
+        }
+    }
+
+    /// A trailing slash and an empty path segment are refused.
+    ///
+    /// Both were accepted, and both make two distinct strings denote the same
+    /// record — so any consumer comparing, deduping or indexing by AT-URI sees
+    /// two where there is one. The empty-segment case was the worse of the
+    /// two: the old code skipped an empty collection segment *and* the record
+    /// key behind it, so `at://alice//com.example.thing` validated without the
+    /// collection ever being looked at.
+    #[test]
+    fn empty_path_segments_and_trailing_slashes_are_refused() {
+        for uri in [
+            "at://did:plc:asdf123/",
+            "at://did:plc:asdf123/com.atproto.feed.post/",
+            "at://user.bsky.social/",
+            "at://user.bsky.social//",
+            "at://user.bsky.social//com.atproto.feed.post",
+        ] {
+            assert!(validate_at_uri(uri).is_err(), "should be invalid: {uri}");
+        }
+    }
+
+    /// The grammar defines two path segments; a third is not folded into the
+    /// record key.
+    #[test]
+    fn a_third_path_segment_is_refused() {
+        assert!(validate_at_uri("at://did:plc:asdf123/com.atproto.feed.post/rec/extra").is_err());
+    }
+
+    /// A space is reported as a space, not as an invalid record key.
+    #[test]
+    fn a_space_is_named_as_such() {
+        let err = validate_at_uri("at://did:plc:asdf123/com.atproto.feed.post/rec ").unwrap_err();
+        let DataValidationError::StringFormatInvalid { reason, .. } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(
+            reason.contains("space"),
+            "the refusal should name the space, got {reason:?}"
+        );
+    }
+
+    /// The fix must not narrow what is accepted: every shape the grammar
+    /// allows still validates.
+    #[test]
+    fn the_accepted_shapes_are_unchanged() {
+        for uri in [
+            "at://did:plc:asdf123",
+            "at://user.bsky.social",
+            "at://did:plc:asdf123/com.atproto.feed.post",
+            "at://did:plc:asdf123/com.atproto.feed.post/record",
+            "at://did:abc:123/io.nsid.someFunc/record-key",
+            "at://did:abc:123/io.nsid.someFunc/self.",
+            "at://did:abc:123/io.nsid.someFunc/...",
+        ] {
+            assert!(validate_at_uri(uri).is_ok(), "should be valid: {uri}");
         }
     }
 }

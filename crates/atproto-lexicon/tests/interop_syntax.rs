@@ -91,35 +91,6 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "test.12345.record",
         "digit-leading domain segment",
     ),
-    // -- AT-URI -----------------------------------------------------------
-    // A trailing slash and an empty path segment are both rejected by the
-    // grammar. Accepting them means two different strings denote the same
-    // record, which breaks anything that compares AT-URIs for equality.
-    (
-        "syntax/aturi_syntax_invalid.txt",
-        "at://did:plc:asdf123/",
-        "trailing slash",
-    ),
-    (
-        "syntax/aturi_syntax_invalid.txt",
-        "at://did:plc:asdf123/com.atproto.feed.post/",
-        "trailing slash after collection",
-    ),
-    (
-        "syntax/aturi_syntax_invalid.txt",
-        "at://user.bsky.social/",
-        "trailing slash",
-    ),
-    (
-        "syntax/aturi_syntax_invalid.txt",
-        "at://user.bsky.social//",
-        "empty path segment",
-    ),
-    (
-        "syntax/aturi_syntax_invalid.txt",
-        "at://user.bsky.social//com.atproto.feed.post",
-        "empty path segment",
-    ),
     // -- CID --------------------------------------------------------------
     // A CID is multibase-prefixed and base32 (`b`) is only the common case.
     // The corpus carries base58btc (`z`), base64 (`m`), base16 (`f`) and

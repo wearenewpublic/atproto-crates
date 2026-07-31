@@ -87,6 +87,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_at_uri` accepted a trailing slash and empty path segments —
+  `at://alice/`, `at://alice//`, `at://alice//com.example.thing`. Both make two distinct strings
+  denote the same record, so anything comparing, deduping or indexing by AT-URI sees two where there
+  is one.
+
+  The empty-segment case was the worse of the two. Segments were validated behind
+  `!segments[1].is_empty()` guards, so an empty collection segment did not merely pass — it skipped
+  the record key behind it as well, and `at://alice//com.example.thing` validated without the
+  collection ever being looked at.
+
+  Also now refused, matching the reference (`aturi_validation.ts:225-245`): a space anywhere in the
+  URI, reported as a space rather than as an invalid record key, and a third path segment, which
+  `splitn(3, '/')` had silently folded into the record key.
+
+  Closes 5 of the remaining pinned cases in `interop_syntax.rs`.
+
 - `atproto-pds`: a new account had no repository until its first write. `getLatestCommit` answered
   `RepoNotFound` for a valid account, `getRepo` had nothing to export, and the account announcement
   on the firehose could carry neither `#commit` nor `#sync` because there was no commit to name — a
