@@ -351,6 +351,7 @@ dependencies = [
  "atproto-identity",
  "base64 0.22.1",
  "bitflags",
+ "chrono",
  "clap",
  "hickory-resolver",
  "indexmap",

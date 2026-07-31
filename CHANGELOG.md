@@ -87,6 +87,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_datetime` accepted `-00:00` as a UTC offset and checked the year
+  before the offset was applied.
+
+  RFC 3339 §4.3 gives `-00:00` a meaning of its own — "the offset to local time is unknown" — rather
+  than making it a spelling of UTC. Both references refuse it by name. `Z` and `+00:00` are
+  unaffected.
+
+  The year was read off the `YYYY` field, so `0000-01-01T00:00:00+01:00` passed: a well-formed string
+  naming an instant in year -1, which no `YYYY` field can represent. The year is now checked after
+  normalization, which also catches the mirror case, `9999-12-31T23:59:00-00:01`.
+
+  Per-field range checks are replaced by an actual parse. They could only ask whether each number was
+  individually plausible: `2023-02-30` has a month in 1..=12 and a day in 1..=31 and is not a date.
+  It used to validate; it no longer does, along with `2023-04-31` and `2023-02-29`. Leap seconds
+  remain valid.
+
+  The lenient flag still widens the accepted *shape* — lowercase `t`/`z`, a space separator, a
+  colon-less offset — but no longer skips the calendar. Lenient meant "accepts more forms", and had
+  come to mean "checks less", which made the flag a way to write an impossible date into a record.
+
+  Closes the last 2 of the 31 pinned cases. **532 of 536 assert**; the 4 that remain are the CID
+  multibase encodings where the two reference implementations disagree with each other.
+
 - `atproto-lexicon`: `validate_did` accepted a DID ending in `%`, so `did:method:val%` validated. A
   `%` introduces a percent-escape, and a trailing one is an escape with nothing to escape. The crate
   already refused a trailing `:` and the `%` half of the same rule was simply missing.

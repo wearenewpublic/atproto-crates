@@ -92,17 +92,7 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "z7x3CtScH765HvShXT",
         "base58btc multibase",
     ),
-    (
-        "syntax/datetime_syntax_invalid.txt",
-        "1985-04-12T23:20:50.123-00:00",
-        "negative zero UTC offset",
-    ),
     // Year 0000 with a positive offset normalizes to before year 1.
-    (
-        "syntax/datetime_parse_invalid.txt",
-        "0000-01-01T00:00:00+01:00",
-        "normalizes below the representable range",
-    ),
 ];
 
 fn is_known_failure(file: &str, case: &str) -> bool {
