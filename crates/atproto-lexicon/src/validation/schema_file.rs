@@ -86,12 +86,44 @@ impl SchemaFile {
         for (name, _def) in &self.defs {
             validate_def_name(name)?;
         }
+        for (name, def) in &self.defs {
+            Self::validate_def_is_a_user_type(name, def)?;
+        }
         for def in self.defs.values() {
             match def {
                 SchemaDef::PermissionSet(ps) => validate_permission_set(ps, &self.id)?,
                 SchemaDef::Space(space) => validate_space(space)?,
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    /// Reject definition types that are only meaningful *inside* another
+    /// definition.
+    ///
+    /// `ref`, `union` and `params` describe how a field relates to something
+    /// else, so they say nothing on their own: a top-level `ref` is a pointer
+    /// with no one holding it, and a `params` is the query-string half of an
+    /// endpoint that is not there. The reference lists the types a definition
+    /// may take (`lexUserType`, `packages/lexicon/src/types.ts:372-404`) and
+    /// none of the three appears in it.
+    ///
+    /// This matters more than an invalid record does. A record that should not
+    /// validate is one bad record; a schema that should not parse is every
+    /// record validated against it, and the mistake is inherited rather than
+    /// repeated.
+    fn validate_def_is_a_user_type(name: &str, def: &SchemaDef) -> Result<(), DataValidationError> {
+        let type_name = def.type_name();
+        if matches!(
+            def,
+            SchemaDef::Ref(_) | SchemaDef::Union(_) | SchemaDef::Params(_)
+        ) {
+            return Err(DataValidationError::SchemaStructureInvalid {
+                message: format!(
+                    "definition '{name}' has type '{type_name}', which is only valid inside another definition, not as a definition itself"
+                ),
+            });
         }
         Ok(())
     }
@@ -1129,5 +1161,76 @@ mod namespace_authority {
                 "{resource:?} cannot be both checked and exempt"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod definition_types {
+    use super::*;
+
+    fn doc(def: &str) -> Result<SchemaFile, DataValidationError> {
+        SchemaFile::parse(&format!(
+            r#"{{"lexicon":1,"id":"com.example.t","defs":{{"demo":{def}}}}}"#
+        ))
+    }
+
+    /// `ref`, `union` and `params` are not definition types.
+    ///
+    /// Each describes how a field relates to something else, so none says
+    /// anything standing alone: a top-level `ref` is a pointer with nobody
+    /// holding it, and a `params` is the query-string half of an endpoint that
+    /// is not there. The reference lists what a definition may be
+    /// (`lexUserType`) and none of the three appears; none of the 396
+    /// lexicons in the reference repository defines one either.
+    #[test]
+    fn non_user_types_are_refused_as_definitions() {
+        for def in [
+            r#"{"type":"ref","ref":"com.atproto.repo.strongRef"}"#,
+            r##"{"type":"union","refs":["#a"]}"##,
+            r#"{"type":"params","properties":{}}"#,
+        ] {
+            let err = doc(def).unwrap_err();
+            let DataValidationError::SchemaStructureInvalid { message } = &err else {
+                panic!("expected SchemaStructureInvalid, got {err:?}");
+            };
+            assert!(
+                message.contains("only valid inside another definition"),
+                "the refusal should say why, got {message:?}"
+            );
+        }
+    }
+
+    /// Everything the reference does list still parses.
+    ///
+    /// The refusal above is a list of three, not a whitelist of what someone
+    /// happened to test — narrowing it further would refuse schemas that
+    /// exist.
+    #[test]
+    fn user_types_are_still_accepted_as_definitions() {
+        for def in [
+            r#"{"type":"integer"}"#,
+            r#"{"type":"string"}"#,
+            r#"{"type":"boolean"}"#,
+            r#"{"type":"bytes"}"#,
+            r#"{"type":"cid-link"}"#,
+            r#"{"type":"blob"}"#,
+            r#"{"type":"token"}"#,
+            r#"{"type":"unknown"}"#,
+            r#"{"type":"object","properties":{}}"#,
+            r#"{"type":"array","items":{"type":"integer"}}"#,
+        ] {
+            assert!(doc(def).is_ok(), "should parse: {def}");
+        }
+    }
+
+    /// `unknown` stays accepted, deliberately.
+    ///
+    /// The interop corpus lists a lone `{"type": "unknown"}` definition as
+    /// invalid, but the reference's `lexUserType` has a case for it, so the
+    /// corpus and the reference disagree and this is not this crate's call to
+    /// settle. `interop_lexicon.rs` pins that vector with the same reasoning.
+    #[test]
+    fn unknown_is_a_definition_type_despite_the_corpus() {
+        assert!(doc(r#"{"type":"unknown"}"#).is_ok());
     }
 }

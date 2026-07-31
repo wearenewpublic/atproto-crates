@@ -138,6 +138,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permissions.
 
 ### Fixed
+- `atproto-lexicon`: `ref`, `union` and `params` were accepted as top-level definitions. None is a
+  definition type — each describes how a field relates to something else, so none says anything
+  standing alone: a top-level `ref` is a pointer with nobody holding it, and a `params` is the
+  query-string half of an endpoint that is not there.
+
+  The reference lists what a definition may be (`lexUserType`,
+  `packages/lexicon/src/types.ts:372-404`) and has no case for any of the three. Checked from the
+  other side too: **none of the 396 lexicons in the reference repository** defines one.
+
+  A bad schema costs more than a bad record. One record that should not validate is one record; a
+  schema that should not parse is every record validated against it, and the mistake is inherited
+  rather than repeated.
+
+  `unknown` is **not** included, though the interop corpus calls a lone `{"type": "unknown"}`
+  definition invalid. The reference's `lexUserType` has a case for it, so corpus and reference
+  disagree, and that is not this crate's call to settle. It stays pinned in `interop_lexicon.rs` with
+  that reasoning.
+
+  Several recursion-limit fixtures defined a top-level `union` or `ref` and so are no longer valid
+  documents. They now build their catalogs through `BaseCatalog::add_schema` without document
+  validation, which is a truer test than before: `SchemaFile`'s fields are public, so a catalog can
+  be assembled from a cache or a peer with no parse step, and the validator's own bounds still have
+  to hold. Document validation is the first line of defence and is asserted separately; it was never
+  the only one.
+
 - `atproto-lexicon`: a union value with no `$type` was accepted by **structural matching** — each ref
   was tried in order and the first that matched was taken. A union is discriminated: the member names
   the variant it is. The reference refuses a value without `$type` outright, and that holds for open

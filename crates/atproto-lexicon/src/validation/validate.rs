@@ -2865,6 +2865,28 @@ mod recursion_limit_tests {
         catalog
     }
 
+    /// Build a catalog **without** running document validation.
+    ///
+    /// Several fixtures below define a top-level `union` or `ref`, which
+    /// `SchemaFile::parse` now refuses — those are not definition types, and
+    /// no published lexicon contains one (checked: none of the 396 lexicons in
+    /// the reference repository).
+    ///
+    /// That refusal is the first line of defence, and it is asserted
+    /// separately in `test_non_user_types_are_refused_as_definitions`. It is
+    /// not the only one that has to hold. `BaseCatalog::add_schema` takes a
+    /// `SchemaFile` whose fields are public, so a catalog can be assembled
+    /// from a cache, a peer, or a hand-built struct without any document
+    /// validation having happened. These tests exercise the validator's own
+    /// bounds under exactly that assumption: the schema is already inside, and
+    /// the walk still has to terminate.
+    fn catalog_from_unvalidated(json: &str) -> BaseCatalog {
+        let file: SchemaFile = serde_json::from_str(json).expect("fixture should deserialize");
+        let mut catalog = BaseCatalog::new();
+        catalog.add_schema(file);
+        catalog
+    }
+
     /// Build a chain lexicon `a0 -> a1 -> ... -> a{n-1}` terminating in an
     /// object, where each link uses `link_json` with `{next}` substituted.
     fn chain_lexicon(n: usize, main_prop: &str, link_template: &str) -> String {
@@ -2920,7 +2942,7 @@ mod recursion_limit_tests {
     #[test]
     fn test_union_self_reference_via_type_marker_is_bounded() {
         let err = on_worker_stack(|| {
-            let catalog = catalog_from(LOOP_LEXICON);
+            let catalog = catalog_from_unvalidated(LOOP_LEXICON);
             // The $type must be the fully normalized ref: schema parsing rewrites
             // ["#loop"] to ["com.example.loop#loop"], and the bare "#loop" form
             // would be treated as an unknown type by the open union.
@@ -2953,7 +2975,7 @@ mod recursion_limit_tests {
                 r##"{"type": "ref", "ref": "#a0"}"##,
                 r##"{"type": "ref", "ref": "{next}"}"##,
             );
-            let catalog = catalog_from(&lexicon);
+            let catalog = catalog_from_unvalidated(&lexicon);
             let record = serde_json::json!({"$type": "com.example.chain", "x": {}});
             validate_record(
                 "com.example.chain",
@@ -3200,7 +3222,7 @@ mod recursion_limit_tests {
     /// This is the property every test below rests on.
     #[test]
     fn test_union_without_type_marker_is_refused() {
-        let catalog = catalog_from(LOOP_LEXICON);
+        let catalog = catalog_from_unvalidated(LOOP_LEXICON);
         let record = serde_json::json!({"$type": "com.example.loop", "x": {}});
         let err = validate_record(
             "com.example.loop",
@@ -3245,7 +3267,7 @@ mod recursion_limit_tests {
         );
 
         let started = std::time::Instant::now();
-        let catalog = catalog_from(&lexicon);
+        let catalog = catalog_from_unvalidated(&lexicon);
         let record = serde_json::json!({"$type": "com.example.fan", "x": {}});
         let err = validate_record("com.example.fan", &record, &catalog, ValidateFlags::empty())
             .unwrap_err();
@@ -3275,7 +3297,7 @@ mod recursion_limit_tests {
             r##"{"type": "union", "refs": ["#a0"]}"##,
             r##"{"type": "union", "refs": ["{next}"]}"##,
         );
-        let catalog = catalog_from(&lexicon);
+        let catalog = catalog_from_unvalidated(&lexicon);
         let record = serde_json::json!({"$type": "com.example.chain", "x": {}});
         let err = validate_record(
             "com.example.chain",
@@ -3314,7 +3336,7 @@ mod recursion_limit_tests {
                 "r": {"type": "ref", "ref": "#u"}
             }
         }"##;
-        let catalog = catalog_from(lexicon);
+        let catalog = catalog_from_unvalidated(lexicon);
         let record = serde_json::json!({"$type": "com.example.mixed", "x": {}});
         let err = validate_record(
             "com.example.mixed",
@@ -3355,7 +3377,7 @@ mod recursion_limit_tests {
         }"##;
 
         let body = serde_json::json!({"x": {}});
-        let catalog = catalog_from(procedure);
+        let catalog = catalog_from_unvalidated(procedure);
         let err =
             validate_procedure_input("com.example.ploop", &body, &catalog, ValidateFlags::empty())
                 .unwrap_err();
@@ -3364,7 +3386,8 @@ mod recursion_limit_tests {
             "validate_procedure_input: expected UnionMissingType, got {err:?}"
         );
 
-        let schema_file = SchemaFile::parse(procedure).unwrap();
+        let schema_file: SchemaFile =
+            serde_json::from_str(procedure).expect("fixture should deserialize");
         let err = validate_procedure_input_with_schema(
             &body,
             &schema_file,

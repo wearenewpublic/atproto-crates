@@ -26,24 +26,20 @@ use std::path::PathBuf;
 
 /// Cases that do not pass yet, as `(file, case name, why)`.
 ///
-/// Two, out of 63. Each was read against the vector and the reference before
+/// One, out of 63. Each was read against the vector and the reference before
 /// being recorded; none is a corpus quirk. They are pinned rather than fixed
 /// here because the harness is what makes them visible, and landing it first
 /// turns the other 59 into a gate immediately.
 const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
-    // `unknown` and `ref` are *field* types, not definition types. A top-level
-    // def of either is not a schema anything can be validated against, and
-    // accepting it is worse than accepting a bad record: everything validated
-    // against that schema inherits the mistake.
+    // `unknown` is listed here as a corpus/reference disagreement, not a
+    // defect. The reference's `lexUserType` has a case for `unknown`, so it
+    // accepts a lone `{"type": "unknown"}` definition; the corpus does not.
+    // `ref` was the real half of this pair and is fixed — the reference has no
+    // case for it, and neither do any published lexicons.
     (
         "lexicon/lexicon-invalid.json",
         "defined unknown",
         "a def of type `unknown` is accepted",
-    ),
-    (
-        "lexicon/lexicon-invalid.json",
-        "defined ref",
-        "a def of type `ref` is accepted",
     ),
     // Same finding as the catalog schema that will not parse — see
     // `permission_set_namespace_authority_is_enforced_at_parse_time`.
