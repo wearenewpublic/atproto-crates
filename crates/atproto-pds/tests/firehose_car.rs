@@ -85,6 +85,19 @@ fn body_of(row: &StreamRow) -> BTreeMap<String, atproto_dasl::Ipld> {
     }
 }
 
+/// The `#commit` rows of a stream read, in order.
+///
+/// Account creation also emits `#identity` and `#account`, so the first row of
+/// a stream is no longer necessarily the commit. These tests are about what a
+/// commit carries, so they select commits rather than assuming a position.
+fn commit_rows(
+    rows: Vec<atproto_pds::sequencer::StreamRow>,
+) -> Vec<atproto_pds::sequencer::StreamRow> {
+    rows.into_iter()
+        .filter(|row| row.event_type == atproto_pds::sequencer::EventType::Commit.as_str())
+        .collect()
+}
+
 fn blocks_field(body: &BTreeMap<String, atproto_dasl::Ipld>) -> Vec<u8> {
     match body.get("blocks") {
         Some(atproto_dasl::Ipld::Bytes(bytes)) => bytes.clone(),
@@ -145,7 +158,7 @@ async fn a_commit_ships_the_record_it_announces() {
         .await
         .unwrap();
 
-    let rows = stream.read_after(None, None, 10).await.unwrap();
+    let rows = commit_rows(stream.read_after(None, None, 10).await.unwrap());
     assert_eq!(rows.len(), 1);
     let body = body_of(&rows[0]);
     let (root, blocks) = read_car(&blocks_field(&body)).await;
@@ -189,7 +202,7 @@ async fn a_commit_ships_the_tree_its_root_points_at() {
         .await
         .unwrap();
 
-    let rows = stream.read_after(None, None, 10).await.unwrap();
+    let rows = commit_rows(stream.read_after(None, None, 10).await.unwrap());
     let (_, blocks) = read_car(&blocks_field(&body_of(&rows[0]))).await;
     assert!(
         blocks.contains_key(&result.data_cid),
@@ -216,7 +229,7 @@ async fn a_later_commit_ships_only_what_it_changed() {
         .await
         .unwrap();
 
-    let rows = stream.read_after(None, None, 10).await.unwrap();
+    let rows = commit_rows(stream.read_after(None, None, 10).await.unwrap());
     assert_eq!(rows.len(), 2);
     let (_, second_blocks) = read_car(&blocks_field(&body_of(&rows[1]))).await;
 
@@ -245,7 +258,7 @@ async fn a_delete_ships_a_tree_but_no_record() {
         .await
         .unwrap();
 
-    let rows = stream.read_after(None, None, 10).await.unwrap();
+    let rows = commit_rows(stream.read_after(None, None, 10).await.unwrap());
     let body = body_of(&rows[1]);
     let (root, blocks) = read_car(&blocks_field(&body)).await;
 
@@ -300,8 +313,13 @@ async fn a_sync_event_ships_its_commit() {
         .await
         .unwrap();
 
+    // This one wants the #sync row, not a commit — filtering to commits here
+    // would select the wrong event and assert against it.
     let rows = stream.read_after(None, None, 10).await.unwrap();
-    let sync = rows.last().unwrap();
+    let sync = rows
+        .iter()
+        .find(|row| row.event_type == atproto_pds::sequencer::EventType::Sync.as_str())
+        .expect("publish_sync should have appended a #sync event");
     assert_eq!(sync.event_type, "sync");
     let (root, blocks) = read_car(&blocks_field(&body_of(sync))).await;
 

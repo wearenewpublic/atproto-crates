@@ -137,6 +137,49 @@ async fn serve(app: axum::Router) -> std::net::SocketAddr {
     addr
 }
 
+/// Creating an account announces it on the firehose.
+///
+/// A relay or appview learns that an account exists from `#identity` and
+/// `#account`. Without them a new account is invisible to the network until it
+/// happens to write a record, and a consumer that indexes identity separately
+/// never learns its handle at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_an_account_emits_identity_and_account() {
+    let (app, manager, _tmp) = build_app().await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=json")
+        .parse()
+        .unwrap();
+    let (mut socket, _) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+
+    let did = "did:plc:announcealice";
+    let _token = create_account(&app, &manager, did, "alice.announce.example").await;
+
+    // Both events, in whichever order they are sequenced.
+    let mut seen: Vec<String> = Vec::new();
+    while seen.len() < 2 {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+            .await
+            .expect("creating an account should announce it within 30s")
+            .expect("the socket should stay open")
+            .expect("the frame should not be a protocol error");
+        let text = String::from_utf8_lossy(message.as_payload()).to_string();
+        if text.contains("#identity") {
+            seen.push("identity".to_string());
+        } else if text.contains("#account") {
+            seen.push("account".to_string());
+        }
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["account".to_string(), "identity".to_string()],
+        "a new account must be announced with both #identity and #account"
+    );
+}
+
 /// Two repositories must never be handed the same `seq`.
 ///
 /// This is the core of F-FIRE-05: with an `AUTOINCREMENT` column in each

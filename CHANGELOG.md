@@ -62,6 +62,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-pds`: creating an account emitted no firehose events at all, so a new account was
+  invisible to the network until it happened to write a record — and a consumer that indexes identity
+  separately never learned its handle. A relay or appview learns an account exists from `#identity`
+  and `#account`; the reference sequences both as part of account creation.
+
+  Emitted from `AccountManager::create_account` rather than the `createAccount` handler, because that
+  is the choke point every creation path passes through — the XRPC endpoint, account migration, and
+  fixtures alike. Announcing from one caller would have left the others silent, and the crate's own
+  firehose tests create accounts through the manager.
+
+  Only for accounts that land active. A verified inbound migration lands deactivated deliberately —
+  until the DID document points here the repository must not be publicly readable or emit firehose
+  events — and `set_account_state` already announces it on activation.
+
+  `#commit` and `#sync`, which the reference also sequences here, are deliberately **not** emitted:
+  it creates an empty repository with a genesis commit, whereas this server defers the first commit
+  to the first write, so `getLatestCommit` answers `RepoNotFound` until then and there is no commit
+  to name. Emitting either would mean inventing one. A genesis commit at signup is separate work.
+
+  Several existing tests read the whole stream and assumed the first row was the commit. They now
+  select by event type, which is what each was actually asserting.
+
 - `atproto-identity` / `atproto-oauth`: JWS signature verification rejected the high-S form, so
   roughly half of all DPoP proofs from a conforming OAuth client failed at random with
   `invalid_dpop_proof … invalid signature`. `key::validate` refuses high-S — correctly, because AT

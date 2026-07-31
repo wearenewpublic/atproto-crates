@@ -1185,16 +1185,28 @@ mod tests {
         assert_eq!(result.writes.len(), 3);
         // All three writes share one rev and one commit.
         let rev = &result.rev;
-        let events = stream_of(_tmp.path())
+        let all = stream_of(_tmp.path())
             .await
             .read_after(None, None, 100)
             .await
             .unwrap();
+        // Filtered to `#commit` rather than counting the whole stream: account
+        // creation also announces `#identity` and `#account`, and the claim
+        // under test is about how many commits a batch produces, not how many
+        // events exist.
+        let events: Vec<_> = all
+            .iter()
+            .filter(|row| row.event_type == crate::sequencer::EventType::Commit.as_str())
+            .collect();
         assert_eq!(events.len(), 1, "one batch → one #commit event");
         assert_eq!(events[0].did, "did:plc:alice");
         assert_eq!(
-            events[0].seq, 1,
+            all[0].seq, 1,
             "the stream numbers from 1 regardless of which repository wrote"
+        );
+        assert!(
+            events[0].seq > all[0].seq,
+            "the commit follows the account announcements it was preceded by"
         );
         // The stored body is DAG-CBOR in the lexicon's `#commit` shape.
         let atproto_dasl::Ipld::Map(payload) =

@@ -311,6 +311,58 @@ impl AccountManager {
         // 5. Open per-actor file (creates + migrates).
         let _ = SqlActorStore::open(&self.data_dir, params.did).await?;
 
+        // 6. Tell the network the account exists.
+        //
+        // A relay or appview learns that an account exists from `#identity` and
+        // `#account`; without them a new account is invisible until it happens
+        // to write a record, and a consumer that indexes identity separately
+        // never learns its handle at all. The reference sequences both as part
+        // of account creation.
+        //
+        // Emitted here rather than in the `createAccount` handler because this
+        // is the choke point every creation path passes through — the handler,
+        // account migration, and fixtures alike. Announcing from one caller
+        // would leave the others silent.
+        //
+        // Only for accounts that land active. A verified inbound migration
+        // lands deactivated on purpose: until the DID document points here the
+        // repository must not be publicly readable or emit firehose events, and
+        // announcing it would contradict that. `set_account_state` already
+        // emits `#account` when such an account is later activated.
+        //
+        // NOT emitted: `#commit` and `#sync`, which the reference also
+        // sequences at this point. It can, because it creates an empty
+        // repository with a genesis commit; this server defers the first commit
+        // to the first write, so `getLatestCommit` answers `RepoNotFound` until
+        // then and there is no commit to name. Emitting either would mean
+        // inventing one. A genesis commit at signup is separate work.
+        //
+        // Best-effort, matching `set_account_state`: the account is durable by
+        // this point, and a consumer that misses the announcement recovers by
+        // resolving the identity. Failing the creation would be worse.
+        if matches!(params.state, AccountState::Active) {
+            if let Err(e) = self
+                .emit_identity_event(params.did, Some(params.handle))
+                .await
+            {
+                tracing::warn!(
+                    did = params.did,
+                    ?e,
+                    "failed to emit #identity for a new account"
+                );
+            }
+            if let Err(e) = self
+                .emit_account_event(params.did, AccountState::Active)
+                .await
+            {
+                tracing::warn!(
+                    did = params.did,
+                    ?e,
+                    "failed to emit #account for a new account"
+                );
+            }
+        }
+
         Ok(AccountRow {
             did: params.did.to_string(),
             handle: params.handle.to_string(),
@@ -507,6 +559,22 @@ impl AccountManager {
         if let Err(e) = self.emit_account_event(did, new_state).await {
             tracing::warn!(did, ?e, "failed to emit #account event");
         }
+        Ok(())
+    }
+
+    /// Append an `#identity` event announcing a DID and its handle.
+    ///
+    /// Mirrors `crate::http::identity_handlers::emit_identity_event`, which
+    /// serves the handle-change paths; this one exists so account creation does
+    /// not have to reach into the HTTP layer.
+    async fn emit_identity_event(&self, did: &str, handle: Option<&str>) -> PdsResult<()> {
+        let bytes = crate::sequencer::payload::encode(&crate::sequencer::payload::IdentityBody {
+            did: did.to_string(),
+            handle: handle.map(str::to_string),
+        })?;
+        self.sequencer()
+            .append(did, crate::sequencer::EventType::Identity.as_str(), bytes)
+            .await?;
         Ok(())
     }
 

@@ -368,20 +368,32 @@ async fn subscribe_repos_end_to_end() {
         response.into_body().collect().await.unwrap().to_bytes()
     );
 
-    let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
-        .await
-        .expect("a frame should arrive within 30s of the write")
-        .expect("the socket should stay open")
-        .expect("the frame should not be a protocol error");
-
-    assert!(
-        message.is_binary(),
-        "CBOR subscribers must receive binary frames, got {message:?}"
-    );
-    let frame = message.as_payload();
+    // Read until the commit arrives rather than asserting on the first frame.
+    // Account creation announces itself with `#identity` and `#account`, so a
+    // subscriber connected before the account existed sees those first. The
+    // claim under test is that the write produces a well-formed `#commit`, not
+    // that it is the only thing on the stream.
+    let mut frame = None;
+    for _ in 0..8 {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+            .await
+            .expect("a frame should arrive within 30s of the write")
+            .expect("the socket should stay open")
+            .expect("the frame should not be a protocol error");
+        assert!(
+            message.is_binary(),
+            "CBOR subscribers must receive binary frames, got {message:?}"
+        );
+        let payload = message.as_payload().to_vec();
+        if payload.starts_with(COMMIT_HEADER_CBOR) {
+            frame = Some(payload);
+            break;
+        }
+    }
+    let frame = frame.expect("the write should produce a #commit frame");
     assert!(
         frame.starts_with(COMMIT_HEADER_CBOR),
-        "first frame is not a #commit event\n  expected header: {}\n  got frame start: {}",
+        "frame is not a #commit event\n  expected header: {}\n  got frame start: {}",
         hex::encode(COMMIT_HEADER_CBOR),
         hex::encode(&frame[..frame.len().min(COMMIT_HEADER_CBOR.len())])
     );
