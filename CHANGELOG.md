@@ -62,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-identity` / `atproto-oauth`: JWS signature verification rejected the high-S form, so
+  roughly half of all DPoP proofs from a conforming OAuth client failed at random with
+  `invalid_dpop_proof … invalid signature`. `key::validate` refuses high-S — correctly, because AT
+  Protocol signatures are specified as low-S and the malleable twin must not verify — but the same
+  function backed JWS verification, where that constraint does not apply. RFC 7515 defines ES256 as
+  the raw `r || s` pair and imposes no low-S rule, and WebCrypto (every browser, and Node's
+  `crypto.subtle`) does not normalise `s`.
+
+  `validate_with_policy` now takes a `SignaturePolicy`. `validate` keeps `LowSOnly` and every AT
+  Protocol caller keeps today's behaviour unchanged; `jwt::verify_with_config` and
+  `dpop::verify_dpop_proof` pass `AnyS`.
+
+  Measured against a live PDS before and after: of 14 proofs from a WebCrypto client, 9 carried
+  high-S and all 9 were refused beforehand; afterwards all 14 verified. The failure looked
+  intermittent, which is what made it hard to attribute — the same client, unchanged, succeeded or
+  failed depending only on a bit of the signature.
+
 - `atproto-pds`: a request to an `/xrpc/` path the router does not serve answered a bare HTTP 404 with
   no body at all. XRPC requires every error response to carry `{"error", "message"}`, and the reference
   server maps an unrouted method id to `MethodNotImplementedError` — `ResponseType.MethodNotImplemented`,

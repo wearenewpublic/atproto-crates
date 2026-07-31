@@ -318,9 +318,34 @@ where
     Ok(())
 }
 
+/// Which ECDSA signature forms a verifier will accept.
+///
+/// The two callers of [`validate_with_policy`] want opposite things, and
+/// collapsing them is why a conforming OAuth client could not authenticate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignaturePolicy {
+    /// Reject the high-S form. AT Protocol signatures — repository commits,
+    /// service auth, PLC operations — are specified as low-S, and accepting the
+    /// malleable twin would let a third party alter a signature's bytes without
+    /// invalidating it.
+    LowSOnly,
+
+    /// Accept either form, as JWS requires.
+    ///
+    /// A DPoP proof is an ordinary ES256 JWS produced by whatever client is
+    /// talking to us. RFC 7515 defines the signature as the raw `r || s` pair
+    /// and imposes no low-S constraint, and WebCrypto — every browser, and
+    /// Node's `crypto.subtle` — does not normalise `s`. Roughly half of all
+    /// proofs from a conforming client therefore carry high-S. Rejecting those
+    /// does not make the protocol stricter, it makes authentication fail at
+    /// random for clients doing nothing wrong.
+    AnyS,
+}
+
 /// Validates a signature against content using the provided key.
 ///
-/// Supports both public and private keys for signature verification.
+/// Applies [`SignaturePolicy::LowSOnly`]: this is the AT Protocol signature
+/// path. Use [`validate_with_policy`] for JWS, where the high-S form is legal.
 ///
 /// # Errors
 ///
@@ -328,11 +353,28 @@ where
 /// high-S form, which AT Protocol does not accept, before checking whether it
 /// verifies at all.
 pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<(), KeyError> {
+    validate_with_policy(key_data, signature, content, SignaturePolicy::LowSOnly)
+}
+
+/// Validates a signature under an explicit malleability policy.
+///
+/// # Errors
+///
+/// Returns [`KeyError::SignatureMalleable`] only under
+/// [`SignaturePolicy::LowSOnly`]; otherwise the same errors as [`validate`].
+pub fn validate_with_policy(
+    key_data: &KeyData,
+    signature: &[u8],
+    content: &[u8],
+    policy: SignaturePolicy,
+) -> Result<(), KeyError> {
     match *key_data.key_type() {
         KeyType::P256Public => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
-            reject_high_s(&signature)?;
+            if policy == SignaturePolicy::LowSOnly {
+                reject_high_s(&signature)?;
+            }
             let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(key_data.bytes())
                 .map_err(|error| KeyError::P256Error { error })?;
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
@@ -341,7 +383,9 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::P384Public => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
-            reject_high_s(&signature)?;
+            if policy == SignaturePolicy::LowSOnly {
+                reject_high_s(&signature)?;
+            }
             let verifying_key = p384::ecdsa::VerifyingKey::from_sec1_bytes(key_data.bytes())
                 .map_err(|error| KeyError::P384Error { error })?;
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
@@ -350,7 +394,9 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::K256Public => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
-            reject_high_s(&signature)?;
+            if policy == SignaturePolicy::LowSOnly {
+                reject_high_s(&signature)?;
+            }
             let verifying_key = k256::ecdsa::VerifyingKey::from_sec1_bytes(key_data.bytes())
                 .map_err(|error| KeyError::K256Error { error })?;
             ecdsa::signature::Verifier::verify(&verifying_key, content, &signature)
@@ -359,7 +405,9 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::P256Private => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
-            reject_high_s(&signature)?;
+            if policy == SignaturePolicy::LowSOnly {
+                reject_high_s(&signature)?;
+            }
             let secret_key: p256::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
@@ -371,7 +419,9 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::P384Private => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
-            reject_high_s(&signature)?;
+            if policy == SignaturePolicy::LowSOnly {
+                reject_high_s(&signature)?;
+            }
             let secret_key: p384::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
@@ -383,7 +433,9 @@ pub fn validate(key_data: &KeyData, signature: &[u8], content: &[u8]) -> Result<
         KeyType::K256Private => {
             let signature = ecdsa::Signature::from_slice(signature)
                 .map_err(|error| KeyError::SignatureError { error })?;
-            reject_high_s(&signature)?;
+            if policy == SignaturePolicy::LowSOnly {
+                reject_high_s(&signature)?;
+            }
             let secret_key: k256::SecretKey =
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
@@ -834,6 +886,67 @@ pub fn to_public(key_data: &KeyData) -> Result<KeyData, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signature in the high-S form must verify under
+    /// [`SignaturePolicy::AnyS`] and be refused under
+    /// [`SignaturePolicy::LowSOnly`].
+    ///
+    /// This is not hypothetical. WebCrypto — every browser, and Node's
+    /// `crypto.subtle` — emits `s` unnormalised, so about half of the DPoP
+    /// proofs a conforming OAuth client sends carry high-S. While the JWS path
+    /// enforced low-S, those clients failed authentication at random and the
+    /// error said only "invalid signature".
+    ///
+    /// The high-S twin is constructed rather than hunted for: for any valid
+    /// `(r, s)`, `(r, n - s)` is the other valid signature over the same
+    /// message, so negating `s` flips the form deterministically.
+    #[test]
+    fn high_s_signatures_are_accepted_only_under_any_s() {
+        use ecdsa::elliptic_curve::scalar::IsHigh;
+
+        let content = b"atpint high-S regression";
+
+        for _ in 0..16 {
+            let private_key_data = generate_key(KeyType::P256Private).unwrap();
+            let public_key_data = to_public(&private_key_data).unwrap();
+            let signed = sign(&private_key_data, content).unwrap();
+
+            let signature = ecdsa::Signature::<p256::NistP256>::from_slice(&signed).unwrap();
+            // `sign` normalises, so flip it to get the malleable twin.
+            assert!(
+                !bool::from(signature.s().is_high()),
+                "sign() should emit low-S"
+            );
+            let high = ecdsa::Signature::<p256::NistP256>::from_scalars(
+                signature.r().to_owned(),
+                -signature.s().to_owned(),
+            )
+            .unwrap();
+            assert!(
+                bool::from(high.s().is_high()),
+                "negating s must yield high-S"
+            );
+            let high_bytes = high.to_vec();
+
+            // Both forms are cryptographically valid over the same message.
+            validate_with_policy(&public_key_data, &signed, content, SignaturePolicy::AnyS)
+                .expect("low-S must verify under AnyS");
+            validate_with_policy(
+                &public_key_data,
+                &high_bytes,
+                content,
+                SignaturePolicy::AnyS,
+            )
+            .expect("high-S must verify under AnyS — this is what JWS requires");
+
+            // The AT Protocol path still refuses the malleable twin.
+            assert!(matches!(
+                validate(&public_key_data, &high_bytes, content),
+                Err(KeyError::SignatureMalleable)
+            ));
+            validate(&public_key_data, &signed, content).expect("low-S must verify by default");
+        }
+    }
 
     #[test]
     fn test_identify_key() {

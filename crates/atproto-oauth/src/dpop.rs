@@ -5,7 +5,7 @@
 
 use crate::errors::{JWKError, JWTError};
 use anyhow::Result;
-use atproto_identity::key::{KeyData, to_public, validate};
+use atproto_identity::key::{KeyData, SignaturePolicy, to_public, validate_with_policy};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use elliptic_curve::JwkEcKey;
 use reqwest::header::HeaderValue;
@@ -750,8 +750,15 @@ pub fn validate_dpop_jwt(dpop_jwt: &str, config: &DpopValidationConfig) -> Resul
         .decode(encoded_signature)
         .map_err(|_| JWTError::InvalidSignature)?;
 
-    validate(&key_data, &signature_bytes, content.as_bytes())
-        .map_err(|_| JWTError::SignatureVerificationFailed)?;
+    // See the note in `jwt::verify_with_config`: a DPoP proof is an ordinary
+    // JWS from an arbitrary client, so the high-S form is legal here.
+    validate_with_policy(
+        &key_data,
+        &signature_bytes,
+        content.as_bytes(),
+        SignaturePolicy::AnyS,
+    )
+    .map_err(|_| JWTError::SignatureVerificationFailed)?;
 
     // 4. CALCULATE AND RETURN JWK THUMBPRINT
     thumbprint(&wrapped_jwk).map_err(|e| e.into())

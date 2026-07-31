@@ -10,7 +10,9 @@
 //! [`crate::jwt::JwtValidationConfig::allow_missing_expiration`].
 
 use anyhow::Result;
-use atproto_identity::key::{KeyData, KeyType, sign, to_public, validate};
+use atproto_identity::key::{
+    KeyData, KeyType, SignaturePolicy, sign, to_public, validate_with_policy,
+};
 use base64::{Engine as _, engine::general_purpose};
 use elliptic_curve::JwkEcKey;
 use serde::{Deserialize, Serialize};
@@ -292,8 +294,17 @@ pub fn verify_with_config(
 
     let content = format!("{}.{}", encoded_header, encoded_claims);
 
-    validate(key_data, &signature_bytes, content.as_bytes())
-        .map_err(|_| JWTError::SignatureVerificationFailed)?;
+    // JWS, not an AT Protocol signature: RFC 7515 defines ES256 as the raw
+    // `r || s` pair with no low-S constraint, and WebCrypto does not normalise
+    // `s`. Enforcing low-S here rejected roughly half of all proofs from
+    // conforming clients, at random.
+    validate_with_policy(
+        key_data,
+        &signature_bytes,
+        content.as_bytes(),
+        SignaturePolicy::AnyS,
+    )
+    .map_err(|_| JWTError::SignatureVerificationFailed)?;
 
     // Get current timestamp for validation
     let now = match config.now {
