@@ -122,6 +122,7 @@ struct CommitProofVector {
     dels: Vec<String>,
     root_before_commit: String,
     root_after_commit: String,
+    blocks_in_proof: Vec<String>,
 }
 
 #[test]
@@ -228,6 +229,38 @@ async fn interop_commit_proof_roots() {
             mismatches.push(format!(
                 "rootAfterCommit: expected {}, got {actual_after}",
                 vector.root_after_commit
+            ));
+        }
+
+        // The covering proof: the blocks an inductive consumer needs to verify
+        // this commit's operations without holding the repository. Taken over
+        // the post-commit tree and unioned across every touched key, matching
+        // the reference (`packages/repo/src/repo.ts:145-152`).
+        //
+        // This is the assertion the fixtures exist for. Checking only the two
+        // roots — which is all this test did before the proof was constructed —
+        // says the tree ends up the right shape, not that a consumer can check
+        // it, and those are the two different claims F-FIRE-06 was about.
+        let mut proof: std::collections::HashMap<cid::Cid, Vec<u8>> =
+            std::collections::HashMap::new();
+        for key in vector.adds.iter().chain(vector.dels.iter()) {
+            let blocks = tree.covering_proof(key).await.unwrap_or_else(|err| {
+                panic!("{}: proof for {key:?} failed: {err}", vector.comment)
+            });
+            proof.extend(blocks);
+        }
+
+        let mut actual: Vec<String> = proof.keys().map(ToString::to_string).collect();
+        actual.sort();
+        let mut expected = vector.blocks_in_proof.clone();
+        expected.sort();
+        if actual != expected {
+            let missing: Vec<_> = expected.iter().filter(|c| !actual.contains(c)).collect();
+            let extra: Vec<_> = actual.iter().filter(|c| !expected.contains(c)).collect();
+            mismatches.push(format!(
+                "blocksInProof: {} expected, {} produced; missing {missing:?}; unexpected {extra:?}",
+                expected.len(),
+                actual.len()
             ));
         }
 

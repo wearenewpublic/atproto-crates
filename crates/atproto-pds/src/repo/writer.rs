@@ -398,6 +398,7 @@ impl RepoWriter {
         let mut delete_rkeys: Vec<(String, String)> = Vec::new(); // (collection, rkey)
 
         let now = Utc::now().to_rfc3339();
+        let mut touched_keys: Vec<String> = Vec::new();
         for op in &ops {
             let mst_key = format!("{}/{}", op.collection, op.rkey);
             match op.action {
@@ -447,6 +448,7 @@ impl RepoWriter {
                     }
 
                     let dasl_cid: atproto_dasl::Cid = cid.into();
+                    touched_keys.push(mst_key.clone());
                     mst.insert(&mst_key, dasl_cid.clone()).await.map_err(|e| {
                         PdsError::Storage {
                             reason: format!("mst insert: {e}"),
@@ -488,6 +490,7 @@ impl RepoWriter {
                             reason: format!("swapRecord mismatch on delete: {}", mst_key),
                         });
                     }
+                    touched_keys.push(mst_key.clone());
                     mst.delete(&mst_key).await.map_err(|e| PdsError::Storage {
                         reason: format!("mst delete: {e}"),
                     })?;
@@ -570,10 +573,37 @@ impl RepoWriter {
             reason: format!("encode signed commit: {e}"),
         })?;
         let commit_cid = compute_cid(&commit_bytes);
-        // The CARv1 slice this event carries. `mst` is finished with by now, so
-        // the recorder can be unwrapped for the blocks the commit wrote.
+        // The CARv1 slice this event carries.
+        //
+        // The blocks this commit wrote are not sufficient on their own: a
+        // Sync 1.1 consumer verifies the frame inductively, from the previous
+        // root and these blocks alone, and to check an operation on a key it
+        // needs the nodes along that key's path — including ones this commit
+        // left untouched. Without them it reports "partial MST, can't determine
+        // insertion order" and rejects the frame (F-FIRE-06).
+        //
+        // So the covering proof for every touched key is collected from the
+        // post-commit tree and unioned with what was written, matching the
+        // reference (`packages/repo/src/repo.ts:145-152`). Untouched blocks the
+        // consumer already holds are still skipped by `build_commit_car`'s
+        // reachability walk; the proof only adds what verification needs.
+        let mut proof_blocks = std::collections::BTreeMap::new();
+        for key in &touched_keys {
+            let blocks = mst
+                .covering_proof(key)
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("covering proof for {key}: {e}"),
+                })?;
+            for (cid, bytes) in blocks {
+                proof_blocks.insert(cid, bytes);
+            }
+        }
         let (_, written_blocks) = mst.into_storage().into_parts();
-        let blocks_car = build_commit_car(&commit_cid, &commit_bytes, &written_blocks).await?;
+        for (cid, bytes) in written_blocks {
+            proof_blocks.insert(cid, bytes);
+        }
+        let blocks_car = build_commit_car(&commit_cid, &commit_bytes, &proof_blocks).await?;
 
         // Persist commit + record-rows + outbox event in one tx.
         let mut tx = pool.begin().await.map_err(|e| PdsError::Storage {
@@ -726,6 +756,7 @@ impl RepoWriter {
         let mut record_rows: Vec<(String, String, String, String)> = Vec::with_capacity(ops.len());
         let mut delete_rkeys: Vec<(String, String)> = Vec::new();
         let now = Utc::now().to_rfc3339();
+        let mut touched_keys: Vec<String> = Vec::new();
         for op in &ops {
             let mst_key = format!("{}/{}", op.collection, op.rkey);
             match op.action {
@@ -771,6 +802,7 @@ impl RepoWriter {
                         }
                     }
                     let dasl_cid: atproto_dasl::Cid = cid.into();
+                    touched_keys.push(mst_key.clone());
                     mst.insert(&mst_key, dasl_cid.clone()).await.map_err(|e| {
                         PdsError::Storage {
                             reason: format!("mst insert: {e}"),
@@ -811,6 +843,7 @@ impl RepoWriter {
                             reason: format!("swapRecord mismatch on delete: {}", mst_key),
                         });
                     }
+                    touched_keys.push(mst_key.clone());
                     mst.delete(&mst_key).await.map_err(|e| PdsError::Storage {
                         reason: format!("mst delete: {e}"),
                     })?;
@@ -889,10 +922,37 @@ impl RepoWriter {
             reason: format!("encode signed commit: {e}"),
         })?;
         let commit_cid = compute_cid(&commit_bytes);
-        // The CARv1 slice this event carries. `mst` is finished with by now, so
-        // the recorder can be unwrapped for the blocks the commit wrote.
+        // The CARv1 slice this event carries.
+        //
+        // The blocks this commit wrote are not sufficient on their own: a
+        // Sync 1.1 consumer verifies the frame inductively, from the previous
+        // root and these blocks alone, and to check an operation on a key it
+        // needs the nodes along that key's path — including ones this commit
+        // left untouched. Without them it reports "partial MST, can't determine
+        // insertion order" and rejects the frame (F-FIRE-06).
+        //
+        // So the covering proof for every touched key is collected from the
+        // post-commit tree and unioned with what was written, matching the
+        // reference (`packages/repo/src/repo.ts:145-152`). Untouched blocks the
+        // consumer already holds are still skipped by `build_commit_car`'s
+        // reachability walk; the proof only adds what verification needs.
+        let mut proof_blocks = std::collections::BTreeMap::new();
+        for key in &touched_keys {
+            let blocks = mst
+                .covering_proof(key)
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("covering proof for {key}: {e}"),
+                })?;
+            for (cid, bytes) in blocks {
+                proof_blocks.insert(cid, bytes);
+            }
+        }
         let (_, written_blocks) = mst.into_storage().into_parts();
-        let blocks_car = build_commit_car(&commit_cid, &commit_bytes, &written_blocks).await?;
+        for (cid, bytes) in written_blocks {
+            proof_blocks.insert(cid, bytes);
+        }
+        let blocks_car = build_commit_car(&commit_cid, &commit_bytes, &proof_blocks).await?;
 
         // Build the atomic-commit batch.
         let commit_row = ActorCommitRow {

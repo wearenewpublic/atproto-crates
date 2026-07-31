@@ -62,6 +62,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-repo` / `atproto-pds`: `#commit` frames carried only the blocks a commit wrote, not the
+  Sync 1.1 covering proof, so an inductive consumer could not verify them. A consumer checks a frame
+  from the previous root and the frame's blocks alone; to check an operation on a key it needs the
+  nodes along that key's path, including ones the commit left untouched. Without them `goat firehose
+  --verify` — and indigo's relay in strict mode — answer *"partial MST, can't determine insertion
+  order"* and reject the frame.
+
+  `Mst::covering_proof(key)` returns those blocks: the union of the descent to the key and the
+  descents to its left and right neighbouring subtrees, matching the reference
+  (`packages/repo/src/mst/mst.ts:784-849`). The write path collects the proof for every touched key
+  from the post-commit tree and unions it with the written blocks before building the CAR, as the
+  reference does. `build_commit_car`'s reachability walk still omits anything the consumer already
+  holds — the proof adds only what verification needs.
+
+  Written as three loops rather than three recursive calls: each descent is a tail descent, and
+  `BlockStorage::get` is an `async fn` in a trait whose future is not automatically `Send`, so boxed
+  recursion cannot satisfy the bound axum requires of a handler.
+
+  The six vendored `firehose/commit-proof-fixtures.json` vectors now assert `blocksInProof` rather
+  than only the two roots — the assertion those fixtures exist for, and previously unexercised.
+  Checking the roots says the tree ends up the right shape; checking the proof says a consumer can
+  verify it, and only the second was ever in question.
+
+  Verified live: with 8 records written to a fresh repository, `goat firehose --verify` reports zero
+  inversion failures where every frame was previously rejected.
+
 - `atproto-pds`: creating an account emitted no firehose events at all, so a new account was
   invisible to the network until it happened to write a record — and a consumer that indexes identity
   separately never learned its handle. A relay or appview learns an account exists from `#identity`

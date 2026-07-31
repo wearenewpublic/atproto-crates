@@ -9,6 +9,7 @@ use crate::config::RepoConfig;
 use crate::errors::MstError;
 use atproto_dasl::Cid;
 use atproto_dasl::storage::{BlockStorage, MemoryStorage};
+use std::collections::HashMap;
 
 /// Merkle Search Tree backed by pluggable block storage.
 ///
@@ -484,6 +485,181 @@ impl<S: BlockStorage> Mst<S> {
             });
         }
         Ok(())
+    }
+
+    /// Iterate over all key-value pairs in sorted order.
+    ///
+    /// Returns pairs as `(key, cid)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MstError` if traversal fails.
+    /// Blocks proving what this tree says about `key`.
+    ///
+    /// A Sync 1.1 consumer verifies a commit *inductively*: from the previous
+    /// root and the frame's blocks alone, without holding the repository. To do
+    /// that for an operation on `key` it must be able to walk from the root to
+    /// where `key` sits — or would sit — and to see the neighbours that decide
+    /// the shape of that path. The blocks a commit happens to write are not
+    /// enough: a node whose child was untouched still needs that child present
+    /// to be checked, which is why a consumer without this proof reports
+    /// "partial MST, can't determine insertion order" and rejects the frame.
+    ///
+    /// The proof is the union of three descents, matching the reference
+    /// (`packages/repo/src/mst/mst.ts:784-849`): the path to the key itself and
+    /// the paths to its left and right neighbouring subtrees. The neighbours
+    /// matter because an insert or delete can rebalance across them, so their
+    /// prior shape is part of what the new root asserts.
+    ///
+    /// Call on the tree *after* the commit, as the reference does.
+    ///
+    /// Written as three loops rather than three recursive calls. Each descent
+    /// is a tail descent, and `BlockStorage::get` is an `async fn` in a trait —
+    /// its future is not automatically `Send`, so a boxed recursive future
+    /// cannot satisfy the `Send` bound axum requires of a handler.
+    pub async fn covering_proof(&self, key: &str) -> Result<HashMap<cid::Cid, Vec<u8>>, MstError> {
+        let mut out = HashMap::new();
+        let Some(root) = self.root else {
+            return Ok(out);
+        };
+        self.proof_for_key(root, key, &mut out).await?;
+        self.proof_for_left_sib(root, key, &mut out).await?;
+        self.proof_for_right_sib(root, key, &mut out).await?;
+        Ok(out)
+    }
+
+    /// Add every node on `path` to the proof.
+    async fn add_path(
+        &self,
+        path: &[cid::Cid],
+        out: &mut HashMap<cid::Cid, Vec<u8>>,
+    ) -> Result<(), MstError> {
+        for cid in path {
+            if out.contains_key(cid) {
+                continue;
+            }
+            let node = self.load_node(cid).await?;
+            out.insert(*cid, node.to_bytes()?);
+        }
+        Ok(())
+    }
+
+    /// The path from the root down to `key`.
+    async fn proof_for_key(
+        &self,
+        root: cid::Cid,
+        key: &str,
+        out: &mut HashMap<cid::Cid, Vec<u8>>,
+    ) -> Result<(), MstError> {
+        let mut path = Vec::new();
+        let mut cid = root;
+        loop {
+            let entries = entries::from_node(&self.load_node(&cid).await?)?;
+            path.push(cid);
+
+            let index = entries::find_leaf_index(&entries, key);
+            if matches!(entries.get(index), Some(NodeEntry::Leaf { key: k, .. }) if k == key) {
+                break;
+            }
+            let prev = if index == 0 {
+                None
+            } else {
+                entries.get(index - 1)
+            };
+            match prev {
+                Some(NodeEntry::Tree(child)) => cid = *child,
+                // The descent runs out here. The reference returns an empty map
+                // from this level *without* adding the node it stopped at, so
+                // this node is dropped while its ancestors are kept. A proof
+                // that differs from the reference's is not interoperable even
+                // where it is arguably sufficient.
+                _ => {
+                    path.pop();
+                    break;
+                }
+            }
+        }
+        self.add_path(&path, out).await
+    }
+
+    /// The path down the left-hand neighbour of `key`.
+    async fn proof_for_left_sib(
+        &self,
+        root: cid::Cid,
+        key: &str,
+        out: &mut HashMap<cid::Cid, Vec<u8>>,
+    ) -> Result<(), MstError> {
+        let mut path = Vec::new();
+        let mut cid = root;
+        loop {
+            let entries = entries::from_node(&self.load_node(&cid).await?)?;
+            path.push(cid);
+
+            let index = entries::find_leaf_index(&entries, key);
+            let prev = if index == 0 {
+                None
+            } else {
+                entries.get(index - 1)
+            };
+            match prev {
+                Some(NodeEntry::Tree(child)) => cid = *child,
+                _ => break,
+            }
+        }
+        self.add_path(&path, out).await
+    }
+
+    /// The path down the right-hand neighbour of `key`.
+    ///
+    /// Asymmetric with the left descent: which neighbour to follow depends on
+    /// whether the entry at the key's position is a subtree, the key itself, or
+    /// some other leaf.
+    async fn proof_for_right_sib(
+        &self,
+        root: cid::Cid,
+        key: &str,
+        out: &mut HashMap<cid::Cid, Vec<u8>>,
+    ) -> Result<(), MstError> {
+        let mut path = Vec::new();
+        let mut cid = root;
+        loop {
+            let entries = entries::from_node(&self.load_node(&cid).await?)?;
+            path.push(cid);
+
+            let index = entries::find_leaf_index(&entries, key);
+            // Fall back to the entry before the position when the position is
+            // past the end.
+            let found = match entries.get(index) {
+                Some(entry) => Some(entry),
+                None if index > 0 => entries.get(index - 1),
+                None => None,
+            };
+
+            let next = match found {
+                None => None,
+                Some(NodeEntry::Tree(child)) => Some(*child),
+                Some(NodeEntry::Leaf { key: found_key, .. }) => {
+                    // Past the key, look one further right; otherwise one left.
+                    let neighbour = if found_key == key {
+                        entries.get(index + 1)
+                    } else if index == 0 {
+                        None
+                    } else {
+                        entries.get(index - 1)
+                    };
+                    match neighbour {
+                        Some(NodeEntry::Tree(child)) => Some(*child),
+                        _ => None,
+                    }
+                }
+            };
+
+            match next {
+                Some(child) => cid = child,
+                None => break,
+            }
+        }
+        self.add_path(&path, out).await
     }
 
     /// Iterate over all key-value pairs in sorted order.
