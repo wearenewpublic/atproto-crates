@@ -184,12 +184,27 @@ pub enum SpaceType {
     Nsid(String),
 }
 
-/// The `did` component of a `space:` scope: a specific DID or any (`*`).
+/// The `authority` component of a `space:` scope: `self`, a specific DID, or
+/// any (`*`).
+///
+/// The spec calls this parameter `authority` (0016, "OAuth scopes"). This
+/// crate accepted only `did`, and rejected `authority` as unknown, so every
+/// spec-conformant `space:` scope string failed to parse — the syntax here was
+/// written against an earlier draft. `did` is still accepted as a deprecated
+/// alias so existing grants keep working.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SpaceDid {
-    /// Matches any owner DID (wildcard `*`).
+    /// The granting user's own DID — the **default** when `authority` is
+    /// omitted.
+    ///
+    /// Resolved against the subject of the token carrying the grant, at match
+    /// time. A [`ScopesSet`](crate::scopes::ScopesSet) built without a subject
+    /// cannot resolve it and so matches nothing: failing closed is the only
+    /// safe answer when "whose spaces?" has no answer.
+    SelfDid,
+    /// Matches any authority DID (wildcard `*`).
     All,
-    /// A specific owner DID.
+    /// A specific authority DID.
     Did(String),
 }
 
@@ -403,12 +418,11 @@ impl SpacePermission {
             }
         }
 
-        // Reject any query key that is not part of the schema. The five valid
-        // query parameters are `did`, `skey`, `collection`, `action`, and
-        // `manage` (spec lines 373-384).
+        // Reject any query key that is not part of the schema: `authority`
+        // (alias `did`), `skey`, `collection`, `action`, and `manage`.
         for (key, _) in &params {
             match key.as_str() {
-                "did" | "skey" | "collection" | "action" | "manage" => {}
+                "authority" | "did" | "skey" | "collection" | "action" | "manage" => {}
                 "type" => {
                     // `type` is positional-only; it cannot be supplied as a
                     // named parameter alongside the positional value.
@@ -430,10 +444,26 @@ impl SpacePermission {
             _ => return Err(ParseError::MissingResource),
         };
 
-        // Resolve `did` (single, default `*`).
-        let did = match Self::single_param(&params, "did")? {
+        // Resolve the authority (single, default `self`).
+        //
+        // `authority` is the spec's name. `did` is the name this crate used
+        // before, kept as an alias so grants already issued keep parsing;
+        // naming both is a contradiction rather than a preference, so it is
+        // refused.
+        if Self::single_param(&params, "authority")?.is_some()
+            && Self::single_param(&params, "did")?.is_some()
+        {
+            return Err(ParseError::InvalidResource(
+                "space scope names both 'authority' and its deprecated alias 'did'".to_string(),
+            ));
+        }
+        let authority_param = match Self::single_param(&params, "authority")? {
+            Some(value) => Some(value),
+            None => Self::single_param(&params, "did")?,
+        };
+        let did = match authority_param {
             Some(value) => Self::parse_did(value)?,
-            None => SpaceDid::All,
+            None => SpaceDid::SelfDid,
         };
 
         // Resolve `skey` (single, default `*`).
@@ -523,10 +553,10 @@ impl SpacePermission {
     }
 
     fn parse_did(value: &str) -> Result<SpaceDid, ParseError> {
-        if value == "*" {
-            Ok(SpaceDid::All)
-        } else {
-            Ok(SpaceDid::Did(value.to_string()))
+        match value {
+            "*" => Ok(SpaceDid::All),
+            "self" => Ok(SpaceDid::SelfDid),
+            did => Ok(SpaceDid::Did(did.to_string())),
         }
     }
 
@@ -569,9 +599,13 @@ impl SpacePermission {
 
         let mut params: Vec<String> = Vec::new();
 
-        // did (default `*`).
-        if let SpaceDid::Did(did) = &self.did {
-            params.push(format!("did={did}"));
+        // authority (default `self`, so `self` is omitted). `*` is no longer
+        // the default and must be spelled, or the round trip would silently
+        // narrow an any-authority grant to the user's own.
+        match &self.did {
+            SpaceDid::SelfDid => {}
+            SpaceDid::All => params.push("authority=*".to_string()),
+            SpaceDid::Did(did) => params.push(format!("authority={did}")),
         }
 
         // skey (default `*`).
@@ -617,18 +651,31 @@ impl SpacePermission {
             && SpaceAction::DEFAULT.iter().all(|a| self.action.contains(a))
     }
 
-    /// Returns `true` when `space_type`/`did`/`skey` of this grant overlap the
-    /// given target components (each grant component is `*` or equal).
-    fn tuple_overlaps(&self, space_type: &str, did: &str, skey: &str) -> bool {
+    /// Returns `true` when `space_type`/`authority`/`skey` of this grant
+    /// overlap the given target components (each grant component is `*` or
+    /// equal).
+    ///
+    /// `subject` is the DID the grant was issued to, used to resolve a
+    /// [`SpaceDid::SelfDid`] authority. `None` means the caller could not say
+    /// whose grant this is, and a `self` grant then matches nothing — see
+    /// [`SpaceDid::SelfDid`].
+    fn tuple_overlaps(
+        &self,
+        space_type: &str,
+        did: &str,
+        skey: &str,
+        subject: Option<&str>,
+    ) -> bool {
         if let SpaceType::Nsid(t) = &self.space_type
             && t != space_type
         {
             return false;
         }
-        if let SpaceDid::Did(d) = &self.did
-            && d != did
-        {
-            return false;
+        match &self.did {
+            SpaceDid::All => {}
+            SpaceDid::Did(d) if d == did => {}
+            SpaceDid::SelfDid if subject == Some(did) => {}
+            _ => return false,
         }
         if let SpaceSkey::Key(s) = &self.skey
             && s != skey
@@ -665,8 +712,13 @@ impl SpacePermission {
     ///    covered.
     /// 4. `create` / `update` / `delete`: granted if the action set includes
     ///    the action **and** the target collection is covered.
-    pub fn matches_with(&self, target: &SpaceTarget, declared: &[String]) -> bool {
-        if !self.tuple_overlaps(&target.space_type, &target.did, &target.skey) {
+    pub fn matches_with(
+        &self,
+        target: &SpaceTarget,
+        declared: &[String],
+        subject: Option<&str>,
+    ) -> bool {
+        if !self.tuple_overlaps(&target.space_type, &target.did, &target.skey, subject) {
             return false;
         }
 
@@ -700,8 +752,8 @@ impl SpacePermission {
     /// treating an omitted-`collection` grant as conferring **no** write
     /// targets (the `spaceType=*` / no-declaration case). Convenience wrapper
     /// over [`matches_with`](Self::matches_with) with an empty declared list.
-    pub fn matches(&self, target: &SpaceTarget) -> bool {
-        self.matches_with(target, &[])
+    pub fn matches(&self, target: &SpaceTarget, subject: Option<&str>) -> bool {
+        self.matches_with(target, &[], subject)
     }
 
     /// Whether this grant's collection set (resolved against `declared`) covers
@@ -721,8 +773,8 @@ impl SpacePermission {
     /// [`SpaceManageTarget`] (spec lines 415-419): the tuple must overlap and the
     /// grant's `manage` set must contain the requested verb. `manage` ignores
     /// `collection`.
-    pub fn matches_manage(&self, target: &SpaceManageTarget) -> bool {
-        if !self.tuple_overlaps(&target.space_type, &target.did, &target.skey) {
+    pub fn matches_manage(&self, target: &SpaceManageTarget, subject: Option<&str>) -> bool {
+        if !self.tuple_overlaps(&target.space_type, &target.did, &target.skey, subject) {
             return false;
         }
         self.manage.contains(&target.verb)
@@ -833,6 +885,11 @@ impl fmt::Display for SpacePermission {
 
 #[cfg(test)]
 mod tests {
+    /// The DID the grants under test were issued to, which `authority=self`
+    /// resolves against. Most tests here exercise action and collection logic
+    /// and use a bare grant, whose authority now defaults to `self`.
+    const SUBJECT: Option<&str> = Some("did:plc:abc");
+
     use super::*;
     use crate::scopes::Scope;
 
@@ -863,9 +920,11 @@ mod tests {
             permission.space_type,
             SpaceType::Nsid("com.example.space".to_string())
         );
-        // Defaults: did=*, skey=*, collection=Default, action={read,create,
-        // update,delete} (no read_self/no manage), manage empty.
-        assert_eq!(permission.did, SpaceDid::All);
+        // Defaults: authority=self, skey=*, collection=Default,
+        // action={read,create,update,delete} (no read_self/no manage), manage
+        // empty. The authority default is `self`, not `*` — a bare grant
+        // covers only the granting user's own spaces.
+        assert_eq!(permission.did, SpaceDid::SelfDid);
         assert_eq!(permission.skey, SpaceSkey::All);
         assert_eq!(permission.collection, SpaceCollections::Default);
         assert_eq!(permission.action, actions(&SpaceAction::DEFAULT));
@@ -881,7 +940,7 @@ mod tests {
     #[test]
     fn test_parse_all_params() {
         let permission = parse(
-            "space:com.example.space?did=did:plc:abc&skey=my-space&collection=com.example.note&collection=com.example.photo&action=read&action=create&manage=update",
+            "space:com.example.space?authority=did:plc:abc&skey=my-space&collection=com.example.note&collection=com.example.photo&action=read&action=create&manage=update",
         );
         assert_eq!(
             permission.space_type,
@@ -928,7 +987,7 @@ mod tests {
 
     #[test]
     fn test_parse_wildcards_in_params() {
-        let permission = parse("space:*?did=*&skey=*&collection=*");
+        let permission = parse("space:*?authority=*&skey=*&collection=*");
         assert_eq!(permission.space_type, SpaceType::All);
         assert_eq!(permission.did, SpaceDid::All);
         assert_eq!(permission.skey, SpaceSkey::All);
@@ -979,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_parse_duplicate_single_param_is_error() {
-        assert!(Scope::parse("space:com.example.space?did=did:a&did=did:b").is_err());
+        assert!(Scope::parse("space:com.example.space?authority=did:a&did=did:b").is_err());
         assert!(Scope::parse("space:com.example.space?skey=a&skey=b").is_err());
     }
 
@@ -1003,9 +1062,16 @@ mod tests {
         let permission = parse("space:com.example.space");
         assert_eq!(permission.to_scope_string(), "space:com.example.space");
 
-        // Explicit defaults are stripped on format.
-        let permission = parse("space:com.example.space?did=*&skey=*");
+        // Explicit defaults are stripped on format — but `authority=*` is not
+        // a default any more, so it survives. Dropping it would silently
+        // narrow an any-authority grant to the user's own on a round trip.
+        let permission = parse("space:com.example.space?skey=*");
         assert_eq!(permission.to_scope_string(), "space:com.example.space");
+        let permission = parse("space:com.example.space?authority=*&skey=*");
+        assert_eq!(
+            permission.to_scope_string(),
+            "space:com.example.space?authority=*"
+        );
 
         // The default action set ({read,create,update,delete}) is omitted.
         let permission =
@@ -1016,11 +1082,11 @@ mod tests {
     #[test]
     fn test_format_includes_non_defaults() {
         let permission = parse(
-            "space:com.example.space?did=did:plc:abc&skey=my-space&collection=com.example.note&action=read",
+            "space:com.example.space?authority=did:plc:abc&skey=my-space&collection=com.example.note&action=read",
         );
         assert_eq!(
             permission.to_scope_string(),
-            "space:com.example.space?did=did:plc:abc&skey=my-space&collection=com.example.note&action=read"
+            "space:com.example.space?authority=did:plc:abc&skey=my-space&collection=com.example.note&action=read"
         );
     }
 
@@ -1038,7 +1104,7 @@ mod tests {
         let cases = [
             "space:com.example.space",
             "space:*",
-            "space:com.example.space?did=did:plc:abc",
+            "space:com.example.space?authority=did:plc:abc",
             "space:com.example.space?skey=my-space",
             "space:com.example.space?collection=com.example.note",
             "space:com.example.space?collection=*",
@@ -1047,7 +1113,7 @@ mod tests {
             "space:com.example.space?action=create&action=update",
             "space:com.example.space?manage=update",
             "space:com.example.space?action=read_self&manage=update&manage=delete",
-            "space:com.example.space?did=did:plc:abc&skey=s&collection=a.b.c&action=read&action=create",
+            "space:com.example.space?authority=did:plc:abc&skey=s&collection=a.b.c&action=read&action=create",
         ];
 
         for case in cases {
@@ -1064,68 +1130,61 @@ mod tests {
 
     #[test]
     fn test_match_tuple_gate() {
-        let grant = parse("space:com.example.space?did=did:plc:abc&skey=s1");
+        let grant = parse("space:com.example.space?authority=did:plc:abc&skey=s1");
 
         // Exact tuple matches for read (read is in default action set).
-        assert!(grant.matches(&SpaceTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Read,
-        )));
+        assert!(grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
 
         // Wrong type, did, or skey each block.
-        assert!(!grant.matches(&SpaceTarget::new(
-            "com.other.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Read,
-        )));
-        assert!(!grant.matches(&SpaceTarget::new(
-            "com.example.space",
-            "did:plc:xyz",
-            "s1",
-            SpaceAction::Read,
-        )));
-        assert!(!grant.matches(&SpaceTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s2",
-            SpaceAction::Read,
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::new("com.other.space", "did:plc:abc", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
+        assert!(!grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:xyz", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
+        assert!(!grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:abc", "s2", SpaceAction::Read,),
+            SUBJECT,
+        ));
     }
 
     #[test]
     fn test_match_tuple_wildcards() {
-        let grant = parse("space:*");
-        // type/did/skey all `*` overlap any concrete tuple.
-        assert!(grant.matches(&SpaceTarget::new(
-            "anything",
-            "did:plc:zzz",
-            "whatever",
-            SpaceAction::Read,
-        )));
+        let grant = parse("space:*?authority=*");
+        // type/authority/skey all `*` overlap any concrete tuple. `authority`
+        // must now be spelled: a bare `space:*` means "any type, *my own*
+        // spaces", because the authority default is `self`.
+        assert!(grant.matches(
+            &SpaceTarget::new("anything", "did:plc:zzz", "whatever", SpaceAction::Read,),
+            SUBJECT,
+        ));
     }
 
     #[test]
     fn test_match_read_does_not_imply_write_or_manage() {
         // A read grant does not confer create.
         let grant = parse("space:com.example.space?action=read");
-        assert!(!grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Create,
-            "com.example.note",
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Create,
+                "com.example.note",
+            ),
+            SUBJECT,
+        ));
         // A grant without read does not confer whole-space read.
         let grant = parse("space:com.example.space?action=create&collection=com.example.note");
-        assert!(!grant.matches(&SpaceTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Read,
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
     }
 
     #[test]
@@ -1133,60 +1192,73 @@ mod tests {
         // A whole-space `read` grant satisfies a read_self request and is not
         // collection-constrained for the own repo.
         let grant = parse("space:com.example.space?action=read");
-        assert!(grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::ReadSelf,
-            "any.collection.here",
-        )));
+        assert!(grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::ReadSelf,
+                "any.collection.here",
+            ),
+            SUBJECT,
+        ));
     }
 
     #[test]
     fn test_match_read_self_is_collection_constrained() {
         // A read_self grant covers only the listed collection on the own repo.
         let grant = parse("space:com.example.space?action=read_self&collection=com.example.note");
-        assert!(grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::ReadSelf,
-            "com.example.note",
-        )));
+        assert!(grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::ReadSelf,
+                "com.example.note",
+            ),
+            SUBJECT,
+        ));
         // A different collection is not covered.
-        assert!(!grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::ReadSelf,
-            "com.example.photo",
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::ReadSelf,
+                "com.example.photo",
+            ),
+            SUBJECT,
+        ));
         // read_self does NOT confer whole-space read.
-        assert!(!grant.matches(&SpaceTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Read,
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
     }
 
     #[test]
     fn test_match_manage_verbs() {
         let grant = parse("space:com.example.space?manage=update");
         // The granted verb is permitted; collection is ignored.
-        assert!(grant.matches_manage(&SpaceManageTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceManageVerb::Update,
-        )));
+        assert!(grant.matches_manage(
+            &SpaceManageTarget::new(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceManageVerb::Update,
+            ),
+            SUBJECT,
+        ));
         // A different verb is not.
-        assert!(!grant.matches_manage(&SpaceManageTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceManageVerb::Create,
-        )));
+        assert!(!grant.matches_manage(
+            &SpaceManageTarget::new(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceManageVerb::Create,
+            ),
+            SUBJECT,
+        ));
     }
 
     #[test]
@@ -1194,12 +1266,10 @@ mod tests {
         // An ordinary record-access grant confers no administrative capability.
         let grant = parse("space:com.example.space");
         for verb in SpaceManageVerb::ALL {
-            assert!(!grant.matches_manage(&SpaceManageTarget::new(
-                "com.example.space",
-                "did:plc:abc",
-                "s1",
-                verb,
-            )));
+            assert!(!grant.matches_manage(
+                &SpaceManageTarget::new("com.example.space", "did:plc:abc", "s1", verb,),
+                None
+            ));
         }
     }
 
@@ -1210,43 +1280,55 @@ mod tests {
         );
 
         // create on the covered collection is granted.
-        assert!(grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Create,
-            "com.example.note",
-        )));
+        assert!(grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Create,
+                "com.example.note",
+            ),
+            SUBJECT,
+        ));
 
         // delete is not in the action list.
-        assert!(!grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Delete,
-            "com.example.note",
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Delete,
+                "com.example.note",
+            ),
+            SUBJECT,
+        ));
 
         // create on a different collection is not covered.
-        assert!(!grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Create,
-            "com.example.photo",
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Create,
+                "com.example.photo",
+            ),
+            SUBJECT,
+        ));
     }
 
     #[test]
     fn test_match_write_collection_wildcard() {
         let grant = parse("space:com.example.space?collection=*&action=create");
-        assert!(grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Create,
-            "any.collection.here",
-        )));
+        assert!(grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Create,
+                "any.collection.here",
+            ),
+            SUBJECT,
+        ));
     }
 
     #[test]
@@ -1259,13 +1341,16 @@ mod tests {
         let declared = vec!["com.example.note".to_string()];
 
         // With no declared collections (e.g. spaceType=*), writes are blocked.
-        assert!(!grant.matches(&SpaceTarget::with_collection(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Create,
-            "com.example.note",
-        )));
+        assert!(!grant.matches(
+            &SpaceTarget::with_collection(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::Create,
+                "com.example.note",
+            ),
+            SUBJECT,
+        ));
 
         // With the declared collections resolved in, the write is permitted.
         assert!(grant.matches_with(
@@ -1277,6 +1362,7 @@ mod tests {
                 "com.example.note",
             ),
             &declared,
+            SUBJECT,
         ));
         // A collection outside the declaration is still blocked.
         assert!(!grant.matches_with(
@@ -1288,15 +1374,14 @@ mod tests {
                 "com.example.photo",
             ),
             &declared,
+            SUBJECT,
         ));
 
         // Whole-space read is allowed regardless of collection.
-        assert!(grant.matches(&SpaceTarget::new(
-            "com.example.space",
-            "did:plc:abc",
-            "s1",
-            SpaceAction::Read,
-        )));
+        assert!(grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
     }
 
     #[test]
@@ -1333,7 +1418,7 @@ mod tests {
             "s1",
             SpaceAction::Create,
         );
-        assert!(!grant.matches(&target));
+        assert!(!grant.matches(&target, SUBJECT));
     }
 
     // --- scope_needed_for ---
@@ -1343,7 +1428,7 @@ mod tests {
         let target = SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read);
         assert_eq!(
             SpacePermission::scope_needed_for(&target),
-            "space:com.example.space?did=did:plc:abc&skey=s1&action=read"
+            "space:com.example.space?authority=did:plc:abc&skey=s1&action=read"
         );
     }
 
@@ -1357,7 +1442,7 @@ mod tests {
         );
         assert_eq!(
             SpacePermission::scope_needed_for_manage(&target),
-            "space:com.example.space?did=did:plc:abc&skey=s1&manage=update"
+            "space:com.example.space?authority=did:plc:abc&skey=s1&manage=update"
         );
     }
 
@@ -1372,7 +1457,7 @@ mod tests {
         );
         assert_eq!(
             SpacePermission::scope_needed_for(&target),
-            "space:com.example.space?did=did:plc:abc&skey=s1&collection=com.example.note&action=create"
+            "space:com.example.space?authority=did:plc:abc&skey=s1&collection=com.example.note&action=create"
         );
     }
 
@@ -1387,6 +1472,103 @@ mod tests {
         );
         let scope = SpacePermission::scope_needed_for(&target);
         let permission = parse(&scope);
-        assert!(permission.matches(&target));
+        assert!(permission.matches(&target, SUBJECT));
+    }
+}
+
+#[cfg(test)]
+mod authority_resolution {
+    use super::*;
+    use crate::scopes::Scope;
+
+    fn parse(s: &str) -> SpacePermission {
+        match Scope::parse(s) {
+            Ok(Scope::Space(p)) => p,
+            other => panic!("expected a space scope, got {other:?}"),
+        }
+    }
+
+    /// The spec's parameter name is `authority`; `did` was this crate's.
+    #[test]
+    fn authority_is_the_parameter_name_and_did_is_an_alias() {
+        assert_eq!(
+            parse("space:com.example.s?authority=did:plc:x").did,
+            SpaceDid::Did("did:plc:x".to_string())
+        );
+        assert_eq!(
+            parse("space:com.example.s?did=did:plc:x").did,
+            SpaceDid::Did("did:plc:x".to_string())
+        );
+        // Naming both is a contradiction, not a preference.
+        assert!(Scope::parse("space:com.example.s?authority=self&did=did:plc:x").is_err());
+    }
+
+    /// Omitting the authority means `self`, not `*`.
+    ///
+    /// This is the difference between "my bookmarks" and "everyone's
+    /// bookmarks", and it is the default, so it is what most grants get.
+    #[test]
+    fn the_default_authority_is_self() {
+        assert_eq!(parse("space:com.example.s").did, SpaceDid::SelfDid);
+        assert_eq!(
+            parse("space:com.example.s?authority=self").did,
+            SpaceDid::SelfDid
+        );
+        assert_eq!(parse("space:com.example.s?authority=*").did, SpaceDid::All);
+    }
+
+    /// `self` resolves against the DID the grant was issued to.
+    #[test]
+    fn self_matches_only_the_subjects_own_spaces() {
+        let grant = parse("space:com.example.s");
+        let own = SpaceTarget::new("com.example.s", "did:plc:me", "k", SpaceAction::Read);
+        let other = SpaceTarget::new("com.example.s", "did:plc:you", "k", SpaceAction::Read);
+
+        assert!(grant.matches(&own, Some("did:plc:me")));
+        assert!(
+            !grant.matches(&other, Some("did:plc:me")),
+            "a bare grant must not reach another authority's space"
+        );
+    }
+
+    /// With no subject, a `self` grant matches nothing.
+    ///
+    /// Failing closed is the only safe answer when "whose spaces?" has no
+    /// answer — but it is silent, which is why `ScopesSet::from_scope_string`
+    /// carries a warning and `from_scope_string_for` exists.
+    #[test]
+    fn self_matches_nothing_without_a_subject() {
+        let grant = parse("space:com.example.s");
+        let target = SpaceTarget::new("com.example.s", "did:plc:me", "k", SpaceAction::Read);
+        assert!(!grant.matches(&target, None));
+    }
+
+    /// `authority=*` still reaches everyone, and must be spelled to do so.
+    #[test]
+    fn wildcard_authority_reaches_any_owner() {
+        let grant = parse("space:com.example.s?authority=*");
+        for owner in ["did:plc:me", "did:plc:you"] {
+            let target = SpaceTarget::new("com.example.s", owner, "k", SpaceAction::Read);
+            assert!(grant.matches(&target, Some("did:plc:me")), "owner {owner}");
+        }
+    }
+
+    /// A round trip must not narrow a grant.
+    ///
+    /// `self` is the default and is omitted; `*` is not and must survive, or
+    /// re-serializing an any-authority grant would quietly turn it into a
+    /// self-only one.
+    #[test]
+    fn round_trips_do_not_change_what_is_granted() {
+        for s in [
+            "space:com.example.s",
+            "space:com.example.s?authority=*",
+            "space:com.example.s?authority=did:plc:x",
+        ] {
+            let once = parse(s).to_scope_string();
+            let twice = parse(&once).to_scope_string();
+            assert_eq!(once, twice, "not stable: {s}");
+            assert_eq!(parse(s).did, parse(&once).did, "authority changed: {s}");
+        }
     }
 }

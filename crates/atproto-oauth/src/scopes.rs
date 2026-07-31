@@ -1068,6 +1068,14 @@ impl std::error::Error for ParseError {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopesSet {
     scopes: Vec<String>,
+    /// The DID these grants were issued to, used to resolve a `self`
+    /// authority in a `space:` scope.
+    ///
+    /// The subject belongs to the token, not to each question asked of it, so
+    /// it is bound once here rather than threaded through every `allows_*`
+    /// call. `None` means the caller did not say, and a `self` grant then
+    /// matches nothing.
+    subject: Option<String>,
 }
 
 impl ScopesSet {
@@ -1077,10 +1085,49 @@ impl ScopesSet {
     }
 
     /// Build a scope set from a space-separated OAuth scope string.
+    ///
+    /// **The result cannot resolve a `self` authority.** `space:` grants
+    /// default to `authority=self`, so a set built this way matches no space
+    /// at all unless the grant names its authority explicitly. Prefer
+    /// [`from_scope_string_for`](Self::from_scope_string_for), which supplies
+    /// the DID the token was issued to.
+    ///
+    /// Kept for callers that genuinely have no subject — scope-string
+    /// round-trips, consent-screen rendering — where failing closed is right.
     pub fn from_scope_string(scope: &str) -> Self {
         ScopesSet {
             scopes: scope.split_whitespace().map(|s| s.to_string()).collect(),
+            subject: None,
         }
+    }
+
+    /// Build a scope set from a scope string, bound to the DID it was issued
+    /// to.
+    ///
+    /// `subject` is what `authority=self` resolves to — the default for every
+    /// `space:` grant that does not name an authority.
+    pub fn from_scope_string_for(scope: &str, subject: impl Into<String>) -> Self {
+        ScopesSet {
+            scopes: scope.split_whitespace().map(|s| s.to_string()).collect(),
+            subject: Some(subject.into()),
+        }
+    }
+
+    /// Bind this set to the DID its grants were issued to.
+    ///
+    /// Chainable form of [`from_scope_string_for`](Self::from_scope_string_for),
+    /// for sets assembled from individual scopes.
+    #[must_use]
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    /// The DID `authority=self` resolves against, if the set was built with
+    /// one.
+    #[must_use]
+    pub fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
     }
 
     /// Build a scope set from an iterator of individual scope strings.
@@ -1091,6 +1138,7 @@ impl ScopesSet {
     {
         ScopesSet {
             scopes: scopes.into_iter().map(Into::into).collect(),
+            subject: None,
         }
     }
 
@@ -1357,7 +1405,7 @@ impl ScopesSet {
     /// `collections`) per spec line 413.
     pub fn allows_space_with(&self, target: &SpaceTarget, declared: &[String]) -> bool {
         self.scopes.iter().any(|scope| {
-            matches!(Scope::parse(scope), Ok(Scope::Space(permission)) if permission.matches_with(target, declared))
+            matches!(Scope::parse(scope), Ok(Scope::Space(permission)) if permission.matches_with(target, declared, self.subject()))
         })
     }
 
@@ -1365,7 +1413,7 @@ impl ScopesSet {
     /// space-management target (spec lines 415-419).
     pub fn allows_space_manage(&self, target: &SpaceManageTarget) -> bool {
         self.scopes.iter().any(|scope| {
-            matches!(Scope::parse(scope), Ok(Scope::Space(permission)) if permission.matches_manage(target))
+            matches!(Scope::parse(scope), Ok(Scope::Space(permission)) if permission.matches_manage(target, self.subject()))
         })
     }
 
@@ -2633,18 +2681,21 @@ mod tests {
         let tests = vec![
             ("space:com.example.space", "space:com.example.space"),
             ("space:*", "space:*"),
-            // Explicit defaults stripped.
+            // Explicit defaults stripped — but `authority=*` is no longer a
+            // default, so it survives. Dropping it would silently narrow an
+            // any-authority grant to the user's own on a round trip.
+            ("space:com.example.space?skey=*", "space:com.example.space"),
             (
-                "space:com.example.space?did=*&skey=*",
-                "space:com.example.space",
+                "space:com.example.space?authority=*&skey=*",
+                "space:com.example.space?authority=*",
             ),
             (
                 "space:com.example.space?action=read&action=create&action=update&action=delete",
                 "space:com.example.space",
             ),
             (
-                "space:com.example.space?did=did:plc:abc&action=read",
-                "space:com.example.space?did=did:plc:abc&action=read",
+                "space:com.example.space?authority=did:plc:abc&action=read",
+                "space:com.example.space?authority=did:plc:abc&action=read",
             ),
             // `manage` is a separate parameter, preserved on normalization.
             (
@@ -2688,7 +2739,7 @@ mod tests {
     #[test]
     fn test_scopes_set_allows_space() {
         let set = ScopesSet::from_scope_string(
-            "atproto space:com.example.space?did=did:plc:abc&skey=s1&collection=com.example.note&action=read&action=create",
+            "atproto space:com.example.space?authority=did:plc:abc&skey=s1&collection=com.example.note&action=read&action=create",
         );
 
         // read is allowed.
@@ -2728,7 +2779,10 @@ mod tests {
 
     #[test]
     fn test_scopes_set_assert_space() {
-        let set = ScopesSet::from_scope_string("space:com.example.space?action=read");
+        // Bound to a subject: the grant omits `authority`, which means
+        // `self`, and `self` resolves against the DID the token was issued to.
+        let set =
+            ScopesSet::from_scope_string_for("space:com.example.space?action=read", "did:plc:abc");
 
         // Satisfied: Ok.
         assert!(
@@ -2757,7 +2811,8 @@ mod tests {
     #[test]
     fn test_scopes_set_ignores_unparseable_scopes() {
         // A non-space and a malformed scope are simply ignored for matching.
-        let set = ScopesSet::from_scopes(["account:email", "space:com.example.space?action=read"]);
+        let set = ScopesSet::from_scopes(["account:email", "space:com.example.space?action=read"])
+            .with_subject("did:plc:abc");
         assert!(set.allows_space(&SpaceTarget::new(
             "com.example.space",
             "did:plc:abc",

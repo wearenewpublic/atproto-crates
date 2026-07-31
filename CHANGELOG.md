@@ -156,6 +156,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   told apart from one whose table the parser failed on.
 
 ### Fixed
+- `atproto-oauth`: the `space:` OAuth scope syntax was from a superseded draft of proposal-0016, and
+  was wrong in two ways — one that made conformant grants unparseable, one that made every bare grant
+  far wider than intended.
+
+  **The parameter is `authority`, not `did`.** `authority` was rejected outright as an unknown query
+  key, so *every spec-conformant `space:` scope string failed to parse*. `did` is kept as a deprecated
+  alias so grants already issued keep working; naming both is refused.
+
+  **`authority` defaults to `self`, not `*`.** A bare `space:com.example.bookmarks` covers only the
+  granting user's own spaces of that type; reaching another authority's requires naming it or
+  `authority=*`. The default was `SpaceDid::All`, so every bare grant reached **every authority's
+  spaces of that type**, and `self` was not representable at all.
+
+  `self` is resolved at match time against the DID the token was issued to. `ScopesSet` carries that
+  subject — bound once at construction via `from_scope_string_for`, since the subject belongs to the
+  token rather than to each question asked of it — so no call site changed.
+
+  > **This needs attention.** `ScopesSet::from_scope_string` cannot resolve `self`, and a set built
+  > that way now matches **no space at all** unless the grant names its authority explicitly. That
+  > fails closed, which is the safe direction, but it fails *silently*: an authorization check that
+  > should pass will simply return false. Every caller that authorizes a space request must build its
+  > set with `from_scope_string_for` or `with_subject`. The PDS's `AuthSubject::scopes()` does; a new
+  > caller that forgets will not fail loudly.
+
+  Consequences worth noting. The consent screen now renders a bare grant as "your own" rather than
+  "any owner" — the line the user reads before deciding. And the network-wide warning no longer fires
+  on `space:*`, which under the corrected default means every space type under the user's *own* DID:
+  it now requires `space:*?authority=*`. A warning shown on a narrow grant is one users learn to
+  dismiss.
+
 - `atproto-lexicon`: `ref`, `union` and `params` were accepted as top-level definitions. None is a
   definition type — each describes how a field relates to something else, so none says anything
   standing alone: a top-level `ref` is a pointer with nobody holding it, and a `params` is the

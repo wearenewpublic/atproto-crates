@@ -3286,7 +3286,9 @@ mod scope_gate_tests {
     #[tokio::test]
     async fn oauth_wildcard_type_and_did_allows_any_space() {
         let state = test_state().await;
-        let subject = oauth_subject("space:*?action=read");
+        // `authority=*` is what makes this reach a space owned by someone
+        // else; a bare `space:*` would cover only the subject's own spaces.
+        let subject = oauth_subject("space:*?authority=*&action=read");
         assert!(
             assert_space_scope(&state, &subject, &space_uri(), SpaceAction::Read, None)
                 .await

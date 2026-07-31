@@ -99,7 +99,12 @@ impl AuthSubject {
     pub fn scopes(&self) -> atproto_oauth::scopes::ScopesSet {
         match self {
             AuthSubject::AppPassword(_) => atproto_oauth::scopes::ScopesSet::new(),
-            AuthSubject::OAuth(c) => atproto_oauth::scopes::ScopesSet::from_scope_string(&c.scope),
+            AuthSubject::OAuth(c) => {
+                // Bound to the token's subject so a `space:` grant that omits
+                // `authority` resolves to the account it was issued for, which
+                // is what `authority=self` means and what the default is.
+                atproto_oauth::scopes::ScopesSet::from_scope_string_for(&c.scope, &c.sub)
+            }
         }
     }
 

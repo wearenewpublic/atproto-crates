@@ -345,9 +345,12 @@ fn render_consent(
 }
 
 /// `true` when any `space:` scope in `scope` grants access to every space on
-/// the network — i.e. its `type` is `*` **and** its `did` is `*`. This is the
-/// broad-grant condition that requires a prominent consent warning (spec lines
-/// 437-438).
+/// the network — i.e. its `type` is `*` **and** its `authority` is `*`.
+///
+/// Both halves are load-bearing, and the authority half more than it looks. A
+/// bare `space:*` is *not* universal: `authority` defaults to `self`, so it
+/// covers every space type under the signing-in user's own DID and nothing
+/// else. Warning on that would train users to dismiss the warning.
 fn has_universal_space_scope(scope: &str) -> bool {
     scope.split_whitespace().any(|token| {
         matches!(
@@ -420,6 +423,11 @@ pub fn describe_space_scope(
     };
 
     let owner_label = match &perm.did {
+        // The default, and the narrow case: only the signing-in user's own
+        // spaces. Worth saying plainly, because "any owner" and "your own" are
+        // very different grants and this line is what the user reads before
+        // deciding.
+        SpaceDid::SelfDid => "your own".to_string(),
         SpaceDid::All => "any owner".to_string(),
         SpaceDid::Did(did) => handles
             .get(did)
@@ -570,7 +578,8 @@ mod tests {
 
     #[test]
     fn describe_scope_space_read_only() {
-        // `action=read` on a concrete type; no did/skey → "any owner".
+        // `action=read` on a concrete type; no authority/skey → "your own",
+        // because `authority` defaults to `self`.
         let d = describe_scope(
             "space:app.bsky.group?action=read",
             &no_handles(),
@@ -578,7 +587,7 @@ mod tests {
         );
         assert!(d.contains("read access to"), "got: {d}");
         assert!(d.contains("app.bsky.group"), "got: {d}");
-        assert!(d.contains("any owner"), "got: {d}");
+        assert!(d.contains("your own"), "got: {d}");
     }
 
     #[test]
@@ -681,11 +690,24 @@ mod tests {
 
     #[test]
     fn universal_warning_triggers_on_type_and_did_wildcard() {
-        // `space:*` defaults did=* skey=* → universal.
-        assert!(has_universal_space_scope("space:*"));
-        let html = render_consent("uri", "client", "space:*", &no_handles(), &no_names());
+        // Universal needs both wildcards: any type *and* any authority.
+        assert!(has_universal_space_scope("space:*?authority=*"));
+        let html = render_consent(
+            "uri",
+            "client",
+            "space:*?authority=*",
+            &no_handles(),
+            &no_names(),
+        );
         assert!(html.contains("every space on the network"));
         assert!(html.contains("space-warning"));
+
+        // A bare `space:*` is every space *type* under the user's own DID, and
+        // must not raise the network-wide warning — a warning shown on a
+        // narrow grant is a warning users learn to dismiss.
+        assert!(!has_universal_space_scope("space:*"));
+        let own = render_consent("uri", "client", "space:*", &no_handles(), &no_names());
+        assert!(!own.contains("every space on the network"));
     }
 
     #[test]
