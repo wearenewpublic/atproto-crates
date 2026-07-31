@@ -28,14 +28,14 @@ itself. These files are the only thing in the repository that proves the code ag
 | `mst/key_heights.json`, `mst/common_prefix.json`, `firehose/commit-proof-fixtures.json` | `crates/atproto-repo/tests/interop_mst.rs` |
 | `data-model/data-model-fixtures.json`, `data-model/data-model-{valid,invalid}.json` | `crates/atproto-dasl/tests/interop_data_model.rs` |
 | `syntax/` (all 24 files) | `crates/atproto-lexicon/tests/interop_syntax.rs` |
+| `crypto/` (all 3 files) | `crates/atproto-identity/tests/interop_crypto.rs` |
 
-The remaining files (`crypto/`, `lexicon/`, `mst/example_keys.txt`)
+The remaining files (`lexicon/`, `mst/example_keys.txt`)
 are vendored for future harnesses and are not yet consumed.
 
 What each of those would take:
 
 - **`lexicon/`** — 68 cases across 9 files, against `crates/atproto-lexicon`'s record validation.
-- **`crypto/`** — signature and `did:key` encoding vectors.
 - **`mst/example_keys.txt`** — 156 keys. Unlike the rest of the corpus this file carries no expected
   answers: it is tree-building *input*, so consuming it means asserting a resulting tree shape
   against another implementation rather than checking an oracle.

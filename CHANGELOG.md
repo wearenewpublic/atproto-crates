@@ -86,6 +86,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denote the same record, which breaks equality comparison anywhere it is done; refusing digit-leading
   domain segments refuses names that exist.
 
+### Added
+- `atproto-identity`: `tests/interop_crypto.rs` runs the vendored crypto corpus — 12 cases across 3
+  files — against this crate's signature verification and `did:key` derivation. **All 12 pass**; no
+  defect was found, which is the result rather than an absence of one.
+
+  The negative fixtures are why the file is worth having. `signature-fixtures.json` carries high-S
+  and DER-encoded signatures a conforming verifier must *refuse*, and neither is reachable from a
+  sign-then-verify test: `sign` normalises, so this crate cannot produce a high-S signature to check
+  itself against. Those two classes had no coverage at all.
+
+  Confirmed load-bearing by mutation: switching `validate` to `SignaturePolicy::AnyS` — the policy
+  split added in `F-OAUTH-13` — makes the **P-256** high-S vector pass when it must fail. The K-256
+  high-S vector stays refused under either policy, because the underlying k256 verifier rejects
+  high-S on its own, so the low-S guard is only load-bearing for P-256.
+
+  The `did:key` vectors derive a public `did:key` from private key material, which the crate's own
+  tests do not do: they pin `did:key` literals for keys they generate, fixing the string format but
+  not the derivation. A wrong multicodec prefix would round-trip cleanly here and be unreadable
+  everywhere else.
+
+  One check is implemented rather than ported. The reference cross-checks `publicKeyMultibase`
+  against `publicKeyDid` with `expect(uint8arrays.equals(a, b))` and no matcher attached, so it
+  passes whatever the comparison returns. It is a real assertion here.
+
 ### Fixed
 - `atproto-lexicon`: `validate_datetime` accepted `-00:00` as a UTC offset and checked the year
   before the offset was applied.

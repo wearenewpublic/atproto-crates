@@ -91,6 +91,9 @@ tracing.workspace = true
 url.workspace = true
 zeroize = { workspace = true, optional = true }
 
+[dev-dependencies]
+hex = "0.4"
+
 [features]
 default = ["lru", "hickory-dns"]
 lru = ["dep:lru"]

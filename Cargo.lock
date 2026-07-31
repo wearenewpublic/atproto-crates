@@ -300,6 +300,7 @@ dependencies = [
  "ecdsa",
  "ed25519-dalek",
  "elliptic-curve",
+ "hex",
  "hickory-resolver",
  "idna",
  "k256",
