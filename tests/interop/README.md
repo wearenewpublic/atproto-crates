@@ -27,16 +27,13 @@ itself. These files are the only thing in the repository that proves the code ag
 | --- | --- |
 | `mst/key_heights.json`, `mst/common_prefix.json`, `firehose/commit-proof-fixtures.json` | `crates/atproto-repo/tests/interop_mst.rs` |
 | `data-model/data-model-fixtures.json`, `data-model/data-model-{valid,invalid}.json` | `crates/atproto-dasl/tests/interop_data_model.rs` |
+| `syntax/` (all 24 files) | `crates/atproto-lexicon/tests/interop_syntax.rs` |
 
-The remaining files (`crypto/`, `lexicon/`, `syntax/`, `mst/example_keys.txt`)
+The remaining files (`crypto/`, `lexicon/`, `mst/example_keys.txt`)
 are vendored for future harnesses and are not yet consumed.
 
 What each of those would take:
 
-- **`syntax/`** — 536 cases across 24 files, the largest suite in the corpus.
-  `crates/atproto-lexicon/src/validation/syntax/` already implements a parser per grammar (handle,
-  DID, NSID, AT-URI, TID, record key, datetime, language, CID, URI, AT-identifier), and none is held
-  to these answers. Both reference implementations run exactly this corpus.
 - **`lexicon/`** — 68 cases across 9 files, against `crates/atproto-lexicon`'s record validation.
 - **`crypto/`** — signature and `did:key` encoding vectors.
 - **`mst/example_keys.txt`** — 156 keys. Unlike the rest of the corpus this file carries no expected

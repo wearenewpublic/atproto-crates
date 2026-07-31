@@ -61,6 +61,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded. Any DID created against a directory that validated `did:key` less strictly should be
   treated as compromised and rotated using a key generated after this change.
 
+### Added
+- `atproto-lexicon`: `tests/interop_syntax.rs` runs the vendored syntax corpus — **536 cases across 24
+  files**, the largest suite in the corpus and the one both reference implementations run — against
+  this crate's grammar validators. Every test for those parsers had been written alongside the parser
+  it tests, so each encoded the same reading of the grammar the parser did; these vectors are the
+  first external oracle they have been held to.
+
+  **505 pass. 31 do not**, and are pinned in `KNOWN_FAILURES` so the disagreement cannot widen and
+  cannot be silently closed. They are real disagreements with the network, not corpus quirks:
+
+  | grammar | cases | disagreement |
+  |---|---|---|
+  | NSID | 6 | domain segments may begin with a digit — `org.4chan.lex.getThing` is refused |
+  | CID | 6 | only base32 multibase accepted; base58btc, base64, base16 and base10 are refused |
+  | AT-URI | 5 | a trailing slash and an empty path segment are accepted |
+  | language | 4 | grandfathered tags (`i-default`) and uppercase private-use (`X-fr-CH`) refused |
+  | TID | 2 | first character is not range-checked, so `zzzzzzzzzzzzz` is accepted |
+  | URI | 2 | raw and trailing spaces accepted |
+  | DID | 2 | an incomplete percent-escape (`did:method:val%`) is accepted |
+  | datetime | 2 | `-00:00` accepted, which RFC 3339 reserves for "offset unknown" |
+
+  The AT-URI and NSID entries are the ones with teeth: accepting a trailing slash means two strings
+  denote the same record, which breaks equality comparison anywhere it is done; refusing digit-leading
+  domain segments refuses names that exist.
+
 ### Fixed
 - `atproto-pds`: a new account had no repository until its first write. `getLatestCommit` answered
   `RepoNotFound` for a valid account, `getRepo` had nothing to export, and the account announcement
