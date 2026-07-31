@@ -88,6 +88,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Everything else about the OAuth surface was already correct: PAR required, S256-only PKCE, DPoP
   algorithms advertised, `redirect_uri` validated against the fetched document. One absent boolean
   made all of it unreachable.
+- `atproto-pds`: `POST /oauth/par` accepted a `dpop_jkt` parameter that contradicted the DPoP proof
+  sent alongside it, storing the parameter unchecked. RFC 9449 §10.1 lets a pushed request bind the
+  key either way, and either alone remains fine — the proof is optional on PAR and a bare request is
+  still accepted. But `dpop_jkt` is an assertion by whoever sent the request while a proof is a
+  demonstration of key possession, so honouring the parameter over a contradicting proof let a caller
+  bind the eventual token to a key it does not hold. The reference provider raises
+  `InvalidDpopKeyBindingError` for the same case.
+
+  The check is deliberately not a replay guard: consuming the proof's `jti` at PAR would make the
+  same proof unusable at the token endpoint moments later.
 
 - `atproto-pds`: a request to an `/xrpc/` path the router does not serve answered a bare HTTP 404 with
   no body at all. XRPC requires every error response to carry `{"error", "message"}`, and the reference

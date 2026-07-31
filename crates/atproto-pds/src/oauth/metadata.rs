@@ -103,7 +103,7 @@ pub async fn oauth_protected_resource(
     })
 }
 
-fn issuer_url(service_did: &str) -> String {
+pub(crate) fn issuer_url(service_did: &str) -> String {
     if let Some(host) = service_did.strip_prefix("did:web:") {
         format!("https://{host}")
     } else {

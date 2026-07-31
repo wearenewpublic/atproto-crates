@@ -1,7 +1,7 @@
 //! Phase 4 OAuth integration tests — PAR → authorize → token end-to-end.
 
 use atproto_identity::key::{KeyData, KeyType, generate_key};
-use atproto_oauth::dpop::{auth_dpop, request_dpop};
+use atproto_oauth::dpop::{auth_dpop, extract_jwk_thumbprint, request_dpop};
 use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
@@ -101,6 +101,9 @@ const REDIRECT_URI: &str = "http://127.0.0.1/";
 /// The `htu` a token-endpoint DPoP proof must be bound to, given the
 /// `did:web:test.example` service DID these tests build.
 const TOKEN_ENDPOINT: &str = "https://test.example/oauth/token";
+
+/// The `htu` a PAR-time DPoP proof must be bound to.
+const PAR_ENDPOINT: &str = "https://test.example/oauth/par";
 
 fn dpop_key() -> KeyData {
     generate_key(KeyType::P256Private).expect("generate DPoP key")
@@ -212,6 +215,95 @@ async fn write_with_token(
         ))
         .unwrap();
     app.clone().oneshot(request).await.unwrap().status()
+}
+
+/// A `dpop_jkt` that contradicts the DPoP proof on the same PAR request must be
+/// refused.
+///
+/// RFC 9449 §10.1 lets a pushed request bind the key by either mechanism, and
+/// either alone is fine — the proof is optional on PAR. What must not happen is
+/// the parameter winning over a signed proof: `dpop_jkt` is an assertion by
+/// whoever sent the request, so honouring it would let a caller bind the
+/// eventual token to a key it does not hold.
+#[tokio::test]
+async fn par_refuses_a_dpop_jkt_that_contradicts_the_proof() {
+    let (app, _manager, _tmp) = build_app().await;
+
+    let holder = dpop_key();
+    let other = dpop_key();
+    let (proof, _, _) = auth_dpop(&holder, "POST", PAR_ENDPOINT).expect("mint DPoP proof");
+    let (other_proof, _, _) = auth_dpop(&other, "POST", PAR_ENDPOINT).expect("mint other proof");
+    let holder_jkt = extract_jwk_thumbprint(&proof).expect("thumbprint");
+    let other_jkt = extract_jwk_thumbprint(&other_proof).expect("thumbprint");
+    assert_ne!(holder_jkt, other_jkt, "the two keys must differ");
+
+    let par = json!({
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": "atproto transition:generic",
+        "state": "abc",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
+        // Names a key the sender does not hold.
+        "dpop_jkt": other_jkt,
+    });
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/oauth/par")
+        .header("content-type", "application/json")
+        .header("DPoP", proof)
+        .body(axum::body::Body::from(serde_json::to_vec(&par).unwrap()))
+        .unwrap();
+    let res = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "invalid_dpop_proof", "body: {body}");
+}
+
+/// The same request with a matching `dpop_jkt` is accepted, so the check above
+/// is rejecting the contradiction rather than the presence of both.
+#[tokio::test]
+async fn par_accepts_a_dpop_jkt_matching_the_proof() {
+    let (app, _manager, _tmp) = build_app().await;
+
+    let holder = dpop_key();
+    let (proof, _, _) = auth_dpop(&holder, "POST", PAR_ENDPOINT).expect("mint DPoP proof");
+    let holder_jkt = extract_jwk_thumbprint(&proof).expect("thumbprint");
+
+    let par = json!({
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": "atproto transition:generic",
+        "state": "abc",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
+        "dpop_jkt": holder_jkt,
+    });
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/oauth/par")
+        .header("content-type", "application/json")
+        .header("DPoP", proof)
+        .body(axum::body::Body::from(serde_json::to_vec(&par).unwrap()))
+        .unwrap();
+    let res = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["request_uri"].is_string(), "body: {body}");
 }
 
 /// Run PAR + authorize, optionally pinning a DPoP thumbprint at PAR time.

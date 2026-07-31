@@ -157,6 +157,40 @@ pub async fn verify_token_endpoint_dpop(
     Ok(jkt)
 }
 
+/// Thumbprint of a DPoP proof presented on a PAR request, if one was sent.
+///
+/// Returns `Ok(None)` when there is no DPoP header — RFC 9449 §10.1 makes the
+/// proof optional on PAR, and the reference provider allows it explicitly, so a
+/// bare pushed request is not an error. When a proof *is* present it must be
+/// valid, and the caller must check the thumbprint against any `dpop_jkt` the
+/// request body carries.
+///
+/// No replay guard here: PAR is not a token grant, and consuming the `jti`
+/// would make the same proof unusable at the token endpoint moments later.
+///
+/// # Errors
+///
+/// Returns a 400 `invalid_dpop_proof` when a proof is present but malformed or
+/// fails validation.
+pub fn par_dpop_thumbprint(headers: &HeaderMap, htu: &str) -> Result<Option<String>, XrpcError> {
+    let Some(proof) = headers.get(DPOP_HEADER) else {
+        return Ok(None);
+    };
+    let invalid =
+        |message: String| XrpcError::new(StatusCode::BAD_REQUEST, "invalid_dpop_proof", message);
+
+    let proof = proof
+        .to_str()
+        .map_err(|_| invalid("DPoP header is not valid UTF-8".to_string()))?;
+
+    let mut config = DpopValidationConfig::for_authorization("POST", htu);
+    config.max_age_seconds = DPOP_MAX_AGE_SECS;
+    let jkt = validate_dpop_jwt(proof, &config)
+        .map_err(|e| invalid(format!("DPoP proof invalid: {e}")))?;
+
+    Ok(Some(jkt))
+}
+
 /// Decode the `jti` claim from a DPoP proof's payload (no signature check —
 /// the caller has already done that via `validate_dpop_jwt`).
 fn extract_jti(proof: &str) -> Option<String> {

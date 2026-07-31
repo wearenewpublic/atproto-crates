@@ -133,6 +133,7 @@ pub struct ParResponse {
 /// Handler for `POST /oauth/par`.
 pub async fn par_handler(
     State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
     JsonOrForm(input): JsonOrForm<ParInput>,
 ) -> Result<Json<ParResponse>, XrpcError> {
     // §10.2 — when `request` is present, JWS-verify against the client
@@ -144,6 +145,28 @@ pub async fn par_handler(
     } else {
         merge_inline_into_resolved(&input)?
     };
+
+    // RFC 9449 §10.1: on PAR the key may be bound by the DPoP header or by the
+    // `dpop_jkt` parameter. Either alone is fine — the proof is optional here,
+    // and a bare request is not an error. But when both are present and
+    // disagree, the request must be refused: `dpop_jkt` is an assertion by
+    // whoever sent the request, and honouring it over a signed proof would let
+    // a caller bind the eventual token to a key it does not hold. The reference
+    // provider raises InvalidDpopKeyBindingError for exactly this.
+    let par_url = format!(
+        "{}/oauth/par",
+        crate::oauth::metadata::issuer_url(&state.service_did)
+    );
+    if let Some(proof_jkt) = crate::oauth::dpop::par_dpop_thumbprint(&headers, &par_url)?
+        && let Some(claimed) = resolved.dpop_jkt.as_deref()
+        && claimed != proof_jkt
+    {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            "dpop_jkt does not match the thumbprint of the DPoP proof",
+        ));
+    }
 
     // Spec-required validations (apply to whichever shape we resolved).
     if resolved.response_type != "code" {
