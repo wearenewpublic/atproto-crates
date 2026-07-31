@@ -87,6 +87,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_nsid` refused NSIDs whose domain authority contains a segment
+  beginning with a digit — `org.4chan.lex.getThing`, `cn.8.lex.stuff`, and any name under an onion
+  address, which is digit-leading by construction. These are ordinary NSIDs for ordinary domains: DNS
+  labels may begin with a digit (RFC 1123 §2.1), and only the first segment (the TLD) and the last
+  (the name) are further restricted.
+
+  The cause was one regex requiring *every* dot-separated segment to start with a letter, which
+  flattened three different rules into one. The validator now follows the reference's own structure
+  (`validateNsid`, `packages/syntax/src/nsid.ts:89-122`), checking each rule where it applies: the
+  character set over the whole string, length and hyphen placement per segment, no leading digit on
+  the first segment only, and letters-and-digits-no-leading-digit-no-hyphen on the name.
+
+  Closes 7 of the 31 cases pinned in `interop_syntax.rs` (six vectors, one of which the corpus lists
+  twice). 512 of 536 now assert.
+
 - `atproto-lexicon`: `validate_at_uri` accepted a trailing slash and empty path segments —
   `at://alice/`, `at://alice//`, `at://alice//com.example.thing`. Both make two distinct strings
   denote the same record, so anything comparing, deduping or indexing by AT-URI sees two where there

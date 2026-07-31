@@ -56,41 +56,6 @@ use std::path::PathBuf;
 /// the remaining 505 cases become a gate immediately, and no fix can silently
 /// regress one.
 const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
-    // -- NSID -------------------------------------------------------------
-    // The domain authority segments may begin with a digit; only the final
-    // *name* segment may not. `org.4chan.lex.getThing` is a legitimate NSID
-    // for a real domain, and an onion address is digits-first by construction.
-    // Rejecting these refuses names that exist.
-    (
-        "syntax/nsid_syntax_valid.txt",
-        "a.0.c",
-        "digit-leading domain segment",
-    ),
-    (
-        "syntax/nsid_syntax_valid.txt",
-        "cn.8.lex.stuff",
-        "digit-leading domain segment",
-    ),
-    (
-        "syntax/nsid_syntax_valid.txt",
-        "one.2.three",
-        "digit-leading domain segment",
-    ),
-    (
-        "syntax/nsid_syntax_valid.txt",
-        "onion.2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.lex.deleteThing",
-        "digit-leading domain segment (onion address)",
-    ),
-    (
-        "syntax/nsid_syntax_valid.txt",
-        "org.4chan.lex.getThing",
-        "digit-leading domain segment",
-    ),
-    (
-        "syntax/nsid_syntax_valid.txt",
-        "test.12345.record",
-        "digit-leading domain segment",
-    ),
     // -- CID --------------------------------------------------------------
     // A CID is multibase-prefixed and base32 (`b`) is only the common case.
     // The corpus carries base58btc (`z`), base64 (`m`), base16 (`f`) and
