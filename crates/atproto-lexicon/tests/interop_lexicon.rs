@@ -26,19 +26,11 @@ use std::path::PathBuf;
 
 /// Cases that do not pass yet, as `(file, case name, why)`.
 ///
-/// Three, out of 63. Each was read against the vector and the reference before
+/// Two, out of 63. Each was read against the vector and the reference before
 /// being recorded; none is a corpus quirk. They are pinned rather than fixed
 /// here because the harness is what makes them visible, and landing it first
 /// turns the other 59 into a gate immediately.
 const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
-    // A member of an open union must carry `$type` naming which variant it is.
-    // Without it a consumer cannot tell which branch to validate against, so
-    // accepting it means accepting a value nothing can interpret.
-    (
-        "lexicon/record-data-invalid.json",
-        "open union missing $type",
-        "open union member without $type is accepted",
-    ),
     // `unknown` and `ref` are *field* types, not definition types. A top-level
     // def of either is not a schema anything can be validated against, and
     // accepting it is worse than accepting a bad record: everything validated

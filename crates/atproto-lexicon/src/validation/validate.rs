@@ -1475,58 +1475,25 @@ fn validate_union_inner(
         return Ok(());
     }
 
-    // No $type field - try each type in order
-    let mut last_error = None;
-    let mut any_resolved = false;
-    for ref_path in &schema.refs {
-        if let Some(resolved) = ctx.resolve_ref(ref_path) {
-            any_resolved = true;
-
-            // Charge every candidate attempt, not just the ones that recurse
-            // into another ref/union: a union listing thousands of plain object
-            // refs would otherwise do unbounded work for a single hop.
-            ctx.charge_step()?;
-
-            if ctx.is_nonproductive_union(&resolved.id)
-                || (ctx
-                    .flags
-                    .contains(ValidateFlags::STRICT_RECURSIVE_VALIDATION)
-                    && ctx.is_recursive_union(&resolved.id))
-            {
-                // Skip the candidate rather than accepting it; a non-productive
-                // cycle proves nothing about the value.
-                last_error = Some(DataValidationError::RecursiveReference {
-                    ref_path: ref_path.clone(),
-                });
-                continue;
-            }
-
-            let level = ctx.enter_union_target(&resolved.id);
-            let attempt = validate_value(value, &resolved.def, ctx);
-            ctx.exit_union_target(level, &resolved.id);
-
-            match attempt {
-                Ok(()) => return Ok(()),
-                Err(e) => last_error = Some(e),
-            }
-        }
-    }
-
-    // If SKIP_EXTERNAL_REFS is set and no refs could be resolved, accept the value
-    if !any_resolved && ctx.flags.contains(ValidateFlags::SKIP_EXTERNAL_REFS) {
-        tracing::debug!(
-            refs = ?schema.refs,
-            "Skipping union with no resolvable refs (SKIP_EXTERNAL_REFS)"
-        );
-        return Ok(());
-    }
-
-    Err(
-        last_error.unwrap_or_else(|| DataValidationError::UnionNoMatchingType {
-            path: ctx.current_path(),
-            refs: schema.refs.clone(),
-        }),
-    )
+    // No `$type`, so this is not a union member.
+    //
+    // A union is *discriminated*: the value names the variant it is. This
+    // previously fell back to trying each ref in order and accepting the first
+    // that matched structurally, which is a different question with a
+    // different answer. Two variants with compatible shapes are
+    // indistinguishable that way, so the validator's answer depended on the
+    // order `refs` happened to be written in, while a consumer — which has no
+    // such list to walk — could only ever read `$type`. They could disagree
+    // about the same record.
+    //
+    // The reference refuses it outright: "must be an object which includes the
+    // `$type` property". Note this holds for an *open* union too. Openness is
+    // about tolerating `$type` values not in `refs`, not about tolerating no
+    // `$type` at all.
+    Err(DataValidationError::UnionMissingType {
+        path: ctx.current_path(),
+        refs: schema.refs.clone(),
+    })
 }
 
 fn validate_unknown(
@@ -2977,59 +2944,6 @@ mod recursion_limit_tests {
     }
 
     #[test]
-    fn test_union_self_reference_without_type_marker_is_bounded() {
-        let err = on_worker_stack(|| {
-            let catalog = catalog_from(LOOP_LEXICON);
-            let record = serde_json::json!({"$type": "com.example.loop", "x": {}});
-            validate_record(
-                "com.example.loop",
-                &record,
-                &catalog,
-                ValidateFlags::empty(),
-            )
-            .unwrap_err()
-        });
-
-        assert!(
-            matches!(err, DataValidationError::RecursiveReference { .. }),
-            "expected RecursiveReference, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_acyclic_union_chain_hits_depth_limit() {
-        // No cycle anywhere: cycle detection alone cannot stop this, only a
-        // depth bound can.
-        let err = on_worker_stack(|| {
-            let lexicon = chain_lexicon(
-                5000,
-                r##"{"type": "union", "refs": ["#a0"]}"##,
-                r##"{"type": "union", "refs": ["{next}"]}"##,
-            );
-            let catalog = catalog_from(&lexicon);
-            let record = serde_json::json!({"$type": "com.example.chain", "x": {}});
-            validate_record(
-                "com.example.chain",
-                &record,
-                &catalog,
-                ValidateFlags::empty(),
-            )
-            .unwrap_err()
-        });
-
-        assert!(
-            matches!(
-                err,
-                DataValidationError::RefDepthExceeded {
-                    max_depth: crate::validation::limits::DEFAULT_MAX_REF_DEPTH,
-                    ..
-                }
-            ),
-            "expected RefDepthExceeded, got {err:?}"
-        );
-    }
-
-    #[test]
     fn test_acyclic_plain_ref_chain_hits_depth_limit() {
         // Same shape with no unions at all. `visited_refs` only detects cycles,
         // so an acyclic ref chain was an abort vector too.
@@ -3053,102 +2967,6 @@ mod recursion_limit_tests {
         assert!(
             matches!(err, DataValidationError::RefDepthExceeded { .. }),
             "expected RefDepthExceeded, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_union_fanout_hits_step_budget() {
-        // Depth 13, width 4: 4^13 combinations from a 34-byte body and a
-        // sub-1 KiB lexicon. Took ~25 s before the fix.
-        let mut defs = String::new();
-        for i in 0..13 {
-            defs.push_str(&format!(
-                "\"u{0}\": {{\"type\": \"union\", \"refs\": [\"#u{1}\", \"#u{1}\", \"#u{1}\", \"#u{1}\"]}},",
-                i,
-                i + 1
-            ));
-        }
-        defs.push_str(
-            r##""u13": {"type": "object", "required": ["zzz"], "properties": {"zzz": {"type": "string"}}}"##,
-        );
-        let lexicon = format!(
-            r##"{{"lexicon": 1, "id": "com.example.fan", "defs": {{
-                "main": {{"type": "record", "key": "tid", "record": {{
-                    "type": "object", "properties": {{"x": {{"type": "union", "refs": ["#u0"]}}}}
-                }}}},
-                {}
-            }}}}"##,
-            defs
-        );
-
-        let started = std::time::Instant::now();
-        let err = on_worker_stack(move || {
-            let catalog = catalog_from(&lexicon);
-            let record = serde_json::json!({"$type": "com.example.fan", "x": {}});
-            validate_record("com.example.fan", &record, &catalog, ValidateFlags::empty())
-                .unwrap_err()
-        });
-        let elapsed = started.elapsed();
-
-        match err {
-            DataValidationError::RefStepBudgetExhausted { max_steps, .. } => {
-                // A three-node body must not buy meaningful extra budget: the
-                // per-node allowance is proportional, so amplification from a
-                // tiny request stays bounded by the fixed allowance.
-                assert!(
-                    max_steps < DEFAULT_MAX_REF_STEPS + 1_000,
-                    "tiny body granted {max_steps} steps, expected ~{DEFAULT_MAX_REF_STEPS}"
-                );
-            }
-            other => panic!("expected RefStepBudgetExhausted, got {other:?}"),
-        }
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "fan-out validation took {elapsed:?}, expected well under 2s"
-        );
-    }
-
-    #[test]
-    fn test_mixed_union_ref_cycle_is_bounded() {
-        // union -> ref -> union: the union frame set and validate_ref's
-        // visited_refs must interlock rather than each hiding the other's cycle.
-        let lexicon = r##"{
-            "lexicon": 1,
-            "id": "com.example.mixed",
-            "defs": {
-                "main": {
-                    "type": "record",
-                    "key": "tid",
-                    "record": {
-                        "type": "object",
-                        "properties": {"x": {"type": "union", "refs": ["#u"]}}
-                    }
-                },
-                "u": {"type": "union", "refs": ["#r"]},
-                "r": {"type": "ref", "ref": "#u"}
-            }
-        }"##;
-
-        let err = on_worker_stack(|| {
-            let catalog = catalog_from(lexicon);
-            let record = serde_json::json!({"$type": "com.example.mixed", "x": {}});
-            validate_record(
-                "com.example.mixed",
-                &record,
-                &catalog,
-                ValidateFlags::empty(),
-            )
-            .unwrap_err()
-        });
-
-        assert!(
-            matches!(
-                err,
-                DataValidationError::RecursiveReference { .. }
-                    | DataValidationError::RefDepthExceeded { .. }
-                    | DataValidationError::RefStepBudgetExhausted { .. }
-            ),
-            "expected a bounded recursion error, got {err:?}"
         );
     }
 
@@ -3304,7 +3122,9 @@ mod recursion_limit_tests {
 
     /// Build the `com.example.fanarray` record with `n` union elements.
     fn build_open_union_record(n: usize) -> serde_json::Value {
-        let items: Vec<serde_json::Value> = (0..n).map(|_| serde_json::json!({"v": "x"})).collect();
+        let items: Vec<serde_json::Value> = (0..n)
+            .map(|_| serde_json::json!({"$type": "com.example.fanarray#a", "aa": "x"}))
+            .collect();
         serde_json::json!({"$type": "com.example.fanarray", "items": items})
     }
 
@@ -3353,64 +3173,208 @@ mod recursion_limit_tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    //  Union candidate search, and why these tests changed shape.
+    //
+    //  A union used to accept a value with no `$type` by trying each ref in
+    //  turn and keeping the first that matched. That search was the engine
+    //  behind every union-driven resource attack here: fan-out (4^13
+    //  combinations from a 34-byte body), nested backtracking, union chains
+    //  deep enough to trip the depth limit, and the frame- and
+    //  counter-leak bugs that came from unwinding a failed candidate.
+    //
+    //  Requiring `$type` — which the specification and both reference
+    //  implementations already required — deletes the search. A union now
+    //  resolves to at most one ref, so there are no candidates to enumerate,
+    //  nothing to backtrack out of, and no failed attempt to unwind. The
+    //  tests that bounded that work have been replaced by these, which assert
+    //  it cannot start.
+    //
+    //  What remains bounded, and still has tests above: a union that names
+    //  *itself* through `$type` (cycle detection), plain `ref` chains (the
+    //  depth limit), and large records (the step budget).
+    // ---------------------------------------------------------------------
+
+    /// A union value without `$type` is refused, not searched for a match.
+    ///
+    /// This is the property every test below rests on.
     #[test]
-    fn test_nested_backtracking_fanout_is_bounded() {
-        // The proportional allowance must not become an escape hatch. Here every
-        // union candidate *descends* into a child value, so the hops are not
-        // same-value re-entries, yet the search still explores 4^depth branches
-        // because the innermost value fails. A 700-byte body must not buy that.
+    fn test_union_without_type_marker_is_refused() {
+        let catalog = catalog_from(LOOP_LEXICON);
+        let record = serde_json::json!({"$type": "com.example.loop", "x": {}});
+        let err = validate_record(
+            "com.example.loop",
+            &record,
+            &catalog,
+            ValidateFlags::empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DataValidationError::UnionMissingType { .. }),
+            "expected UnionMissingType, got {err:?}"
+        );
+    }
+
+    /// The exponential fan-out is unreachable.
+    ///
+    /// Depth 13, width 4: 4^13 combinations from a 34-byte body and a sub-1
+    /// KiB lexicon. It took ~25 s when candidates were enumerated, then was
+    /// contained by the step budget. It is now refused outright, because the
+    /// body names no variant and so no combination is ever tried.
+    #[test]
+    fn test_union_fanout_is_unreachable() {
+        let mut defs = String::new();
+        for i in 0..13 {
+            defs.push_str(&format!(
+                "\"u{0}\": {{\"type\": \"union\", \"refs\": [\"#u{1}\", \"#u{1}\", \"#u{1}\", \"#u{1}\"]}},",
+                i,
+                i + 1
+            ));
+        }
+        defs.push_str(
+            r##""u13": {"type": "object", "required": ["zzz"], "properties": {"zzz": {"type": "string"}}}"##,
+        );
+        let lexicon = format!(
+            r##"{{"lexicon": 1, "id": "com.example.fan", "defs": {{
+                "main": {{"type": "record", "key": "tid", "record": {{
+                    "type": "object", "properties": {{"x": {{"type": "union", "refs": ["#u0"]}}}}
+                }}}},
+                {}
+            }}}}"##,
+            defs
+        );
+
+        let started = std::time::Instant::now();
+        let catalog = catalog_from(&lexicon);
+        let record = serde_json::json!({"$type": "com.example.fan", "x": {}});
+        let err = validate_record("com.example.fan", &record, &catalog, ValidateFlags::empty())
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, DataValidationError::UnionMissingType { .. }),
+            "expected UnionMissingType, got {err:?}"
+        );
+        // Not a bound on the search — a statement that there was none.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "refusal should be immediate, took {elapsed:?}"
+        );
+    }
+
+    /// A union chain cannot be walked by a value that names nothing.
+    ///
+    /// `#a0 -> #a1 -> ... -> #a4999`, no cycle anywhere. Reaching the depth
+    /// limit required trying each link in turn; a value carrying `$type`
+    /// stops at the first link whose refs do not name it, and a value
+    /// carrying none is refused at the first union.
+    #[test]
+    fn test_union_chain_is_not_walked() {
+        let lexicon = chain_lexicon(
+            5000,
+            r##"{"type": "union", "refs": ["#a0"]}"##,
+            r##"{"type": "union", "refs": ["{next}"]}"##,
+        );
+        let catalog = catalog_from(&lexicon);
+        let record = serde_json::json!({"$type": "com.example.chain", "x": {}});
+        let err = validate_record(
+            "com.example.chain",
+            &record,
+            &catalog,
+            ValidateFlags::empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DataValidationError::UnionMissingType { .. }),
+            "expected UnionMissingType, got {err:?}"
+        );
+    }
+
+    /// The union/ref cycle needs a discriminator to be entered at all.
+    ///
+    /// `union -> ref -> union` was reached by candidate search. It is still
+    /// detected when a value names its way in — see
+    /// `test_union_self_reference_via_type_marker_is_bounded` — but a value
+    /// that names nothing never enters it.
+    #[test]
+    fn test_mixed_union_ref_cycle_is_not_entered() {
         let lexicon = r##"{
             "lexicon": 1,
-            "id": "com.example.nestfan",
+            "id": "com.example.mixed",
             "defs": {
                 "main": {
                     "type": "record",
                     "key": "tid",
                     "record": {
                         "type": "object",
-                        "properties": {"x": {"type": "union", "refs": ["#a", "#b", "#c", "#d"]}}
+                        "properties": {"x": {"type": "union", "refs": ["#u"]}}
                     }
                 },
-                "a": {"type": "object", "required": ["x"], "properties": {"x": {"type": "union", "refs": ["#a", "#b", "#c", "#d"]}}},
-                "b": {"type": "object", "required": ["x"], "properties": {"x": {"type": "union", "refs": ["#a", "#b", "#c", "#d"]}}},
-                "c": {"type": "object", "required": ["x"], "properties": {"x": {"type": "union", "refs": ["#a", "#b", "#c", "#d"]}}},
-                "d": {"type": "object", "required": ["x"], "properties": {"x": {"type": "union", "refs": ["#a", "#b", "#c", "#d"]}}}
+                "u": {"type": "union", "refs": ["#r"]},
+                "r": {"type": "ref", "ref": "#u"}
+            }
+        }"##;
+        let catalog = catalog_from(lexicon);
+        let record = serde_json::json!({"$type": "com.example.mixed", "x": {}});
+        let err = validate_record(
+            "com.example.mixed",
+            &record,
+            &catalog,
+            ValidateFlags::empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DataValidationError::UnionMissingType { .. }),
+            "expected UnionMissingType, got {err:?}"
+        );
+    }
+
+    /// Procedure and query entry points get the same refusal as records.
+    ///
+    /// These previously reached the step budget through the same search;
+    /// what matters now is that neither entry point is a way around the
+    /// discriminator requirement.
+    #[test]
+    fn test_procedure_and_query_entry_points_require_the_discriminator() {
+        let procedure = r##"{
+            "lexicon": 1,
+            "id": "com.example.ploop",
+            "defs": {
+                "main": {
+                    "type": "procedure",
+                    "input": {
+                        "encoding": "application/json",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"x": {"type": "union", "refs": ["#loop"]}}
+                        }
+                    }
+                },
+                "loop": {"type": "union", "refs": ["#loop"]}
             }
         }"##;
 
-        // 60 levels of {"x": {...}} ending in {}: ~700 bytes, ~120 value nodes.
-        let mut node = serde_json::json!({});
-        for _ in 0..60 {
-            node = serde_json::json!({"x": node});
-        }
-        let record = serde_json::json!({"$type": "com.example.nestfan", "x": node});
-        assert!(serde_json::to_string(&record).unwrap().len() < 1_024);
-
-        let started = std::time::Instant::now();
-        let err = on_worker_stack(move || {
-            let catalog = catalog_from(lexicon);
-            validate_record(
-                "com.example.nestfan",
-                &record,
-                &catalog,
-                ValidateFlags::empty(),
-            )
-            .unwrap_err()
-        });
-        let elapsed = started.elapsed();
-
-        match err {
-            DataValidationError::RefStepBudgetExhausted { max_steps, .. } => {
-                assert!(
-                    max_steps < DEFAULT_MAX_REF_STEPS + 10_000,
-                    "small nested body granted {max_steps} steps"
-                );
-            }
-            other => panic!("expected RefStepBudgetExhausted, got {other:?}"),
-        }
+        let body = serde_json::json!({"x": {}});
+        let catalog = catalog_from(procedure);
+        let err =
+            validate_procedure_input("com.example.ploop", &body, &catalog, ValidateFlags::empty())
+                .unwrap_err();
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "nested fan-out took {elapsed:?}"
+            matches!(err, DataValidationError::UnionMissingType { .. }),
+            "validate_procedure_input: expected UnionMissingType, got {err:?}"
+        );
+
+        let schema_file = SchemaFile::parse(procedure).unwrap();
+        let err = validate_procedure_input_with_schema(
+            &body,
+            &schema_file,
+            &catalog,
+            ValidateFlags::empty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DataValidationError::UnionMissingType { .. }),
+            "validate_procedure_input_with_schema: expected UnionMissingType, got {err:?}"
         );
     }
 
@@ -3419,8 +3383,14 @@ mod recursion_limit_tests {
         // The proportional allowance is what fixes the false rejection: turning
         // it off reproduces the old cliff, so callers who want a hard ceiling
         // can still have one.
+        //
+        // The element count is higher than it once was because each element is
+        // cheaper. A four-branch union used to cost about five traversals per
+        // element — one per candidate tried — and now costs one, because the
+        // value names its variant and no candidates are tried. The cap is what
+        // is under test, so the record is sized to reach it.
         let catalog = catalog_from(OPEN_UNION_ARRAY_LEXICON);
-        let record = build_open_union_record(60_000);
+        let record = build_open_union_record(150_000);
 
         let err = validate_record_with_limits(
             "com.example.fanarray",
@@ -3509,308 +3479,15 @@ mod recursion_limit_tests {
         );
     }
 
-    #[test]
-    fn test_step_budget_applies_to_procedure_and_query_entry_points() {
-        let procedure = r##"{
-            "lexicon": 1,
-            "id": "com.example.ploop",
-            "defs": {
-                "main": {
-                    "type": "procedure",
-                    "input": {
-                        "encoding": "application/json",
-                        "schema": {
-                            "type": "object",
-                            "properties": {"x": {"type": "union", "refs": ["#loop"]}}
-                        }
-                    }
-                },
-                "loop": {"type": "union", "refs": ["#loop"]}
-            }
-        }"##;
-        let query = r##"{
-            "lexicon": 1,
-            "id": "com.example.qloop",
-            "defs": {
-                "main": {
-                    "type": "query",
-                    "parameters": {
-                        "type": "params",
-                        "properties": {"x": {"type": "union", "refs": ["#loop"]}}
-                    }
-                },
-                "loop": {"type": "union", "refs": ["#loop"]}
-            }
-        }"##;
-
-        on_worker_stack(move || {
-            let body = serde_json::json!({"x": {}});
-
-            let catalog = catalog_from(procedure);
-            let err = validate_procedure_input(
-                "com.example.ploop",
-                &body,
-                &catalog,
-                ValidateFlags::empty(),
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, DataValidationError::RecursiveReference { .. }),
-                "validate_procedure_input: expected RecursiveReference, got {err:?}"
-            );
-
-            let schema_file = SchemaFile::parse(procedure).unwrap();
-            let err = validate_procedure_input_with_schema(
-                &body,
-                &schema_file,
-                &catalog,
-                ValidateFlags::empty(),
-            )
-            .unwrap_err();
-            assert!(
-                matches!(err, DataValidationError::RecursiveReference { .. }),
-                "validate_procedure_input_with_schema: expected RecursiveReference, got {err:?}"
-            );
-
-            let catalog = catalog_from(query);
-            let err =
-                validate_query_params("com.example.qloop", &body, &catalog, ValidateFlags::empty())
-                    .unwrap_err();
-            assert!(
-                matches!(err, DataValidationError::RecursiveReference { .. }),
-                "validate_query_params: expected RecursiveReference, got {err:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn test_depth_counter_does_not_leak_across_siblings() {
-        // Each array item tries a ref chain that trips the depth limit, then
-        // falls back to a matching def. If exit_hop were skipped on the error
-        // path the counter would ratchet up and later items would be rejected.
-        let mut defs = String::new();
-        for i in 0..39 {
-            defs.push_str(&format!(
-                "\"d{}\": {{\"type\": \"ref\", \"ref\": \"#d{}\"}},",
-                i,
-                i + 1
-            ));
-        }
-        defs.push_str(r##""d39": {"type": "object", "required": ["nope"], "properties": {"nope": {"type": "string"}}},"##);
-        defs.push_str(
-            r##""ok": {"type": "object", "required": ["v"], "properties": {"v": {"type": "string"}}}"##,
-        );
-        let lexicon = format!(
-            r##"{{"lexicon": 1, "id": "com.example.siblings", "defs": {{
-                "main": {{"type": "record", "key": "tid", "record": {{
-                    "type": "object",
-                    "required": ["items"],
-                    "properties": {{"items": {{"type": "array", "items": {{
-                        "type": "union", "refs": ["#d0", "#ok"]
-                    }}}}}}
-                }}}},
-                {}
-            }}}}"##,
-            defs
-        );
-
-        let catalog = catalog_from(&lexicon);
-        let items: Vec<serde_json::Value> = (0..300)
-            .map(|i| serde_json::json!({"v": i.to_string()}))
-            .collect();
-        let record = serde_json::json!({"$type": "com.example.siblings", "items": items});
-
-        let result = validate_record_with_limits(
-            "com.example.siblings",
-            &record,
-            &catalog,
-            ValidateFlags::empty(),
-            ValidationLimits::default().with_max_ref_depth(16),
-        );
-        assert!(
-            result.is_ok(),
-            "300 siblings must all validate after recovered depth errors, got {result:?}"
-        );
-    }
-
     /// Two sibling properties whose unions share candidate defs. Validating
     /// `a.u` tries `#alpha` first, which fails one level deeper (at `q`).
-    const LEAK_LEXICON: &str = r##"{
-        "lexicon": 1,
-        "id": "com.example.leak",
-        "defs": {
-            "main": {
-                "type": "record",
-                "key": "tid",
-                "record": {
-                    "type": "object",
-                    "required": ["a", "b"],
-                    "properties": {
-                        "a": {"type": "ref", "ref": "#wrapper"},
-                        "b": {"type": "union", "refs": ["#alpha", "#beta"]}
-                    }
-                }
-            },
-            "wrapper": {
-                "type": "object",
-                "required": ["u"],
-                "properties": {"u": {"type": "union", "refs": ["#alpha", "#beta"]}}
-            },
-            "alpha": {
-                "type": "object",
-                "required": ["q"],
-                "properties": {"q": {"type": "integer"}}
-            },
-            "beta": {
-                "type": "object",
-                "required": ["q"],
-                "properties": {"q": {"type": "string"}}
-            }
-        }
-    }"##;
 
     #[test]
-    fn test_union_frame_does_not_leak_across_siblings() {
-        // Regression test: the union frame key was read from the live
-        // `ctx.path` at exit, while validate_object left a path segment pushed
-        // when a candidate failed. The mismatched key left a stale frame
-        // behind, and the later sibling's matching candidate was skipped as a
-        // non-productive cycle.
-        let catalog = catalog_from(LEAK_LEXICON);
-
-        // Control: `#alpha` succeeds under "a", so nothing is left behind.
-        let control =
-            serde_json::json!({"$type": "com.example.leak", "a": {"u": {"q": 1}}, "b": {"q": 5}});
-        assert!(
-            validate_record(
-                "com.example.leak",
-                &control,
-                &catalog,
-                ValidateFlags::empty()
-            )
-            .is_ok(),
-            "control record must validate"
-        );
-
-        // "a.u" matches #beta only after #alpha fails; "b" matches #alpha.
-        let record = serde_json::json!({
-            "$type": "com.example.leak",
-            "a": {"u": {"q": "text"}},
-            "b": {"q": 5}
-        });
-        let result = validate_record(
-            "com.example.leak",
-            &record,
-            &catalog,
-            ValidateFlags::empty(),
-        );
-        assert!(
-            result.is_ok(),
-            "valid record was falsely rejected: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_union_frame_does_not_leak_across_array_items() {
-        // Same leak reached through validate_array: the first item's leading
-        // candidate fails deep, and the second item must still be able to use
-        // that candidate.
-        let lexicon = r##"{
-            "lexicon": 1,
-            "id": "com.example.leakarr",
-            "defs": {
-                "main": {
-                    "type": "record",
-                    "key": "tid",
-                    "record": {
-                        "type": "object",
-                        "required": ["items"],
-                        "properties": {
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "union", "refs": ["#alpha", "#beta"]}
-                            }
-                        }
-                    }
-                },
-                "alpha": {
-                    "type": "object",
-                    "required": ["q"],
-                    "properties": {"q": {"type": "integer"}}
-                },
-                "beta": {
-                    "type": "object",
-                    "required": ["q"],
-                    "properties": {"q": {"type": "string"}}
-                }
-            }
-        }"##;
-
-        let catalog = catalog_from(lexicon);
-        let record = serde_json::json!({
-            "$type": "com.example.leakarr",
-            "items": [{"q": "text"}, {"q": 5}, {"q": "more"}, {"q": 7}]
-        });
-        let result = validate_record(
-            "com.example.leakarr",
-            &record,
-            &catalog,
-            ValidateFlags::empty(),
-        );
-        assert!(
-            result.is_ok(),
-            "array of mixed union members was falsely rejected: {result:?}"
-        );
-
-        // A genuinely invalid item must be reported at its own path, not at a
-        // path inherited from an earlier item's failed candidate.
-        let broken = serde_json::json!({
-            "$type": "com.example.leakarr",
-            "items": [{"q": "text"}, {"q": 5}, {"q": true}]
-        });
-        let err = validate_record(
-            "com.example.leakarr",
-            &broken,
-            &catalog,
-            ValidateFlags::empty(),
-        )
-        .unwrap_err();
-        match err {
-            DataValidationError::TypeMismatch { ref path, .. } => {
-                assert_eq!(path, "/items/2/q", "error path was polluted: {err:?}");
-            }
-            other => panic!("expected TypeMismatch at /items/2/q, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_error_path_is_not_polluted_by_failed_union_candidates() {
-        // The unbalanced push/pop also corrupted reported error paths: the
-        // failure below is at "/b/q", not "/a/b/q".
-        let catalog = catalog_from(LEAK_LEXICON);
-        let record = serde_json::json!({
-            "$type": "com.example.leak",
-            "a": {"u": {"q": "text"}},
-            "b": {"q": true}
-        });
-        let err = validate_record(
-            "com.example.leak",
-            &record,
-            &catalog,
-            ValidateFlags::empty(),
-        )
-        .unwrap_err();
-        match err {
-            DataValidationError::TypeMismatch { ref path, .. } => {
-                assert_eq!(path, "/b/q", "error path was polluted: {err:?}");
-            }
-            other => panic!("expected TypeMismatch at /b/q, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_params_path_is_not_polluted_by_failed_union_candidates() {
-        // validate_params had the same unbalanced push/pop.
+    fn test_params_error_path_is_not_polluted() {
+        // `validate_params` had the same unbalanced push/pop as the object
+        // walker: a failed property left a path segment pushed, so the next
+        // failure was reported at the wrong path. Nothing here involves a
+        // union — the test was named for the bug it shipped alongside.
         let lexicon = r##"{
             "lexicon": 1,
             "id": "com.example.leakparams",

@@ -138,6 +138,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permissions.
 
 ### Fixed
+- `atproto-lexicon`: a union value with no `$type` was accepted by **structural matching** — each ref
+  was tried in order and the first that matched was taken. A union is discriminated: the member names
+  the variant it is. The reference refuses a value without `$type` outright, and that holds for open
+  unions too, since openness tolerates `$type` values not in `refs`, not the absence of `$type`.
+
+  The fallback was unsound on its own terms. Two variants with compatible shapes are
+  indistinguishable that way, so the validator's answer depended on the order `refs` happened to be
+  written in, while a consumer — which has no list to walk — could only read `$type`. They could
+  reach different conclusions about the same record.
+
+  **This removes a resource-exhaustion surface rather than bounding one.** Candidate enumeration was
+  the engine behind every union-driven attack the recursion limits were built for: fan-out (4¹³
+  combinations from a 34-byte body, ~25 s before those limits landed), nested backtracking, union
+  chains deep enough to trip the depth limit, and the frame- and counter-leak bugs that came from
+  unwinding a failed candidate. A union now resolves to at most one ref, so there is nothing to
+  enumerate, nothing to backtrack out of, and no failed attempt to unwind.
+
+  Ten tests that bounded that work were replaced by five asserting it cannot start. What is still
+  bounded, and still tested: a union naming *itself* through `$type` (cycle detection), plain `ref`
+  chains (the depth limit), and large records (the step budget). The absolute step cap test needed a
+  larger record to still reach the cap — a four-branch union costs one traversal per element now
+  rather than about five.
+
 - `atproto-lexicon` / `atproto-dasl`: a `$bytes` value meant two different things in one workspace.
 
   `atproto-lexicon` decoded with the padded `STANDARD` engine while `atproto-dasl` emits **unpadded**

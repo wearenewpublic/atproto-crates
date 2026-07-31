@@ -362,6 +362,20 @@ pub enum DataValidationError {
         refs: Vec<String>,
     },
 
+    /// A union value carries no `$type` discriminator.
+    ///
+    /// A union is discriminated: the member says which variant it is. Without
+    /// `$type` the value is not a union member at all, whatever its shape.
+    #[error(
+        "error-atproto-lexicon-data-validation-94 Union value at {path} must be an object with a \"$type\" property naming one of: {refs:?}"
+    )]
+    UnionMissingType {
+        /// The JSON path where the union was found.
+        path: String,
+        /// The set of union refs declared by the schema.
+        refs: Vec<String>,
+    },
+
     /// A CID value is invalid.
     #[error("error-atproto-lexicon-data-validation-33 Invalid CID: {value}")]
     InvalidCid {
