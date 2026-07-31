@@ -367,6 +367,35 @@ pub async fn create_account(
         }
     }
 
+    // Give the account an empty repository, so it *has* one rather than
+    // merely being entitled to one. Without this, `getLatestCommit` answers
+    // `RepoNotFound` for a valid account, `getRepo` has nothing to export,
+    // and the account announcement can carry neither `#commit` nor `#sync`
+    // because there is no commit to name — a relay learns the account exists
+    // and cannot learn where its repository starts.
+    //
+    // Here rather than in `AccountManager`, which is where the `#identity`
+    // and `#account` events are emitted from: a repository is a different
+    // subsystem, and `RepoWriter` already holds an `Arc<AccountManager>`, so
+    // reaching the other way would invert the dependency. The reference makes
+    // the same split — `actorTxn.repo.createRepo([])` lives in
+    // `createAccount.ts`, not in its account store.
+    //
+    // Only for accounts that land active. A verified inbound migration lands
+    // deactivated and receives its repository from the CAR import; creating
+    // an empty genesis commit first would give the import a prior commit to
+    // conflict with.
+    if !verified_migration
+        && let Some(writer) = state.writer.as_ref()
+        && let Err(error) = writer.create_genesis_commit(&row.did).await
+    {
+        // Best-effort, matching the account announcement: the account row is
+        // durable and usable, and the first write will create a commit
+        // anyway. Logged at ERROR because until then the repository reads as
+        // absent rather than empty.
+        tracing::error!(did = %row.did, ?error, "createAccount: genesis commit failed");
+    }
+
     // Mint a session immediately. We need an app-password row to attach the
     // session to; createAccount issues an implicit "primary" app password
     // on account creation, mirroring how the TS reference treats the

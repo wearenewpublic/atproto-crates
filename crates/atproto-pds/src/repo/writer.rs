@@ -183,7 +183,21 @@ impl RepoWriter {
                 what: "applyWrites called with empty ops".to_string(),
             });
         }
+        self.commit(did, ops, swap_commit).await
+    }
 
+    /// Commit a batch, **including an empty one**.
+    ///
+    /// The empty case is not reachable from `applyWrites` — a client asking to
+    /// write nothing is a client error, and the guard above says so. It exists
+    /// for the genesis commit, which is by definition a commit over no
+    /// records.
+    async fn commit(
+        &self,
+        did: &str,
+        ops: Vec<WriteOp>,
+        swap_commit: Option<&str>,
+    ) -> PdsResult<CommitResult> {
         // Structural checks before the lock is taken and before anything is
         // encoded. The repository is append-only: a record key containing `/`
         // produces a record whose MST path and its own AT-URI disagree, and
@@ -204,6 +218,92 @@ impl RepoWriter {
                     .await
             }
             None => self.apply_writes_legacy(did, ops, swap_commit).await,
+        }
+    }
+
+    /// Create the repository's first commit: an empty one.
+    ///
+    /// A signup produces an account whose repository exists and is empty, not
+    /// one that has no repository. The difference is visible: without a
+    /// genesis commit `getLatestCommit` answers `RepoNotFound` for a valid
+    /// account, `getRepo` has nothing to export, and the account announcement
+    /// on the firehose can carry neither `#commit` nor `#sync` because there
+    /// is no commit to name. A relay learns the account exists and cannot
+    /// learn where its repository starts.
+    ///
+    /// The reference does the same thing at the same point —
+    /// `actorTxn.repo.createRepo([])` in `createAccount.ts`, followed by
+    /// `sequenceAccountCreation`, which sequences `#identity`, `#account`,
+    /// `#commit` and `#sync` together.
+    ///
+    /// `#sync` accompanies `#commit` here, and only here among ordinary
+    /// writes: it force-sets repo state without a diff, which is exactly what
+    /// a consumer needs for a repository it has never seen. Subsequent commits
+    /// are diffs against a head the consumer already has.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any storage or signing failure from the commit path.
+    pub async fn create_genesis_commit(&self, did: &str) -> PdsResult<CommitResult> {
+        let result = self.commit(did, Vec::new(), None).await?;
+
+        // Best-effort, matching how the account announcement itself is
+        // emitted: the repository is durable before the announcement is
+        // attempted, and a consumer that misses `#sync` recovers via
+        // `getRepo`. Failing the signup over a firehose event would be the
+        // worse trade.
+        self.publish_genesis_sync(did, &result).await;
+        Ok(result)
+    }
+
+    /// Emit the `#sync` that accompanies a genesis commit.
+    ///
+    /// `#sync` carries the commit block itself, so it is read back out of the
+    /// repository — the same route `admin.forceRepoSync` takes, and for the
+    /// same reason: the commit is durable by now and the block is where it
+    /// lives.
+    async fn publish_genesis_sync(&self, did: &str, result: &CommitResult) {
+        let commit_cid: cid::Cid = match result.commit_cid.parse() {
+            Ok(c) => c,
+            Err(error) => {
+                tracing::error!(did, ?error, "genesis: commit CID did not parse; no #sync");
+                return;
+            }
+        };
+
+        let store = match SqlActorStore::open(&self.data_dir, did).await {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::error!(did, ?error, "genesis: could not open actor store; no #sync");
+                return;
+            }
+        };
+        let block: Result<Option<(Vec<u8>,)>, _> =
+            sqlx::query_as("SELECT data FROM repo_block WHERE cid = ?")
+                .bind(&result.commit_cid)
+                .fetch_optional(store.pool())
+                .await;
+        let block = match block {
+            Ok(Some(b)) => b.0,
+            Ok(None) => {
+                tracing::error!(did, cid = %result.commit_cid, "genesis: commit block missing; no #sync");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(did, ?error, "genesis: commit block lookup failed; no #sync");
+                return;
+            }
+        };
+
+        let event = crate::sequencer::sync_event::SyncEvent {
+            did,
+            rev: &result.rev,
+            commit_cid: &commit_cid,
+            commit_block: &block,
+        };
+        match crate::sequencer::publish_sync(&self.accounts.sequencer(), &event).await {
+            Ok(seq) => tracing::debug!(did, seq, "firehose: sequenced genesis #sync"),
+            Err(error) => tracing::error!(did, ?error, "genesis: failed to sequence #sync"),
         }
     }
 

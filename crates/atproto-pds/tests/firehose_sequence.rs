@@ -507,3 +507,129 @@ async fn a_cursor_past_the_head_is_refused() {
         "expected a FutureCursor frame, got: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+//  F-FIRE-20 — the genesis commit.
+//
+//  A signup produces an account whose repository exists and is empty, not one
+//  that has no repository. Without a genesis commit `getLatestCommit` answers
+//  `RepoNotFound` for a valid account and the account announcement can carry
+//  neither `#commit` nor `#sync`, because there is no commit to name.
+//
+//  These exercise `RepoWriter::create_genesis_commit` directly. The
+//  `createAccount` handler calls it on the active-signup path, which is not
+//  reachable from a crate test: that path mints the DID through PLC, and the
+//  only PLC service the test suite constructs points at an unroutable host on
+//  purpose. That wiring is covered by the external conformance harness against
+//  a live server instead, which is where it was verified.
+// ---------------------------------------------------------------------------
+
+/// The genesis commit is a real, signed commit over an empty repository.
+#[tokio::test(flavor = "multi_thread")]
+async fn genesis_commit_gives_a_fresh_account_an_empty_repository() {
+    let (app, manager, tmp) = build_app().await;
+    let did = "did:plc:genesisalice";
+    let _token = create_account(&app, &manager, did, "alice.genesis.example").await;
+
+    let writer = RepoWriter::new(manager.clone(), tmp.path().to_path_buf());
+    let result = writer
+        .create_genesis_commit(did)
+        .await
+        .expect("a fresh account should take a genesis commit");
+
+    assert!(!result.commit_cid.is_empty(), "the commit needs a CID");
+    assert!(!result.rev.is_empty(), "the commit needs a rev");
+    assert!(
+        result.writes.is_empty(),
+        "a genesis commit writes no records, got {:?}",
+        result.writes
+    );
+
+    // And it is visible as the repository head, which is the whole point:
+    // before this, `getLatestCommit` answered RepoNotFound for a valid
+    // account.
+    let request = Request::builder()
+        .uri(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "getLatestCommit should find the genesis commit"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        body["cid"], result.commit_cid,
+        "getLatestCommit should name the genesis commit"
+    );
+}
+
+/// It announces itself with **both** `#commit` and `#sync`.
+///
+/// `#sync` is what a consumer needs for a repository it has never seen — it
+/// force-sets state without a diff, where `#commit` is a diff against a head
+/// the consumer is assumed to hold. For a genesis commit there is no such
+/// head, so `#commit` alone would leave a fresh consumer unable to anchor.
+/// The reference sequences both together in `sequenceAccountCreation`.
+#[tokio::test(flavor = "multi_thread")]
+async fn genesis_commit_emits_both_commit_and_sync() {
+    let (app, manager, tmp) = build_app().await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=json")
+        .parse()
+        .unwrap();
+    let (mut socket, _) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+
+    let did = "did:plc:genesissync";
+    let _token = create_account(&app, &manager, did, "alice.gsync.example").await;
+
+    let writer = RepoWriter::new(manager.clone(), tmp.path().to_path_buf());
+    writer.create_genesis_commit(did).await.expect("genesis");
+
+    let mut seen: Vec<String> = Vec::new();
+    while !(seen.iter().any(|s| s == "commit") && seen.iter().any(|s| s == "sync")) {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+            .await
+            .expect("a genesis commit should announce itself within 30s")
+            .expect("the socket should stay open")
+            .expect("the frame should not be a protocol error");
+        let text = String::from_utf8_lossy(message.as_payload()).to_string();
+        if !text.contains(did) {
+            continue;
+        }
+        if text.contains("#commit") {
+            seen.push("commit".to_string());
+        } else if text.contains("#sync") {
+            seen.push("sync".to_string());
+        }
+    }
+
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen,
+        vec!["commit".to_string(), "sync".to_string()],
+        "a genesis commit must be announced with both #commit and #sync"
+    );
+}
+
+/// `applyWrites` with no operations stays an error.
+///
+/// The genesis path commits an empty batch, so the guard that refuses one had
+/// to move rather than disappear. A client asking to write nothing is still a
+/// client error, and widening the endpoint would have been the easy way to
+/// make the genesis commit work.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_still_refuses_an_empty_batch() {
+    let (_app, manager, tmp) = build_app().await;
+    let writer = RepoWriter::new(manager.clone(), tmp.path().to_path_buf());
+
+    let result = writer.apply_writes("did:plc:emptybatch", Vec::new()).await;
+    assert!(
+        result.is_err(),
+        "applyWrites with no ops must stay an error, got {result:?}"
+    );
+}

@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as compromised and rotated using a key generated after this change.
 
 ### Fixed
+- `atproto-pds`: a new account had no repository until its first write. `getLatestCommit` answered
+  `RepoNotFound` for a valid account, `getRepo` had nothing to export, and the account announcement
+  on the firehose could carry neither `#commit` nor `#sync` because there was no commit to name — a
+  relay learned the account existed and could not learn where its repository started.
+
+  `createAccount` now creates the genesis commit: an empty, signed commit, announced with `#commit`
+  **and** `#sync`. `#sync` matters here specifically — it force-sets repo state without a diff, which
+  is what a consumer needs for a repository it has never seen, where `#commit` is a diff against a
+  head the consumer is assumed to hold. The reference sequences all four events together in
+  `sequenceAccountCreation`, after `actorTxn.repo.createRepo([])`.
+
+  `applyWrites` still refuses an empty batch. The genesis path commits one, so the guard moved rather
+  than disappeared — widening the endpoint would have been the easy way to make this work and would
+  have turned a client error into a silent no-op.
+
+  Only accounts that land active. A verified inbound migration lands deactivated and receives its
+  repository from the CAR import; an empty genesis commit first would give the import a prior commit
+  to conflict with.
+
 - `atproto-pds`: fifteen endpoints in `auth_handlers` verified an app-password session and nothing
   else, so a valid OAuth token was answered `expected typ at-pp-access, got at-oauth-access`. Five of
   them should take one, per the reference's per-endpoint `authorize:` callback:
