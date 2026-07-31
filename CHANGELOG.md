@@ -87,6 +87,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   domain segments refuses names that exist.
 
 ### Fixed
+- `atproto-lexicon`: `validate_did` accepted a DID ending in `%`, so `did:method:val%` validated. A
+  `%` introduces a percent-escape, and a trailing one is an escape with nothing to escape. The crate
+  already refused a trailing `:` and the `%` half of the same rule was simply missing.
+
+  The regex now carries the reference implementations' final-character class —
+  `^did:[a-z]+:[a-zA-Z0-9._:%-]*[a-zA-Z0-9._-]$`, which both spell identically — and the explicit
+  check alongside it now names both characters so the refusal says why.
+
+  This is deliberately not a validity check on each escape: `did:method:va%20l` remains valid, and so
+  does a malformed interior escape, matching both references. The rule is about the final character.
+
+  Closes 3 of the pinned cases — the same defect reached `at-identifier`, which delegates here.
+  530 of 536 now assert.
+
 - `atproto-lexicon`: `validate_uri` accepted raw whitespace, so `https://example.com/path gap` and
   `https://example.com/trailing-whitespace  ` both validated. RFC 3986 has no production admitting a
   raw space — it must be percent-encoded. The scheme-specific part is now `\S+` rather than `.+`.

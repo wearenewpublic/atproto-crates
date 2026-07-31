@@ -92,22 +92,6 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "z7x3CtScH765HvShXT",
         "base58btc multibase",
     ),
-    // -- DID / at-identifier ----------------------------------------------
-    // A `%` in the method-specific id must introduce a two-digit hex escape.
-    // A bare trailing `%` is an incomplete escape.
-    (
-        "syntax/did_syntax_invalid.txt",
-        "did:method:val%",
-        "incomplete percent-escape",
-    ),
-    (
-        "syntax/atidentifier_syntax_invalid.txt",
-        "did:method:val%",
-        "incomplete percent-escape (via DID)",
-    ),
-    // -- datetime ---------------------------------------------------------
-    // RFC 3339 §4.3 makes `-00:00` mean "offset unknown", which the AT
-    // Protocol datetime grammar excludes; `Z` or `+00:00` is required.
     (
         "syntax/datetime_syntax_invalid.txt",
         "1985-04-12T23:20:50.123-00:00",

@@ -11,11 +11,17 @@ use crate::validation::data_errors::DataValidationError;
 
 /// Regex for validating DID syntax
 ///
-/// Format: did:<method>:<method-specific-id>
-/// - method: lowercase letters and digits
-/// - method-specific-id: alphanumeric, dots, hyphens, underscores, colons, percent-encoded
+/// Format: `did:<method>:<method-specific-id>`
+/// - method: lowercase letters only — not digits, so `did:m123:val` is invalid
+/// - method-specific-id: alphanumeric, dots, hyphens, underscores, colons and
+///   percent signs, ending in a character that is neither `:` nor `%`
+///
+/// The trailing-character class is the whole point of the second bracket
+/// group, and is how both reference implementations spell the rule. A DID may
+/// not end in `%`, because `%` introduces a percent-escape and a trailing one
+/// is an escape with nothing to escape.
 static DID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^did:[a-z]+:[a-zA-Z0-9._:%-]+$").expect("DID regex should compile")
+    Regex::new(r"^did:[a-z]+:[a-zA-Z0-9._:%-]*[a-zA-Z0-9._-]$").expect("DID regex should compile")
 });
 
 /// Validate a DID string
@@ -51,11 +57,14 @@ pub fn validate_did(value: &str) -> Result<(), DataValidationError> {
         });
     }
 
-    if value.ends_with(':') {
+    // Checked separately from the regex so the refusal names the reason. The
+    // regex enforces the same thing structurally, via its final character
+    // class; this is here to say *why*.
+    if value.ends_with(':') || value.ends_with('%') {
         return Err(DataValidationError::StringFormatInvalid {
             format: "did".to_string(),
             value: value.to_string(),
-            reason: "DID must not end with ':'".to_string(),
+            reason: "DID must not end with ':' or '%'".to_string(),
         });
     }
 
@@ -113,5 +122,35 @@ mod tests {
         for did in invalid {
             assert!(validate_did(did).is_err(), "should be invalid: {}", did);
         }
+    }
+
+    /// A DID may not end in `%`.
+    ///
+    /// `%` introduces a percent-escape, so a trailing one is an escape with
+    /// nothing to escape. Both reference implementations spell this as the
+    /// final character class of their DID regex, and the TypeScript one also
+    /// says it outright: "DID can not end with ':' or '%'".
+    #[test]
+    fn a_did_may_not_end_with_a_percent_sign() {
+        assert!(validate_did("did:method:val%").is_err());
+        assert!(validate_did("did:method:val:").is_err());
+        // A percent inside the identifier is still allowed — the rule is about
+        // the final character, not about validating each escape.
+        assert!(validate_did("did:method:va%20l").is_ok());
+    }
+
+    /// The method name is lowercase letters only.
+    #[test]
+    fn the_method_name_takes_no_digits_or_uppercase() {
+        assert!(validate_did("did:m123:val").is_err());
+        assert!(validate_did("did:METHOD:val").is_err());
+        assert!(validate_did("did:method:val").is_ok());
+    }
+
+    /// The identifier may contain colons; only a trailing one is refused.
+    #[test]
+    fn interior_colons_are_part_of_the_identifier() {
+        assert!(validate_did("did:method:val:sub:path").is_ok());
+        assert!(validate_did("did:plc:7iza6de2dwap2sbkpav7c6c6").is_ok());
     }
 }
