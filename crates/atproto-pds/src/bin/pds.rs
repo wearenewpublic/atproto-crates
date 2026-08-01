@@ -552,10 +552,13 @@ async fn main() -> anyhow::Result<()> {
         SpaceWriter::new(account_manager.clone(), args.data_dir.clone())
             .with_plc_directory(args.plc_directory.clone()),
     );
-    let space_reader = Arc::new(SpaceReader::new(
-        account_manager.clone(),
-        args.data_dir.clone(),
-    ));
+    let space_reader = Arc::new(
+        SpaceReader::new(account_manager.clone(), args.data_dir.clone())
+            // Without this the reader can only verify credentials from
+            // authorities this PDS itself hosts, which confines every
+            // permissioned space to a single host.
+            .with_plc_directory(args.plc_directory.clone()),
+    );
     let space_sync = Arc::new(SpaceSync::new(args.data_dir.clone()));
 
     // §11d — externally-supplied PLC rotation key (optional).

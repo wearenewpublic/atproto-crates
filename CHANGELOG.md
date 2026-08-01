@@ -156,6 +156,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   told apart from one whose table the parser failed on.
 
 ### Fixed
+- `atproto-pds`: a space credential could only be verified by the host that minted it, which confined
+  every permissioned space to a single PDS — the opposite of what proposal-0016 is for.
+
+  `SpaceReader::authority_public_key` resolved the authority's key with
+  `SELECT signing_key_ref FROM account WHERE did = ?` against its **own** account table. A repo host
+  serving a member whose space authority lives elsewhere has no such row, so every read was refused:
+
+  ```
+  401 invalid space credential: not found: account did:plc:… (signing_key_ref)
+  ```
+
+  0016 requires the opposite: a credential is "signed by the space authority's signing key, so **any
+  repo host can verify it against the authority's key without contacting the authority**" — the key
+  comes from the DID document, the same third party every other atproto signature is checked against.
+
+  Local authorities are still answered from the account table, which is faster and works before a new
+  account has propagated. Everyone else is now resolved from their DID document, preferring the
+  `#atproto_space` verification method and falling back to `#atproto`, which 0016 allows to coincide.
+  A reader with no PLC directory configured says so rather than failing the signature check, since
+  that is a deployment problem and not a bad token.
+
+  Found by a second PDS added to the conformance rig. Everything around this already worked — the
+  authority verifies a delegation token minted by a host it has never contacted, and the repo host
+  auto-registers the authority's `#atproto_space_host` endpoint on the first write — so the identity
+  resolution this needed was in use a few lines away.
+
 - `atproto-oauth`: the `space:` OAuth scope syntax was from a superseded draft of proposal-0016, and
   was wrong in two ways — one that made conformant grants unparseable, one that made every bare grant
   far wider than intended.

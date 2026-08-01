@@ -83,13 +83,31 @@ pub struct RecordListing<'a> {
 pub struct SpaceReader {
     data_dir: PathBuf,
     accounts: Arc<crate::account::AccountManager>,
+    /// PLC directory hostname, for resolving a **remote** space authority's
+    /// credential-signing key. Absent means only local authorities can be
+    /// verified — see [`SpaceReader::authority_public_key`].
+    plc_directory: Option<String>,
+    http_client: reqwest::Client,
 }
 
 impl SpaceReader {
     /// Construct.
     #[must_use]
     pub fn new(accounts: Arc<crate::account::AccountManager>, data_dir: PathBuf) -> Self {
-        Self { data_dir, accounts }
+        Self {
+            data_dir,
+            accounts,
+            plc_directory: None,
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    /// Point this reader at a PLC directory so it can verify credentials from
+    /// authorities it does not host.
+    #[must_use]
+    pub fn with_plc_directory(mut self, plc_directory: Option<String>) -> Self {
+        self.plc_directory = plc_directory;
+        self
     }
 
     /// Fail with `SpaceNotFound` when the space is tombstoned. The tombstone
@@ -281,12 +299,74 @@ impl SpaceReader {
         }
     }
 
-    /// Resolve a local authority's space-credential verification key in
-    /// *public* form. Used to verify SpaceCredentials minted by this PDS for one
-    /// of its authorities. Per 0016 line 92 the authority's `#atproto_space`
-    /// verification method MAY coincide with `#atproto`; for accounts this PDS
-    /// manages it does, so this returns the account's atproto signing key.
+    /// Resolve a space authority's credential-signing key in *public* form.
+    ///
+    /// Local authorities are answered from the account table, which is both
+    /// faster and the only path that works before a newly created account has
+    /// propagated. Everyone else is resolved from their DID document.
+    ///
+    /// That second half is the point. A space credential is "signed by the
+    /// space authority's signing key, so **any repo host can verify it against
+    /// the authority's key without contacting the authority**" — the key comes
+    /// from the DID document, which is the same third party every other
+    /// atproto signature is checked against. Looking only in the local account
+    /// table made a credential verifiable solely on the host that minted it,
+    /// which confines a permissioned space to one PDS and is the opposite of
+    /// what the design is for.
+    ///
+    /// Per 0016 the authority's `#atproto_space` verification method MAY
+    /// coincide with `#atproto`, so `#atproto_space` is preferred and
+    /// `#atproto` accepted as the fallback.
     async fn authority_public_key(&self, authority_did: &str) -> PdsResult<KeyData> {
+        match self.local_authority_public_key(authority_did).await {
+            Ok(key) => return Ok(key),
+            Err(PdsError::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        self.remote_authority_public_key(authority_did).await
+    }
+
+    /// The authority's key from its DID document.
+    async fn remote_authority_public_key(&self, authority_did: &str) -> PdsResult<KeyData> {
+        let document = if let Some(rest) = authority_did.strip_prefix("did:web:") {
+            let _ = rest;
+            atproto_identity::web::query(&self.http_client, authority_did)
+                .await
+                .map_err(|e| PdsError::AuthDenied {
+                    reason: format!("resolve space authority {authority_did}: {e}"),
+                })?
+        } else {
+            let plc = self.plc_directory.as_deref().ok_or_else(|| {
+                // Stated rather than silently failing the signature check: a
+                // reader with no directory configured cannot verify any remote
+                // authority, and that is a deployment problem, not a bad token.
+                PdsError::AuthDenied {
+                    reason: format!(
+                        "space authority {authority_did} is not local and no PLC directory is configured to resolve it"
+                    ),
+                }
+            })?;
+            atproto_identity::plc::query(&self.http_client, plc, authority_did)
+                .await
+                .map_err(|e| PdsError::AuthDenied {
+                    reason: format!("resolve space authority {authority_did}: {e}"),
+                })?
+        };
+
+        let multibase = verification_method_key(&document, "atproto_space")
+            .or_else(|| verification_method_key(&document, "atproto"))
+            .ok_or_else(|| PdsError::AuthDenied {
+                reason: format!(
+                    "space authority {authority_did} publishes neither #atproto_space nor #atproto"
+                ),
+            })?;
+
+        atproto_identity::key::identify_key(multibase).map_err(|e| PdsError::AuthDenied {
+            reason: format!("space authority {authority_did} key is unreadable: {e}"),
+        })
+    }
+
+    async fn local_authority_public_key(&self, authority_did: &str) -> PdsResult<KeyData> {
         let key_ref: Option<(String,)> =
             sqlx::query_as("SELECT signing_key_ref FROM account WHERE did = ?")
                 .bind(authority_did)
@@ -305,6 +385,28 @@ impl SpaceReader {
             reason: format!("derive public key: {e}"),
         })
     }
+}
+
+/// The multibase key of the verification method with the given fragment.
+///
+/// Matched on the fragment rather than the whole id, because a DID document
+/// spells the id as `<did>#atproto_space` and the fragment is the part the
+/// specification names.
+fn verification_method_key<'a>(
+    document: &'a atproto_identity::model::Document,
+    fragment: &str,
+) -> Option<&'a str> {
+    document.verification_method.iter().find_map(|method| {
+        let atproto_identity::model::VerificationMethod::Multikey {
+            id,
+            public_key_multibase,
+            ..
+        } = method
+        else {
+            return None;
+        };
+        (id.rsplit('#').next() == Some(fragment)).then_some(public_key_multibase.as_str())
+    })
 }
 
 /// Returns true when a row in `space_record_takedown` matches the
@@ -788,5 +890,82 @@ mod tests {
             page.records.is_empty(),
             "taken-down record must be filtered from list_records"
         );
+    }
+}
+
+#[cfg(test)]
+mod authority_key_resolution {
+    use super::*;
+    use atproto_identity::model::DocumentBuilder;
+
+    fn document(did: &str, fragments: &[(&str, &str)]) -> atproto_identity::model::Document {
+        let mut b = DocumentBuilder::default().id(did.to_string());
+        for (fragment, key) in fragments {
+            // A DID document spells the id fully qualified, which is exactly
+            // what makes fragment matching necessary.
+            b = b.add_multikey(
+                format!("{did}#{fragment}"),
+                did.to_string(),
+                (*key).to_string(),
+            );
+        }
+        b.build().expect("document")
+    }
+
+    /// `#atproto_space` is preferred; `#atproto` is the fallback.
+    ///
+    /// 0016 allows the two to coincide, and this PDS's own PLC genesis
+    /// publishes both — but an authority elsewhere may publish only one, and a
+    /// verifier that insisted on `#atproto_space` would refuse it.
+    #[test]
+    fn the_space_method_is_preferred_and_atproto_is_the_fallback() {
+        let both = document(
+            "did:plc:x",
+            &[("atproto", "zAAA"), ("atproto_space", "zBBB")],
+        );
+        assert_eq!(
+            verification_method_key(&both, "atproto_space"),
+            Some("zBBB")
+        );
+        assert_eq!(verification_method_key(&both, "atproto"), Some("zAAA"));
+
+        let only_atproto = document("did:plc:x", &[("atproto", "zAAA")]);
+        assert_eq!(
+            verification_method_key(&only_atproto, "atproto_space"),
+            None
+        );
+        assert_eq!(
+            verification_method_key(&only_atproto, "atproto"),
+            Some("zAAA")
+        );
+    }
+
+    /// The fragment is matched, not the whole id.
+    ///
+    /// A document spells the id as `<did>#atproto_space`, and the DID part
+    /// varies per authority — comparing whole ids would match nothing.
+    #[test]
+    fn the_fragment_is_matched_not_the_whole_id() {
+        let doc = document("did:plc:whoever", &[("atproto_space", "zKEY")]);
+        let atproto_identity::model::VerificationMethod::Multikey { id, .. } =
+            &doc.verification_method[0]
+        else {
+            panic!("expected a multikey");
+        };
+        assert!(
+            id.contains('#'),
+            "id should be fragment-qualified, got {id}"
+        );
+        assert_eq!(verification_method_key(&doc, "atproto_space"), Some("zKEY"));
+    }
+
+    /// A near-miss fragment does not match.
+    ///
+    /// `#atproto_space_host` is a *service*, not a verification method, and
+    /// shares a prefix with the one wanted. A `starts_with` would take it.
+    #[test]
+    fn a_prefix_of_the_fragment_does_not_match() {
+        let doc = document("did:plc:x", &[("atproto_space_host", "zWRONG")]);
+        assert_eq!(verification_method_key(&doc, "atproto_space"), None);
     }
 }
