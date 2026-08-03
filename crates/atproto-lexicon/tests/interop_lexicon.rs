@@ -18,7 +18,7 @@
 //! tells you to delete the entry, so the table cannot silently rot.
 
 use atproto_lexicon::validation::flags::ValidateFlags;
-use atproto_lexicon::validation::schema_file::SchemaFile;
+use atproto_lexicon::validation::schema_file::{SchemaFile, permission_within_authority};
 use atproto_lexicon::validation::validate::{BaseCatalog, validate_record};
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,12 +41,15 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "defined unknown",
         "a def of type `unknown` is accepted",
     ),
-    // Same finding as the catalog schema that will not parse — see
-    // `permission_set_namespace_authority_is_enforced_at_parse_time`.
+    // NOT a namespace-authority refusal, though it was recorded as one until
+    // the cause was actually read off the error. `validate_permission_set`
+    // checks `detail` before it looks at any permission, so this vector never
+    // reaches the authority code at all — it is refused for omitting `detail`,
+    // which the reference declares `z.string().optional()`.
     (
         "lexicon/lexicon-valid.json",
         "basic permission-set",
-        "grants across authorities; refused by the Namespace Authority rule",
+        "`detail` is required here and optional in the reference",
     ),
 ];
 
@@ -83,7 +86,8 @@ const CATALOG: &[&str] = &[
 /// rather than worked around silently.
 const CATALOG_KNOWN_FAILURES: &[(&str, &str)] = &[(
     "lexicon/catalog/permission-set.json",
-    "namespace authority enforced at parse time; see the test that pins this",
+    "declares `lxm: [\"*\"]`, refused at parse time; the reference admits the wildcard \
+     into the document and declines to grant it when an `include:` scope resolves it",
 )];
 
 /// Load the catalog, returning it alongside the schemas that failed to parse.
@@ -159,33 +163,60 @@ fn interop_lexicon_catalog_parses() {
     );
 }
 
-/// The one catalog schema this crate refuses, and exactly why.
+/// Namespace authority is computed, but no longer refuses a document.
 ///
-/// `permission-set.json` grants over `com.example.calendar.*` while living at
-/// `example.lexicon.permissionset`. That crosses to an unrelated authority,
-/// which the [Namespace Authority](https://atproto.com/specs/permission#namespace-authority)
-/// rule forbids: a set may address its own NSID group and children, never
-/// siblings or parents.
+/// The rule is unchanged and still correct: a permission set may grant only
+/// within its own authority — the lexicon NSID minus its final segment — so
+/// `example.lexicon.permissionset` may reach `example.lexicon.*` and must not
+/// reach `com.example.calendar.*`. What changed is *when* it applies.
 ///
-/// So the vector is not conformant, and the refusal is correct. The
-/// reference's `lexPermissionSet` schema does no namespace check at all —
-/// its Zod type accepts any `resource` with arbitrary fields — so the corpus
-/// records what that parser accepts rather than what the specification
-/// permits, and the two differ here.
+/// `validate_permission_set` no longer rejects a document for carrying an
+/// out-of-authority grant. The reference does not either: `lexPermissionSet`
+/// performs no authority check, and `isAllowedPermission` drops the offending
+/// permissions as an `include:` scope resolves them. Refusing at parse time made
+/// this crate unable to read lexicons the reference reads, losing every
+/// unrelated definition in the same file.
 ///
-/// Pinned rather than "fixed": there is nothing to fix. The rule is enforced
-/// deliberately, and the spec is explicit that it admits no exceptions —
-/// authority is computed "without \"siblings\" or special namespaces".
+/// So the rule is asserted here directly, through the predicate a future
+/// resolver must call. `permission-set.json` still fails to parse — for its
+/// wildcard `lxm`, a separate divergence recorded in [`CATALOG_KNOWN_FAILURES`]
+/// — which is why this test exercises the predicate rather than the catalog.
 #[test]
-fn permission_set_namespace_authority_is_enforced_at_parse_time() {
-    let (_, failed) = catalog_with_failures();
-    let (file, reason) = failed
-        .first()
-        .expect("the permission-set schema should currently fail to parse");
-    assert_eq!(file, "lexicon/catalog/permission-set.json");
+fn namespace_authority_is_computed_but_does_not_refuse_a_document() {
+    const LEXICON: &str = "example.lexicon.permissionset";
+
     assert!(
-        reason.contains("PermissionNsidOutsideNamespace"),
-        "expected a namespace-authority refusal, got {reason}"
+        !permission_within_authority("com.example.calendar.event", LEXICON),
+        "a sibling authority must not be grantable"
+    );
+    assert!(
+        permission_within_authority("example.lexicon.endpoint", LEXICON),
+        "the declaring authority's own namespace must be grantable"
+    );
+    // The authority is the group prefix, so the lexicon's own NSID sits inside
+    // it — `example.lexicon.permissionset` is under `example.lexicon`. The
+    // reference's `groupPrefixEnd` comparison reaches the same answer.
+    assert!(permission_within_authority(LEXICON, LEXICON));
+
+    // A document whose only sin is an out-of-authority grant now parses.
+    let doc = serde_json::json!({
+        "lexicon": 1,
+        "id": LEXICON,
+        "defs": {"main": {
+            "type": "permission-set",
+            "title": "t",
+            "detail": "d",
+            "permissions": [{
+                "type": "permission",
+                "resource": "repo",
+                "collection": ["com.example.calendar.event"],
+                "action": ["create"]
+            }]
+        }}
+    });
+    assert!(
+        SchemaFile::from_value(doc).is_ok(),
+        "an out-of-authority grant must not make the document unreadable"
     );
 }
 

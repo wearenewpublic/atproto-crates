@@ -156,6 +156,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   told apart from one whose table the parser failed on.
 
 ### Fixed
+- `atproto-lexicon`: a permission set that granted outside its own namespace authority made the
+  whole lexicon document unreadable. The rule was right and the layer was wrong.
+
+  An `include:` scope names a permission set rather than listing permissions, so the user consents to
+  a name; the Namespace Authority rule is what stops `app.evil.authFull` declaring
+  `repo:com.yourbank.records`. The reference enforces it as an `include:` scope is *resolved*
+  (`isAllowedPermission` in `@atproto/oauth-scopes`), dropping the offending permissions —
+  `lexPermissionSet` itself performs no authority check at all. Enforcing it at parse time meant this
+  crate refused documents the reference reads happily, and lost every unrelated definition sharing
+  the file.
+
+  `repo` `collection` and `rpc` `lxm` are no longer authority-checked when a permission set is
+  parsed. Structural validation is untouched: the NSIDs must still be well formed, non-empty and
+  wildcard-free, and `include` and `space` permissions keep their existing constraints.
+
+  The rule itself is preserved as `permission_within_authority`, documented as the security check it
+  is. It has no caller: nothing in this workspace resolves `include:` scopes — `Scope::Include`
+  grants only itself — so there is currently no path an out-of-authority permission could travel
+  down. `atproto-oauth`'s `include_scope_grants_nothing_until_authority_filtering_exists` asserts
+  that invariant and will fail the moment resolution is implemented, so the filter cannot be
+  forgotten silently.
+
 - `atproto-lexicon`: two record-structure rules from the interop corpus were unenforced — a record
   could be a bare string rather than an object, and `$type` could be the empty string.
 

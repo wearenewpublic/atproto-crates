@@ -218,6 +218,37 @@ fn nsid_in_namespace(nsid: &str, namespace: &str) -> bool {
         && nsid.as_bytes()[namespace.len()] == b'.'
 }
 
+/// Whether a permission's NSID may be granted by a permission set declared in
+/// `lexicon_nsid`.
+///
+/// **This is a security check and it has no caller yet.** It is the rule that
+/// stops `app.evil.authFull` from declaring `repo:com.yourbank.records`: an
+/// `include:` scope names a permission set, so the user consents to a *name*
+/// rather than to a list they have read, and only this constraint keeps a
+/// lexicon author inside namespaces they actually control.
+///
+/// It lives here, unwired, rather than in [`validate_permission_set`], because
+/// the reference applies it when an `include:` scope is *resolved* — see
+/// `isAllowedPermission` in `@atproto/oauth-scopes`, which drops offending
+/// permissions instead of rejecting the document that carries them. Enforcing
+/// it at parse time made this crate refuse whole lexicons the reference reads
+/// happily, losing every unrelated definition in the same file along with them.
+///
+/// This workspace does not resolve `include:` scopes at all — `Scope::Include`
+/// grants only itself — so there is currently no grant path for an
+/// out-of-authority permission to travel down. **Whoever builds that path must
+/// call this**, or the escalation it prevents becomes reachable. A guard test in
+/// `atproto-oauth` fails the moment `include:` starts granting anything, so this
+/// cannot be forgotten silently.
+///
+/// The authority is the lexicon's NSID minus its final segment, matching the
+/// reference's `lastIndexOf('.')`: `example.lexicon.perms` has authority
+/// `example.lexicon`, which admits `example.lexicon.endpoint` and refuses
+/// `com.example.calendar.event`.
+pub fn permission_within_authority(nsid: &str, lexicon_nsid: &str) -> bool {
+    nsid_in_namespace(nsid, extract_namespace(lexicon_nsid))
+}
+
 fn validate_permission(
     permission: &Permission,
     namespace: &str,
@@ -234,10 +265,10 @@ fn validate_permission(
     }
     match permission.resource.as_str() {
         "repo" => {
-            validate_repo_permission(permission, namespace)?;
+            validate_repo_permission(permission)?;
         }
         "rpc" => {
-            validate_rpc_permission(permission, namespace)?;
+            validate_rpc_permission(permission)?;
         }
         "space" => {
             validate_space_permission(permission, namespace)?;
@@ -367,10 +398,7 @@ fn validate_space(space: &SpaceSchema) -> Result<(), DataValidationError> {
     Ok(())
 }
 
-fn validate_repo_permission(
-    permission: &Permission,
-    namespace: &str,
-) -> Result<(), DataValidationError> {
+fn validate_repo_permission(permission: &Permission) -> Result<(), DataValidationError> {
     if let Some(action) = &permission.action {
         if action.is_empty() {
             return Err(DataValidationError::PermissionEmptyAction);
@@ -396,20 +424,13 @@ fn validate_repo_permission(
                 reason: e.to_string(),
             });
         }
-        if !nsid_in_namespace(nsid, namespace) {
-            return Err(DataValidationError::PermissionNsidOutsideNamespace {
-                nsid: nsid.clone(),
-                namespace: namespace.to_string(),
-            });
-        }
+        // Namespace authority is deliberately NOT enforced here — see
+        // [`permission_within_authority`] for where it belongs and why.
     }
     Ok(())
 }
 
-fn validate_rpc_permission(
-    permission: &Permission,
-    namespace: &str,
-) -> Result<(), DataValidationError> {
+fn validate_rpc_permission(permission: &Permission) -> Result<(), DataValidationError> {
     let lxm = permission
         .lxm
         .as_ref()
@@ -425,12 +446,8 @@ fn validate_rpc_permission(
                 reason: e.to_string(),
             });
         }
-        if !nsid_in_namespace(nsid, namespace) {
-            return Err(DataValidationError::PermissionNsidOutsideNamespace {
-                nsid: nsid.clone(),
-                namespace: namespace.to_string(),
-            });
-        }
+        // Namespace authority is deliberately NOT enforced here — see
+        // [`permission_within_authority`] for where it belongs and why.
     }
     Ok(())
 }
@@ -693,10 +710,14 @@ mod tests {
     #[test]
     fn test_permission_nsid_outside_namespace() {
         let json = r#"{"lexicon": 1, "id": "com.example.app.auth", "defs": {"main": {"type": "permission-set", "title": "Some Title", "description": "Some description", "permissions": [{"type": "permission", "resource": "repo", "action": ["create"], "collection": ["com.other.app.post"]}]}}}"#;
-        let result = SchemaFile::parse(json);
-        assert!(matches!(
-            result,
-            Err(DataValidationError::PermissionNsidOutsideNamespace { .. })
+        // The document is readable: an out-of-authority grant is no longer a
+        // parse error, matching the reference, which performs no authority
+        // check on the schema at all.
+        assert!(SchemaFile::parse(json).is_ok());
+        // The rule that governs it still says no.
+        assert!(!permission_within_authority(
+            "com.other.app.post",
+            "com.example.app.auth"
         ));
     }
 
@@ -1065,16 +1086,34 @@ mod namespace_authority {
         let post = "app.example.feed.authOnlyPost";
         let full = "app.example.authFull";
 
-        assert!(permission_set(post, &repo("app.example.feed.post")).is_ok());
-        assert!(permission_set(post, &rpc("app.example.feed.getPostThread")).is_ok());
+        // The rule, which now bounds what may be *granted* rather than what may
+        // be written down — see `permission_within_authority`.
+        assert!(permission_within_authority("app.example.feed.post", post));
+        assert!(permission_within_authority(
+            "app.example.feed.getPostThread",
+            post
+        ));
         assert!(
-            permission_set(post, &repo("app.example.actor.profile")).is_err(),
+            !permission_within_authority("app.example.actor.profile", post),
             "a sibling group must not be reachable"
         );
 
-        assert!(permission_set(full, &repo("app.example.feed.post")).is_ok());
+        assert!(permission_within_authority("app.example.feed.post", full));
+        assert!(permission_within_authority(
+            "app.example.actor.profile",
+            full
+        ));
+        assert!(permission_within_authority(
+            "app.example.feed.getPostThread",
+            full
+        ));
+
+        // Every one of those documents parses, including the one whose grant is
+        // out of authority. Refusing to *read* it is what this crate stopped
+        // doing; refusing to *honour* it is the resolver's job.
+        assert!(permission_set(post, &repo("app.example.feed.post")).is_ok());
+        assert!(permission_set(post, &repo("app.example.actor.profile")).is_ok());
         assert!(permission_set(full, &repo("app.example.actor.profile")).is_ok());
-        assert!(permission_set(full, &rpc("app.example.feed.getPostThread")).is_ok());
     }
 
     /// Authority runs downward only: children yes, parents and siblings no.
@@ -1082,16 +1121,22 @@ mod namespace_authority {
     fn parents_and_siblings_are_refused_children_are_not() {
         let set = "app.example.feed.authOnlyPost";
         // Same group.
-        assert!(permission_set(set, &repo("app.example.feed.post")).is_ok());
+        assert!(permission_within_authority("app.example.feed.post", set));
         // Children, recursively deep.
-        assert!(permission_set(set, &repo("app.example.feed.thread.reply")).is_ok());
+        assert!(permission_within_authority(
+            "app.example.feed.thread.reply",
+            set
+        ));
         // A parent.
-        assert!(permission_set(set, &repo("app.example.post")).is_err());
+        assert!(!permission_within_authority("app.example.post", set));
         // An unrelated authority.
-        assert!(permission_set(set, &repo("com.other.thing")).is_err());
+        assert!(!permission_within_authority("com.other.thing", set));
         // A name that merely shares a prefix without a segment boundary — the
         // check must not be a bare `starts_with`.
-        assert!(permission_set(set, &repo("app.examplefeed.post")).is_err());
+        assert!(!permission_within_authority("app.examplefeed.post", set));
+
+        // None of them makes the document unreadable.
+        assert!(permission_set(set, &repo("com.other.thing")).is_ok());
     }
 
     /// `include` is transitive, so the rule binds it too.

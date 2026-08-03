@@ -2568,6 +2568,49 @@ mod tests {
         assert!(!transition.grants(&include1));
     }
 
+    /// `include:` grants nothing, and the day it does is the day a security
+    /// check becomes mandatory.
+    ///
+    /// An `include:` scope names a permission set the user never reads, so the
+    /// permissions it expands to must be filtered to the declaring lexicon's own
+    /// namespace authority — otherwise `include:app.evil.authFull` can grant
+    /// `repo:com.yourbank.records`. The reference does that filtering in
+    /// `isAllowedPermission` as it resolves the scope.
+    ///
+    /// `atproto-lexicon` no longer enforces that rule when the permission set is
+    /// *parsed*, because the reference does not either and doing so made this
+    /// crate refuse documents the reference accepts. The rule now lives in
+    /// `atproto_lexicon::validation::schema_file::permission_within_authority`,
+    /// which has no caller because nothing here resolves `include:` yet.
+    ///
+    /// This test exists so that gap cannot close quietly. It asserts the current
+    /// invariant — an `include:` scope expands to nothing — so implementing
+    /// resolution *will* fail it. When it does, do not simply update it: wire
+    /// `permission_within_authority` into the expansion first, then assert that
+    /// out-of-authority permissions are dropped.
+    #[test]
+    fn include_scope_grants_nothing_until_authority_filtering_exists() {
+        let include = Scope::parse("include:app.example.authFull").unwrap();
+
+        // Every concrete permission an expanded set could plausibly yield.
+        for granted in [
+            "repo:com.example.calendar.event",
+            "repo:*",
+            "rpc:example.lexicon.endpoint",
+            "blob:*/*",
+            "account:email",
+        ] {
+            let scope = Scope::parse(granted)
+                .unwrap_or_else(|e| panic!("{granted} should be a parsable scope: {e:?}"));
+            assert!(
+                !include.grants(&scope),
+                "include: now grants {granted} — resolution has been implemented. Filter the \
+                 expansion through permission_within_authority before relaxing this assertion; \
+                 without it, a permission set can grant across namespace authorities."
+            );
+        }
+    }
+
     #[test]
     fn test_parse_multiple_with_include() {
         let scopes = Scope::parse_multiple("atproto include:app.example.auth repo:*").unwrap();
