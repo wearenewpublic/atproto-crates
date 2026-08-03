@@ -156,6 +156,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   told apart from one whose table the parser failed on.
 
 ### Fixed
+- `atproto-lexicon`: two record-structure rules from the interop corpus were unenforced — a record
+  could be a bare string rather than an object, and `$type` could be the empty string.
+
+  `parse_json` is called for every value at every depth, so it cannot demand that its argument be an
+  object: `"blah"` is a perfectly well-formed data-model *value*, and is only ill-formed as a
+  *record*. The rule needs a record-level entry point, so there is now `parse_record_json`, which
+  requires a top-level object and then delegates. An empty `$type` is refused outright: `$type` names
+  the schema a consumer dispatches on, and the empty string names nothing — an object that claims to
+  be typed but can never be resolved is worse than one with no `$type` at all, because absence is at
+  least detectable.
+
+  Found by asserting the six cases `atproto-dasl`'s `interop_data_model` excludes as
+  `NOT_AN_ENCODING_CONCERN`. Four of the six turned out to be enforced already, contradicting that
+  exclusion's claim that they were "not implemented yet" — which is the hazard of a rule that is
+  implemented but unasserted: it is one refactor away from silently disappearing. All six are now
+  covered by `atproto-lexicon`'s `interop_data_model_structure`, whose `ASSERTED_CASES` mirrors the
+  exclusion list so the two cannot drift apart unnoticed.
+
 - `atproto-pds`: a space credential could only be verified by the host that minted it, which confined
   every permissioned space to a single PDS — the opposite of what proposal-0016 is for.
 

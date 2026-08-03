@@ -7,6 +7,36 @@ use crate::validation::data_errors::DataValidationError;
 use crate::validation::data_types::{Blob, Bytes, CIDLink, DataValue};
 use crate::validation::flags::ValidateFlags;
 
+/// Parse a top-level record document into a [`DataValue`].
+///
+/// Identical to [`parse_json`] except that the document itself must be an
+/// object. The distinction is not pedantic: the data model permits any value in
+/// a *field*, so `"blah"` is a well-formed data-model value — it is only
+/// ill-formed as a *record*. [`parse_json`] is called recursively for every
+/// nested field and so cannot make that demand; only a record-level entry point
+/// can, which is why the rule lives here rather than there.
+pub fn parse_record_json(
+    value: &JsonValue,
+    flags: ValidateFlags,
+) -> Result<DataValue, DataValidationError> {
+    if !value.is_object() {
+        return Err(DataValidationError::DataModelInvalid {
+            reason: format!(
+                "a record must be an object, got {}",
+                match value {
+                    JsonValue::Null => "null",
+                    JsonValue::Bool(_) => "boolean",
+                    JsonValue::Number(_) => "number",
+                    JsonValue::String(_) => "string",
+                    JsonValue::Array(_) => "array",
+                    JsonValue::Object(_) => unreachable!("guarded above"),
+                }
+            ),
+        });
+    }
+    parse_json(value, flags)
+}
+
 /// Parse a JSON value into a DataValue
 pub fn parse_json(
     value: &JsonValue,
@@ -79,6 +109,16 @@ fn parse_object(
             .ok_or_else(|| DataValidationError::DataModelInvalid {
                 reason: "$type value must be a string".to_string(),
             })?;
+        // An empty `$type` is not merely an unknown type: `$type` names the
+        // schema a consumer is meant to dispatch on, and the empty string names
+        // nothing. Accepting it produced an object that claimed to be typed and
+        // could never be resolved, which is worse than an absent `$type` —
+        // absence is at least detectable as such.
+        if type_str.is_empty() {
+            return Err(DataValidationError::DataModelInvalid {
+                reason: "$type value must not be empty".to_string(),
+            });
+        }
         if type_str == "blob" {
             return parse_blob(obj, flags);
         }
