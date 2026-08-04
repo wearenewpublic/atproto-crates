@@ -798,8 +798,14 @@ async fn main() -> anyhow::Result<()> {
     }
     // Resolvers for record validation, assembled below: the bundled corpus is
     // always present, and network resolution is added when DNS is available.
-    let mut network_lexicon_resolver: Option<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>> =
-        None;
+    // Assigned by the `hickory-dns` block below when a DNS resolver exists.
+    // Declared without an initialiser so the compiled-out case is a genuine
+    // "never set" rather than a value assigned and immediately overwritten.
+    let network_lexicon_resolver: Option<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>>;
+    #[cfg(not(feature = "hickory-dns"))]
+    {
+        network_lexicon_resolver = None;
+    }
 
     #[cfg(feature = "hickory-dns")]
     {
@@ -865,7 +871,7 @@ async fn main() -> anyhow::Result<()> {
             "lexicon corpus loaded for record validation"
         );
         let mut chain: Vec<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>> = vec![bundled];
-        if let Some(network) = network_lexicon_resolver.take() {
+        if let Some(network) = network_lexicon_resolver {
             chain.push(network);
         }
         state = state.with_lexicon_resolver(Arc::new(
