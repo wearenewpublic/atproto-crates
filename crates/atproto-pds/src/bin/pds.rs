@@ -796,6 +796,11 @@ async fn main() -> anyhow::Result<()> {
             ),
         ));
     }
+    // Resolvers for record validation, assembled below: the bundled corpus is
+    // always present, and network resolution is added when DNS is available.
+    let mut network_lexicon_resolver: Option<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>> =
+        None;
+
     #[cfg(feature = "hickory-dns")]
     {
         // Space-type declaration resolver (NSID → declared `collections`) for
@@ -824,11 +829,10 @@ async fn main() -> anyhow::Result<()> {
         );
         state = state.with_space_declaration_resolver(Arc::new(cached));
 
-        // Record validation resolves lexicons over the same path, so it is
-        // available exactly when DNS resolution is. Without a DNS resolver no
-        // lexicon is knowable, `validate: true` is refused, and an unset
-        // `validate` passes through unchecked -- see
-        // `http::write_handlers::validate_record`.
+        // Application lexicons -- anything outside the bundled vocabulary --
+        // are resolved over the same path space declarations use, so network
+        // resolution is available exactly when DNS is. The bundled corpus is
+        // attached unconditionally below and sits in front of this.
         let lexicon_http = reqwest::Client::builder()
             .user_agent(user_agent())
             .timeout(std::time::Duration::from_secs(5))
@@ -839,13 +843,36 @@ async fn main() -> anyhow::Result<()> {
             lexicon_http,
             lexicon_plc_hostname,
         );
-        let lexicon_cached = atproto_pds::repo::lexicon::CachingLexiconResolver::new(
-            Arc::new(lexicon_network),
-            std::time::Duration::from_secs(300),
-        );
-        state = state.with_lexicon_resolver(Arc::new(lexicon_cached));
+        network_lexicon_resolver = Some(Arc::new(
+            atproto_pds::repo::lexicon::CachingLexiconResolver::new(
+                Arc::new(lexicon_network),
+                std::time::Duration::from_secs(300),
+            ),
+        ));
         state = state.with_dns_resolver(dns_resolver);
     }
+    // The bundled vocabulary first, then the network. Order is deliberate: a
+    // bundled schema is the one this build was tested against, so letting a
+    // network answer override it would make validation depend on what an
+    // authority published today. The bundle needs no DNS, so `validate: true`
+    // works for `app.bsky.*`, `com.atproto.*` and `tools.ozone.*` on a server
+    // with no resolver configured at all.
+    {
+        let bundled = Arc::new(atproto_pds::repo::lexicon::BundledLexiconResolver::new());
+        info!(
+            lexicons = bundled.len(),
+            network = network_lexicon_resolver.is_some(),
+            "lexicon corpus loaded for record validation"
+        );
+        let mut chain: Vec<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>> = vec![bundled];
+        if let Some(network) = network_lexicon_resolver.take() {
+            chain.push(network);
+        }
+        state = state.with_lexicon_resolver(Arc::new(
+            atproto_pds::repo::lexicon::ChainedLexiconResolver::new(chain),
+        ));
+    }
+
     if let (Some(did), Some(url)) = (
         args.report_service_did.as_deref(),
         args.report_service_url.as_deref(),

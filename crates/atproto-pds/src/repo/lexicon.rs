@@ -320,6 +320,100 @@ async fn lexicon_authority_did(
     if dids.len() == 1 { dids.pop() } else { None }
 }
 
+// ---------------------------------------------------------------------------
+//  The bundled corpus
+// ---------------------------------------------------------------------------
+
+include!(concat!(env!("OUT_DIR"), "/bundled_lexicons.rs"));
+
+/// Serves the lexicons vendored into this binary.
+///
+/// `app.bsky.*`, `com.atproto.*` and `tools.ozone.*` are bundled because they
+/// are the schemas a PDS is asked to validate against constantly and cannot
+/// afford to be unable to. Resolving them over the network is possible in
+/// principle -- Bluesky publishes `_lexicon.feed.bsky.app` and the rest -- but
+/// it makes every first write of a collection wait on DNS and two HTTP round
+/// trips, and it makes validation fail whenever the network or the authority's
+/// PDS is unavailable. A schema that ships with the binary is knowable
+/// offline, which is what "known lexicon" ought to mean for the vocabulary the
+/// protocol itself defines.
+///
+/// The corpus is generated at build time from `lexicons/`, vendored from
+/// bluesky-social/atproto (dual MIT / Apache-2.0, the same terms as this
+/// workspace).
+pub struct BundledLexiconResolver {
+    schemas: HashMap<&'static str, &'static str>,
+}
+
+impl BundledLexiconResolver {
+    /// Build the index over the embedded corpus.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            schemas: BUNDLED_LEXICONS.iter().copied().collect(),
+        }
+    }
+
+    /// How many lexicons are bundled.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.schemas.len()
+    }
+
+    /// Whether the corpus is empty, which would mean the build embedded
+    /// nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.schemas.is_empty()
+    }
+}
+
+impl Default for BundledLexiconResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl LexiconResolver for BundledLexiconResolver {
+    async fn resolve(&self, nsid: &str) -> Option<serde_json::Value> {
+        let raw = self.schemas.get(nsid)?;
+        serde_json::from_str(raw).ok()
+    }
+}
+
+/// Tries each resolver in order and takes the first answer.
+///
+/// Used to put the bundled corpus in front of the network: a bundled schema is
+/// authoritative for the vocabulary this server ships, and anything else --
+/// an application's own lexicons -- falls through to resolution. The order
+/// matters and is not a preference for speed: a bundled schema is the one this
+/// build was tested against, so letting the network override it would make
+/// validation depend on what a third party published today.
+pub struct ChainedLexiconResolver {
+    resolvers: Vec<Arc<dyn LexiconResolver>>,
+}
+
+impl ChainedLexiconResolver {
+    /// Chain resolvers, first match wins.
+    #[must_use]
+    pub fn new(resolvers: Vec<Arc<dyn LexiconResolver>>) -> Self {
+        Self { resolvers }
+    }
+}
+
+#[async_trait::async_trait]
+impl LexiconResolver for ChainedLexiconResolver {
+    async fn resolve(&self, nsid: &str) -> Option<serde_json::Value> {
+        for resolver in &self.resolvers {
+            if let Some(found) = resolver.resolve(nsid).await {
+                return Some(found);
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +528,112 @@ mod tests {
             }
             _ => panic!("expected an incomplete closure"),
         }
+    }
+
+    #[test]
+    fn the_bundled_corpus_covers_the_protocol_vocabulary() {
+        let bundled = BundledLexiconResolver::new();
+        assert!(
+            bundled.len() > 300,
+            "expected the full corpus, got {} lexicons",
+            bundled.len()
+        );
+        for nsid in [
+            "app.bsky.feed.post",
+            "app.bsky.actor.profile",
+            "com.atproto.repo.createRecord",
+            "tools.ozone.moderation.defs",
+        ] {
+            assert!(
+                BUNDLED_LEXICONS.iter().any(|(id, _)| *id == nsid),
+                "{nsid} should be bundled",
+            );
+        }
+    }
+
+    /// The closure has to resolve entirely from the bundle, with no network.
+    /// `app.bsky.feed.post` references facets and several embed types, so this
+    /// is the case that would otherwise reject every real post.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bundled_schema_resolves_its_whole_closure_offline() {
+        let bundled = BundledLexiconResolver::new();
+        match resolve_catalog(&bundled, "app.bsky.feed.post").await {
+            CatalogOutcome::Ready(catalog) => {
+                assert!(catalog.get_schema("app.bsky.feed.post").is_some());
+                assert!(
+                    catalog.get_schema("app.bsky.richtext.facet").is_some(),
+                    "a referenced schema should have come from the bundle too",
+                );
+            }
+            CatalogOutcome::Unresolvable => panic!("app.bsky.feed.post is bundled"),
+            CatalogOutcome::IncompleteClosure { missing } => {
+                panic!("closure incomplete offline, missing {missing}")
+            }
+        }
+    }
+
+    /// A real post validates against the bundled schema, and one missing a
+    /// required field does not. Without both halves the bundle could be
+    /// present and inert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_bundled_schema_accepts_a_good_post_and_rejects_a_bad_one() {
+        let bundled = BundledLexiconResolver::new();
+        let CatalogOutcome::Ready(catalog) = resolve_catalog(&bundled, "app.bsky.feed.post").await
+        else {
+            panic!("app.bsky.feed.post is bundled")
+        };
+        let schema = catalog.get_schema("app.bsky.feed.post").unwrap().clone();
+        let flags = atproto_lexicon::validation::flags::ValidateFlags::default();
+
+        let good = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "a perfectly ordinary post",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        });
+        atproto_lexicon::validation::validate::validate_record_with_schema(
+            &good,
+            &schema,
+            catalog.as_ref(),
+            flags,
+        )
+        .expect("a valid post should validate");
+
+        let bad = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "no createdAt",
+        });
+        let err = atproto_lexicon::validation::validate::validate_record_with_schema(
+            &bad,
+            &schema,
+            catalog.as_ref(),
+            flags,
+        )
+        .expect_err("a post without createdAt should be rejected");
+        assert!(err.to_string().contains("createdAt"), "got: {err}");
+    }
+
+    /// The bundle answers before the network, so a bundled schema cannot be
+    /// replaced by whatever an authority publishes today.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chain_prefers_the_bundle() {
+        let mut map = HashMap::new();
+        map.insert(
+            "app.bsky.feed.post".to_string(),
+            record_schema("app.bsky.feed.post", None),
+        );
+        let chain = ChainedLexiconResolver::new(vec![
+            Arc::new(BundledLexiconResolver::new()),
+            Arc::new(StubResolver(map)),
+        ]);
+        let resolved = chain.resolve("app.bsky.feed.post").await.expect("resolves");
+        // The stub's stand-in has a single `text` property; the real one has
+        // many more, so a shallow document means the stub won.
+        let props = resolved
+            .pointer("/defs/main/record/properties")
+            .and_then(|v| v.as_object())
+            .map(serde_json::Map::len)
+            .unwrap_or(0);
+        assert!(props > 1, "the network stub overrode the bundled schema");
     }
 
     #[tokio::test(flavor = "multi_thread")]
