@@ -139,18 +139,34 @@ struct Args {
 
     /// Requests per window allowed from one client address on ordinary
     /// routes. `0` disables the global tier.
-    #[arg(long, env = "PDS_RATE_LIMIT", default_value_t = 300)]
+    ///
+    /// 3000 over the default 300s window is 600/minute, matching the
+    /// reference's `global-ip` bucket (3000 points per 5 minutes,
+    /// packages/pds/src/rate-limits.ts).
+    ///
+    /// The previous default of 300 per 60s was half that rate, and measurably
+    /// too low for a real client: the official Bluesky app polls
+    /// `getTrends`, `getPreferences`, `getProfile`, `getUnreadCounts`,
+    /// `getDrafts` and `getSession` on a ~2s cycle, which is ~180 requests a
+    /// minute from a single idle signed-in tab. Every proxied `app.bsky.*`
+    /// call is counted here too, because this server forwards them rather
+    /// than the client reaching an AppView directly. One user browsing
+    /// normally saturated the bucket and the client degraded to constant
+    /// failure.
+    #[arg(long, env = "PDS_RATE_LIMIT", default_value_t = 3000)]
     rate_limit: usize,
 
     /// Requests per window allowed from one client address on the
     /// authentication and account-creation endpoints. Tighter than the global
     /// tier: a hundred `getRecord` calls a minute is a busy client, a hundred
     /// `createSession` calls a minute is someone guessing. `0` disables it.
-    #[arg(long, env = "PDS_RATE_LIMIT_AUTH", default_value_t = 30)]
+    /// 150 over the default 300s window preserves the previous effective rate
+    /// of 30/minute; only the window changed.
+    #[arg(long, env = "PDS_RATE_LIMIT_AUTH", default_value_t = 150)]
     rate_limit_auth: usize,
 
     /// Sliding-window length in seconds for both rate-limit tiers.
-    #[arg(long, env = "PDS_RATE_LIMIT_WINDOW_SECS", default_value_t = 60)]
+    #[arg(long, env = "PDS_RATE_LIMIT_WINDOW_SECS", default_value_t = 300)]
     rate_limit_window_secs: u64,
 
     /// Client addresses exempt from rate limiting — a relay, an AppView, a
@@ -656,17 +672,29 @@ async fn main() -> anyhow::Result<()> {
                     atproto_pds::security::JtiReplayGuard::new_valkey(client.clone()),
                     atproto_pds::security::SlidingWindowLimiter::new_valkey(
                         client.clone(),
-                        args.rate_limit.max(1),
+                        if args.rate_limit == 0 {
+                            usize::MAX
+                        } else {
+                            args.rate_limit
+                        },
                         rate_window,
                     ),
                     atproto_pds::security::SlidingWindowLimiter::new_valkey(
                         client.clone(),
-                        args.rate_limit.max(1),
+                        if args.rate_limit == 0 {
+                            usize::MAX
+                        } else {
+                            args.rate_limit
+                        },
                         rate_window,
                     ),
                     atproto_pds::security::SlidingWindowLimiter::new_valkey(
                         client,
-                        args.rate_limit_auth.max(1),
+                        if args.rate_limit_auth == 0 {
+                            usize::MAX
+                        } else {
+                            args.rate_limit_auth
+                        },
                         rate_window,
                     ),
                 )
@@ -1273,11 +1301,25 @@ fn durability_profile_sql_or_memory(
     atproto_pds::security::SlidingWindowLimiter,
 ) {
     let window = Duration::from_secs(args.rate_limit_window_secs);
-    // `max(1)` because a limit of zero would refuse every request; disabling a
-    // tier is expressed by the bypass path in `build_rate_limit_policy`, not
-    // by a zero budget here.
-    let global = args.rate_limit.max(1);
-    let auth = args.rate_limit_auth.max(1);
+    // `0` means "disable this tier", which is what both the CLI help and
+    // `build_rate_limit_policy` document. It has to become an unbounded budget,
+    // not a small one.
+    //
+    // This was `max(1)`, which turned the documented way to switch a tier off
+    // into the most restrictive setting the server can have: one request per
+    // window, refusing essentially everything. An operator reaching for the
+    // documented escape hatch got the opposite of what it says, and the
+    // failure looks like the limiter working rather than like a
+    // misconfiguration.
+    let disabled_or = |configured: usize| {
+        if configured == 0 {
+            usize::MAX
+        } else {
+            configured
+        }
+    };
+    let global = disabled_or(args.rate_limit);
+    let auth = disabled_or(args.rate_limit_auth);
     match args.durability_profile.as_str() {
         "sql" => {
             info!("durability profile: SQL (jti_replay + rate_limit_window persisted)");

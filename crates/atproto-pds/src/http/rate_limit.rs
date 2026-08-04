@@ -146,6 +146,10 @@ pub fn client_ip(request: &Request, trusted_proxy_hops: usize) -> Option<IpAddr>
         .map(|ConnectInfo(addr)| addr.ip())
 }
 
+/// The repository export path, exempt from the shared bucket. See the
+/// middleware for why.
+const SYNC_GET_REPO_PATH: &str = "/xrpc/com.atproto.sync.getRepo";
+
 /// Whether a path belongs to the tighter auth tier.
 #[must_use]
 pub fn is_auth_path(path: &str) -> bool {
@@ -170,6 +174,17 @@ pub async fn rate_limit_middleware(
     }
 
     let path = request.uri().path();
+
+    // `getRepo` is the repository sync path: a full CAR export, called during
+    // account migration and by any consumer backfilling this server. It is
+    // high-volume by design and unrelated to the abuse the shared bucket
+    // exists to bound, so charging it there means one migration can exhaust an
+    // address's budget for everything else. The reference excludes it from its
+    // global-ip bucket for the same reason (packages/pds/src/rate-limits.ts).
+    if path == SYNC_GET_REPO_PATH {
+        return next.run(request).await;
+    }
+
     let (limiter, key) = if is_auth_path(path) {
         (&policy.auth, format!("ip-auth:{ip}"))
     } else {
@@ -196,6 +211,20 @@ pub async fn rate_limit_middleware(
 mod tests {
     use super::*;
     use axum::body::Body;
+
+    /// The repository export is exempt from the shared bucket.
+    ///
+    /// It is the sync path -- a full CAR -- used by account migration and by
+    /// any consumer backfilling this server. Charging it to the same bucket as
+    /// ordinary reads means one migration can exhaust an address's budget for
+    /// everything else.
+    #[test]
+    fn get_repo_is_outside_the_shared_bucket() {
+        assert_eq!(SYNC_GET_REPO_PATH, "/xrpc/com.atproto.sync.getRepo");
+        // And it is not in the auth tier either -- it is exempt, not merely
+        // moved to the tighter one.
+        assert!(!is_auth_path(SYNC_GET_REPO_PATH));
+    }
 
     fn request_with(xff: Option<&str>, peer: Option<&str>) -> Request {
         let mut builder = axum::http::Request::builder().uri("/xrpc/whatever");
