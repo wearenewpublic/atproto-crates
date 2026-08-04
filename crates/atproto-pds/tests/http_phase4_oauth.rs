@@ -306,7 +306,8 @@ async fn par_accepts_a_dpop_jkt_matching_the_proof() {
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
 
-    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // RFC 9126 §2.2: a pushed authorization request responds 201 Created.
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
     assert!(body["request_uri"].is_string(), "body: {body}");
 }
 
@@ -329,7 +330,7 @@ async fn authorize_for_code_with_jkt(
         par["dpop_jkt"] = json!(jkt);
     }
     let (status, body) = post_json(app.clone(), "/oauth/par", par).await;
-    assert_eq!(status, StatusCode::OK, "PAR setup failed: {body}");
+    assert_eq!(status, StatusCode::CREATED, "PAR setup failed: {body}");
     let request_uri = body["request_uri"].as_str().unwrap().to_string();
 
     let (status, body) = post_json(
@@ -420,7 +421,7 @@ async fn par_then_authorize_then_token_flow() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "PAR body: {body}");
+    assert_eq!(status, StatusCode::CREATED, "PAR body: {body}");
     let request_uri = body["request_uri"].as_str().unwrap().to_string();
     assert!(request_uri.starts_with("urn:ietf:params:oauth:request_uri:"));
 
@@ -723,7 +724,7 @@ async fn oauth_state_persists_across_restart() {
             }),
         )
         .await;
-        assert_eq!(s, StatusCode::OK, "PAR: {body}");
+        assert_eq!(s, StatusCode::CREATED, "PAR: {body}");
         let request_uri = body["request_uri"].as_str().unwrap().to_string();
 
         let (s, body) = post_json(
@@ -979,7 +980,11 @@ async fn par_and_token_accept_form_encoding() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "form-encoded PAR must work: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "form-encoded PAR must work: {body}"
+    );
     let request_uri = body["request_uri"].as_str().unwrap().to_string();
 
     let (_, authz) = post_json(

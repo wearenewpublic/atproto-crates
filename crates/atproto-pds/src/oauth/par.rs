@@ -135,7 +135,7 @@ pub async fn par_handler(
     State(state): State<HttpState>,
     headers: axum::http::HeaderMap,
     JsonOrForm(input): JsonOrForm<ParInput>,
-) -> Result<Json<ParResponse>, XrpcError> {
+) -> Result<(StatusCode, Json<ParResponse>), XrpcError> {
     // §10.2 — when `request` is present, JWS-verify against the client
     // metadata's `jwks_uri` and use the embedded payload. Otherwise fall
     // through to the inline-parameters path.
@@ -247,10 +247,17 @@ pub async fn par_handler(
         .await
         .map_err(XrpcError::from)?;
 
-    Ok(Json(ParResponse {
-        request_uri,
-        expires_in: PAR_TTL_SECS,
-    }))
+    // 201, not 200. RFC 9126 §2.2: "the authorization server ... responds
+    // with an HTTP 201 Created". A pushed authorization request creates a
+    // resource -- the request_uri names it -- and the status is how a client
+    // distinguishes that from a 200 carrying an error-shaped body.
+    Ok((
+        StatusCode::CREATED,
+        Json(ParResponse {
+            request_uri,
+            expires_in: PAR_TTL_SECS,
+        }),
+    ))
 }
 
 fn merge_inline_into_resolved(input: &ParInput) -> Result<ResolvedFields, XrpcError> {

@@ -186,16 +186,94 @@ async fn request_email_update_requires_auth() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// Headers a browser sends on a top-level navigation, which is what arriving
+/// at the consent screen is.
+fn navigation(req: axum::http::request::Builder) -> axum::http::request::Builder {
+    req.header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-site", "cross-site")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oauth_consent_page_responds_404_for_unknown_request_uri() {
     let (app, _manager, _tmp) = build_app().await;
-    let req = Request::builder()
-        .uri("/oauth/authorize?request_uri=urn:nope")
+    let req = navigation(Request::builder().uri("/oauth/authorize?request_uri=urn:nope"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     // Either 400 (invalid_request) is expected for unknown URI.
     assert!(resp.status().is_client_error(), "got {:?}", resp.status());
+}
+
+/// The consent screen is only rendered for a real browser navigation.
+///
+/// It is where an account holder grants an application access to their
+/// repository, so a page that can drive it without the user seeing it has a
+/// clickjacking and CSRF vector. `Sec-Fetch-*` are forbidden header names —
+/// script cannot set them — which is what makes them worth trusting.
+///
+/// A request carrying none of them is refused too: every browser that can run
+/// an OAuth client sends them, so their absence means the caller is not one.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_consent_page_refuses_anything_that_is_not_a_navigation() {
+    let (app, _manager, _tmp) = build_app().await;
+
+    for (label, headers) in [
+        ("no Sec-Fetch-* at all", vec![]),
+        (
+            "fetched by script rather than navigated to",
+            vec![
+                ("sec-fetch-mode", "cors"),
+                ("sec-fetch-dest", "empty"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+        ),
+        (
+            "loaded as a subresource rather than a document",
+            vec![
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "iframe"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+        ),
+    ] {
+        let mut req = Request::builder().uri("/oauth/authorize?request_uri=urn:nope");
+        for (k, v) in &headers {
+            req = req.header(*k, *v);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "consent screen rendered for a request that was {label}",
+        );
+    }
+}
+
+/// The mirror: a genuine navigation is not refused by the guard.
+///
+/// It still fails on the unknown `request_uri`, which is the point — the
+/// request gets past the Fetch Metadata check and is rejected for its
+/// contents, not for how it arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_consent_page_admits_a_browser_navigation() {
+    let (app, _manager, _tmp) = build_app().await;
+    let req = navigation(Request::builder().uri("/oauth/authorize?request_uri=urn:nope"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("sec-fetch"),
+        "a real navigation was refused by the Fetch Metadata guard: {text}",
+    );
 }
 
 /// Log in as a fixture account and return its access token.

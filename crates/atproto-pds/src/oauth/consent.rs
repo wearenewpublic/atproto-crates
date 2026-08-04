@@ -23,6 +23,7 @@ use crate::http::state::HttpState;
 use atproto_oauth::scopes::{Scope, SpaceCollection, SpaceDid, SpacePermission, SpaceType};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -34,6 +35,87 @@ pub struct ConsentQuery {
     pub request_uri: String,
 }
 
+/// Reject an authorize request that does not look like a browser navigation.
+///
+/// The consent screen is where an account holder grants an application access
+/// to their repository. Rendering it for a request that a page made *about*
+/// the user rather than a navigation *by* the user is the setup for
+/// clickjacking and cross-site request forgery: a hostile page can embed or
+/// fetch the endpoint and drive the grant without the user ever seeing it.
+///
+/// `Sec-Fetch-*` are the browser's own account of how a request was initiated,
+/// and a page cannot forge them — they are forbidden header names, so script
+/// cannot set them. That makes them the one signal here worth trusting.
+///
+/// The accepted values mirror the reference
+/// (`packages/oauth/oauth-provider/src/router/create-authorization-page-middleware.ts`):
+///
+/// - `sec-fetch-mode: navigate` — the user went here, rather than a page
+///   fetching it in the background
+/// - `sec-fetch-dest: document` — it is being rendered as a page, not loaded
+///   as a script, image or frame subresource
+/// - `sec-fetch-site` — any of `same-origin`, `same-site`, `cross-site` or
+///   `none`. Deliberately permissive: a client on another origin redirecting
+///   the user here is the *ordinary* case, so this header cannot be used to
+///   distinguish an attack. The other two carry the weight.
+///
+/// A request with no `Sec-Fetch-*` headers at all is refused. Every browser
+/// that can run an OAuth client sends them, so their absence means the caller
+/// is not a browser — and a non-browser has no business rendering a consent
+/// screen.
+fn require_browser_navigation(parts: &Parts) -> Result<(), XrpcError> {
+    let header = |name: &str| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+    };
+
+    let refuse = |detail: String| {
+        tracing::warn!(
+            detail,
+            "refused an authorize request that is not a browser navigation"
+        );
+        Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            detail,
+        ))
+    };
+
+    match header("sec-fetch-mode").as_deref() {
+        Some("navigate") => {}
+        Some(other) => {
+            return refuse(format!(
+                "Forbidden sec-fetch-mode header \"{other}\" (expected navigate)"
+            ));
+        }
+        None => return refuse("Missing sec-fetch-mode header".to_string()),
+    }
+
+    match header("sec-fetch-dest").as_deref() {
+        Some("document") => {}
+        Some(other) => {
+            return refuse(format!(
+                "Forbidden sec-fetch-dest header \"{other}\" (expected document)"
+            ));
+        }
+        None => return refuse("Missing sec-fetch-dest header".to_string()),
+    }
+
+    match header("sec-fetch-site").as_deref() {
+        Some("same-origin" | "same-site" | "cross-site" | "none") => {}
+        Some(other) => {
+            return refuse(format!("Forbidden sec-fetch-site header \"{other}\""));
+        }
+        None => return refuse("Missing sec-fetch-site header".to_string()),
+    }
+
+    Ok(())
+}
+
 /// `GET /oauth/authorize` — renders the consent form.
 ///
 /// The form action is `POST /oauth/authorize` (the existing JSON endpoint),
@@ -42,8 +124,11 @@ pub struct ConsentQuery {
 /// `request_uri` for an authorization code.
 pub async fn consent_page(
     State(state): State<HttpState>,
+    parts: Parts,
     Query(q): Query<ConsentQuery>,
 ) -> Result<Response, XrpcError> {
+    require_browser_navigation(&parts)?;
+
     let request = state
         .oauth
         .peek_par(&q.request_uri)
@@ -74,7 +159,23 @@ pub async fn consent_page(
         &handles,
         &type_names,
     );
-    Ok(Html(html).into_response())
+    // Never cached. The page is per-user and per-request: it names the client
+    // asking, the scopes it wants, and the account being asked. A copy served
+    // to someone else -- from a shared proxy, or replayed from history after
+    // sign-out -- shows one account's pending grant to whoever comes next.
+    //
+    // `Pragma` alongside `Cache-Control` for HTTP/1.0 intermediaries, which is
+    // what the reference sends.
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    Ok(response)
 }
 
 /// Collect the distinct, concrete owner DIDs referenced by `space:` scopes in
