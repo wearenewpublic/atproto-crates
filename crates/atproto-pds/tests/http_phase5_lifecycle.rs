@@ -473,11 +473,53 @@ async fn account_delete_request_then_confirm() {
             .await
             .unwrap();
 
-    // deleteAccount(token) → 200; account state flips to deleted.
+    // The token alone is not enough. It arrives by email, so treating it as a
+    // single factor means anyone who reads the message can destroy the
+    // account.
     let (status, _) = post_json(
         app.clone(),
         "/xrpc/com.atproto.server.deleteAccount",
-        json!({"token": confirm.0}),
+        json!({"did": "did:plc:alice", "password": "not-the-password", "token": confirm.0}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an account was deleted with the wrong password",
+    );
+
+    // A token issued for one account cannot delete another.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.deleteAccount",
+        json!({"did": "did:plc:someone-else", "password": "pw", "token": confirm.0}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a token deleted an account it was not issued for",
+    );
+
+    // Still intact after both refusals — a rejected delete must not have
+    // consumed the token or half-applied the state change.
+    let state_row: (String,) = sqlx::query_as("SELECT state FROM account WHERE did = ?")
+        .bind("did:plc:alice")
+        .fetch_one(&accounts_pool)
+        .await
+        .unwrap();
+    assert_ne!(
+        state_row.0, "deleted",
+        "a refused delete deleted the account"
+    );
+
+    // deleteAccount(did + password + token) → 200; state flips to deleted.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.deleteAccount",
+        json!({"did": "did:plc:alice", "password": "pw", "token": confirm.0}),
         None,
     )
     .await;

@@ -1535,8 +1535,17 @@ pub async fn request_account_delete(
 }
 
 /// Inputs for `com.atproto.server.deleteAccount`.
+///
+/// All three fields are required by the lexicon
+/// (`lexicons/com/atproto/server/deleteAccount.json`,
+/// `required: ["did", "password", "token"]`). This accepted the token alone,
+/// which made the emailed token a single factor for destroying an account.
 #[derive(Debug, Deserialize)]
 pub struct DeleteAccountInput {
+    /// The account being deleted. Checked against the token's own DID.
+    pub did: String,
+    /// The account password — not an app password.
+    pub password: String,
     /// Confirmation token from `requestAccountDelete`.
     pub token: String,
 }
@@ -1578,6 +1587,39 @@ pub async fn delete_account_with_token(
             StatusCode::BAD_REQUEST,
             "InvalidToken",
             "token expired",
+        ));
+    }
+
+    // The token names the account; the caller must name the same one. A
+    // mismatch means the request and the token disagree about what is being
+    // deleted, and guessing which to believe is not this endpoint's job.
+    if row.did != input.did {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidToken",
+            "the token was not issued for the DID in this request",
+        ));
+    }
+
+    // Second factor. Deletion is irreversible, and without this the emailed
+    // token was sufficient on its own: anyone who read the message — a
+    // forwarded mail, a shared inbox, a mail client on an unlocked phone —
+    // could destroy the account. The lexicon has required `password`
+    // alongside `token` all along, and the reference enforces it.
+    //
+    // `__primary__` is the account password specifically. An app password
+    // must not satisfy this: app passwords are handed to third-party tools,
+    // and one of them being able to complete an account deletion is the
+    // outcome this check exists to prevent.
+    let verified = crate::account::app_password::verify(&pool, &row.did, &input.password)
+        .await
+        .map_err(XrpcError::from)?;
+    if verified.is_none_or(|p| p.name != "__primary__") {
+        tracing::warn!(did = %row.did, "deleteAccount: password verification failed");
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "the account password is required to delete an account",
         ));
     }
 
