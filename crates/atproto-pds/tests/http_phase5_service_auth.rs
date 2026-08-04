@@ -7,6 +7,7 @@
 
 use atproto_identity::key::{KeyData, validate as identity_validate};
 use atproto_identity::key::{KeyType, to_public};
+use atproto_pds::account::session::SessionAuthority;
 use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
@@ -379,7 +380,7 @@ async fn service_auth_refuses_privileged_methods_to_unprivileged_sessions() {
         "did:web:test.example",
         "did:plc:alice",
         "app-password-1",
-        false,
+        SessionAuthority::AppPassword,
         b"test-secret-do-not-use-in-prod-32!",
         600,
         3600,

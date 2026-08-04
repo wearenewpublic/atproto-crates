@@ -108,6 +108,33 @@ impl AuthSubject {
         }
     }
 
+    /// `true` when the caller authenticated with the account password itself,
+    /// rather than with an app password or an OAuth grant.
+    ///
+    /// This is a stricter question than [`privileged`](Self::privileged), and
+    /// the two are not interchangeable. `privileged` asks whether an app
+    /// password was marked privileged when it was created; this asks whether
+    /// there is an app password involved at all.
+    ///
+    /// It gates the operations that can take over or destroy an identity —
+    /// minting further app passwords, signing PLC operations, starting an
+    /// account deletion or an email change. App passwords are handed to
+    /// third-party tools, so a tool holding one must not be able to reach
+    /// them. The reference draws the same line, reserving these to
+    /// `AuthScope.Access` and refusing both `AppPass` and
+    /// `AppPassPrivileged`.
+    ///
+    /// OAuth tokens are not full sessions. An OAuth client is a third party
+    /// in the same sense an app-password holder is, and `transition:generic`
+    /// exists to mean "whatever an app password can do" — not more.
+    #[must_use]
+    pub fn is_full_session(&self) -> bool {
+        match self {
+            AuthSubject::AppPassword(c) => c.full,
+            AuthSubject::OAuth(_) => false,
+        }
+    }
+
     /// `true` if the token is allowed to perform privileged operations
     /// (those gated to sensitive paths like `importRepo`,
     /// `getServiceAuth`, account migration). For app-password sessions

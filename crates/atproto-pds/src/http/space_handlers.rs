@@ -3151,6 +3151,7 @@ mod scope_gate_tests {
             iss: "did:web:pds".to_string(),
             apw: "apw".to_string(),
             privileged: true,
+            full: true,
             iat: 0,
             exp: u64::MAX,
             jti: "jti".to_string(),

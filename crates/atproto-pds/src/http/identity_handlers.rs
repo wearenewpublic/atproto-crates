@@ -456,7 +456,26 @@ pub async fn request_plc_operation_signature(
     parts: Parts,
 ) -> Result<StatusCode, XrpcError> {
     let (htm, htu) = request_htm_htu(&parts);
-    let did = require_authn_sub(&parts, &state, &htm, &htu).await?;
+    let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
+    let did = subject.sub().to_string();
+
+    // A PLC signature token is the first step to rewriting the account's
+    // rotation keys and verification methods — that is, to taking the identity
+    // over. App passwords are given to third-party tools, so a tool holding
+    // one must not be able to start that. The reference refuses this same
+    // request from an app-password session with `InvalidToken`.
+    if !subject.is_full_session() {
+        tracing::warn!(
+            did = %did,
+            "refused requestPlcOperationSignature from a non-full session"
+        );
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidToken",
+            "requesting a PLC operation signature requires the account password, \
+             not an app password",
+        ));
+    }
 
     let manager = state.account_manager.as_ref().ok_or_else(|| {
         XrpcError::new(

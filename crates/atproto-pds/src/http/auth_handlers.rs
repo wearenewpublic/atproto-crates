@@ -409,7 +409,8 @@ pub async fn create_account(
         &state.service_did,
         &row.did,
         &primary_id,
-        true,
+        // The signup session is the account password by definition.
+        session::SessionAuthority::Full,
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
         session::DEFAULT_REFRESH_TTL_SECS,
@@ -473,8 +474,11 @@ pub async fn create_session(
     let app = app_password::verify(&manager.account_pool(), &account.did, &input.password)
         .await
         .map_err(XrpcError::from)?;
-    let (app_id, privileged) = match app {
-        Some(row) => (row.id, row.privileged),
+    let (app_id, authority) = match app {
+        Some(row) => {
+            let authority = session::SessionAuthority::from_row(&row.name, row.privileged);
+            (row.id, authority)
+        }
         None => {
             return Err(XrpcError::new(
                 StatusCode::UNAUTHORIZED,
@@ -488,7 +492,7 @@ pub async fn create_session(
         &state.service_did,
         &account.did,
         &app_id,
-        privileged,
+        authority,
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
         session::DEFAULT_REFRESH_TTL_SECS,
@@ -599,7 +603,15 @@ pub async fn refresh_session(
         &state.service_did,
         &account.did,
         &claims.apw,
-        claims.privileged,
+        // Carried, not recomputed: refreshing a session must not change what
+        // it is allowed to do.
+        if claims.full {
+            session::SessionAuthority::Full
+        } else if claims.privileged {
+            session::SessionAuthority::PrivilegedAppPassword
+        } else {
+            session::SessionAuthority::AppPassword
+        },
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
         session::DEFAULT_REFRESH_TTL_SECS,
@@ -669,6 +681,7 @@ pub async fn create_app_password(
     Json(input): Json<CreateAppPasswordInput>,
 ) -> Result<Json<AppPasswordCreated>, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
+    require_full_session(&claims, "com.atproto.server.createAppPassword")?;
     let manager = account_manager(&state)?;
     // Deactivation is self-service and reversible; a takedown or suspension is
     // a moderation decision and must not be. `valid_transition` still permits
@@ -1343,6 +1356,7 @@ pub async fn request_email_update(
     Json(input): Json<RequestEmailUpdateInput>,
 ) -> Result<Json<RequestEmailUpdateResponse>, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
+    require_full_session(&claims, "com.atproto.server.requestEmailUpdate")?;
     if !is_email_shape(&input.email) {
         return Err(XrpcError::new(
             StatusCode::BAD_REQUEST,
@@ -1479,6 +1493,7 @@ pub async fn request_account_delete(
     parts: Parts,
 ) -> Result<axum::http::StatusCode, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
+    require_full_session(&claims, "com.atproto.server.requestAccountDelete")?;
     let manager = account_manager(&state)?;
 
     let directory = state.reader.accounts();
@@ -2473,6 +2488,33 @@ fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
 /// The distinction is worth making in the error: a well-formed OAuth token is
 /// not a malformed session token, and reporting it as one sent client authors
 /// looking for a bug in their JWT.
+/// Refuse an operation that an app-password or OAuth session must not reach.
+///
+/// App passwords and OAuth grants are given to third parties. These four
+/// operations can take over or destroy the identity -- mint further app
+/// passwords, begin a PLC signature (identity takeover), begin an account
+/// deletion, begin an email change -- so they are reserved to a session the
+/// account holder authenticated for directly.
+///
+/// `400 InvalidToken` matches what the reference answers for the same
+/// requests, so a client can tell "wrong kind of credential" from "no
+/// credential" without special-casing this implementation.
+fn require_full_session(claims: &account::SessionClaims, operation: &str) -> Result<(), XrpcError> {
+    if claims.full {
+        return Ok(());
+    }
+    tracing::warn!(
+        did = %claims.sub,
+        operation,
+        "refused a privileged operation from an app-password session"
+    );
+    Err(XrpcError::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidToken",
+        format!("{operation} requires the account password, not an app password"),
+    ))
+}
+
 fn require_access_jwt(
     parts: &Parts,
     state: &HttpState,

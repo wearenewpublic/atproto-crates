@@ -48,6 +48,22 @@ pub struct SessionClaims {
     pub apw: String,
     /// `true` if this session can access privileged endpoints.
     pub privileged: bool,
+    /// `true` when the session was minted from the account password itself
+    /// rather than from an app password.
+    ///
+    /// App passwords are handed to third-party tools, so the operations that
+    /// can take over or destroy an identity -- minting further app passwords,
+    /// signing PLC operations, starting an account deletion -- are reserved to
+    /// a session the account holder authenticated for directly. This is the
+    /// same split the reference draws between `AuthScope.Access` and
+    /// `AuthScope.AppPass`.
+    ///
+    /// `#[serde(default)]` so tokens issued before this claim existed decode
+    /// as `false`. That fails closed: such a session keeps working for
+    /// ordinary reads and writes and is refused for privileged operations
+    /// until the holder signs in again.
+    #[serde(default)]
+    pub full: bool,
     /// Issued-at (seconds since epoch).
     pub iat: u64,
     /// Expiration (seconds since epoch).
@@ -157,6 +173,55 @@ fn verify(token: &str, expected_typ: &str, secret: &[u8]) -> PdsResult<SessionCl
     Ok(claims)
 }
 
+/// What a session is allowed to do, by how the holder authenticated.
+///
+/// Three states rather than two independent booleans, because only three of
+/// the four combinations are reachable — an app password cannot be "full", and
+/// a full session is always privileged. Encoding that here means callers
+/// cannot construct the impossible fourth.
+///
+/// Mirrors the reference's `AuthScope` split: `Access`, `AppPassPrivileged`,
+/// `AppPass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthority {
+    /// The account password itself. May reach operations that can take over
+    /// or destroy the identity.
+    Full,
+    /// An app password created with `privileged: true`. May reach the
+    /// privileged *data* paths (`importRepo`, `getServiceAuth`) but not the
+    /// identity ones.
+    PrivilegedAppPassword,
+    /// An ordinary app password.
+    AppPassword,
+}
+
+impl SessionAuthority {
+    /// Whether privileged data paths are reachable.
+    #[must_use]
+    pub fn privileged(self) -> bool {
+        matches!(self, Self::Full | Self::PrivilegedAppPassword)
+    }
+
+    /// Whether the account holder authenticated directly.
+    #[must_use]
+    pub fn full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Classify a matched app-password row. `__primary__` is the account
+    /// password; every other row is an app password.
+    #[must_use]
+    pub fn from_row(name: &str, privileged: bool) -> Self {
+        if name == "__primary__" {
+            Self::Full
+        } else if privileged {
+            Self::PrivilegedAppPassword
+        } else {
+            Self::AppPassword
+        }
+    }
+}
+
 /// Issue an access+refresh token pair for a freshly-validated app-password sign-in.
 ///
 /// `service_did` is the PDS's own DID (e.g., `did:web:pds.example.com`).
@@ -165,7 +230,7 @@ pub fn issue_pair(
     service_did: &str,
     account_did: &str,
     app_password_id: &str,
-    privileged: bool,
+    authority: SessionAuthority,
     secret: &[u8],
     access_ttl_secs: u64,
     refresh_ttl_secs: u64,
@@ -175,7 +240,8 @@ pub fn issue_pair(
         sub: account_did.to_string(),
         iss: service_did.to_string(),
         apw: app_password_id.to_string(),
-        privileged,
+        privileged: authority.privileged(),
+        full: authority.full(),
         iat,
         exp: iat + access_ttl_secs,
         jti: random_jti(),
@@ -217,7 +283,7 @@ mod tests {
             "did:web:pds.example",
             "did:plc:alice",
             "ap-1",
-            false,
+            SessionAuthority::AppPassword,
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
@@ -235,7 +301,7 @@ mod tests {
             "did:web:pds.example",
             "did:plc:alice",
             "ap-1",
-            true,
+            SessionAuthority::PrivilegedAppPassword,
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
@@ -255,7 +321,7 @@ mod tests {
             "did:web:pds.example",
             "did:plc:alice",
             "ap-1",
-            false,
+            SessionAuthority::AppPassword,
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
@@ -271,7 +337,7 @@ mod tests {
             "did:web:pds.example",
             "did:plc:alice",
             "ap-1",
-            false,
+            SessionAuthority::AppPassword,
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
@@ -286,7 +352,7 @@ mod tests {
             "did:web:pds.example",
             "did:plc:alice",
             "ap-1",
-            false,
+            SessionAuthority::AppPassword,
             secret(),
             0, // immediate expiration
             DEFAULT_REFRESH_TTL_SECS,
