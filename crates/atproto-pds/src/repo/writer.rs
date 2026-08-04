@@ -625,23 +625,27 @@ impl RepoWriter {
 
         // Build the unsigned commit + sign with the account's signing key.
         let rev = atproto_record::tid::Tid::new().to_string();
-        let prev_cid_parsed: Option<atproto_dasl::Cid> = prev_commit_cid
-            .as_deref()
-            .map(|s| s.parse::<cid::Cid>().map(atproto_dasl::Cid::from))
-            .transpose()
-            .map_err(|e: cid::Error| PdsError::Storage {
-                reason: format!("parse prev commit cid: {e}"),
-            })?;
 
-        // `prevData` is deliberately absent from the signed commit body: it is
-        // a `com.atproto.sync.subscribeRepos#commit` event field, not
-        // repository state, and it is not part of what the account signs.
-        // Subscribers still receive it, from the outbox payload built below.
+        // `prev` is null. It survives in the commit schema only for
+        // backwards compatibility with repo v2 — "no requirement of keeping
+        // around history" (atproto packages/repo/src/types.ts) — and the
+        // reference writes null on every commit it creates
+        // (packages/repo/src/repo.ts, `prev: null`).
+        //
+        // Writing the parent CID here instead made a repo un-migratable. The
+        // chain it described is not carried by `getRepo`, which exports
+        // current state, so re-importing a repo with more than one commit
+        // failed on an ancestor block that was never supposed to be in the
+        // CAR. `prev` claimed history the export does not promise.
+        //
+        // The parent CID is still tracked — `check_swap` compares it for
+        // swapCommit, the commit log persists it, and the firehose payload
+        // carries it as `prevData`. None of those are the signed commit body.
         let unsigned = UnsignedCommit::new(
             did.to_string(),
             atproto_dasl::Cid::from(new_root),
             rev.clone(),
-            prev_cid_parsed,
+            None,
         );
         let signing_bytes = atproto_dasl::to_vec(&unsigned).map_err(|e| PdsError::Storage {
             reason: format!("encode unsigned commit: {e}"),
@@ -975,24 +979,16 @@ impl RepoWriter {
             }
         };
 
-        // Build + sign the commit.
+        // Build + sign the commit. `prev` is null for the reason given on the
+        // other commit-building path above: it exists only for repo-v2
+        // compatibility, the reference always writes null, and populating it
+        // claims a history that `getRepo` does not export.
         let rev = atproto_record::tid::Tid::new().to_string();
-        let prev_cid_parsed: Option<atproto_dasl::Cid> = prev_commit_cid
-            .as_deref()
-            .map(|s| s.parse::<cid::Cid>().map(atproto_dasl::Cid::from))
-            .transpose()
-            .map_err(|e: cid::Error| PdsError::Storage {
-                reason: format!("parse prev commit cid: {e}"),
-            })?;
-        // `prevData` is deliberately absent from the signed commit body: it is
-        // a `com.atproto.sync.subscribeRepos#commit` event field, not
-        // repository state, and it is not part of what the account signs.
-        // Subscribers still receive it, from the outbox payload built below.
         let unsigned = UnsignedCommit::new(
             did.to_string(),
             atproto_dasl::Cid::from(new_root),
             rev.clone(),
-            prev_cid_parsed,
+            None,
         );
         let signing_bytes = atproto_dasl::to_vec(&unsigned).map_err(|e| PdsError::Storage {
             reason: format!("encode unsigned commit: {e}"),

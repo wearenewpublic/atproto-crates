@@ -11,14 +11,22 @@
 //!
 //! # Verification model
 //!
-//! Each commit in the chain carries `prev`, the prior commit CID. We walk the
-//! chain from the CAR's root commit backward to genesis, then verify forward
-//! using [`atproto_repo::verify_inductive`], carrying the prior MST root
-//! (Sync 1.1 `prevData`) down the chain as we go — it is derived from the
-//! previous commit's `data`, not read off the commit, because `prevData` is a
+//! We walk back from the CAR's root commit through whatever `prev` links the
+//! CAR actually carries, then verify forward using
+//! [`atproto_repo::verify_inductive`], carrying the prior MST root (Sync 1.1
+//! `prevData`) down the chain as we go — it is derived from the previous
+//! commit's `data`, not read off the commit, because `prevData` is a
 //! `subscribeRepos#commit` event field rather than repository state. Every
-//! block in the CAR must content-address correctly; every commit must be
-//! reachable through `prev` links.
+//! block in the CAR must content-address correctly.
+//!
+//! **History is optional.** `prev` survives in the commit schema only for
+//! repo-v2 compatibility and carries "no requirement of keeping around
+//! history" (atproto `packages/repo/src/types.ts`), so the walk stops at the
+//! first ancestor the CAR does not carry rather than rejecting the import.
+//! That is the ordinary case: `com.atproto.sync.getRepo` exports current
+//! state, so an export of a repo with more than one commit never contains its
+//! own ancestors. The root block itself is still required — a CAR missing it
+//! is malformed rather than merely history-free.
 //!
 //! # Streaming
 //!
@@ -659,11 +667,36 @@ fn build_commit_chain(
     let mut cursor: Option<RawCid> = Some(*head);
 
     while let Some(cid) = cursor {
-        let block = block_index.get(&cid).ok_or_else(|| {
-            PdsError::Repo(atproto_repo::errors::RepoError::InvalidCommit {
-                reason: format!("commit {cid} referenced but not present in CAR"),
-            })
-        })?;
+        let block = match block_index.get(&cid) {
+            Some(b) => b,
+            None if chain.is_empty() => {
+                // The head itself. A CAR whose root block is missing is
+                // malformed however it was produced.
+                return Err(PdsError::Repo(
+                    atproto_repo::errors::RepoError::InvalidCommit {
+                        reason: format!("commit {cid} referenced but not present in CAR"),
+                    },
+                ));
+            }
+            None => {
+                // An ancestor is absent, which is normal and not an error.
+                // `prev` exists for repo-v2 compatibility and carries "no
+                // requirement of keeping around history"
+                // (atproto packages/repo/src/types.ts), so an exporter is
+                // free to omit ancestors — `com.atproto.sync.getRepo` exports
+                // current state and always does.
+                //
+                // Demanding them rejected every CAR this PDS itself produced
+                // for a repo with more than one commit, which made inbound
+                // migration impossible. The reference verifies the single root
+                // and walks no chain at all
+                // (packages/pds/src/api/com/atproto/repo/importRepo.ts).
+                //
+                // Whatever history *is* present still gets verified below;
+                // absence just ends the walk.
+                break;
+            }
+        };
 
         let commit = match Commit::from_bytes(&block.data) {
             Ok(c) => c,
@@ -761,6 +794,106 @@ mod tests {
             "single-commit CAR should give 1-element chain"
         );
         assert!(chain[0].prev.is_none());
+    }
+
+    /// A commit whose `prev` names a block the CAR does not carry, which is
+    /// what every `com.atproto.sync.getRepo` export of a multi-commit repo
+    /// looks like from an implementation that still populates `prev`.
+    async fn one_commit_car_with_absent_prev() -> (Vec<u8>, atproto_dasl::Cid) {
+        let empty_mst_bytes =
+            atproto_dasl::to_vec(&serde_json::json!({"e": [], "l": null})).expect("encode mst");
+        let mst_cid_raw = atproto_dasl::cid::compute_cid(&empty_mst_bytes);
+        let mst_cid = atproto_dasl::Cid(mst_cid_raw);
+
+        // Any CID that is not written into the CAR below. The MST bytes hashed
+        // a second time give a well-formed CID for a block nobody stored.
+        let absent = atproto_dasl::Cid(atproto_dasl::cid::compute_cid(b"a block not in this CAR"));
+
+        let signed = UnsignedCommit::new(
+            "did:plc:alice".to_string(),
+            mst_cid.clone(),
+            "3jui7kd2z2y2e".to_string(),
+            Some(absent),
+        )
+        .sign(vec![0u8; 64]);
+        let commit_bytes = signed.to_bytes().expect("encode commit");
+        let commit_cid_raw = signed.cid().expect("commit cid");
+        let commit_cid = atproto_dasl::Cid(commit_cid_raw);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = CarWriter::new(&mut buf, vec![commit_cid.clone()])
+            .await
+            .unwrap();
+        writer
+            .write_block(&CarBlock {
+                cid: commit_cid_raw,
+                data: commit_bytes,
+            })
+            .await
+            .unwrap();
+        writer
+            .write_block(&CarBlock {
+                cid: mst_cid_raw,
+                data: empty_mst_bytes,
+            })
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        (buf, commit_cid)
+    }
+
+    /// History is optional, so a `prev` pointing outside the CAR ends the walk
+    /// instead of failing it.
+    ///
+    /// This is the case that made inbound migration impossible: `getRepo`
+    /// exports current state, so the ancestor named by `prev` is never in the
+    /// CAR, and requiring it rejected every repo with more than one commit —
+    /// including CARs this PDS produced itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_commit_chain_stops_at_an_absent_ancestor() {
+        let (car_bytes, _) = one_commit_car_with_absent_prev().await;
+        let mut car = CarReader::new(Cursor::new(car_bytes)).await.unwrap();
+        let root = car.root().unwrap().clone();
+        let mut blocks = Vec::new();
+        while let Some(b) = car.next_block().await.unwrap() {
+            blocks.push(b);
+        }
+        let mut idx = HashMap::new();
+        for b in &blocks {
+            idx.insert(b.cid, b);
+        }
+
+        let chain = build_commit_chain(&idx, &root.0)
+            .expect("an absent ancestor is not an error: history is not required");
+        assert_eq!(
+            chain.len(),
+            1,
+            "the walk should stop at the absent ancestor"
+        );
+        assert!(
+            chain[0].prev.is_some(),
+            "the head still records its parent; only the walk stopped",
+        );
+    }
+
+    /// The head is not history — a CAR that does not carry its own root block
+    /// is malformed, and that distinction is the whole reason the absent-
+    /// ancestor case above is allowed to pass silently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_commit_chain_still_rejects_an_absent_head() {
+        let (car_bytes, _) = minimal_one_commit_car().await;
+        let mut car = CarReader::new(Cursor::new(car_bytes)).await.unwrap();
+        let root = car.root().unwrap().clone();
+        while (car.next_block().await.unwrap()).is_some() {}
+
+        // Nothing indexed: the root block is absent.
+        let idx: HashMap<RawCid, &CarBlock> = HashMap::new();
+        let err = build_commit_chain(&idx, &root.0)
+            .expect_err("a CAR missing its own root block is malformed");
+        assert!(
+            err.to_string().contains("not present in CAR"),
+            "unexpected error: {err}",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
