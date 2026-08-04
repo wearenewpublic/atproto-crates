@@ -243,6 +243,106 @@ async fn resolve_repo_did(state: &HttpState, repo: &str) -> Result<String, XrpcE
 }
 
 /// Handler for `com.atproto.repo.createRecord`.
+/// Validate a record against its collection's lexicon, as far as the lexicon
+/// is resolvable.
+///
+/// The `validate` flag has three meanings and this returns a different outcome
+/// for each (`com.atproto.repo.createRecord`, `validate`): "'false' to skip
+/// Lexicon schema validation of record data, 'true' to require it, or leave
+/// unset to validate only for known Lexicons."
+///
+/// A lexicon is *known* when it and everything it references resolve over the
+/// network (`repo::lexicon`). Unset therefore validates opportunistically and
+/// accepts an unresolvable collection; `true` refuses one, because a caller
+/// who required validation is owed an error rather than a success that
+/// checked nothing.
+///
+/// # Errors
+///
+/// - `ValidationUnavailable` when validation was required and the lexicon
+///   could not be resolved.
+/// - `InvalidRecord` when a resolved schema rejects the record.
+async fn validate_record(
+    state: &HttpState,
+    mode: crate::repo::prepare::ValidateMode,
+    collection: &str,
+    record: &serde_json::Value,
+) -> Result<crate::repo::prepare::ValidationOutcome, XrpcError> {
+    use crate::repo::lexicon::{CatalogOutcome, resolve_catalog};
+    use crate::repo::prepare::{ValidateMode, ValidationOutcome};
+
+    if mode == ValidateMode::Skipped {
+        return Ok(ValidationOutcome::Skipped);
+    }
+
+    let required = mode == ValidateMode::Required;
+
+    // No resolver configured means no lexicon is knowable, so `true` is
+    // refused and unset passes through unchecked. Fail-closed for the caller
+    // who asked to be sure, permissive for the one who did not.
+    let Some(resolver) = state.lexicon_resolver.as_ref() else {
+        return if required {
+            Err(XrpcError::from(
+                crate::errors::PdsError::ValidationUnavailable,
+            ))
+        } else {
+            Ok(ValidationOutcome::NotChecked)
+        };
+    };
+
+    let unresolvable = |detail: String| {
+        if required {
+            tracing::debug!(
+                collection,
+                detail,
+                "validation required but the lexicon is not resolvable"
+            );
+            Err(XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "ValidationUnavailable",
+                format!("cannot validate {collection}: {detail}"),
+            ))
+        } else {
+            Ok(ValidationOutcome::NotChecked)
+        }
+    };
+
+    let catalog = match resolve_catalog(resolver.as_ref(), collection).await {
+        CatalogOutcome::Ready(catalog) => catalog,
+        CatalogOutcome::Unresolvable => {
+            return unresolvable("no lexicon is published for this collection".to_string());
+        }
+        CatalogOutcome::IncompleteClosure { missing } => {
+            // The schema exists but something it references does not, so
+            // validating would fail on the missing reference rather than on
+            // the record. Reporting that as an invalid record would blame the
+            // caller for a gap upstream of them.
+            return unresolvable(format!(
+                "its schema references {missing}, which does not resolve"
+            ));
+        }
+    };
+
+    let Some(schema_file) = catalog.get_schema(collection).cloned() else {
+        return unresolvable("the resolved document declares a different NSID".to_string());
+    };
+
+    match atproto_lexicon::validation::validate::validate_record_with_schema(
+        record,
+        &schema_file,
+        catalog.as_ref(),
+        atproto_lexicon::validation::flags::ValidateFlags::default(),
+    ) {
+        Ok(()) => Ok(ValidationOutcome::Validated),
+        Err(e) => Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRecord",
+            format!("record does not satisfy {collection}: {e}"),
+        )),
+    }
+}
+
+/// Handler for `com.atproto.repo.createRecord`.
 pub async fn create_record(
     State(state): State<HttpState>,
     parts: Parts,
@@ -258,12 +358,8 @@ pub async fn create_record(
         atproto_oauth::scopes::RepoAction::Create,
     )?;
 
-    // `validate: true` means "refuse this write unless you validated it".
-    // Accepting it while validating nothing would be a control that reads as
-    // working and is not, so it is refused by name until the schema engine is
-    // wired.
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
-    validate.ensure_supported().map_err(XrpcError::from)?;
+    let outcome = validate_record(&state, validate, &input.collection, &input.record).await?;
 
     let rkey = input.rkey.unwrap_or_else(|| Tid::new().to_string());
     let result = writer
@@ -289,7 +385,7 @@ pub async fn create_record(
             cid: result.commit_cid,
             rev: result.rev,
         },
-        validation_status: validate.status(),
+        validation_status: outcome.status(),
     }))
 }
 
@@ -334,7 +430,7 @@ pub async fn put_record(
     )?;
 
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
-    validate.ensure_supported().map_err(XrpcError::from)?;
+    let outcome = validate_record(&state, validate, &input.collection, &input.record).await?;
 
     let result = writer
         .apply_writes_with_swap(
@@ -359,7 +455,7 @@ pub async fn put_record(
             cid: result.commit_cid,
             rev: result.rev,
         },
-        validation_status: validate.status(),
+        validation_status: outcome.status(),
     }))
 }
 
@@ -566,8 +662,23 @@ pub async fn apply_writes(
         assert_repo_scope(&claims, collection, action)?;
     }
 
+    // Every create and update in the batch is validated. A batch that
+    // validated only its first entry would let the rest through unchecked
+    // while reporting the whole call as validated.
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
-    validate.ensure_supported().map_err(XrpcError::from)?;
+    for entry in &input.writes {
+        match entry {
+            ApplyWritesEntry::Create {
+                collection, value, ..
+            }
+            | ApplyWritesEntry::Update {
+                collection, value, ..
+            } => {
+                validate_record(&state, validate, collection, value).await?;
+            }
+            ApplyWritesEntry::Delete { .. } => {}
+        }
+    }
 
     let ops: Vec<WriteOp> = input
         .writes

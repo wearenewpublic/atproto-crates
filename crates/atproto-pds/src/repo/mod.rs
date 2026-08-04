@@ -12,6 +12,10 @@
 
 pub mod car_export;
 #[cfg(feature = "sqlite")]
+/// Lexicon resolution, for deciding whether a record's schema is *known* --
+/// the distinction `validate` in the repo-write lexicons turns on.
+pub mod lexicon;
+
 pub mod prepare;
 
 /// CARv1 slices for the firehose `blocks` field.

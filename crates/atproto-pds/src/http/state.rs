@@ -55,6 +55,13 @@ pub struct HttpState {
     /// (spec line 413). `None` disables the default (bare grants confer no
     /// write targets); typically a TTL-cached network resolver.
     pub space_declaration_resolver: Option<Arc<dyn SpaceDeclarationResolver>>,
+    /// Resolves lexicon NSIDs to schema documents, for record validation.
+    ///
+    /// `None` when no DNS resolver is configured, which makes every lexicon
+    /// unresolvable -- and so `validate: true` is refused rather than silently
+    /// passing. That is the same fail-closed shape as space-declaration
+    /// resolution above.
+    pub lexicon_resolver: Option<Arc<dyn crate::repo::lexicon::LexiconResolver>>,
     /// PLC genesis service (None disables PLC-managed DID creation).
     pub plc_service: Option<Arc<PlcService>>,
     /// JWT-jti replay guard (always populated; in-memory by default).
@@ -159,6 +166,7 @@ impl HttpState {
             space_reader: None,
             space_sync: None,
             space_declaration_resolver: None,
+            lexicon_resolver: None,
             plc_service: None,
             jti_guard: JtiReplayGuard::new(100_000),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -205,6 +213,7 @@ impl HttpState {
             space_reader: None,
             space_sync: None,
             space_declaration_resolver: None,
+            lexicon_resolver: None,
             plc_service: None,
             jti_guard: JtiReplayGuard::new(100_000),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -326,6 +335,16 @@ impl HttpState {
         resolver: Arc<dyn SpaceDeclarationResolver>,
     ) -> Self {
         self.space_declaration_resolver = Some(resolver);
+        self
+    }
+
+    /// Attach a lexicon resolver, enabling record validation.
+    #[must_use]
+    pub fn with_lexicon_resolver(
+        mut self,
+        resolver: Arc<dyn crate::repo::lexicon::LexiconResolver>,
+    ) -> Self {
+        self.lexicon_resolver = Some(resolver);
         self
     }
 

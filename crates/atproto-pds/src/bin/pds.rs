@@ -807,6 +807,7 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .and_then(|url| url.split("://").nth(1).map(|h| h.to_string()))
             .unwrap_or_else(|| "plc.directory".to_string());
+        let lexicon_plc_hostname = plc_hostname.clone();
         let decl_http = reqwest::Client::builder()
             .user_agent(user_agent())
             .timeout(std::time::Duration::from_secs(5))
@@ -822,6 +823,27 @@ async fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(300),
         );
         state = state.with_space_declaration_resolver(Arc::new(cached));
+
+        // Record validation resolves lexicons over the same path, so it is
+        // available exactly when DNS resolution is. Without a DNS resolver no
+        // lexicon is knowable, `validate: true` is refused, and an unset
+        // `validate` passes through unchecked -- see
+        // `http::write_handlers::validate_record`.
+        let lexicon_http = reqwest::Client::builder()
+            .user_agent(user_agent())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let lexicon_network = atproto_pds::repo::lexicon::NetworkLexiconResolver::new(
+            dns_resolver.clone(),
+            lexicon_http,
+            lexicon_plc_hostname,
+        );
+        let lexicon_cached = atproto_pds::repo::lexicon::CachingLexiconResolver::new(
+            Arc::new(lexicon_network),
+            std::time::Duration::from_secs(300),
+        );
+        state = state.with_lexicon_resolver(Arc::new(lexicon_cached));
         state = state.with_dns_resolver(dns_resolver);
     }
     if let (Some(did), Some(url)) = (

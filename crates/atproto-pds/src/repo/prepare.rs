@@ -50,36 +50,19 @@ impl ValidateMode {
         }
     }
 
-    /// The `validationStatus` this write should report.
+    /// The `validationStatus` for a write whose schema was never checked.
     ///
-    /// Always `unknown` today: schema validation is not implemented, so no
-    /// record can be reported as `valid` without lying. The lexicon's
-    /// `knownValues` are `valid` and `unknown`, and `unknown` is the honest
-    /// one until the schema engine is wired.
+    /// `unknown` is the honest answer when no schema was resolved: the
+    /// lexicon's `knownValues` are `valid` and `unknown`, and claiming `valid`
+    /// without having validated is the failure this endpoint is careful to
+    /// avoid. A write that *was* validated reports `valid`, which
+    /// [`ValidationOutcome::status`] decides.
     #[must_use]
     pub fn status(self) -> Option<&'static str> {
         match self {
             ValidateMode::Skipped => None,
             _ => Some("unknown"),
         }
-    }
-
-    /// Refuse a request that requires validation this build cannot perform.
-    ///
-    /// Accepting `validate: true` and doing nothing is the failure mode this
-    /// codebase keeps producing: a control that reads as working and is not.
-    /// A caller who explicitly asked for validation is better served by an
-    /// error naming the gap than by a success that did not validate anything.
-    ///
-    /// # Errors
-    ///
-    /// [`PdsError::ValidationUnavailable`] when the caller passed
-    /// `validate: true`.
-    pub fn ensure_supported(self) -> PdsResult<()> {
-        if self == ValidateMode::Required {
-            return Err(PdsError::ValidationUnavailable);
-        }
-        Ok(())
     }
 }
 
@@ -247,15 +230,49 @@ mod tests {
         assert_eq!(ValidateMode::from_flag(Some(true)), ValidateMode::Required);
         assert_eq!(ValidateMode::from_flag(Some(false)), ValidateMode::Skipped);
 
-        // Only the explicit `true` is refused. Accepting it and validating
-        // nothing would be a control that reads as working and is not.
-        assert!(ValidateMode::KnownOnly.ensure_supported().is_ok());
-        assert!(ValidateMode::Skipped.ensure_supported().is_ok());
-        assert!(ValidateMode::Required.ensure_supported().is_err());
-
-        // `unknown` is the honest status while no schema engine is wired;
+        // `unknown` is the status for a write whose schema was never checked;
         // a skipped validation reports nothing at all.
         assert_eq!(ValidateMode::KnownOnly.status(), Some("unknown"));
         assert_eq!(ValidateMode::Skipped.status(), None);
+    }
+
+    /// The three outcomes report three different statuses, and the difference
+    /// is the point: `valid` is only ever claimed for a record that was
+    /// actually checked against a resolved schema.
+    #[test]
+    fn validation_outcomes_report_distinct_statuses() {
+        assert_eq!(ValidationOutcome::Validated.status(), Some("valid"));
+        assert_eq!(ValidationOutcome::NotChecked.status(), Some("unknown"));
+        assert_eq!(ValidationOutcome::Skipped.status(), None);
+    }
+}
+
+/// What validation actually did for one write.
+///
+/// The three states are not interchangeable and the caller reports each
+/// differently, which is the whole reason this is an enum rather than a bool:
+/// a record can be accepted because it was checked and passed, or accepted
+/// because nobody publishes a schema to check it against, and a client that
+/// asked to *require* validation needs to be able to tell those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    /// The schema resolved and the record satisfies it.
+    Validated,
+    /// No schema was checked -- either the caller asked to skip, or the
+    /// lexicon is not resolvable and the caller did not require it.
+    NotChecked,
+    /// The caller asked to skip validation entirely.
+    Skipped,
+}
+
+impl ValidationOutcome {
+    /// The `validationStatus` to report for this outcome.
+    #[must_use]
+    pub fn status(self) -> Option<&'static str> {
+        match self {
+            ValidationOutcome::Validated => Some("valid"),
+            ValidationOutcome::NotChecked => Some("unknown"),
+            ValidationOutcome::Skipped => None,
+        }
     }
 }
