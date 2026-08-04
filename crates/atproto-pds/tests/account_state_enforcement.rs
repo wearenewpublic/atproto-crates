@@ -427,3 +427,78 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+/// Activation is gated on the DID document naming this server.
+///
+/// This is the last step of an inbound migration. Without the gate an account
+/// activates while its DID still names the source PDS, and two servers both
+/// consider themselves authoritative for one identity — both answer
+/// `describeRepo` and `getRepo`, both sequence commits, and nothing reconciles
+/// it afterwards.
+///
+/// The directory configured here does not resolve the test DID, which
+/// exercises the unresolvable arm: activation refuses rather than assuming.
+/// Assuming is what the endpoint used to do for every account.
+#[tokio::test(flavor = "multi_thread")]
+async fn activation_refuses_when_the_did_document_cannot_be_checked() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store.clone(),
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+
+    // A directory on a reserved-for-documentation address, so the lookup fails
+    // rather than reaching anything real.
+    let plc = Arc::new(atproto_pds::plc::PlcService::new(
+        atproto_pds::plc::PlcConfig::new(
+            "192.0.2.1:1".to_string(),
+            "did:web:test.example".to_string(),
+            "https://test.example".to_string(),
+        ),
+        key_store,
+    ));
+
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_plc_service(plc);
+    let app = build_router(state);
+
+    let token = create_account(&app, &manager).await;
+    manager
+        .set_state(DID, AccountState::Deactivated)
+        .await
+        .unwrap();
+
+    let request = Request::builder()
+        .uri("/xrpc/com.atproto.server.activateAccount")
+        .method("POST")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::BAD_REQUEST,
+        "activation proceeded without verifying the DID document",
+    );
+
+    assert_eq!(
+        manager.account_state(DID).await.unwrap(),
+        Some(AccountState::Deactivated),
+        "the account activated anyway",
+    );
+}

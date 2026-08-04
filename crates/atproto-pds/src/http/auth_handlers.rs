@@ -850,11 +850,72 @@ pub async fn create_invite_code(
     Ok(Json(InviteCodeIssued { code: issued.code }))
 }
 
+/// Outcome of asking whether an account's DID document names this server.
+///
+/// Four states rather than a `Result<bool, _>` because "no PLC directory is
+/// configured" and "the PLC directory did not answer" are different situations
+/// that deserve different responses, and collapsing them into one error was
+/// what made this awkward to get right.
+#[derive(Debug)]
+enum DidDocCheck {
+    /// The document resolved and names this server.
+    NamesThisPds,
+    /// The document resolved and names somewhere else.
+    NamesElsewhere,
+    /// No PLC directory is configured, so this deployment has no `did:plc`
+    /// identity for the server to be wrong about — and no migration path
+    /// either, since every phase of one goes through PLC.
+    NotApplicable,
+    /// A directory is configured but the document could not be resolved.
+    /// Transient, and distinct from the above: the answer is unknown rather
+    /// than known-not-to-matter.
+    Unresolvable(String),
+}
+
+/// Does the account's DID document name this server as its PDS?
+///
+/// Resolves the DID through the configured PLC directory and compares the
+/// `AtprotoPersonalDataServer` service endpoints against this server's public
+/// URL.
+async fn check_did_document(state: &HttpState, did: &str) -> DidDocCheck {
+    let Some(plc) = state.plc_service.as_ref() else {
+        return DidDocCheck::NotApplicable;
+    };
+
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(crate::user_agent())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return DidDocCheck::Unresolvable(format!("build http client: {e}")),
+    };
+
+    let document = match atproto_identity::plc::query(&http, plc.directory_hostname(), did).await {
+        Ok(d) => d,
+        Err(e) => return DidDocCheck::Unresolvable(format!("resolve {did}: {e}")),
+    };
+
+    // Trailing slashes are not a difference: an endpoint is a URL, and
+    // `https://pds.example` and `https://pds.example/` name the same server.
+    let ours = plc.service_endpoint().trim_end_matches('/');
+    if document
+        .pds_endpoints()
+        .iter()
+        .any(|e| e.trim_end_matches('/') == ours)
+    {
+        DidDocCheck::NamesThisPds
+    } else {
+        DidDocCheck::NamesElsewhere
+    }
+}
+
 /// `POST /xrpc/com.atproto.server.activateAccount`. Auth-required.
 ///
-/// transitions a `Deactivated` account back to `Active`.
-/// Used at the end of an account migration after the new PDS has imported
-/// the repo and rotated keys via PLC.
+/// Transitions a `Deactivated` account back to `Active`, once the account's
+/// DID document names this server as its PDS. Used at the end of an account
+/// migration, after the new PDS has imported the repo and the PLC operation
+/// repointing the identity has been submitted.
 pub async fn activate_account(
     State(state): State<HttpState>,
     parts: Parts,
@@ -883,6 +944,54 @@ pub async fn activate_account(
                 claims.sub
             ),
         ));
+    }
+
+    // The DID has to point here before this server starts serving the repo
+    // and emitting firehose events for it.
+    //
+    // This is the last step of an inbound migration, and without the check an
+    // account activates while its DID document still names the *source* PDS.
+    // Two servers then both consider themselves authoritative for one
+    // identity: both answer describeRepo and getRepo, both sequence commits,
+    // and consumers resolve the DID to the old host while the new host insists
+    // otherwise. Nothing reconciles that afterwards — the split is silent and
+    // the account looks activated.
+    //
+    // The reference gates activation the same way, through
+    // `assertValidDidDocumentForService` (packages/pds/src/account-manager/
+    // account-manager.ts, `activateAccount`).
+    //
+    // An unresolvable DID refuses rather than passes: activation is the point
+    // where this server takes responsibility for an identity, and it should
+    // not do that on an assumption. The account stays deactivated and the
+    // caller can retry once the PLC operation has propagated.
+    match check_did_document(&state, &claims.sub).await {
+        // Nothing to contradict. Deactivation stays self-service on a
+        // deployment that has no PLC directory, which also has no migration
+        // flow for this check to protect.
+        DidDocCheck::NamesThisPds | DidDocCheck::NotApplicable => {}
+        DidDocCheck::NamesElsewhere => {
+            return Err(XrpcError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "InvalidDidDoc",
+                format!(
+                    "the DID document for {} does not name this server as its PDS; \
+                     submit the PLC operation before activating",
+                    claims.sub
+                ),
+            ));
+        }
+        DidDocCheck::Unresolvable(reason) => {
+            tracing::warn!(did = %claims.sub, reason, "activateAccount: DID document unresolvable");
+            return Err(XrpcError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "InvalidDidDoc",
+                format!(
+                    "could not verify the DID document for {}: {reason}",
+                    claims.sub
+                ),
+            ));
+        }
     }
 
     manager
@@ -1021,9 +1130,28 @@ pub async fn check_account_status(
         .await
         .unwrap_or(0);
 
+    // Actually resolved, not assumed. This reported a hardcoded `true`, which
+    // made the field useless exactly when it matters: during a migration it is
+    // what tells the operator whether the identity has finished moving, and it
+    // answered "yes" before the PLC operation had even been submitted.
+    //
+    // Unlike `activateAccount`, a resolution failure is reported rather than
+    // raised — this endpoint is a status report, and the other counts above
+    // already degrade to a best-effort value rather than failing the call.
+    let valid_did = match check_did_document(&state, &did).await {
+        DidDocCheck::NamesThisPds => true,
+        // No directory to disagree with, so nothing contradicts the claim.
+        DidDocCheck::NotApplicable => true,
+        DidDocCheck::NamesElsewhere => false,
+        DidDocCheck::Unresolvable(reason) => {
+            tracing::warn!(did = %did, reason, "checkAccountStatus: DID document unresolvable");
+            false
+        }
+    };
+
     Ok(Json(CheckAccountStatusResponse {
         activated: matches!(account.state, AccountState::Active),
-        valid_did: true,
+        valid_did,
         repo_commit,
         repo_rev,
         repo_blocks,
