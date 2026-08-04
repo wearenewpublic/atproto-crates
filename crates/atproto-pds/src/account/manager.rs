@@ -209,6 +209,39 @@ impl AccountManager {
         };
         let key_ref = signing_key_ref;
 
+        // 1b. Same for the rotation key, and for the same reason.
+        //
+        // PLC genesis pre-allocates one; every other path — inbound account
+        // migration above all — arrives with `None` and previously got no
+        // rotation key at all, while still recording
+        // `pds_managed_rotation = true`. The row then said this server managed
+        // a rotation key it did not have.
+        //
+        // That is unrecoverable for a migrating account rather than merely
+        // untidy. Without a rotation key, `getRecommendedDidCredentials`
+        // returns `rotationKeys: []`, so the PLC operation built from it would
+        // list no rotation keys and leave the DID permanently unupdatable by
+        // anyone. `submitPlcOperation` refuses it — correctly — and the
+        // migration cannot complete: the destination can never take over the
+        // identity.
+        //
+        // The reference has no equivalent gap because it recommends one
+        // service-wide rotation key (`ctx.plcRotationKey.did()`,
+        // packages/pds/src/api/com/atproto/identity/
+        // getRecommendedDidCredentials.ts) and so always returns at least one.
+        // This implementation keeps its per-account model and mints the key
+        // here instead.
+        //
+        // P-256 to match what genesis mints (`PlcConfig::rotation_key_type`).
+        let rotation_key_ref: Option<String> = if let Some(r) = params.rotation_key_ref {
+            Some(r.to_string())
+        } else if params.pds_managed_rotation {
+            let rotation_key = generate_account_signing_key(KeyType::P256Private)?;
+            Some(self.key_store.put(&rotation_key).await?)
+        } else {
+            None
+        };
+
         // 2. Hash password.
         let password_hash = hash_password(params.password)?;
 
@@ -235,7 +268,7 @@ impl AccountManager {
                 .bind(params.state.as_str())
                 .bind(&key_ref)
                 .bind(if params.pds_managed_rotation { 1i64 } else { 0i64 })
-                .bind(params.rotation_key_ref)
+                .bind(rotation_key_ref.as_deref())
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| account_insert_conflict(&e, &params)
@@ -276,7 +309,7 @@ impl AccountManager {
                 .bind(params.state.as_str())
                 .bind(&key_ref)
                 .bind(params.pds_managed_rotation)
-                .bind(params.rotation_key_ref)
+                .bind(rotation_key_ref.as_deref())
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| account_insert_conflict(&e, &params)
@@ -1481,6 +1514,70 @@ mod tests {
             .join("actors")
             .join(did_filename("did:plc:alice"));
         assert!(actor_path.exists());
+    }
+
+    /// An account that opts into PDS-managed rotation gets a rotation key
+    /// even when the caller pre-allocated none.
+    ///
+    /// This is the inbound-migration shape: `createAccount` with a
+    /// caller-supplied DID skips PLC genesis, so nothing pre-allocates a
+    /// rotation key, and the account previously landed with
+    /// `pds_managed_rotation = true` and `rotation_key_ref = NULL`. That
+    /// combination made the migration unfinishable —
+    /// `getRecommendedDidCredentials` returned an empty `rotationKeys`, so the
+    /// PLC operation built from it would have left the DID unupdatable and
+    /// `submitPlcOperation` refused it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_account_mints_a_rotation_key_when_none_was_preallocated() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:migrated",
+                handle: "migrated.example",
+                email: Some("migrated@example.com"),
+                password: "correct horse battery staple",
+                pds_managed_rotation: true,
+                rotation_key_ref: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let key_ref = manager
+            .lookup_rotation_key_ref("did:plc:migrated")
+            .await
+            .unwrap()
+            .expect("a PDS-managed account must have a rotation key to manage");
+        // Resolvable, not merely non-NULL: a dangling ref would fail at
+        // signPlcOperation instead of here.
+        manager.key_store().get(&key_ref).await.unwrap();
+    }
+
+    /// The mirror: an account that did not opt in gets no key. Minting one
+    /// unconditionally would claim rotation authority this server was never
+    /// given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_account_without_managed_rotation_gets_no_rotation_key() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:external",
+                handle: "external.example",
+                email: Some("external@example.com"),
+                password: "correct horse battery staple",
+                pds_managed_rotation: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .lookup_rotation_key_ref("did:plc:external")
+                .await
+                .unwrap()
+                .is_none(),
+        );
     }
 
     /// A taken handle has to arrive as `HandleNotAvailable`: it is the name
