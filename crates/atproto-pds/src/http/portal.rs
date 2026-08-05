@@ -819,6 +819,11 @@ pub async fn dashboard(
             "A confirmation code was emailed to this address. It expires in an hour.",
         ),
         Some("email-verified") => notice("ok", "Email address confirmed."),
+        Some("handle-changed") => notice(
+            "ok",
+            "Handle updated. Your DID document has been updated in the PLC \
+             directory; other services may take a few minutes to catch up.",
+        ),
         Some("password-changed") => notice(
             "ok",
             "Password changed. Every other session was signed out.",
@@ -939,6 +944,60 @@ pub async fn dashboard(
             .to_string()
     };
 
+    // Which domains this server hands out, named rather than implied. Someone
+    // choosing a handle cannot tell from an empty box that `name.dids.lol` is
+    // free and `name.example.com` needs a DNS record first.
+    let handle_domains = if state.service_handle_domains.is_empty() {
+        r#"<p class="muted">This server issues no handle domains of its own, so a
+        handle here must be a domain you control.</p>"#
+            .to_string()
+    } else {
+        format!(
+            r#"<p class="muted">Handles ending in {} are issued by this server and
+            take effect immediately.</p>"#,
+            state
+                .service_handle_domains
+                .iter()
+                .map(|d| format!("<code>{}</code>", esc(d.trim_start_matches('.'))))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    // On the page, not only in the error. Proving a domain is something the
+    // holder has to do *before* submitting, so instructions that appear only
+    // after a refusal arrive a step too late -- and the DID they need is not
+    // something they can be expected to have to hand.
+    let handle_section = format!(
+        r#"<section>
+<h2 style="margin-top:0">Handle</h2>
+<p><code>{handle}</code></p>
+<form method="POST" action="/account/handle">
+  <label for="handle">New handle</label>
+  <input id="handle" name="handle" type="text" autocomplete="off" spellcheck="false"
+         placeholder="name.example.com" required>
+  {handle_domains}
+  <details style="margin-top:0.6em">
+    <summary class="muted">Using a domain you own</summary>
+    <p class="muted" style="margin-bottom:0.3em">Point the domain at this account
+    first, by either route:</p>
+    <p class="muted" style="margin:0.2em 0">DNS — a <code>TXT</code> record at
+    <code>_atproto.&lt;your-domain&gt;</code> with the value
+    <code>did={did}</code></p>
+    <p class="muted" style="margin:0.2em 0">HTTPS — <code>https://&lt;your-domain&gt;/.well-known/atproto-did</code>
+    returning <code>{did}</code></p>
+    <p class="muted" style="margin-top:0.3em">The change is refused until one of
+    those resolves, so set it up before submitting.</p>
+  </details>
+  <p class="muted">Your DID never changes, so posts, followers and app passwords
+  are unaffected. The old handle stops working and becomes available to others.</p>
+  <button type="submit">Change handle</button>
+</form>
+</section>"#,
+        handle = esc(&account.handle),
+        did = esc(&account.did),
+    );
+
     let body = format!(
         r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
   <form method="POST" action="/account/signout" style="display:inline;float:right">
@@ -947,6 +1006,7 @@ pub async fn dashboard(
 <p class="sub">Everything here applies to this account on this server.</p>
 {banner}
 {fresh_secret}
+{handle_section}
 
 <section>
 <h2 style="margin-top:0">Email</h2>
@@ -1090,6 +1150,78 @@ pub async fn accept_policy(
         ));
     }
     Ok(redirect("/account?msg=policy-accepted"))
+}
+
+// ---------------------------------------------------------------------------
+//  Handle
+// ---------------------------------------------------------------------------
+
+/// Form body for a handle change.
+#[derive(Debug, Deserialize)]
+pub struct HandleForm {
+    /// The handle to move to.
+    pub handle: String,
+}
+
+/// `POST /account/handle`.
+///
+/// Delegates to the same routine `com.atproto.identity.updateHandle` runs, so
+/// the browser and the API cannot drift: validation, the uniqueness check, the
+/// ownership proof for a domain this server does not issue, the PLC operation
+/// and the `#identity` emit all happen in one place.
+///
+/// Only the reporting is portal-specific. `do_update_handle` answers in XRPC
+/// error names, which are the right thing to hand a client and the wrong thing
+/// to show a person -- "HandleOwnershipUnproven" does not say that a DNS record
+/// is missing, or which one.
+pub async fn change_handle(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<HandleForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let Some((_, account)) = current_account(&state, &headers).await else {
+        return Ok(redirect("/account/signin"));
+    };
+
+    let next = form.handle.trim();
+    if next.is_empty() {
+        return Ok(redirect("/account?msg=err-enter-a-handle"));
+    }
+    // Handles are case-insensitive, so a differently-cased copy of the current
+    // one is a no-op -- and not a free one: it would submit a PLC operation and
+    // append an entry to the account's permanent audit log for no change.
+    if next.eq_ignore_ascii_case(&account.handle) {
+        return Ok(redirect("/account?msg=err-that-is-already-your-handle"));
+    }
+
+    match crate::http::identity_handlers::do_update_handle(&state, &account.did, next).await {
+        Ok(()) => {
+            tracing::info!(did = %account.did, handle = %next, "portal handle change");
+            Ok(redirect("/account?msg=handle-changed"))
+        }
+        Err(e) => {
+            tracing::warn!(
+                did = %account.did,
+                handle = %next,
+                error = %e.name,
+                detail = %e.message,
+                "portal handle change refused"
+            );
+            let msg = match e.name.as_str() {
+                "InvalidHandle" => "err-that-is-not-a-valid-handle",
+                "HandleNotAvailable" => "err-that-handle-is-already-taken",
+                // The spec name for a domain that does not resolve here -- the
+                // one failure the holder can act on, and the one that needs
+                // pointing somewhere, so it aims at the instructions on the page.
+                "UnsupportedDomain" => {
+                    "err-that-domain-does-not-point-at-your-did-yet-see-using-a-domain-you-own-below"
+                }
+                _ => "err-the-handle-could-not-be-changed-check-the-server-logs",
+            };
+            Ok(redirect(&format!("/account?msg={msg}")))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

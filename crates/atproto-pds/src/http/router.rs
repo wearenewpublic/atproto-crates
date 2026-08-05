@@ -498,6 +498,7 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/account/signout", post(portal::sign_out))
         .route("/account/signup", get(portal::sign_up_page))
         .route("/account/signup", post(portal::sign_up))
+        .route("/account/handle", post(portal::change_handle))
         .route("/account/email", post(portal::change_email))
         .route("/account/email/verify", post(portal::verify_email))
         .route(
