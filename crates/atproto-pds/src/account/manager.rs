@@ -681,7 +681,13 @@ impl AccountManager {
 
     /// Update an account's email address (set or clear).
     ///
-    /// Used by `confirmEmailUpdate`. Dispatches per backend.
+    /// Used by `confirmEmailUpdate` and the portal. Dispatches per backend.
+    ///
+    /// `account.email` is `UNIQUE`, so moving onto an address another account
+    /// already holds fails here. That is a caller error and reports as
+    /// [`PdsError::EmailNotAvailable`]; letting it through as a storage fault
+    /// told the account holder their server was broken when what they needed to
+    /// hear was that the address was taken.
     pub async fn set_email(&self, did: &str, email: Option<&str>) -> PdsResult<()> {
         match self.accounts_pool.kind() {
             #[cfg(feature = "sqlite")]
@@ -691,8 +697,10 @@ impl AccountManager {
                     .bind(did)
                     .execute(self.accounts_pool.as_sqlite())
                     .await
-                    .map_err(|e| PdsError::Storage {
-                        reason: format!("set_email: {e}"),
+                    .map_err(|e| {
+                        email_update_conflict(&e, email).unwrap_or(PdsError::Storage {
+                            reason: format!("set_email: {e}"),
+                        })
                     })?;
             }
             #[cfg(feature = "postgres")]
@@ -702,8 +710,10 @@ impl AccountManager {
                     .bind(did)
                     .execute(self.accounts_pool.as_postgres())
                     .await
-                    .map_err(|e| PdsError::Storage {
-                        reason: format!("set_email: {e}"),
+                    .map_err(|e| {
+                        email_update_conflict(&e, email).unwrap_or(PdsError::Storage {
+                            reason: format!("set_email: {e}"),
+                        })
                     })?;
             }
             #[cfg(not(feature = "sqlite"))]
@@ -1288,6 +1298,32 @@ impl AccountManager {
 /// Returns `None` for anything this function cannot name as a client-side
 /// conflict, so the caller keeps reporting genuine backend faults as backend
 /// faults.
+/// Map a `UNIQUE` violation on `account.email` from an `UPDATE` to the error
+/// that names it.
+///
+/// The insert path has [`account_insert_conflict`], which reads the whole
+/// create request to say which column collided. An update touches one column,
+/// so the address is the one that was passed in.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn email_update_conflict(error: &sqlx::Error, email: Option<&str>) -> Option<PdsError> {
+    let db = error.as_database_error()?;
+    if !db.is_unique_violation() {
+        return None;
+    }
+    // Same reasoning as `account_insert_conflict`: SQLite and Postgres word the
+    // violation differently but both name the column, so match on that.
+    let detail = format!("{} {}", db.constraint().unwrap_or_default(), db.message());
+    if !detail.contains("email") {
+        return None;
+    }
+    // A NULL email violates a UNIQUE index on neither engine, so a clear cannot
+    // be what collided. `map` keeps the engine's own wording on the way to a
+    // storage fault if it somehow did.
+    email.map(|email| PdsError::EmailNotAvailable {
+        email: email.to_string(),
+    })
+}
+
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn account_insert_conflict(
     error: &sqlx::Error,

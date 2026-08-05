@@ -277,6 +277,48 @@ pub async fn delete(pool: &AccountPool, token: &str) -> PdsResult<()> {
     Ok(())
 }
 
+/// Delete every outstanding token of one purpose for one account.
+///
+/// Used when the thing a code was proof of stops being true. A confirmation
+/// code demonstrates control of the address it was mailed to, so once the
+/// account moves to a different address the codes issued against the old one
+/// are no longer evidence of anything and must not still be redeemable.
+///
+/// Idempotent — `Ok(())` when nothing matched.
+pub async fn delete_for(pool: &AccountPool, did: &str, purpose: &str) -> PdsResult<()> {
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query("DELETE FROM email_token WHERE did = ? AND purpose = ?")
+                .bind(did)
+                .bind(purpose)
+                .execute(pool.as_sqlite())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("email_token delete_for: {e}"),
+                })?;
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query("DELETE FROM email_token WHERE did = $1 AND purpose = $2")
+                .bind(did)
+                .bind(purpose)
+                .execute(pool.as_postgres())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("email_token delete_for: {e}"),
+                })?;
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+    Ok(())
+}
+
 /// Why a token was refused.
 ///
 /// The lexicons that take an email token -- `confirmEmail`, `resetPassword`,

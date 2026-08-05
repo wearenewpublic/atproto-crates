@@ -809,16 +809,16 @@ pub async fn dashboard(
     }
 
     let banner = match q.msg.as_deref() {
-        Some("email-changed") => notice("ok", "Email address updated."),
+        Some("email-changed") => notice(
+            "ok",
+            "Email address updated. A confirmation code was sent to the new \
+             address — enter it below to confirm it.",
+        ),
         Some("verification-sent") => notice(
             "ok",
             "A confirmation code was emailed to this address. It expires in an hour.",
         ),
         Some("email-verified") => notice("ok", "Email address confirmed."),
-        Some("email-code-sent") => notice(
-            "ok",
-            "A confirmation code was emailed to your current address. Enter it below.",
-        ),
         Some("password-changed") => notice(
             "ok",
             "Password changed. Every other session was signed out.",
@@ -916,19 +916,6 @@ pub async fn dashboard(
     } else {
         r#"<span class="muted">not confirmed</span>"#
     };
-    // A confirmed address is a recovery route, so changing it takes a code
-    // mailed to the address currently on file -- otherwise a borrowed session
-    // could quietly redirect recovery to an attacker's mailbox.
-    let email_code_field = if confirmed {
-        r#"<label for="token">Confirmation code (emailed to your current address)</label>
-           <input id="token" name="token" type="text" placeholder="XXXXX-XXXXX" required>
-           <p class="muted">Don't have one?
-             <button class="quiet" type="submit" formaction="/account/email/code">Send me a code</button>
-           </p>"#
-    } else {
-        ""
-    };
-
     // Only while unconfirmed. A confirmed address needs no prompt, and leaving
     // the control visible would invite someone to re-send a code they have no
     // use for.
@@ -968,7 +955,8 @@ pub async fn dashboard(
 <form method="POST" action="/account/email">
   <label for="email">New email address</label>
   <input id="email" name="email" type="email" autocomplete="email" required>
-  {email_code_field}
+  <p class="muted">The new address takes effect straight away and a confirmation
+  code is sent to it. It stays unconfirmed until you enter that code here.</p>
   <button type="submit">Change email</button>
 </form>
 </section>
@@ -1109,52 +1097,14 @@ pub async fn accept_policy(
 // ---------------------------------------------------------------------------
 
 /// Form body for an email change.
+///
+/// Carries only the destination. Proof of the address is collected afterwards,
+/// from the address itself, through the same confirm flow an unconfirmed
+/// address already uses.
 #[derive(Debug, Deserialize)]
 pub struct EmailForm {
     /// The address to move to.
     pub email: String,
-    /// The emailed code, required once the current address is confirmed.
-    #[serde(default)]
-    pub token: Option<String>,
-}
-
-/// `POST /account/email/code` — mail a code to the current address.
-pub async fn email_code(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-) -> Result<Response, XrpcError> {
-    require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
-    };
-    let Some(current) = account.email.clone() else {
-        return Ok(redirect("/account?msg=err-no-email-on-file"));
-    };
-    let pool = state.reader.accounts().account_pool();
-    let token = crate::account::email_token::generate_code();
-    let expires = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
-    crate::account::email_token::insert(
-        &pool,
-        &token,
-        &account.did,
-        crate::account::email_token::PURPOSE_UPDATE_EMAIL,
-        &expires,
-        None,
-    )
-    .await
-    .map_err(XrpcError::from)?;
-    let body = format!(
-        "Your confirmation code for changing the email address on this account is:\n\n  {token}\n\n\
-         It expires in 1 hour. If you did not request this, someone may have your password - change it."
-    );
-    if let Err(e) = state
-        .email
-        .send(&current, "Confirmation code for an email change", &body)
-        .await
-    {
-        tracing::warn!(error = ?e, did = %account.did, "portal email-change code send failed");
-    }
-    Ok(redirect("/account?msg=email-code-sent"))
 }
 
 /// `POST /account/email/verify/send` — mail a fresh confirmation code.
@@ -1276,6 +1226,21 @@ pub async fn verify_email(
 }
 
 /// `POST /account/email`.
+///
+/// One step. The address moves immediately, lands unconfirmed, and the code
+/// that proves it is mailed to the new address.
+///
+/// The form used to require a code mailed to the *current* address, which put
+/// the field on screen before any code existed: the page demanded a value it
+/// had not issued, above the button that issues it. Requesting one then sent it
+/// to the mailbox being left behind, which is not where someone changing their
+/// address is looking.
+///
+/// The trade this makes is worth stating plainly. Nothing here proves control
+/// of the outgoing address, so a session that is not the owner's can move the
+/// address off it. What confinement remains is that the new address arrives
+/// unconfirmed -- `set_email_confirmed_at(None)` below is what enforces that,
+/// and it is not optional.
 pub async fn change_email(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -1298,32 +1263,27 @@ pub async fn change_email(
         ));
     }
 
-    if account.email_confirmed_at.is_some() {
-        let Some(token) = form
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        else {
-            return Ok(redirect("/account?msg=err-a-confirmation-code-is-required"));
-        };
-        if crate::account::email_token::consume(
-            &pool,
-            token,
-            crate::account::email_token::PURPOSE_UPDATE_EMAIL,
-            &account.did,
-        )
-        .await
-        .is_err()
-        {
-            return Ok(redirect("/account?msg=err-that-code-is-not-valid"));
-        }
+    // Short-circuit the no-op. Falling through would clear the confirmation
+    // flag on an address that is not changing, costing the account holder a
+    // recovery route in exchange for nothing.
+    if account.email.as_deref() == Some(next) {
+        return Ok(redirect(
+            "/account?msg=err-that-is-already-the-address-on-file",
+        ));
     }
 
-    manager
-        .set_email(&account.did, Some(next))
-        .await
-        .map_err(XrpcError::from)?;
+    // One account per address. `account.email` is UNIQUE, so the constraint
+    // decides rather than a prior read -- a check-then-write would leave a
+    // window for two accounts to claim the same address at once.
+    match manager.set_email(&account.did, Some(next)).await {
+        Ok(()) => {}
+        Err(crate::errors::PdsError::EmailNotAvailable { .. }) => {
+            return Ok(redirect(
+                "/account?msg=err-that-address-is-already-in-use-on-this-server",
+            ));
+        }
+        Err(e) => return Err(XrpcError::from(e)),
+    }
     // The new address has not been proved, so the confirmation flag must not
     // survive the change -- otherwise an unverified mailbox inherits the
     // standing of the one it replaced.
@@ -1331,6 +1291,50 @@ pub async fn change_email(
         .set_email_confirmed_at(&account.did, None)
         .await
         .map_err(XrpcError::from)?;
+
+    // Codes outstanding against the old address die with it. Each one is proof
+    // of controlling a mailbox this account no longer uses, and redeeming one
+    // afterwards would mark the new address confirmed without anyone having
+    // demonstrated control of it.
+    crate::account::email_token::delete_for(
+        &pool,
+        &account.did,
+        crate::account::email_token::PURPOSE_CONFIRM_EMAIL,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    let token = crate::account::email_token::generate_code();
+    let expires = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
+    crate::account::email_token::insert(
+        &pool,
+        &token,
+        &account.did,
+        crate::account::email_token::PURPOSE_CONFIRM_EMAIL,
+        &expires,
+        None,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    let body = format!(
+        "Your confirmation code for this email address is:\n\n  {token}\n\n\
+         Enter it on your account page to confirm the address. It expires in 1 hour.\n\n\
+         If you did not ask to move an account to this address, ignore this message."
+    );
+    if let Err(e) = state
+        .email
+        .send(next, "Confirm your email address", &body)
+        .await
+    {
+        // The address has already moved, so reporting a plain failure would be
+        // wrong -- the change stands and the code is redeemable. Say which half
+        // did not happen, or the holder re-submits a change that already took.
+        tracing::warn!(error = ?e, did = %account.did, "email-change code send failed");
+        return Ok(redirect(
+            "/account?msg=err-address-changed-but-the-code-could-not-be-emailed-check-the-server-logs",
+        ));
+    }
     tracing::info!(did = %account.did, "portal email change");
     Ok(redirect("/account?msg=email-changed"))
 }
