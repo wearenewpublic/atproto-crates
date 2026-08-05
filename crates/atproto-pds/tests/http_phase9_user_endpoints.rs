@@ -135,6 +135,228 @@ async fn request_email_confirmation_412_when_no_email() {
     assert_eq!(status, StatusCode::PRECONDITION_FAILED);
 }
 
+/// `getSession` reports the fields its lexicon defines, not just the handle.
+///
+/// `emailConfirmed` is the flag a client reads to decide whether to prompt the
+/// account holder to verify their address. While it was omitted the prompt
+/// could not be dismissed: no number of successful `confirmEmail` calls made
+/// the response say so. `active` and `status` are the same story for a
+/// deactivated or suspended account, which otherwise looked ordinary.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_reports_email_confirmation_and_activity() {
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    sqlx::query("UPDATE account SET email = ? WHERE did = ?")
+        .bind("alice@example.com")
+        .bind("did:plc:alice")
+        .execute(manager.pool())
+        .await
+        .unwrap();
+
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["emailConfirmed"], false, "body: {body}");
+    assert_eq!(body["active"], true, "body: {body}");
+    assert!(body["status"].is_null(), "an active account named a status");
+
+    // Confirm, then look again.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.requestEmailConfirmation",
+        json!({}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = fetch_email_token(&manager, "did:plc:alice", "confirm_email")
+        .await
+        .expect("email_token row exists");
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.confirmEmail",
+        json!({"email": "alice@example.com", "token": code}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["emailConfirmed"], true, "body: {body}");
+
+    // A deactivated account says so rather than reading as ordinary.
+    sqlx::query("UPDATE account SET state = 'deactivated' WHERE did = ?")
+        .bind("did:plc:alice")
+        .execute(manager.pool())
+        .await
+        .unwrap();
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["active"], false, "body: {body}");
+    assert_eq!(body["status"], "deactivated", "body: {body}");
+}
+
+/// `confirmEmail` reports refusals under the names its lexicon declares.
+///
+/// `ExpiredToken`, `InvalidToken` and `InvalidEmail` are three separate
+/// declared errors and clients switch on them: expired means "request another
+/// code", invalid means "that code is not yours", and a mismatched address
+/// means the code is fine but names a different mailbox. All three previously
+/// arrived as an undifferentiated `403`, which the lexicon does not declare at
+/// all, so no client could tell them apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn confirm_email_reports_declared_error_names() {
+    let (app, _tmp, manager) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    sqlx::query("UPDATE account SET email = ? WHERE did = ?")
+        .bind("alice@example.com")
+        .bind("did:plc:alice")
+        .execute(manager.pool())
+        .await
+        .unwrap();
+
+    // A code that was never issued.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.confirmEmail",
+        json!({"email": "alice@example.com", "token": "NOPE-NOPE"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InvalidToken", "body: {body}");
+
+    // A real code whose window has closed.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.requestEmailConfirmation",
+        json!({}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = fetch_email_token(&manager, "did:plc:alice", "confirm_email")
+        .await
+        .expect("email_token row exists");
+    sqlx::query("UPDATE email_token SET expires_at = ? WHERE token = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339())
+        .bind(&code)
+        .execute(manager.pool())
+        .await
+        .unwrap();
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.confirmEmail",
+        json!({"email": "alice@example.com", "token": code}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "ExpiredToken", "body: {body}");
+
+    // A valid code, but the caller names an address that is not the one on
+    // the account. Confirming would record the wrong mailbox as verified.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.requestEmailConfirmation",
+        json!({}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = fetch_email_token(&manager, "did:plc:alice", "confirm_email")
+        .await
+        .expect("email_token row exists");
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.confirmEmail",
+        json!({"email": "someone.else@example.com", "token": code}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InvalidEmail", "body: {body}");
+
+    // None of the three confirmed anything.
+    let row: (Option<String>,) =
+        sqlx::query_as("SELECT email_confirmed_at FROM account WHERE did = ?")
+            .bind("did:plc:alice")
+            .fetch_one(manager.pool())
+            .await
+            .unwrap();
+    assert!(
+        row.0.is_none(),
+        "a refused confirmEmail confirmed the email"
+    );
+}
+
+/// `resetPassword` declares `ExpiredToken` and `InvalidToken` too. It is
+/// reached without a session -- the code is the whole credential -- so the row
+/// supplies the account rather than a bearer token.
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_password_reports_declared_error_names() {
+    let (app, _tmp, manager) = build_app().await;
+    let _token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    sqlx::query("UPDATE account SET email = ? WHERE did = ?")
+        .bind("alice@example.com")
+        .bind("did:plc:alice")
+        .execute(manager.pool())
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.resetPassword",
+        json!({"token": "NOT-A-CODE", "password": "new-password"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InvalidToken", "body: {body}");
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.requestPasswordReset",
+        json!({"email": "alice@example.com"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = fetch_email_token(&manager, "did:plc:alice", "reset_password")
+        .await
+        .expect("email_token row exists");
+    sqlx::query("UPDATE email_token SET expires_at = ? WHERE token = ?")
+        .bind((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339())
+        .bind(&code)
+        .execute(manager.pool())
+        .await
+        .unwrap();
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.resetPassword",
+        json!({"token": code, "password": "new-password"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "ExpiredToken", "body: {body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn confirm_email_round_trip_sets_email_confirmed_at() {
     let (app, _tmp, manager) = build_app().await;
@@ -160,12 +382,13 @@ async fn confirm_email_round_trip_sets_email_confirmed_at() {
         .await
         .expect("email_token row exists");
 
-    // Redeem.
+    // Redeem. The lexicon requires `email` alongside `token` and the call is
+    // auth-required: the token confirms an address the session already owns.
     let (status, _) = post_json(
         app.clone(),
         "/xrpc/com.atproto.server.confirmEmail",
-        json!({"token": confirm_token.clone()}),
-        None,
+        json!({"email": "alice@example.com", "token": confirm_token.clone()}),
+        Some(&token),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

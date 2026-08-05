@@ -509,6 +509,7 @@ pub async fn create_session(
 
 /// Output of `com.atproto.server.getSession`.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetSessionResponse {
     /// Account handle.
     pub handle: String,
@@ -517,6 +518,18 @@ pub struct GetSessionResponse {
     /// Email if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// Whether that email has been confirmed.
+    ///
+    /// This is the flag clients read to decide whether to prompt the account
+    /// holder to verify. Omitting it read as "not confirmed" no matter how
+    /// many times they completed `confirmEmail`, so the prompt never went
+    /// away.
+    pub email_confirmed: bool,
+    /// Whether the account is usable. `false` for anything but `active`.
+    pub active: bool,
+    /// Why the account is not usable. Absent while `active` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Handler for `com.atproto.server.getSession`. Auth-required.
@@ -542,10 +555,16 @@ pub async fn get_session(
                 "session subject not found",
             )
         })?;
+    let active = account.state == AccountState::Active;
     Ok(Json(GetSessionResponse {
         handle: account.handle,
         did: account.did,
         email: account.email,
+        email_confirmed: account.email_confirmed_at.is_some(),
+        active,
+        // The lexicon defines `status` as the reason a session is not usable,
+        // so "active" is expressed by its absence rather than by naming it.
+        status: (!active).then(|| account.state.as_str().to_string()),
     }))
 }
 
@@ -1533,13 +1552,9 @@ pub async fn update_email(
             // Consumed, so one token changes the address once. `consume`
             // checks the purpose and expiry and binds it to this DID, so a
             // token minted for another account or another flow does not apply.
-            // Mapped to the name the lexicon declares rather than passing the
-            // generic denial through. `consume` reports a missing, spent,
-            // wrong-purpose, wrong-account or expired token identically, and
-            // that arrives as `403 Forbidden` -- a name this method does not
-            // declare, so a client cannot tell a bad token from any other
-            // refusal. `ExpiredToken` is not signalled separately for the same
-            // reason: the helper does not distinguish it.
+            // One token changes the address once. `consume` checks the
+            // purpose and expiry and binds it to this DID, so a token minted
+            // for another account or another flow does not apply.
             crate::account::email_token::consume(
                 &manager.account_pool(),
                 token,
@@ -1547,14 +1562,7 @@ pub async fn update_email(
                 &claims.sub,
             )
             .await
-            .map_err(|e| {
-                tracing::debug!(did = %claims.sub, error = ?e, "email-change token rejected");
-                XrpcError::new(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidToken",
-                    "the confirmation token is not valid for this account, or has expired",
-                )
-            })?;
+            .map_err(|e| token_error(e, &claims.sub))?;
         }
     }
 
@@ -1675,33 +1683,14 @@ pub async fn delete_account_with_token(
     let manager = account_manager(&state)?;
     let pool = manager.account_pool();
 
-    let row = crate::account::email_token::lookup(&pool, &input.token)
-        .await
-        .map_err(XrpcError::from)?
-        .ok_or_else(|| {
-            XrpcError::new(StatusCode::BAD_REQUEST, "InvalidToken", "token not found")
-        })?;
-    if row.purpose != EMAIL_TOKEN_PURPOSE_DELETE {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            format!("token has wrong purpose: {}", row.purpose),
-        ));
-    }
-    let exp = chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("parse expires_at: {e}"),
-        )
-    })?;
-    if exp < chrono::Utc::now() {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "token expired",
-        ));
-    }
+    // Checked, not yet spent. The password below is a second factor, and
+    // spending the token first would mean one mistyped password destroys a
+    // code the user must then request again -- or lets anyone holding the
+    // token burn codes without knowing the password at all.
+    let row =
+        crate::account::email_token::verify_any(&pool, &input.token, EMAIL_TOKEN_PURPOSE_DELETE)
+            .await
+            .map_err(|e| token_error(e, &input.did))?;
 
     // The token names the account; the caller must name the same one. A
     // mismatch means the request and the token disagree about what is being
@@ -1837,6 +1826,10 @@ pub async fn request_email_confirmation(
 /// Inputs for `com.atproto.server.confirmEmail`.
 #[derive(Debug, Deserialize)]
 pub struct ConfirmEmailInput {
+    /// The address being confirmed. Required by the lexicon, and checked
+    /// against the account's: confirming an address the caller did not name
+    /// would let a token confirm whatever happens to be on file now.
+    pub email: String,
     /// Token issued by `requestEmailConfirmation`.
     pub token: String,
 }
@@ -1849,49 +1842,55 @@ pub struct ConfirmEmailInput {
 /// so it can't be replayed. All in a single transaction.
 pub async fn confirm_email(
     State(state): State<HttpState>,
+    parts: Parts,
     Json(input): Json<ConfirmEmailInput>,
 ) -> Result<axum::http::StatusCode, XrpcError> {
+    // Auth-required, matching the lexicon and the reference. The token alone
+    // was previously sufficient, which made it a bearer credential for
+    // confirming an address rather than a second factor on a session.
+    let claims = require_access_jwt(&parts, &state)?;
     let manager = account_manager(&state)?;
     let pool = manager.account_pool();
-    let row = crate::account::email_token::lookup(&pool, &input.token)
+
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(&claims.sub)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
-            XrpcError::new(StatusCode::BAD_REQUEST, "InvalidToken", "token not found")
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "AccountNotFound",
+                "account not found",
+            )
         })?;
-    if row.purpose != EMAIL_TOKEN_PURPOSE_CONFIRM {
+
+    if account.email.as_deref().map(str::to_ascii_lowercase)
+        != Some(input.email.to_ascii_lowercase())
+    {
         return Err(XrpcError::new(
             StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            format!("token has wrong purpose: {}", row.purpose),
-        ));
-    }
-    let exp = chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("parse expires_at: {e}"),
-        )
-    })?;
-    if exp < chrono::Utc::now() {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "token expired",
+            "InvalidEmail",
+            "that is not the address on this account",
         ));
     }
 
+    let row = crate::account::email_token::consume(
+        &pool,
+        &input.token,
+        EMAIL_TOKEN_PURPOSE_CONFIRM,
+        &claims.sub,
+    )
+    .await
+    .map_err(|e| token_error(e, &claims.sub))?;
+
+    // `consume` already spent the token, so a failure here leaves the address
+    // unconfirmed and the token gone: the caller requests another and retries.
+    // That is the safe direction -- the alternative leaves a live token behind.
     let now = chrono::Utc::now().to_rfc3339();
-    // Pre-Batch-S, these two ops ran in a single SQL transaction. With
-    // dispatch routing through `AccountPool`, atomicity crosses the
-    // connection boundary; we accept best-effort semantic — a partial
-    // failure leaves the email_token row consumable until expires_at
-    // (the unified GC tick prunes), and the user can retry.
     manager
         .set_email_confirmed_at(&row.did, Some(&now))
-        .await
-        .map_err(XrpcError::from)?;
-    crate::account::email_token::delete(&pool, &input.token)
         .await
         .map_err(XrpcError::from)?;
     tracing::info!(did = %row.did, "email confirmed via confirmEmail");
@@ -2025,33 +2024,12 @@ pub async fn reset_password(
     let hash = account::hash_password(&input.password).map_err(XrpcError::from)?;
 
     let pool = manager.account_pool();
-    let row = crate::account::email_token::lookup(&pool, &input.token)
-        .await
-        .map_err(XrpcError::from)?
-        .ok_or_else(|| {
-            XrpcError::new(StatusCode::BAD_REQUEST, "InvalidToken", "token not found")
-        })?;
-    if row.purpose != EMAIL_TOKEN_PURPOSE_RESET {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            format!("token has wrong purpose: {}", row.purpose),
-        ));
-    }
-    let exp = chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("parse expires_at: {e}"),
-        )
-    })?;
-    if exp < chrono::Utc::now() {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "token expired",
-        ));
-    }
+    // No session here -- the token is the credential, and names the account it
+    // belongs to. Spent on verification so a reset link works once.
+    let row =
+        crate::account::email_token::consume_any(&pool, &input.token, EMAIL_TOKEN_PURPOSE_RESET)
+            .await
+            .map_err(|e| token_error(e, "<by token>"))?;
 
     // Pre-Batch-S, these three ops ran in a single SQL transaction.
     // With dispatch routing through `AccountPool`, atomicity crosses
@@ -2230,6 +2208,10 @@ pub async fn sign_plc_operation(
             "a confirmation code from requestPlcOperationSignature is required to sign PLC operations",
         )
     })?;
+    // Unlike the four email flows, `signPlcOperation` declares no errors in
+    // its lexicon, so there is no name to report `ExpiredToken` under and no
+    // client switching on one. It keeps the undifferentiated 403 it has always
+    // answered; only a storage failure is passed through as itself.
     crate::account::email_token::consume(
         &manager.account_pool(),
         token,
@@ -2237,7 +2219,12 @@ pub async fn sign_plc_operation(
         &did,
     )
     .await
-    .map_err(XrpcError::from)?;
+    .map_err(|e| match e {
+        crate::account::email_token::TokenRejected::Storage(e) => XrpcError::from(e),
+        _ => XrpcError::from(crate::errors::PdsError::AuthDenied {
+            reason: "token is invalid or has expired".to_string(),
+        }),
+    })?;
     // The rotation key is tracked in
     // `account.rotation_key_ref` (NOT in the `signing_key` table, which is
     // for the atproto signing key). Pre-genesis rows may have NULL here —
@@ -2575,17 +2562,37 @@ fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
     })
 }
 
-/// Authenticate an endpoint that app-password sessions alone may reach.
+/// Map a refused email token to the error name its lexicon declares.
 ///
-/// Some account-lifecycle operations are deliberately outside what any OAuth
-/// client can do, however broadly scoped — minting app passwords, deleting
-/// the account, changing the email address. The reference refuses those with
-/// `ForbiddenError('OAuth credentials are not supported for this endpoint')`
-/// rather than by scope, and so does this.
-///
-/// The distinction is worth making in the error: a well-formed OAuth token is
-/// not a malformed session token, and reporting it as one sent client authors
-/// looking for a bug in their JWT.
+/// `confirmEmail`, `resetPassword`, `deleteAccount` and `updateEmail` all
+/// declare `InvalidToken` and `ExpiredToken`, and clients switch on the name --
+/// an expired token means "request another", an invalid one means "that is not
+/// a token for this account". These previously arrived as `403 Forbidden`,
+/// which none of them declares, so a client could not tell a bad token from
+/// any other refusal.
+fn token_error(rejected: crate::account::email_token::TokenRejected, did: &str) -> XrpcError {
+    use crate::account::email_token::TokenRejected;
+    match rejected {
+        TokenRejected::Expired => {
+            tracing::debug!(did, "email token expired");
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "ExpiredToken",
+                "this confirmation code has expired; request a new one",
+            )
+        }
+        TokenRejected::Invalid => {
+            tracing::debug!(did, "email token invalid");
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidToken",
+                "this confirmation code is not valid for this account",
+            )
+        }
+        TokenRejected::Storage(e) => XrpcError::from(e),
+    }
+}
+
 /// Refuse an operation that an app-password or OAuth session must not reach.
 ///
 /// App passwords and OAuth grants are given to third parties. These four

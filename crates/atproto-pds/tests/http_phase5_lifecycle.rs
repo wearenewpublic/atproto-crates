@@ -586,6 +586,20 @@ async fn account_delete_request_then_confirm() {
         "a refused delete deleted the account"
     );
 
+    // The code itself must also survive. It is verified before the password is
+    // checked, so spending it on a refusal would let anyone holding the emailed
+    // code burn it without knowing the password -- and would make one typo cost
+    // the account holder a fresh round-trip through their inbox.
+    let surviving: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM email_token WHERE purpose = 'delete_account'")
+            .fetch_one(&accounts_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        surviving.0, 1,
+        "a refused delete consumed the confirmation code"
+    );
+
     // deleteAccount(did + password + token) → 200; state flips to deleted.
     let (status, _) = post_json(
         app.clone(),

@@ -198,33 +198,106 @@ pub async fn delete(pool: &AccountPool, token: &str) -> PdsResult<()> {
     Ok(())
 }
 
-/// Verify a token for `did` and `purpose`, then consume it.
+/// Why a token was refused.
 ///
-/// Checks all four properties a one-time token needs — it exists, it is for
-/// this flow, it is bound to this account, and it has not expired — and
-/// deletes it so it cannot be replayed. Returns the row for callers that
-/// need `new_email`.
+/// The lexicons that take an email token -- `confirmEmail`, `resetPassword`,
+/// `deleteAccount`, `updateEmail` -- each declare `InvalidToken` **and**
+/// `ExpiredToken` as separate errors, and clients switch on the name: an
+/// expired token means "ask for another one", an invalid one means "that is
+/// not a token for this account". Collapsing both into one denial made the
+/// difference unavailable to callers, so it is carried here.
+#[derive(Debug)]
+pub enum TokenRejected {
+    /// No such token, or it belongs to another account or another flow. The
+    /// three are deliberately indistinguishable to the caller: telling a
+    /// stranger which of them applies confirms that a token exists.
+    Invalid,
+    /// The token was this account's and for this flow, but its window has
+    /// closed.
+    Expired,
+    /// The store could not be read. Not a judgement about the token.
+    Storage(PdsError),
+}
+
+impl From<PdsError> for TokenRejected {
+    fn from(e: PdsError) -> Self {
+        TokenRejected::Storage(e)
+    }
+}
+
+/// Verify and spend a token that identifies its own account.
 ///
-/// The email-update and password-reset flows predate this helper and still
-/// check inline; new flows should use it rather than repeat the sequence.
+/// `resetPassword` and `deleteAccount` are reached without a session -- the
+/// token *is* the credential -- so there is no DID to bind against and the row
+/// supplies it. Everything else is checked exactly as [`consume`] does.
 ///
 /// # Errors
 ///
-/// [`PdsError::AuthDenied`] when the token is absent, wrong-purpose,
-/// bound to another account, or expired. All four report the same message:
-/// a caller probing tokens should not learn which of the four it hit.
+/// [`TokenRejected`].
+pub async fn consume_any(
+    pool: &AccountPool,
+    token: &str,
+    purpose: &str,
+) -> Result<EmailTokenRow, TokenRejected> {
+    let row = verify_any(pool, token, purpose).await?;
+    delete(pool, token).await?;
+    Ok(row)
+}
+
+/// Check a self-identifying token without spending it.
+///
+/// `deleteAccount` needs this: it has a second factor -- the account password
+/// -- still to verify, and spending the token first means a single mistyped
+/// password destroys a one-time code the user then has to request again. Worse,
+/// anyone holding the token but not the password could burn codes at will.
+/// Callers must [`delete`] the token once every factor has passed.
+///
+/// An *expired* token is still deleted here. It has no remaining use, and
+/// leaving it for the GC sweep only keeps a dead row addressable.
+///
+/// # Errors
+///
+/// [`TokenRejected`].
+pub async fn verify_any(
+    pool: &AccountPool,
+    token: &str,
+    purpose: &str,
+) -> Result<EmailTokenRow, TokenRejected> {
+    let row = lookup(pool, token).await?.ok_or(TokenRejected::Invalid)?;
+    if row.purpose != purpose {
+        return Err(TokenRejected::Invalid);
+    }
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| PdsError::Storage {
+            reason: format!("email_token expires_at is not RFC-3339: {e}"),
+        })?;
+    if expires <= chrono::Utc::now() {
+        delete(pool, token).await?;
+        return Err(TokenRejected::Expired);
+    }
+    Ok(row)
+}
+
+/// Verify a token for `did` and `purpose`, then consume it.
+///
+/// Checks all four properties a one-time token needs -- it exists, it is for
+/// this flow, it is bound to this account, and it has not expired -- and
+/// deletes it so it cannot be replayed. Returns the row for callers that need
+/// `new_email`.
+///
+/// # Errors
+///
+/// [`TokenRejected`], which the HTTP layer maps to the error name the relevant
+/// lexicon declares.
 pub async fn consume(
     pool: &AccountPool,
     token: &str,
     purpose: &str,
     did: &str,
-) -> PdsResult<EmailTokenRow> {
-    let deny = || PdsError::AuthDenied {
-        reason: "token is invalid or has expired".to_string(),
-    };
-    let row = lookup(pool, token).await?.ok_or_else(deny)?;
+) -> Result<EmailTokenRow, TokenRejected> {
+    let row = lookup(pool, token).await?.ok_or(TokenRejected::Invalid)?;
     if row.purpose != purpose || row.did != did {
-        return Err(deny());
+        return Err(TokenRejected::Invalid);
     }
     let expires =
         chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| PdsError::Storage {
@@ -234,7 +307,7 @@ pub async fn consume(
         // Consume it anyway; an expired token has no further use and leaving
         // it behind only waits for the GC sweep.
         delete(pool, token).await?;
-        return Err(deny());
+        return Err(TokenRejected::Expired);
     }
     delete(pool, token).await?;
     Ok(row)
