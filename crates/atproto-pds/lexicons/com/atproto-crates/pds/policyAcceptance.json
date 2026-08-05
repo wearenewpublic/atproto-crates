@@ -1,0 +1,32 @@
+{
+  "lexicon": 1,
+  "id": "com.atproto-crates.pds.policyAcceptance",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A record of the account holder accepting a policy document set presented by their PDS. Written to the account's own repository so the acceptance travels with the identity: it survives a migration to another host, and can be read by anyone the holder shows it to rather than only by the server that asked.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["policy", "acceptedAt"],
+        "properties": {
+          "policy": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "Identifier of the policy document set that was accepted. Opaque to this lexicon; the operator chooses the form. A dated content hash — `2026-08-05-bafkrei...` — names a specific immutable set, so a later revision is a different value and needs its own acceptance."
+          },
+          "acceptedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the holder accepted. Set by the PDS at the moment the acceptance was recorded."
+          },
+          "policyUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "Where the documents were published at the time of acceptance. Recorded because the identifier alone does not say what was read, and the URL may later move or stop resolving."
+          }
+        }
+      }
+    }
+  }
+}

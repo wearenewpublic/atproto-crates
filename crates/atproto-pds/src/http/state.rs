@@ -21,6 +21,20 @@ use std::time::Duration;
 /// failed for any non-trivial repository.
 pub const DEFAULT_IMPORT_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
+/// A policy document set the portal asks new accounts to accept.
+#[derive(Debug, Clone)]
+pub struct PolicyDocuments {
+    /// Identifier of the set, recorded verbatim in the acceptance record.
+    ///
+    /// A dated content hash names an immutable set, so revising the documents
+    /// produces a different identifier and a fresh acceptance rather than
+    /// silently re-pointing an old one.
+    pub set_id: String,
+    /// Where the documents are published, shown to the holder before they
+    /// agree and recorded alongside the identifier.
+    pub url: String,
+}
+
 /// Shared state for the HTTP layer.
 ///
 /// `Arc`-wrapped so axum can `Clone` the state cheaply across handlers.
@@ -84,6 +98,16 @@ pub struct HttpState {
     /// `PDS_EMAIL_SMTP_URL` + `PDS_EMAIL_FROM_ADDRESS` are set; otherwise a
     /// disabled stub that logs the would-be confirmation URL.
     pub email: EmailService,
+    /// Policy documents the account holder must accept, when the operator has
+    /// configured a set.
+    ///
+    /// Both halves are load-bearing and neither is useful alone: the
+    /// identifier is what gets recorded, and the URL is what the holder
+    /// actually reads before agreeing. A set configured with only one of them
+    /// would either record an agreement to something unnamed or show a
+    /// document that nothing attests to, so the portal treats the pair as
+    /// present or absent together.
+    pub policy: Option<PolicyDocuments>,
     /// Resolves an `Atproto-Proxy` DID to a forwarding target, with a TTL
     /// cache. `None` disables per-request proxy targets, leaving only the
     /// operator-pinned AppView reachable.
@@ -162,6 +186,7 @@ impl HttpState {
             service_did: "did:web:localhost".to_string(),
             jwt_secret: Arc::new(b"dev-only-jwt-secret-32-bytes-min!".to_vec()),
             invite_required: false,
+            policy: None,
             oauth: OAuthState::new(),
             admin_password: None,
             space_service: None,
@@ -210,6 +235,7 @@ impl HttpState {
             service_did,
             jwt_secret: Arc::new(jwt_secret),
             invite_required,
+            policy: None,
             oauth: OAuthState::new(),
             admin_password: None,
             space_service: None,
@@ -300,6 +326,13 @@ impl HttpState {
     /// Attach the outbound email service. Default is the disabled stub
     /// that logs the would-be confirmation URL at INFO.
     #[must_use]
+    /// Configure the policy documents new accounts must accept.
+    pub fn with_policy_documents(mut self, policy: PolicyDocuments) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Attach the outbound email service.
     pub fn with_email_service(mut self, email: EmailService) -> Self {
         self.email = email;
         self

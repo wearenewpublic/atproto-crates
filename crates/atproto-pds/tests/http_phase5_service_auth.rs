@@ -384,6 +384,7 @@ async fn service_auth_refuses_privileged_methods_to_unprivileged_sessions() {
         b"test-secret-do-not-use-in-prod-32!",
         600,
         3600,
+        0,
     )
     .expect("issue an unprivileged session")
     .access_jwt;

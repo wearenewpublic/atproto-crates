@@ -42,6 +42,10 @@ pub mod postgres;
 
 /// A grace window making a refresh idempotent for a few seconds, so a client
 /// racing two refreshes against itself is not logged out.
+/// The account portal's storage: the session epoch that backs "log out
+/// everywhere", and the browser sessions the portal itself runs on.
+pub mod portal;
+
 pub mod refresh_grace;
 
 pub mod session;

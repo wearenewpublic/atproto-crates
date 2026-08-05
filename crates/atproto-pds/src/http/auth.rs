@@ -252,6 +252,48 @@ pub fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
     })
 }
 
+/// Refuse a token minted before the account's current session epoch.
+///
+/// This is what makes "log out everywhere" mean anything. Both credentials
+/// this PDS issues are stateless JWTs, so nothing about verifying one consults
+/// storage -- an app password can be revoked and the sessions minted from it
+/// keep working, which is true of the reference too. The epoch closes that:
+/// the portal advances it, and every token issued under an older one stops
+/// being accepted here, access and refresh alike, for sessions and OAuth
+/// grants alike.
+///
+/// Costs one indexed single-column read per authenticated request. That is the
+/// price of revocation being immediate rather than eventual, and it is the
+/// same read the account-state check already performs on many paths.
+///
+/// A token *ahead* of the stored epoch is not refused. The only way to hold
+/// one is to have been issued it, and refusing would turn a replica that had
+/// not yet caught up into a logout.
+pub(crate) async fn require_current_epoch(
+    state: &HttpState,
+    did: &str,
+    token_epoch: i64,
+) -> Result<(), XrpcError> {
+    let current =
+        crate::account::portal::session_epoch(&state.reader.accounts().account_pool(), did)
+            .await
+            .map_err(XrpcError::from)?;
+    if token_epoch < current {
+        tracing::debug!(
+            did,
+            token_epoch,
+            current,
+            "refusing a token from before the account was signed out everywhere"
+        );
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "this session was ended by a sign-out; sign in again",
+        ));
+    }
+    Ok(())
+}
+
 /// The full XRPC authentication path: bearer extraction → session-or-OAuth
 /// verification → DPoP proof check (when bound).
 ///
@@ -277,6 +319,7 @@ pub async fn require_authn(
             AuthScheme::Bearer,
             "an app-password session token is not bound",
         )?;
+        require_current_epoch(state, &claims.sub, claims.ses).await?;
         return Ok(AuthSubject::AppPassword(claims));
     }
 
@@ -311,6 +354,7 @@ pub async fn require_authn(
         )?;
     }
 
+    require_current_epoch(state, &claims.sub, claims.ses).await?;
     Ok(AuthSubject::OAuth(claims))
 }
 

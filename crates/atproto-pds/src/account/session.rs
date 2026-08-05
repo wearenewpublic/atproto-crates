@@ -70,6 +70,21 @@ pub struct SessionClaims {
     pub exp: u64,
     /// JWT identifier (random 16-byte hex).
     pub jti: String,
+    /// The account's session epoch when this token was minted.
+    ///
+    /// A session JWT is stateless: verifying one reads no storage, so without
+    /// this there is nothing to consult to decide it is no longer wanted, and
+    /// "log out everywhere" could not end a token that had already been
+    /// issued. The auth layer refuses any token whose epoch is behind the
+    /// account's, so advancing that one integer ends every outstanding access
+    /// and refresh token at once.
+    ///
+    /// `#[serde(default)]` so tokens minted before this claim existed decode
+    /// as epoch 0. That is the same value a never-revoked account carries, so
+    /// they keep working -- and the first "log out everywhere" ends them,
+    /// which is the behaviour the holder asked for.
+    #[serde(default)]
+    pub ses: i64,
 }
 
 /// A minted session pair: access + refresh tokens.
@@ -226,6 +241,11 @@ impl SessionAuthority {
 ///
 /// `service_did` is the PDS's own DID (e.g., `did:web:pds.example.com`).
 /// `secret` is the symmetric `PDS_JWT_SECRET` (length-flexible; HS256 uses any byte string).
+// Eight parameters, all of them things the caller genuinely decides: who is
+// issuing, for whom, under which credential and authority, with what secret,
+// lifetimes, and epoch. A params struct would move the same list somewhere
+// else without making any call site clearer.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_pair(
     service_did: &str,
     account_did: &str,
@@ -234,6 +254,7 @@ pub fn issue_pair(
     secret: &[u8],
     access_ttl_secs: u64,
     refresh_ttl_secs: u64,
+    session_epoch: i64,
 ) -> PdsResult<SessionTokens> {
     let iat = now_secs();
     let common = SessionClaims {
@@ -245,6 +266,7 @@ pub fn issue_pair(
         iat,
         exp: iat + access_ttl_secs,
         jti: random_jti(),
+        ses: session_epoch,
     };
     let access_jwt = mint(TYP_ACCESS, &common, secret)?;
     let refresh_claims = SessionClaims {
@@ -287,6 +309,7 @@ mod tests {
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
+            0,
         )
         .unwrap();
         let claims = verify_access(&pair.access_jwt, secret()).unwrap();
@@ -305,6 +328,7 @@ mod tests {
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
+            0,
         )
         .unwrap();
         assert_ne!(pair.access_jwt, pair.refresh_jwt);
@@ -325,6 +349,7 @@ mod tests {
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
+            0,
         )
         .unwrap();
         assert!(verify_access(&pair.refresh_jwt, secret()).is_err());
@@ -341,6 +366,7 @@ mod tests {
             secret(),
             DEFAULT_ACCESS_TTL_SECS,
             DEFAULT_REFRESH_TTL_SECS,
+            0,
         )
         .unwrap();
         assert!(verify_access(&pair.access_jwt, b"different-secret").is_err());
@@ -356,6 +382,7 @@ mod tests {
             secret(),
             0, // immediate expiration
             DEFAULT_REFRESH_TTL_SECS,
+            0,
         )
         .unwrap();
         // Sleep past expiration — exp is now-secs which already lapses with TTL=0.

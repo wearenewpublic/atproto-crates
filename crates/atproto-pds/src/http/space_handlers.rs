@@ -3142,6 +3142,7 @@ mod scope_gate_tests {
             iat: 0,
             exp: u64::MAX,
             jti: "jti".to_string(),
+            ses: 0,
         })
     }
 
@@ -3155,6 +3156,7 @@ mod scope_gate_tests {
             iat: 0,
             exp: u64::MAX,
             jti: "jti".to_string(),
+            ses: 0,
         })
     }
 

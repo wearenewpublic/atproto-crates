@@ -88,6 +88,18 @@ pub struct OAuthClaims {
     pub exp: u64,
     /// JWT ID (for refresh-rotation tracking).
     pub jti: String,
+    /// The account's session epoch when this grant was minted.
+    ///
+    /// An OAuth access token is a stateless JWT, so without this there is
+    /// nothing to consult to end one early -- deleting the refresh row stops
+    /// the grant being renewed but leaves the access token usable for the rest
+    /// of its life. "Log out everywhere" advances the account's epoch, and the
+    /// auth layer refuses any token minted under an older one.
+    ///
+    /// `#[serde(default)]` so grants issued before this claim existed decode
+    /// as epoch 0, which is what a never-revoked account carries.
+    #[serde(default)]
+    pub ses: i64,
 }
 
 /// `cnf` claim for DPoP-bound access tokens (RFC 9449).
@@ -339,6 +351,20 @@ async fn issue_pair(
     let access_ttl = state.oauth_access_ttl_secs;
     let refresh_ttl = state.oauth_refresh_ttl_secs;
 
+    // Stamped so "log out everywhere" can end this grant. Read here rather
+    // than carried from the code or refresh token: a grant minted after the
+    // epoch advanced must carry the new value, not the one in force when the
+    // authorization began.
+    let epoch = crate::account::portal::session_epoch(&state.reader.accounts().account_pool(), did)
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                e.to_string(),
+            )
+        })?;
+
     let access_claims = OAuthClaims {
         sub: did.to_string(),
         iss: format!("did:web:{}", host_from_service_did(&state.service_did)),
@@ -349,6 +375,7 @@ async fn issue_pair(
         iat: now,
         exp: now + access_ttl,
         jti: access_jti,
+        ses: epoch,
     };
     let refresh_claims = OAuthClaims {
         sub: did.to_string(),
@@ -360,6 +387,7 @@ async fn issue_pair(
         iat: now,
         exp: now + refresh_ttl,
         jti: refresh_jti.clone(),
+        ses: epoch,
     };
 
     let access_jwt = mint_oauth_jwt(TYP_ACCESS, &access_claims, &state.jwt_secret)
@@ -507,6 +535,7 @@ mod tests {
             iat: chrono::Utc::now().timestamp() as u64,
             exp: (chrono::Utc::now().timestamp() + 600) as u64,
             jti: "jti1".to_string(),
+            ses: 0,
         };
         let jwt = mint_oauth_jwt(TYP_ACCESS, &claims, secret).unwrap();
         let parsed = verify_oauth_jwt(&jwt, TYP_ACCESS, secret).unwrap();
@@ -527,6 +556,7 @@ mod tests {
             iat: chrono::Utc::now().timestamp() as u64,
             exp: (chrono::Utc::now().timestamp() + 600) as u64,
             jti: "jti1".to_string(),
+            ses: 0,
         };
         let access = mint_oauth_jwt(TYP_ACCESS, &claims, secret).unwrap();
         assert!(verify_oauth_jwt(&access, TYP_REFRESH, secret).is_err());

@@ -120,6 +120,7 @@ mod tests {
             iat: now,
             exp: now + ttl_secs,
             jti: jti.to_string(),
+            ses: 0,
         }
     }
 

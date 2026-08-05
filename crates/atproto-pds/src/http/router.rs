@@ -7,6 +7,7 @@ use crate::http::discovery_handlers;
 use crate::http::handlers;
 use crate::http::identity_handlers;
 use crate::http::moderation_handlers;
+use crate::http::portal;
 use crate::http::preference_handlers;
 use crate::http::proxy_handlers;
 use crate::http::service_auth_handlers;
@@ -488,6 +489,24 @@ pub fn build_router(state: HttpState) -> Router {
             post(admin::force_repo_sync),
         )
         // Operator HTML dashboard (Basic-auth gated, same as JSON admin API).
+        // The account portal. Not XRPC: these are HTML pages and form posts,
+        // the only way to use this server with nothing but a browser.
+        .route("/account", get(portal::dashboard))
+        .route("/account/signin", get(portal::sign_in_page))
+        .route("/account/signin", post(portal::sign_in))
+        .route("/account/signout", post(portal::sign_out))
+        .route("/account/email", post(portal::change_email))
+        .route("/account/email/code", post(portal::email_code))
+        .route("/account/password", post(portal::change_password))
+        .route("/account/app-passwords", post(portal::create_app_password))
+        .route(
+            "/account/app-passwords/revoke",
+            post(portal::revoke_app_password),
+        )
+        .route(
+            "/account/signout-everywhere",
+            post(portal::sign_out_everywhere),
+        )
         .route("/admin", get(admin::dashboard_handler))
         .route("/admin/", get(admin::dashboard_handler))
         .fallback(unmatched)

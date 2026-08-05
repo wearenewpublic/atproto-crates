@@ -414,6 +414,9 @@ pub async fn create_account(
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
         session::DEFAULT_REFRESH_TTL_SECS,
+        crate::account::portal::session_epoch(&manager.account_pool(), &row.did)
+            .await
+            .map_err(XrpcError::from)?,
     )
     .map_err(XrpcError::from)?;
 
@@ -496,6 +499,9 @@ pub async fn create_session(
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
         session::DEFAULT_REFRESH_TTL_SECS,
+        crate::account::portal::session_epoch(&manager.account_pool(), &account.did)
+            .await
+            .map_err(XrpcError::from)?,
     )
     .map_err(XrpcError::from)?;
 
@@ -579,6 +585,10 @@ pub async fn refresh_session(
 ) -> Result<Json<SessionResponse>, XrpcError> {
     let raw = bearer_token(&parts)?;
     let claims = session::verify_refresh(raw, &state.jwt_secret).map_err(XrpcError::from)?;
+    // A refresh token outlives an access token by weeks, so this is the one
+    // that matters most: without it, "log out everywhere" would be undone by
+    // the next refresh a revoked client happened to make.
+    crate::http::auth::require_current_epoch(&state, &claims.sub, claims.ses).await?;
 
     // A client with two requests in flight can meet a 401 on both and refresh
     // with the same stored token twice. One wins the replay check below; the
@@ -665,6 +675,13 @@ pub async fn refresh_session(
         &state.jwt_secret,
         session::DEFAULT_ACCESS_TTL_SECS,
         session::DEFAULT_REFRESH_TTL_SECS,
+        // Re-read rather than carried from `claims.ses`: a refresh that
+        // happens after "log out everywhere" must not mint a token under the
+        // old epoch. The epoch check on the way in has already refused a
+        // stale refresh token, so this can only be the current value.
+        crate::account::portal::session_epoch(&directory.account_pool(), &account.did)
+            .await
+            .map_err(XrpcError::from)?,
     )
     .map_err(XrpcError::from)?;
 
@@ -691,6 +708,10 @@ pub async fn delete_session(
 ) -> Result<StatusCode, XrpcError> {
     let raw = bearer_token(&parts)?;
     let claims = session::verify_refresh(raw, &state.jwt_secret).map_err(XrpcError::from)?;
+    // A refresh token outlives an access token by weeks, so this is the one
+    // that matters most: without it, "log out everywhere" would be undone by
+    // the next refresh a revoked client happened to make.
+    crate::http::auth::require_current_epoch(&state, &claims.sub, claims.ses).await?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -735,7 +756,7 @@ pub async fn create_app_password(
     parts: Parts,
     Json(input): Json<CreateAppPasswordInput>,
 ) -> Result<Json<AppPasswordCreated>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     require_full_session(&claims, "com.atproto.server.createAppPassword")?;
     let manager = account_manager(&state)?;
     // Deactivation is self-service and reversible; a takedown or suspension is
@@ -802,7 +823,7 @@ pub async fn list_app_passwords(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Json<ListAppPasswordsResponse>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
     let rows = app_password::list(&manager.account_pool(), &claims.sub)
         .await
@@ -834,7 +855,7 @@ pub async fn revoke_app_password(
     parts: Parts,
     Json(input): Json<RevokeAppPasswordInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
     let removed = app_password::revoke(&manager.account_pool(), &claims.sub, &input.name)
         .await
@@ -880,7 +901,7 @@ pub async fn create_invite_code(
     parts: Parts,
     Json(input): Json<CreateInviteCodeInput>,
 ) -> Result<Json<InviteCodeIssued>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
     let attribute_to = input.for_account.as_deref().unwrap_or(&claims.sub);
 
@@ -988,7 +1009,7 @@ pub async fn activate_account(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<axum::http::StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
 
     // Deactivation is self-service and reversible; a takedown or suspension is
@@ -1081,7 +1102,7 @@ pub async fn deactivate_account(
     parts: Parts,
     Json(input): Json<DeactivateAccountInput>,
 ) -> Result<axum::http::StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
     manager
         .set_state(&claims.sub, AccountState::Deactivated)
@@ -1299,7 +1320,7 @@ pub async fn reserve_signing_key(
     // a row for whatever `did` the caller named — unbounded key generation and
     // reservation squatting for anyone who could reach the endpoint, and the
     // precursor primitive for claiming a DID outright.
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
 
     // A caller may only reserve against its own DID. `did` is optional in the
@@ -1418,7 +1439,7 @@ pub async fn request_email_update(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Json<RequestEmailUpdateResponse>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     require_full_session(&claims, "com.atproto.server.requestEmailUpdate")?;
     let manager = account_manager(&state)?;
 
@@ -1507,7 +1528,7 @@ pub async fn update_email(
     parts: Parts,
     Json(input): Json<UpdateEmailInput>,
 ) -> Result<axum::http::StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     require_full_session(&claims, "com.atproto.server.updateEmail")?;
     let manager = account_manager(&state)?;
 
@@ -1592,7 +1613,7 @@ pub async fn request_account_delete(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<axum::http::StatusCode, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     require_full_session(&claims, "com.atproto.server.requestAccountDelete")?;
     let manager = account_manager(&state)?;
 
@@ -1830,7 +1851,7 @@ pub async fn confirm_email(
     // Auth-required, matching the lexicon and the reference. The token alone
     // was previously sufficient, which made it a bearer credential for
     // confirming an address rather than a second factor on a session.
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
     let pool = manager.account_pool();
 
@@ -2061,7 +2082,7 @@ pub async fn get_account_invite_codes(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Json<GetAccountInviteCodesResponse>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state)?;
+    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
     let rows = invite::list_for_did(&manager.account_pool(), &claims.sub)
         .await
@@ -2497,7 +2518,7 @@ pub async fn submit_plc_operation(
 }
 
 /// Cheap email-shape validator — `<x>@<y>.<z>` with at least one char per part.
-fn is_email_shape(s: &str) -> bool {
+pub(crate) fn is_email_shape(s: &str) -> bool {
     let mut parts = s.split('@');
     let local = parts.next();
     let domain = parts.next();
@@ -2596,13 +2617,17 @@ fn require_full_session(claims: &account::SessionClaims, operation: &str) -> Res
     ))
 }
 
-fn require_access_jwt(
+async fn require_access_jwt(
     parts: &Parts,
     state: &HttpState,
 ) -> Result<account::SessionClaims, XrpcError> {
     let (_, raw) = authorization_token(parts)?;
 
     if let Ok(claims) = session::verify_access(raw, &state.jwt_secret) {
+        // These are the privileged endpoints -- minting app passwords,
+        // starting a deletion, changing the email address. A session ended by
+        // "log out everywhere" must not reach any of them.
+        crate::http::auth::require_current_epoch(state, &claims.sub, claims.ses).await?;
         return Ok(claims);
     }
 
