@@ -22,9 +22,6 @@ use atproto_identity::resolve::{resolve_handle as identity_resolve_handle, resol
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -495,11 +492,7 @@ pub async fn request_plc_operation_signature(
             XrpcError::new(StatusCode::NOT_FOUND, "AccountNotFound", "no such account")
         })?;
 
-    let token = {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        B64URL.encode(bytes)
-    };
+    let token = crate::account::email_token::generate_code();
     let expires_at =
         (chrono::Utc::now() + chrono::Duration::seconds(PLC_TOKEN_TTL_SECS)).to_rfc3339();
     crate::account::email_token::insert(

@@ -40,6 +40,67 @@ pub const PURPOSE_DELETE_ACCOUNT: &str = "delete_account";
 /// the account's rotation key.
 pub const PURPOSE_PLC_OPERATION: &str = "plc_operation";
 
+/// Alphabet for a mailed confirmation code.
+///
+/// Crockford base32 minus the letters that get misread off a screen and
+/// mistyped back in: no `I`/`L` against `1`, no `O` against `0`, no `U`. A code
+/// exists to be read out of an email and typed into a client, so the cost of an
+/// ambiguous glyph is paid by the account holder every time.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
+
+/// Generate a mailed confirmation code.
+///
+/// Two groups of five from [`CODE_ALPHABET`], joined by a hyphen -- `A3K9M-2XPQR`
+/// -- which is the shape the reference uses and the shape clients prompt for
+/// ("enter the code above"). Codes were 43-character base64 before, which is
+/// correct as a bearer token and unusable as something a person retypes.
+///
+/// 30^10 is a little over 49 bits. These are single-use, expire within the
+/// hour, and are spent behind the auth rate-limit tier, so the search space
+/// that matters is what an attacker can actually try inside that window rather
+/// than the space itself.
+#[must_use]
+pub fn generate_code() -> String {
+    use rand::RngExt;
+    let mut bytes = [0u8; 10];
+    rand::rng().fill(&mut bytes);
+    let pick = |b: u8| CODE_ALPHABET[usize::from(b) % CODE_ALPHABET.len()] as char;
+    let mut out = String::with_capacity(11);
+    for (i, b) in bytes.iter().enumerate() {
+        if i == 5 {
+            out.push('-');
+        }
+        out.push(pick(*b));
+    }
+    out
+}
+
+/// Normalise a code as a person is likely to have typed it.
+///
+/// Codes are mailed uppercase and hyphenated, and get back with the case
+/// changed, the hyphen dropped, or surrounding whitespace from a copy-paste.
+/// None of that is a different code, and refusing it as `InvalidToken` sends
+/// the account holder back to their inbox for a code that was already correct.
+///
+/// Anything that is not a code -- the long base64 tokens issued before this, or
+/// a value from another implementation -- is passed through untouched so it can
+/// still be looked up as-is.
+#[must_use]
+pub fn normalize_code(input: &str) -> String {
+    let trimmed = input.trim();
+    let stripped: String = trimmed
+        .chars()
+        .filter(|c| *c != '-' && !c.is_whitespace())
+        .collect();
+    if stripped.len() == 10 && stripped.chars().all(|c| c.is_ascii_alphanumeric()) {
+        let upper = stripped.to_ascii_uppercase();
+        if upper.bytes().all(|b| CODE_ALPHABET.contains(&b)) {
+            return format!("{}-{}", &upper[..5], &upper[5..]);
+        }
+    }
+    trimmed.to_string()
+}
+
 /// One row from the `email_token` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmailTokenRow {
@@ -114,6 +175,9 @@ pub async fn insert(
 /// Look up an email-token row by its bearer token. Returns `None` if
 /// the token is unknown.
 pub async fn lookup(pool: &AccountPool, token: &str) -> PdsResult<Option<EmailTokenRow>> {
+    // Normalised here rather than at each of the five redemption sites, so
+    // every flow accepts a code as it was actually retyped.
+    let token = &normalize_code(token);
     match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
@@ -167,6 +231,9 @@ pub async fn lookup(pool: &AccountPool, token: &str) -> PdsResult<Option<EmailTo
 /// Delete an email-token row by token. Idempotent — returns `Ok(())`
 /// even if no row matched.
 pub async fn delete(pool: &AccountPool, token: &str) -> PdsResult<()> {
+    // Matches `lookup`: a code that was found in its retyped form must be
+    // spendable in that same form, or it would be redeemed and never cleared.
+    let token = &normalize_code(token);
     match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
@@ -316,6 +383,72 @@ pub async fn consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_codes_are_typeable_and_unambiguous() {
+        for _ in 0..200 {
+            let code = generate_code();
+            assert_eq!(code.len(), 11, "code {code} is not the mailed shape");
+            assert_eq!(code.as_bytes()[5], b'-', "code {code} is not grouped");
+            // Every glyph a reader could confuse for another is absent by
+            // construction: the code is read off a screen and typed back.
+            for b in code.bytes().filter(|b| *b != b'-') {
+                assert!(
+                    CODE_ALPHABET.contains(&b),
+                    "code {code} uses a glyph outside the alphabet"
+                );
+                assert!(
+                    !b"ILOU01".contains(&b),
+                    "code {code} uses an ambiguous glyph"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_codes_do_not_repeat() {
+        // Not a randomness test -- a stuck generator handing every account the
+        // same code is the failure this catches.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            assert!(
+                seen.insert(generate_code()),
+                "generate_code returned a duplicate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_is_recognised_as_it_is_actually_retyped() {
+        let code = generate_code();
+        // Lowercased, un-hyphenated, and surrounded by copy-paste whitespace
+        // are all the same code. Refusing them sends the account holder back
+        // to their inbox for a code that was already right.
+        assert_eq!(normalize_code(&code), code);
+        assert_eq!(normalize_code(&code.to_lowercase()), code);
+        assert_eq!(normalize_code(&code.replace('-', "")), code);
+        assert_eq!(
+            normalize_code(&format!("  {}  ", code.to_lowercase())),
+            code
+        );
+        assert_eq!(
+            normalize_code(&format!("{} ", code.replace('-', " "))),
+            code
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_code_is_left_alone() {
+        // The long base64 tokens issued before this change, and values from
+        // other implementations, must still be looked up exactly as given.
+        let legacy = "r2sr6f67D-KtZAcz6jVIDNbn7-mRKFLBo8eqEnUQhKw";
+        assert_eq!(normalize_code(legacy), legacy);
+        // Right length, but carries glyphs the alphabet excludes -- so it is
+        // not one of ours and must not be rewritten into something else.
+        assert_eq!(normalize_code("ILOU01ILOU"), "ILOU01ILOU");
+        assert_eq!(normalize_code(""), "");
+    }
+
     use crate::account::AccountDirectory;
     use chrono::Utc;
 

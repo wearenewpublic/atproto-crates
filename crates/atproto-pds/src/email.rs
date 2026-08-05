@@ -135,6 +135,7 @@ impl EmailService {
 #[cfg(feature = "smtp")]
 mod smtp {
     use crate::errors::{PdsError, PdsResult};
+    use lettre::message::header::ContentType;
     use lettre::message::{Mailbox, Message};
     use lettre::transport::smtp::AsyncSmtpTransport;
     use lettre::{AsyncTransport, Tokio1Executor};
@@ -172,6 +173,13 @@ mod smtp {
                 .from(self.from.clone())
                 .to(to_mbox)
                 .subject(subject)
+                // Declared explicitly. lettre encodes the body as
+                // quoted-printable regardless, and with no Content-Type a
+                // client falls back to us-ascii -- so every non-ASCII
+                // character in a message body, and there are several, arrives
+                // as mojibake in the one place the account holder is being
+                // asked to read carefully.
+                .header(ContentType::TEXT_PLAIN)
                 .body(body.to_string())
                 .map_err(|e| PdsError::Storage {
                     reason: format!("build email message: {e}"),

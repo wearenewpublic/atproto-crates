@@ -1458,13 +1458,7 @@ pub async fn request_email_update(
         }));
     }
 
-    let token = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use rand::RngExt;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        base64::Engine::encode(&URL_SAFE_NO_PAD, bytes)
-    };
+    let token = crate::account::email_token::generate_code();
     let expires_at =
         (chrono::Utc::now() + chrono::Duration::seconds(EMAIL_TOKEN_TTL_SECS)).to_rfc3339();
     crate::account::email_token::insert(
@@ -1622,13 +1616,7 @@ pub async fn request_account_delete(
         )
     })?;
 
-    let token = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use rand::RngExt;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        base64::Engine::encode(&URL_SAFE_NO_PAD, bytes)
-    };
+    let token = crate::account::email_token::generate_code();
     let now = chrono::Utc::now();
     let expires_at = (now + chrono::Duration::seconds(EMAIL_TOKEN_TTL_SECS)).to_rfc3339();
     crate::account::email_token::insert(
@@ -1643,7 +1631,7 @@ pub async fn request_account_delete(
     .map_err(XrpcError::from)?;
 
     let body = format!(
-        "Confirm account deletion at:\n\n  /xrpc/com.atproto.server.deleteAccount?token={token}\n\nThis link expires in 1 hour. If you did not request this, ignore this message."
+        "Your confirmation code for deleting this account is:\n\n  {token}\n\nEnter it in your app along with your password. It expires in 1 hour. If you did not request this, ignore this message — nothing has been deleted."
     );
     if let Err(e) = state
         .email
@@ -1790,13 +1778,7 @@ pub async fn request_email_confirmation(
         )
     })?;
 
-    let token = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use rand::RngExt;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        base64::Engine::encode(&URL_SAFE_NO_PAD, bytes)
-    };
+    let token = crate::account::email_token::generate_code();
     let now = chrono::Utc::now();
     let expires_at = (now + chrono::Duration::seconds(EMAIL_TOKEN_TTL_SECS)).to_rfc3339();
     crate::account::email_token::insert(
@@ -1811,7 +1793,7 @@ pub async fn request_email_confirmation(
     .map_err(XrpcError::from)?;
 
     let body = format!(
-        "Confirm your email address at:\n\n  /xrpc/com.atproto.server.confirmEmail?token={token}\n\nThis link expires in 1 hour."
+        "Your confirmation code for this email address is:\n\n  {token}\n\nEnter it in your app to confirm the address. It expires in 1 hour."
     );
     if let Err(e) = state
         .email
@@ -1959,13 +1941,7 @@ pub async fn request_password_reset(
         }
     };
 
-    let token = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use rand::RngExt;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        base64::Engine::encode(&URL_SAFE_NO_PAD, bytes)
-    };
+    let token = crate::account::email_token::generate_code();
     let now = chrono::Utc::now();
     let expires_at = (now + chrono::Duration::seconds(EMAIL_TOKEN_TTL_SECS)).to_rfc3339();
     crate::account::email_token::insert(
@@ -1980,7 +1956,7 @@ pub async fn request_password_reset(
     .map_err(XrpcError::from)?;
 
     let body = format!(
-        "Reset your password at:\n\n  /xrpc/com.atproto.server.resetPassword?token={token}\n\nIf you did not request this, you can ignore this email. The link expires in 1 hour."
+        "Your password reset code is:\n\n  {token}\n\nEnter it in your app along with your new password. It expires in 1 hour. If you did not request this, you can ignore this email — your password has not changed."
     );
     if let Err(e) = state
         .email
