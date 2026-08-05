@@ -861,8 +861,8 @@ async fn main() -> anyhow::Result<()> {
     // bundled schema is the one this build was tested against, so letting a
     // network answer override it would make validation depend on what an
     // authority published today. The bundle needs no DNS, so `validate: true`
-    // works for `app.bsky.*`, `com.atproto.*` and `tools.ozone.*` on a server
-    // with no resolver configured at all.
+    // works for `app.bsky.*`, `chat.bsky.*`, `com.atproto.*` and `tools.ozone.*`
+    // on a server with no resolver configured at all.
     {
         let bundled = Arc::new(atproto_pds::repo::lexicon::BundledLexiconResolver::new());
         info!(

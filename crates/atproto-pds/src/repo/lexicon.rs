@@ -328,9 +328,16 @@ include!(concat!(env!("OUT_DIR"), "/bundled_lexicons.rs"));
 
 /// Serves the lexicons vendored into this binary.
 ///
-/// `app.bsky.*`, `com.atproto.*` and `tools.ozone.*` are bundled because they
-/// are the schemas a PDS is asked to validate against constantly and cannot
-/// afford to be unable to. Resolving them over the network is possible in
+/// `app.bsky.*`, `chat.bsky.*`, `com.atproto.*` and `tools.ozone.*` are bundled
+/// because they are the schemas a PDS is asked to validate against constantly
+/// and cannot afford to be unable to.
+///
+/// `chat.bsky.*` earns its place for a reason the other three do not: a PDS
+/// does not serve those methods, it forwards them (see `PROXIED_NAMESPACES` in
+/// `http/proxy_handlers.rs`). But `chat.bsky.actor.declaration` is a record
+/// type that lives in the account holder\'s own repo, so this PDS validates it
+/// on write like any other, and the rest of the namespace is what makes the
+/// declaration\'s references resolvable offline. Resolving them over the network is possible in
 /// principle -- Bluesky publishes `_lexicon.feed.bsky.app` and the rest -- but
 /// it makes every first write of a collection wait on DNS and two HTTP round
 /// trips, and it makes validation fail whenever the network or the authority's
@@ -541,6 +548,8 @@ mod tests {
         for nsid in [
             "app.bsky.feed.post",
             "app.bsky.actor.profile",
+            "chat.bsky.actor.declaration",
+            "chat.bsky.convo.defs",
             "com.atproto.repo.createRecord",
             "tools.ozone.moderation.defs",
         ] {
@@ -570,6 +579,51 @@ mod tests {
                 panic!("closure incomplete offline, missing {missing}")
             }
         }
+    }
+
+    /// `chat.bsky.actor.declaration` is the one `chat.bsky` type a PDS stores
+    /// rather than forwards -- it lives in the account holder\'s own repo, so
+    /// this server validates it on write. Bundling the namespace is what makes
+    /// that possible with no network at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_bundled_chat_declaration_validates_offline() {
+        let bundled = BundledLexiconResolver::new();
+        let CatalogOutcome::Ready(catalog) =
+            resolve_catalog(&bundled, "chat.bsky.actor.declaration").await
+        else {
+            panic!("chat.bsky.actor.declaration is bundled")
+        };
+        let schema = catalog
+            .get_schema("chat.bsky.actor.declaration")
+            .unwrap()
+            .clone();
+        let flags = atproto_lexicon::validation::flags::ValidateFlags::default();
+
+        let good = serde_json::json!({
+            "$type": "chat.bsky.actor.declaration",
+            "allowIncoming": "following",
+        });
+        atproto_lexicon::validation::validate::validate_record_with_schema(
+            &good,
+            &schema,
+            catalog.as_ref(),
+            flags,
+        )
+        .expect("a well-formed declaration validates");
+
+        // `allowIncoming` is the one required property; without it the record
+        // must be refused, or the schema is present but inert.
+        let bad = serde_json::json!({ "$type": "chat.bsky.actor.declaration" });
+        assert!(
+            atproto_lexicon::validation::validate::validate_record_with_schema(
+                &bad,
+                &schema,
+                catalog.as_ref(),
+                flags,
+            )
+            .is_err(),
+            "a declaration missing allowIncoming should not validate"
+        );
     }
 
     /// A real post validates against the bundled schema, and one missing a
