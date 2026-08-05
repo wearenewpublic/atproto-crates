@@ -747,6 +747,7 @@ pub async fn apply_writes(
     let member_did = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &member_did)?;
     let uri = parse_space_uri(&input.space)?;
+    require_space_member(&state, &uri, &member_did).await?;
     let writer = space_writer(&state)?;
 
     if input.writes.is_empty() {
@@ -900,6 +901,7 @@ pub async fn put_record_write(
     let subject = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &subject)?;
     let uri = parse_space_uri(&input.space)?;
+    require_space_member(&state, &uri, &subject).await?;
     // putRecord may either create or update the record, so it requires both
     // the `create` and `update` actions per the 0016 OAuth-scope rules (spec
     // lines 405-411), asserting both before the upsert.
@@ -950,6 +952,7 @@ pub async fn delete_record_write(
     let subject = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &subject)?;
     let uri = parse_space_uri(&input.space)?;
+    require_space_member(&state, &uri, &subject).await?;
     assert_space_scope(
         &state,
         &auth,
@@ -2262,6 +2265,61 @@ async fn assert_space_read_opt(
         }
         None => Ok(()),
     }
+}
+
+/// Refuse a space write from an account that is not a member.
+///
+/// [`assert_space_scope`] is the authorisation on these endpoints and it opens
+/// with `if !subject.is_oauth() { return Ok(()) }`. An app-password session is
+/// not OAuth -- it carries no scopes and is full-authority over its own
+/// account -- so the assertion has nothing to assert and succeeds. Below it the
+/// writer checks only that the space is not tombstoned, and `SpaceRepo` storage
+/// creates the space row on demand, by design, so cross-PDS members can receive
+/// records for a space they have no local row for.
+///
+/// Nothing in that chain asked whether the caller belongs to the space.
+/// `require_repo_matches_subject` keeps a stranger writing into their own
+/// repository rather than someone else's, which bounds the damage without
+/// preventing it: the records are real, are filed under a space they have no
+/// claim to, and sync offers them to that space's members.
+///
+/// Full authority over an account is not authority over every space that
+/// account can name, so this is checked for every caller rather than only the
+/// ones carrying scopes.
+async fn require_space_member(
+    state: &HttpState,
+    uri: &SpaceUri,
+    did: &str,
+) -> Result<(), XrpcError> {
+    // Only when this server can answer the question. Membership lives in the
+    // *authority's* per-actor store, and for a cross-PDS space that store is
+    // not here -- `is_member` would open an empty database, find no row, and
+    // report every legitimate remote member as a stranger, breaking cross-host
+    // spaces outright.
+    //
+    // Same shape as `ensure_space_live`: local authority, enforce; remote
+    // authority, defer to the side that owns the member list. A space
+    // credential minted by that authority is what carries the claim there.
+    if !crate::actor_store::sql::actor_db_path(state.reader.data_dir(), &uri.space_did).exists() {
+        return Ok(());
+    }
+    if space_service(state)?
+        .is_member(uri, did)
+        .await
+        .map_err(XrpcError::from)?
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        did = %did,
+        space = %uri,
+        "refused a space write from a non-member"
+    );
+    Err(XrpcError::new(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "you are not a member of that space",
+    ))
 }
 
 async fn assert_space_scope(
