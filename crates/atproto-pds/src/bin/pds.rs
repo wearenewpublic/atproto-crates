@@ -377,17 +377,21 @@ struct Args {
     #[arg(long, env = "PDS_BSKY_APP_VIEW_URL")]
     bsky_app_view_url: Option<String>,
 
-    /// PLC rotation key — externally supplied. When
-    /// set, the PDS uses this key (instead of generating one) for new
-    /// PLC operations on accounts that opt into PDS-managed rotation.
-    /// Format: `did:key:<multibase>` for the public form, plus the
-    /// matching private bytes encoded as base64url at
-    /// `--plc-rotation-key-private`. K-256 + P-256 are accepted.
-    #[arg(long, env = "PDS_PLC_ROTATION_KEY_DID_KEY")]
-    plc_rotation_key_did_key: Option<String>,
-
-    /// PLC rotation key — private form, base64url-encoded. Required when
-    /// `--plc-rotation-key-did-key` is set.
+    /// Operator-wide PLC rotation key, listed on every genesis operation this
+    /// server signs.
+    ///
+    /// One value, in the form key generators actually print:
+    /// `did:key:z42t…` for a P-256 private key or `did:key:z3vL…` for K-256.
+    /// Those are the two curves PLC accepts for a rotation key.
+    ///
+    /// This used to be two variables -- a public `did:key` plus the raw
+    /// private scalar in base64url -- which meant taking the one string
+    /// `goat key generate` prints and splitting it into two encodings by
+    /// hand. Neither half was independently useful and getting either wrong
+    /// stopped the server from booting.
+    ///
+    /// Keep this key. It is the operator's recovery path for every identity
+    /// this server issues, and nothing here can reproduce it.
     #[arg(long, env = "PDS_PLC_ROTATION_KEY_PRIVATE")]
     plc_rotation_key_private: Option<String>,
 
@@ -625,12 +629,18 @@ async fn main() -> anyhow::Result<()> {
     let space_sync = Arc::new(SpaceSync::new(args.data_dir.clone()));
 
     // §11d — externally-supplied PLC rotation key (optional).
-    let external_plc_key = parse_external_plc_rotation_key(
-        args.plc_rotation_key_did_key.as_deref(),
-        args.plc_rotation_key_private.as_deref(),
-    )?;
-    if external_plc_key.is_some() {
-        info!("externally-supplied PLC rotation key loaded — included in every genesis op");
+    let external_plc_key =
+        parse_external_plc_rotation_key(args.plc_rotation_key_private.as_deref())?;
+    if let Some(key) = external_plc_key.as_ref() {
+        // The public form, so an operator can check the running server against
+        // the key they hold without the log ever carrying the secret.
+        let public = atproto_identity::key::to_public(key)
+            .map(|p| format!("{p}"))
+            .unwrap_or_else(|_| "<underivable>".to_string());
+        info!(
+            public_key = %public,
+            "externally-supplied PLC rotation key loaded — included in every genesis op"
+        );
     }
 
     // PLC genesis service. Constructed when a PLC directory is configured;
@@ -1376,36 +1386,29 @@ fn parse_jwk_set_env(raw: &str) -> anyhow::Result<Vec<atproto_identity::key::Key
 /// `Err` when only one half is provided. The DID-key string identifies
 /// the curve; the private bytes are base64url-decoded.
 fn parse_external_plc_rotation_key(
-    did_key: Option<&str>,
-    private_b64: Option<&str>,
+    private_did_key: Option<&str>,
 ) -> anyhow::Result<Option<atproto_identity::key::KeyData>> {
-    use atproto_identity::key::{KeyData, KeyType, identify_key};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-    match (did_key, private_b64) {
-        (None, None) => Ok(None),
-        (Some(_), None) | (None, Some(_)) => Err(anyhow::anyhow!(
-            "PDS_PLC_ROTATION_KEY_DID_KEY and PDS_PLC_ROTATION_KEY_PRIVATE must both be set"
+    use atproto_identity::key::{KeyType, identify_key};
+    let Some(raw) = private_did_key else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    // `did:key:z…` and a bare `z…` are the same key written two ways.
+    let bare = raw.strip_prefix("did:key:").unwrap_or(raw);
+    let key = identify_key(bare)
+        .map_err(|e| anyhow::anyhow!("PDS_PLC_ROTATION_KEY_PRIVATE is not a usable key: {e}"))?;
+    match key.key_type() {
+        // The two curves PLC accepts for a rotation key.
+        KeyType::P256Private | KeyType::K256Private => Ok(Some(key)),
+        // A public key would let the server list the operator's key and
+        // never sign with it, which fails later and further away.
+        KeyType::P256Public | KeyType::K256Public => Err(anyhow::anyhow!(
+            "PDS_PLC_ROTATION_KEY_PRIVATE is a public key; it must be the private form \
+             (did:key:z42t… for P-256, did:key:z3vL… for K-256)"
         )),
-        (Some(did_key), Some(b64)) => {
-            // Identify the public key from the DID-key form to learn the curve.
-            let public = identify_key(did_key)
-                .map_err(|e| anyhow::anyhow!("identify PLC rotation public key: {e}"))?;
-            let priv_bytes = B64URL
-                .decode(b64.as_bytes())
-                .map_err(|e| anyhow::anyhow!("decode PLC rotation private bytes: {e}"))?;
-            let priv_type = match public.key_type() {
-                &KeyType::P256Public => KeyType::P256Private,
-                &KeyType::P384Public => KeyType::P384Private,
-                &KeyType::K256Public => KeyType::K256Private,
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "PLC rotation key must be P-256, P-384, or K-256; got {other:?}"
-                    ));
-                }
-            };
-            Ok(Some(KeyData::new(priv_type, priv_bytes)))
-        }
+        other => Err(anyhow::anyhow!(
+            "PDS_PLC_ROTATION_KEY_PRIVATE must be a P-256 or K-256 private key; got {other:?}"
+        )),
     }
 }
 

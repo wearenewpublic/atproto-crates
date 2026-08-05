@@ -92,6 +92,38 @@ otherwise. `PDS_PRODUCTION=true` additionally refuses sentinel secrets,
 `did:web:localhost`, and the in-memory durability profile — it is a guard
 against deploying a development configuration by accident.
 
+### Operator-wide PLC rotation key
+
+Optional, and only effective **before** the first account: it is written into
+each account's genesis operation, so accounts created earlier will not carry
+it. It is the operator's recovery path for every identity this server issues.
+
+```
+PDS_PLC_ROTATION_KEY_PRIVATE=did:key:z42t…
+```
+
+One value, in the form key generators print. Make one with either:
+
+```
+goat key generate --type p256
+cargo run -q --features clap --bin atproto-identity-key -- generate p256
+```
+
+and use the **private** `did:key` — `did:key:z42t…` for P-256, `did:key:z3vL…`
+for K-256. Those are the two curves PLC accepts for a rotation key; a public
+key, or any other curve, is refused at boot with a message naming this
+variable.
+
+The server logs the key's **public** form at startup, so a running deployment
+can be checked against the key you hold without the log ever carrying the
+secret.
+
+Keep it offline. Nothing here can reproduce it.
+
+> Changing this later is safe; changing it to a *different* key is not, in the
+> sense that accounts already created keep the key that was in force when
+> their genesis operation was signed. Re-encoding the same key is fine.
+
 ### Administration by DID
 
 ```

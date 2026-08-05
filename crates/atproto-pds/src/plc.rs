@@ -55,8 +55,7 @@ pub struct PlcConfig {
     /// When `Some(...)`, every PLC genesis op lists this key in
     /// `rotation_keys` ALONGSIDE the freshly-generated per-account key —
     /// giving the PDS a fallback-recovery path. Loaded from
-    /// `PDS_PLC_ROTATION_KEY_DID_KEY` + `PDS_PLC_ROTATION_KEY_PRIVATE`
-    /// at startup.
+    /// `PDS_PLC_ROTATION_KEY_PRIVATE` at startup.
     pub external_rotation_key: Option<KeyData>,
 }
 
