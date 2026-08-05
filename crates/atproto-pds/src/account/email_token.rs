@@ -40,25 +40,37 @@ pub const PURPOSE_DELETE_ACCOUNT: &str = "delete_account";
 /// the account's rotation key.
 pub const PURPOSE_PLC_OPERATION: &str = "plc_operation";
 
-/// Alphabet for a mailed confirmation code.
+/// Alphabet for a mailed confirmation code: RFC 4648 base32.
 ///
-/// Crockford base32 minus the letters that get misread off a screen and
-/// mistyped back in: no `I`/`L` against `1`, no `O` against `0`, no `U`. A code
-/// exists to be read out of an email and typed into a client, so the cost of an
-/// ambiguous glyph is paid by the account holder every time.
-const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ23456789";
+/// Not a free choice. The official client sanitises what the account holder
+/// types with `value.toUpperCase().replace(/[^A-Z2-7]/g, \'\')` and validates
+/// against `/^[A-Z2-7]{5}-[A-Z2-7]{5}$/` (social-app,
+/// `components/dialogs/EmailDialog/components/TokenField.tsx` and
+/// `lib/strings/password.ts`). Any character outside this set is silently
+/// dropped as it is typed, so a code containing one cannot be entered at all.
+///
+/// An earlier alphabet here dropped the glyphs that get misread off a screen --
+/// no `I`/`L` against `1`, no `O` against `0` -- and kept `8` and `9` to make up
+/// the count. Both fall outside `[A-Z2-7]`, which left just under half of all
+/// codes impossible to type into the client they were mailed for. Legibility is
+/// worth less than being enterable, and the reference uses base32 for this
+/// reason.
+///
+/// 32 also divides 256 evenly, so the index below is unbiased.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 /// Generate a mailed confirmation code.
 ///
-/// Two groups of five from [`CODE_ALPHABET`], joined by a hyphen -- `A3K9M-2XPQR`
+/// Two groups of five from [`CODE_ALPHABET`], joined by a hyphen -- `A3K7M-2XPQR`
 /// -- which is the shape the reference uses and the shape clients prompt for
-/// ("enter the code above"). Codes were 43-character base64 before, which is
-/// correct as a bearer token and unusable as something a person retypes.
+/// (the official client's field is placeheld `XXXXX-XXXXX`). Codes were
+/// 43-character base64 before, which is correct as a bearer token and unusable
+/// as something a person retypes.
 ///
-/// 30^10 is a little over 49 bits. These are single-use, expire within the
-/// hour, and are spent behind the auth rate-limit tier, so the search space
-/// that matters is what an attacker can actually try inside that window rather
-/// than the space itself.
+/// 32^10 is exactly 50 bits. These are single-use, expire within the hour, and
+/// are spent behind the auth rate-limit tier, so the search space that matters
+/// is what an attacker can actually try inside that window rather than the
+/// space itself.
 #[must_use]
 pub fn generate_code() -> String {
     use rand::RngExt;
@@ -385,21 +397,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_codes_are_typeable_and_unambiguous() {
-        for _ in 0..200 {
+    fn generated_codes_are_enterable_in_the_official_client() {
+        // The client strips anything outside `[A-Z2-7]` as the account holder
+        // types, and validates `^[A-Z2-7]{5}-[A-Z2-7]{5}$`. A code carrying any
+        // other character cannot be entered at all -- not rejected, silently
+        // unenterable -- so this is the property that decides the alphabet.
+        for _ in 0..500 {
             let code = generate_code();
             assert_eq!(code.len(), 11, "code {code} is not the mailed shape");
             assert_eq!(code.as_bytes()[5], b'-', "code {code} is not grouped");
-            // Every glyph a reader could confuse for another is absent by
-            // construction: the code is read off a screen and typed back.
             for b in code.bytes().filter(|b| *b != b'-') {
                 assert!(
-                    CODE_ALPHABET.contains(&b),
-                    "code {code} uses a glyph outside the alphabet"
-                );
-                assert!(
-                    !b"ILOU01".contains(&b),
-                    "code {code} uses an ambiguous glyph"
+                    b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b),
+                    "code {code} carries '{}', which the client silently drops",
+                    b as char
                 );
             }
         }
@@ -443,9 +454,9 @@ mod tests {
         // other implementations, must still be looked up exactly as given.
         let legacy = "r2sr6f67D-KtZAcz6jVIDNbn7-mRKFLBo8eqEnUQhKw";
         assert_eq!(normalize_code(legacy), legacy);
-        // Right length, but carries glyphs the alphabet excludes -- so it is
+        // Right length, but carries digits the alphabet excludes -- so it is
         // not one of ours and must not be rewritten into something else.
-        assert_eq!(normalize_code("ILOU01ILOU"), "ILOU01ILOU");
+        assert_eq!(normalize_code("ABCDE01890"), "ABCDE01890");
         assert_eq!(normalize_code(""), "");
     }
 
