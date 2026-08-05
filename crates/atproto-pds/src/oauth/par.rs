@@ -265,16 +265,29 @@ pub async fn par_handler(
         ));
     }
 
-    // The declared scope is the ceiling. Without this a client could request
-    // any scope it liked at authorization time regardless of what it
-    // published, and the consent screen would faithfully show the holder a
-    // permission the client never registered for.
+    // The declared scope is the ceiling for any scope a client can enumerate.
+    // Without this a client could request whatever it liked at authorization
+    // time regardless of what it published, and the consent screen would
+    // faithfully show the holder a permission the client never registered for.
+    //
+    // `space:` scopes are exempt, and have to be. One carries its subject in
+    // its parameters -- `space:<type>?authority=<did>&action=read`, and
+    // `space:<type>&action=read` for the default self-authority -- so the set
+    // of them is unbounded and no client can list its members in a static
+    // document. The constraint on those is enforced where it can be: the
+    // consent screen names the authority and the action, and the space
+    // authority checks membership when the delegation token is minted.
+    // Requiring them here would mean no client could ever hold one.
+    //
+    // Keyed on the `space:` prefix rather than on the presence of `?`, because
+    // the self-authority form carries parameters without one -- which is what
+    // the space suite caught when the first version of this used `?`.
     if let Some(declared) = metadata.scope.as_deref() {
         let allowed: Vec<&str> = declared.split_whitespace().collect();
         if let Some(extra) = resolved
             .scope
             .split_whitespace()
-            .find(|s| !allowed.contains(s))
+            .find(|s| !s.starts_with("space:") && !allowed.contains(s))
         {
             return Err(refuse(
                 "invalid_scope",
