@@ -327,8 +327,8 @@ impl HttpState {
     /// that logs the would-be confirmation URL at INFO.
     #[must_use]
     /// Configure the policy documents new accounts must accept.
-    pub fn with_policy_documents(mut self, policy: PolicyDocuments) -> Self {
-        self.policy = Some(policy);
+    pub fn with_policy_documents(mut self, policy: Option<PolicyDocuments>) -> Self {
+        self.policy = policy;
         self
     }
 

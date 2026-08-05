@@ -88,6 +88,26 @@ struct Args {
     #[arg(long, env = "PDS_INVITE_REQUIRED", default_value_t = false)]
     invite_required: bool,
 
+    /// Identifier of the policy document set new accounts must accept.
+    ///
+    /// Recorded verbatim in the `com.atproto-crates.pds.policyAcceptance`
+    /// record written to the account's own repository. A dated content hash
+    /// -- `2026-08-05-bafkrei...` -- names an immutable set, so revising the
+    /// documents yields a different identifier and a fresh acceptance rather
+    /// than silently re-pointing an old one.
+    ///
+    /// Takes effect only alongside `--policy-url`: an identifier with nothing
+    /// to read is an agreement to something the holder was never shown.
+    #[arg(long, env = "PDS_POLICY_SET_ID")]
+    policy_set_id: Option<String>,
+
+    /// Where the policy documents are published.
+    ///
+    /// Shown to the holder before they agree, and recorded next to the
+    /// identifier because the identifier alone does not say what was read.
+    #[arg(long, env = "PDS_POLICY_URL")]
+    policy_url: Option<String>,
+
     /// PLC directory hostname (e.g., `plc.directory`). When unset, PLC genesis
     /// is disabled and `createAccount` requires a caller-supplied DID.
     #[arg(long, env = "PDS_DID_PLC_URL")]
@@ -708,6 +728,30 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Policy documents. Both halves or neither: an identifier with no URL
+    // records an agreement to something the holder was never shown, and a URL
+    // with no identifier shows a document that nothing attests to. Half a
+    // configuration is more likely a typo than an intention, so it is refused
+    // at boot rather than silently ignored at signup.
+    let policy_documents = match (&args.policy_set_id, &args.policy_url) {
+        (Some(set_id), Some(url)) => {
+            info!(policy_set_id = %set_id, policy_url = %url, "policy acceptance required at signup");
+            Some(atproto_pds::http::state::PolicyDocuments {
+                set_id: set_id.clone(),
+                url: url.clone(),
+            })
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            error!("PDS_POLICY_SET_ID is set without PDS_POLICY_URL; refusing to start");
+            std::process::exit(2);
+        }
+        (None, Some(_)) => {
+            error!("PDS_POLICY_URL is set without PDS_POLICY_SET_ID; refusing to start");
+            std::process::exit(2);
+        }
+    };
+
     // Captured before `args` is partially moved into `HttpState` below.
     let rate_policy_inputs = RateLimitInputs {
         global: args.rate_limit,
@@ -749,6 +793,7 @@ async fn main() -> anyhow::Result<()> {
     .with_space_credential_ttl(args.space_credential_ttl_seconds)
     .with_service_handle_domains(args.service_handle_domains.clone())
     .with_crawlers(args.crawlers.clone())
+    .with_policy_documents(policy_documents)
     // Persist OAuth in-flight state (PAR / auth-codes / refresh handles)
     // to the accounts DB so the lifecycle survives PDS restart. See
     // for the gap this closes.

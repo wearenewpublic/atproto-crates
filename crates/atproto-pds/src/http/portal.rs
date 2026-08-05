@@ -26,6 +26,7 @@ use crate::account::{app_password, portal};
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
 use axum::extract::{Form, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
@@ -228,6 +229,12 @@ pub struct PortalQuery {
     /// this page can read it again.
     #[serde(default)]
     pub secret: Option<String>,
+    /// Handle re-typed into the signup form after a refusal.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Email re-typed into the signup form after a refusal.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 fn sign_in_body(message: Option<&str>, signup_available: bool) -> String {
@@ -412,6 +419,326 @@ fn new_cookie_value() -> String {
     rand::rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+// ---------------------------------------------------------------------------
+//  Sign up
+// ---------------------------------------------------------------------------
+
+/// `GET /account/signup`.
+pub async fn sign_up_page(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<PortalQuery>,
+) -> Result<Response, XrpcError> {
+    if current_account(&state, &headers).await.is_some() {
+        return Ok(redirect("/account"));
+    }
+    if state.account_manager.is_none() {
+        return Err(XrpcError::new(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            "this server does not create accounts",
+        ));
+    }
+    Ok(page(
+        "Create an account",
+        &sign_up_body(&state, q.msg.as_deref(), &q),
+    )
+    .into_response())
+}
+
+fn sign_up_body(state: &HttpState, message: Option<&str>, prior: &PortalQuery) -> String {
+    let banner = match message {
+        Some(m) if m.starts_with("err-") => notice("err", &m[4..].replace('-', " ")),
+        _ => String::new(),
+    };
+
+    // The handle is `<what they type>.<domain>`, and there is no point letting
+    // someone type a full handle the server will then refuse.
+    let domain = state
+        .service_handle_domains
+        .first()
+        .map(|d| d.trim_start_matches('.').to_string())
+        .unwrap_or_default();
+    let handle_hint = if domain.is_empty() {
+        r#"<p class="muted">This server pins no handle domain, so enter a full handle you control.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<p class="muted">Your handle will be <code>&lt;name&gt;.{}</code>.</p>"#,
+            esc(&domain)
+        )
+    };
+
+    let invite = if state.invite_required {
+        r#"<label for="invite">Invite code</label>
+           <input id="invite" name="invite" type="text" required
+                  autocomplete="off" placeholder="required by this server">"#
+    } else {
+        ""
+    };
+
+    // The checkbox is `required`, so the browser will not submit without it;
+    // the handler checks again, because a form is not a security boundary.
+    let policy = state
+        .policy
+        .as_ref()
+        .map(|p| {
+            format!(
+                r#"<div class="notice warn">
+                     <label style="font-weight:400;margin:0">
+                       <input type="checkbox" name="policy" value="accept" required
+                              style="width:auto;margin-right:0.5em">
+                       You must accept the policy <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> to continue.
+                     </label>
+                   </div>"#,
+                url = esc(&p.url),
+            )
+        })
+        .unwrap_or_default();
+
+    let keep = |v: &Option<String>| v.as_deref().map(esc).unwrap_or_default();
+
+    format!(
+        r#"<h1>Create an account</h1>
+<p class="sub">On this server.</p>
+{banner}
+<section>
+<form method="POST" action="/account/signup">
+  <label for="name">Handle</label>
+  <input id="name" name="name" type="text" required autofocus autocomplete="username"
+         value="{name}" maxlength="63">
+  {handle_hint}
+  <label for="email">Email address</label>
+  <input id="email" name="email" type="email" required autocomplete="email" value="{email}">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" required minlength="8"
+         autocomplete="new-password">
+  {invite}
+  {policy}
+  <button type="submit">Create account</button>
+</form>
+</section>
+<p class="muted">Already have one? <a href="/account/signin">Sign in</a>.</p>"#,
+        name = keep(&prior.name),
+        email = keep(&prior.email),
+    )
+}
+
+/// Form body for account creation.
+#[derive(Debug, Deserialize)]
+pub struct SignUpForm {
+    /// First label of the handle, or a whole handle when no domain is pinned.
+    pub name: String,
+    /// Email address.
+    pub email: String,
+    /// Password.
+    pub password: String,
+    /// Invite code, when the server requires one.
+    #[serde(default)]
+    pub invite: Option<String>,
+    /// Present and equal to `accept` when the policy checkbox was ticked.
+    #[serde(default)]
+    pub policy: Option<String>,
+}
+
+/// `POST /account/signup`.
+pub async fn sign_up(
+    State(state): State<HttpState>,
+    parts: Parts,
+    Form(form): Form<SignUpForm>,
+) -> Result<Response, XrpcError> {
+    let headers = parts.headers.clone();
+    require_same_origin(&headers)?;
+    let manager = state
+        .account_manager
+        .as_ref()
+        .ok_or_else(|| XrpcError::new(StatusCode::NOT_FOUND, "NotFound", "no account manager"))?;
+
+    // Re-typed values come back on the query so a refusal does not empty the
+    // form. The password never does.
+    let again = |msg: &str| {
+        redirect(&format!(
+            "/account/signup?msg=err-{}&name={}&email={}",
+            msg,
+            urlencoding_encode(form.name.trim()),
+            urlencoding_encode(form.email.trim()),
+        ))
+    };
+
+    if state.policy.is_some() && form.policy.as_deref() != Some("accept") {
+        return Ok(again("the-policy-must-be-accepted-to-continue"));
+    }
+
+    let domain = state
+        .service_handle_domains
+        .first()
+        .map(|d| d.trim_start_matches('.').to_string())
+        .unwrap_or_default();
+    let name = form.name.trim().trim_start_matches('@');
+    let handle = if domain.is_empty() || name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{name}.{domain}")
+    };
+
+    // The same validators `createAccount` runs, so the form reports a problem
+    // rather than the server reporting one the form could have caught.
+    let handle = match crate::handle::normalize_and_validate(&handle) {
+        Ok(h) => h,
+        Err(_) => return Ok(again("that-is-not-a-valid-handle")),
+    };
+    if !crate::http::auth_handlers::is_email_shape(form.email.trim()) {
+        return Ok(again("that-is-not-a-valid-email-address"));
+    }
+    if form.password.chars().count() < 8 {
+        return Ok(again("the-password-is-too-short"));
+    }
+    if state
+        .reader
+        .accounts()
+        .lookup_handle(&handle)
+        .await
+        .map_err(XrpcError::from)?
+        .is_some()
+    {
+        return Ok(again("that-handle-is-already-taken"));
+    }
+
+    // Delegated to the XRPC handler rather than reimplemented: invite
+    // redemption, PLC genesis, denylists, rate limits and the sequencer all
+    // live there, and a second creation path would drift from the first.
+    let input = crate::http::auth_handlers::CreateAccountInput {
+        email: Some(form.email.trim().to_string()),
+        handle: handle.clone(),
+        did: None,
+        invite_code: form
+            .invite
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
+        password: form.password.clone(),
+    };
+    let created = match crate::http::auth_handlers::create_account(
+        State(state.clone()),
+        parts,
+        crate::http::extract::XrpcJson(input),
+    )
+    .await
+    {
+        Ok(crate::http::extract::XrpcJson(session)) => session,
+        Err(e) => {
+            tracing::warn!(handle = %handle, error = %e.message, "portal signup refused");
+            return Ok(again(&slugify(&e.message)));
+        }
+    };
+
+    let did = created.did.clone();
+
+    // The acceptance record goes in the account's own repository, so it
+    // travels with the identity rather than living only on the server that
+    // asked for it.
+    if let Some(policy) = state.policy.clone() {
+        record_policy_acceptance(&state, &did, &policy).await;
+    }
+
+    // Sign the new account straight in; making someone type the password they
+    // just chose is friction with nothing behind it.
+    let pool = manager.account_pool();
+    let cookie = new_cookie_value();
+    let epoch = portal::session_epoch(&pool, &did)
+        .await
+        .map_err(XrpcError::from)?;
+    portal::create_session(
+        &pool,
+        &cookie,
+        &did,
+        epoch,
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok()),
+    )
+    .await
+    .map_err(XrpcError::from)?;
+    tracing::info!(did = %did, handle = %handle, "portal signup");
+
+    Ok((
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/account".to_string()),
+            (
+                header::SET_COOKIE,
+                set_cookie(
+                    &cookie,
+                    is_secure(&headers, &state),
+                    portal::PORTAL_SESSION_TTL_SECS,
+                ),
+            ),
+        ],
+    )
+        .into_response())
+}
+
+/// Write the policy-acceptance record into the new account's repository.
+///
+/// Best-effort and logged loudly on failure. The account exists by this point
+/// and the holder did tick the box; refusing the signup because a record write
+/// failed would leave them with neither an account nor an explanation, and
+/// re-running signup would collide on the handle they just took.
+async fn record_policy_acceptance(
+    state: &HttpState,
+    did: &str,
+    policy: &crate::http::state::PolicyDocuments,
+) {
+    let Some(writer) = state.writer.as_ref() else {
+        tracing::error!(
+            did,
+            "policy accepted but this PDS has no repo writer to record it"
+        );
+        return;
+    };
+    let value = serde_json::json!({
+        "$type": POLICY_ACCEPTANCE_NSID,
+        "policy": policy.set_id,
+        "acceptedAt": chrono::Utc::now().to_rfc3339(),
+        "policyUrl": policy.url,
+    });
+    let op = crate::repo::WriteOp {
+        action: crate::repo::WriteAction::Create,
+        collection: POLICY_ACCEPTANCE_NSID.to_string(),
+        rkey: atproto_record::tid::Tid::new().to_string(),
+        value: Some(value),
+        swap_record: None,
+    };
+    match writer.apply_writes(did, vec![op]).await {
+        Ok(_) => tracing::info!(did, policy = %policy.set_id, "policy acceptance recorded"),
+        Err(e) => {
+            tracing::error!(did, policy = %policy.set_id, error = ?e,
+                "policy was accepted but the record could not be written")
+        }
+    }
+}
+
+/// Turn a server message into a hyphenated slug the redirect can carry.
+///
+/// The banner un-slugs it on the way out, so whatever the XRPC layer said
+/// about a refused signup reaches the person who caused it rather than being
+/// replaced by a generic "could not create account".
+fn slugify(message: &str) -> String {
+    let cleaned: String = message
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    cleaned
+        .split_whitespace()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase()
+}
+
+/// The record type an acceptance is written as.
+const POLICY_ACCEPTANCE_NSID: &str = "com.atproto-crates.pds.policyAcceptance";
 
 // ---------------------------------------------------------------------------
 //  Dashboard
