@@ -149,6 +149,18 @@ The server announces itself to each entry at startup, so setting this is the
 whole of what you have to do. It re-announces on every boot, which is harmless
 — `requestCrawl` is idempotent.
 
+It retries, and it needs to. The relay does not take the announcement on
+trust: it tries to reach the hostname you gave it and refuses with a bare
+`400` if it cannot. During a deploy that is exactly the situation — the new
+container is listening locally while Railway is still health-checking it and
+draining the old one, so the moment the server naturally announces is the
+moment it is least reachable. Attempts run at 0s, 15s, 1m, 3m and 15m, and
+stop at the first acceptance.
+
+Watch for `requestCrawl: announced` in the logs. A refusal logs the relay's
+own explanation, not just the status, and giving up entirely logs the `curl`
+to run by hand.
+
 Leave it unset only if you intend to stay off the public network. There is no
 warning when it is unset beyond a debug line, because a private PDS is a
 legitimate thing to run.

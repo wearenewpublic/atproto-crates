@@ -1030,11 +1030,17 @@ async fn main() -> anyhow::Result<()> {
     //
     // Spawned rather than awaited, and after the bind: a relay that is down or
     // slow must not hold up a server that is otherwise ready to serve.
+    //
+    // It retries, because the relay checks that it can reach this host before
+    // accepting, and at process start the deployment is routinely not reachable
+    // yet -- the listener is up locally while the platform is still health-
+    // checking the new container or draining the old one. A single attempt here
+    // fails for a server that is fine a minute later.
     let announce_crawlers = args.crawlers.clone();
     let announce_hostname =
         atproto_pds::crawl::public_hostname(args.hostname.as_deref(), &args.service_did);
     tracker.spawn(async move {
-        atproto_pds::crawl::announce(&announce_crawlers, &announce_hostname).await;
+        atproto_pds::crawl::announce_with_retry(&announce_crawlers, &announce_hostname).await;
     });
 
     // Spaces notifier worker — drains the `notify_attempt` DLQ on a fixed
