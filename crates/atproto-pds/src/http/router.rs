@@ -622,13 +622,24 @@ fn cors_layer() -> tower_http::cors::CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            HeaderName::from_static("dpop"),
-            HeaderName::from_static("atproto-proxy"),
-            HeaderName::from_static("atproto-accept-labelers"),
-        ])
+        // Mirror whatever the client asks for rather than naming a fixed set.
+        //
+        // A PDS cannot know which request headers its callers will send. The
+        // set is open-ended and grows without warning: an app can ship a build
+        // that adds a vendor header — `x-bsky-topics` is a real example — and a
+        // named allowlist rejects it at the preflight. The browser then refuses
+        // to send the request at all, so the failure never reaches the server,
+        // never appears in its logs, and surfaces to the user as a bare
+        // "unable to connect" with a healthy-looking PDS behind it.
+        //
+        // Mirroring costs nothing here. A request header is only attached by a
+        // script that chose to set it, and a script that can set headers can
+        // already make the identical request from its own backend, where no
+        // CORS policy applies. The allowlist was never a barrier to an attacker
+        // — only to legitimate clients. What does the real work is the absence
+        // of `Allow-Credentials` below: that is the switch that would let a page
+        // spend a visitor's ambient credentials, and it stays off.
+        .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
         // A client cannot read a response header it was not told about, so a
         // DPoP nonce challenge or a `WWW-Authenticate` hint would be invisible
         // to the code that has to act on it.

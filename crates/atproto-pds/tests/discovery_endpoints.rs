@@ -338,6 +338,50 @@ async fn preflight_is_answered_without_credentials() {
     }
 }
 
+/// A preflight must allow request headers this server has never heard of.
+///
+/// Clients invent headers. The official Bluesky app sends `x-bsky-topics` on
+/// some feed reads, and nothing in AT Protocol says it may not add another
+/// tomorrow. A fixed allowlist turns each new one into an outage that is
+/// invisible from the server: the browser blocks the request at the preflight,
+/// so it never arrives, never logs, and the operator sees only healthy traffic
+/// while the user sees "unable to connect".
+///
+/// This asserts the open-ended shape directly, with a header no real client
+/// sends — pinning the named set instead would pass while the bug was live.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_allows_unknown_client_headers() {
+    let (app, _mgr, _tmp) = build_app().await;
+
+    let request = Request::builder()
+        .uri("/xrpc/app.bsky.feed.getTimeline")
+        .method("OPTIONS")
+        .header("origin", "https://bsky.app")
+        .header("access-control-request-method", "GET")
+        .header(
+            "access-control-request-headers",
+            "authorization,x-bsky-topics,x-not-invented-yet",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+
+    let allowed = response
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    for header in ["authorization", "x-bsky-topics", "x-not-invented-yet"] {
+        assert!(
+            allowed.contains(header),
+            "preflight refused `{header}`, so a browser will not send the \
+             request at all: {allowed:?}"
+        );
+    }
+}
+
 /// A real response carries the header too, and exposes what a client must read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_simple_request_carries_the_origin_header() {
