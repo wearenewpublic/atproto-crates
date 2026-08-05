@@ -184,12 +184,31 @@ mod smtp {
                 .map_err(|e| PdsError::Storage {
                     reason: format!("build email message: {e}"),
                 })?;
-            self.transport
-                .send(msg)
-                .await
-                .map_err(|e| PdsError::Storage {
+            let response = self.transport.send(msg).await.map_err(|e| {
+                tracing::warn!(to = to, subject = subject, error = %e, "SMTP send failed");
+                PdsError::Storage {
                     reason: format!("smtp send: {e}"),
-                })?;
+                }
+            })?;
+
+            // Logged on success as well as failure.
+            //
+            // Nothing recorded a delivered message, so an operator whose mail
+            // was not arriving had only silence to work with -- and silence
+            // meant either "sent" or "the handler never ran", which are
+            // different problems with different fixes. The relay's reply is
+            // included because it usually carries the queue identifier, which
+            // is what ties this line to a row in the provider's own log.
+            //
+            // Recipient and subject only. Never the body: it carries
+            // password-reset and account-deletion codes, and logs are
+            // routinely lower-trust than the credential store.
+            tracing::info!(
+                to = to,
+                subject = subject,
+                response = ?response.message().collect::<Vec<_>>(),
+                "email accepted by the relay"
+            );
             Ok(())
         }
     }
