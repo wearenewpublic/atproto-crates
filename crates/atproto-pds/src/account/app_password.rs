@@ -35,6 +35,13 @@ pub struct AppPasswordRow {
     pub privileged: bool,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
+    /// When a session was last minted from this password, if ever.
+    ///
+    /// Stamped at sign-in rather than on every authenticated request: the
+    /// question the portal answers is "is this credential still in use, and
+    /// do I recognise it", which a per-session granularity answers without
+    /// putting a write in front of every read.
+    pub last_used_at: Option<String>,
 }
 
 /// Result of `create` — the plaintext password is included exactly once.
@@ -44,6 +51,44 @@ pub struct CreatedAppPassword {
     pub row: AppPasswordRow,
     /// Plaintext password — **shown to the user once**, never retrievable.
     pub plaintext: String,
+}
+
+/// Record that a session was just minted from this app password.
+///
+/// Best-effort by design: the sign-in has already succeeded by the time this
+/// runs, and failing to write a display timestamp is not a reason to refuse
+/// the session. Errors are logged and swallowed.
+pub async fn touch_last_used(pool: &AccountPool, id: &str) {
+    let now = Utc::now().to_rfc3339();
+    let result = match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query("UPDATE app_password SET last_used_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(id)
+                .execute(pool.as_sqlite())
+                .await
+                .map(|_| ())
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query("UPDATE app_password SET last_used_at = $1 WHERE id = $2")
+                .bind(&now)
+                .bind(id)
+                .execute(pool.as_postgres())
+                .await
+                .map(|_| ())
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = ?e, app_password_id = id, "could not record app-password use");
+    }
 }
 
 /// Mint a new app password for `did`.
@@ -117,6 +162,7 @@ pub async fn create(
             name: name.to_string(),
             privileged,
             created_at: now,
+            last_used_at: None,
         },
         plaintext,
     })
@@ -127,8 +173,8 @@ pub async fn list(pool: &AccountPool, did: &str) -> PdsResult<Vec<AppPasswordRow
     match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
-            let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
-                "SELECT id, did, name, privileged, created_at
+            let rows: Vec<(String, String, String, i64, String, Option<String>)> = sqlx::query_as(
+                "SELECT id, did, name, privileged, created_at, last_used_at
                  FROM app_password WHERE did = ? ORDER BY created_at DESC",
             )
             .bind(did)
@@ -139,19 +185,22 @@ pub async fn list(pool: &AccountPool, did: &str) -> PdsResult<Vec<AppPasswordRow
             })?;
             Ok(rows
                 .into_iter()
-                .map(|(id, did, name, privileged, created_at)| AppPasswordRow {
-                    id,
-                    did,
-                    name,
-                    privileged: privileged != 0,
-                    created_at,
-                })
+                .map(
+                    |(id, did, name, privileged, created_at, last_used_at)| AppPasswordRow {
+                        id,
+                        did,
+                        name,
+                        privileged: privileged != 0,
+                        created_at,
+                        last_used_at,
+                    },
+                )
                 .collect())
         }
         #[cfg(feature = "postgres")]
         AccountPoolKind::Postgres => {
-            let rows: Vec<(String, String, String, bool, String)> = sqlx::query_as(
-                "SELECT id, did, name, privileged, created_at
+            let rows: Vec<(String, String, String, bool, String, Option<String>)> = sqlx::query_as(
+                "SELECT id, did, name, privileged, created_at, last_used_at
                  FROM app_password WHERE did = $1 ORDER BY created_at DESC",
             )
             .bind(did)
@@ -162,13 +211,16 @@ pub async fn list(pool: &AccountPool, did: &str) -> PdsResult<Vec<AppPasswordRow
             })?;
             Ok(rows
                 .into_iter()
-                .map(|(id, did, name, privileged, created_at)| AppPasswordRow {
-                    id,
-                    did,
-                    name,
-                    privileged,
-                    created_at,
-                })
+                .map(
+                    |(id, did, name, privileged, created_at, last_used_at)| AppPasswordRow {
+                        id,
+                        did,
+                        name,
+                        privileged,
+                        created_at,
+                        last_used_at,
+                    },
+                )
                 .collect())
         }
         #[cfg(not(feature = "sqlite"))]
@@ -388,6 +440,10 @@ pub async fn verify(
                 name,
                 privileged,
                 created_at,
+                // `verify` is on the sign-in path and reads only what it
+                // needs to check the secret; the portal's list is where this
+                // is actually shown.
+                last_used_at: None,
             }));
         }
     }

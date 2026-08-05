@@ -480,6 +480,10 @@ pub async fn create_session(
     let (app_id, authority) = match app {
         Some(row) => {
             let authority = session::SessionAuthority::from_row(&row.name, row.privileged);
+            // The portal lists app passwords so the holder can spot one they
+            // do not recognise; "created three months ago" does not answer
+            // that on its own, and "last used" does.
+            app_password::touch_last_used(&manager.account_pool(), &row.id).await;
             (row.id, authority)
         }
         None => {

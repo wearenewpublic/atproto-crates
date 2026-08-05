@@ -472,13 +472,14 @@ pub async fn dashboard(
         .filter(|p| p.name != "__primary__")
         .collect();
     let app_rows = if listed.is_empty() {
-        r#"<tr><td colspan="3" class="muted">No app passwords.</td></tr>"#.to_string()
+        r#"<tr><td colspan="4" class="muted">No app passwords.</td></tr>"#.to_string()
     } else {
         listed
             .iter()
             .map(|p| {
                 format!(
                     r#"<tr><td><code>{}</code></td><td class="muted">{}</td>
+                    <td class="muted">{}</td>
                     <td style="text-align:right">
                       <form method="POST" action="/account/app-passwords/revoke" style="display:inline">
                         <input type="hidden" name="name" value="{}">
@@ -486,6 +487,12 @@ pub async fn dashboard(
                       </form></td></tr>"#,
                     esc(&p.name),
                     esc(&p.created_at),
+                    // An app password that has never signed in is worth
+                    // seeing as such rather than as a blank cell.
+                    p.last_used_at
+                        .as_deref()
+                        .map(esc)
+                        .unwrap_or_else(|| "never used".to_string()),
                     esc(&p.name),
                 )
             })
@@ -567,7 +574,7 @@ pub async fn dashboard(
 
 <section>
 <h2 style="margin-top:0">App passwords</h2>
-<table><thead><tr><th>Name</th><th>Created</th><th></th></tr></thead>
+<table><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead>
 <tbody>{app_rows}</tbody></table>
 <form method="POST" action="/account/app-passwords">
   <label for="apname">Name a new app password</label>
