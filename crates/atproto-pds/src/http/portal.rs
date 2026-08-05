@@ -810,6 +810,11 @@ pub async fn dashboard(
 
     let banner = match q.msg.as_deref() {
         Some("email-changed") => notice("ok", "Email address updated."),
+        Some("verification-sent") => notice(
+            "ok",
+            "A confirmation code was emailed to this address. It expires in an hour.",
+        ),
+        Some("email-verified") => notice("ok", "Email address confirmed."),
         Some("email-code-sent") => notice(
             "ok",
             "A confirmation code was emailed to your current address. Enter it below.",
@@ -924,6 +929,29 @@ pub async fn dashboard(
         ""
     };
 
+    // Only while unconfirmed. A confirmed address needs no prompt, and leaving
+    // the control visible would invite someone to re-send a code they have no
+    // use for.
+    let verify_block = if confirmed || email.is_empty() {
+        String::new()
+    } else {
+        r#"<div class="notice warn">
+  <b>This address is not confirmed.</b>
+  <p class="muted" style="margin:0.3em 0 0">Password reset and account recovery
+  are sent here, so an address nobody has proved control of is a recovery route
+  that may not work when it is needed.</p>
+  <form method="POST" action="/account/email/verify" style="margin-top:0.6em">
+    <label for="verify_token">Confirmation code</label>
+    <input id="verify_token" name="token" type="text" placeholder="XXXXX-XXXXX"
+           autocomplete="one-time-code" spellcheck="false" required>
+    <button type="submit">Confirm</button>
+    <button class="quiet" type="submit" formaction="/account/email/verify/send"
+            formnovalidate style="margin-left:0.4em">Send me a code</button>
+  </form>
+</div>"#
+            .to_string()
+    };
+
     let body = format!(
         r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
   <form method="POST" action="/account/signout" style="display:inline;float:right">
@@ -936,6 +964,7 @@ pub async fn dashboard(
 <section>
 <h2 style="margin-top:0">Email</h2>
 <p>{email_display} {email_state}</p>
+{verify_block}
 <form method="POST" action="/account/email">
   <label for="email">New email address</label>
   <input id="email" name="email" type="email" autocomplete="email" required>
@@ -1126,6 +1155,124 @@ pub async fn email_code(
         tracing::warn!(error = ?e, did = %account.did, "portal email-change code send failed");
     }
     Ok(redirect("/account?msg=email-code-sent"))
+}
+
+/// `POST /account/email/verify/send` — mail a fresh confirmation code.
+///
+/// The re-send. There was no way to confirm an address from this page at all:
+/// the dashboard reported "not confirmed" and offered nothing to do about it,
+/// while `requestEmailConfirmation` and `confirmEmail` existed only over XRPC.
+/// An account holder with only a browser could not complete the one step the
+/// page was telling them was outstanding.
+///
+/// Deliberately re-issuable. Mail is lost, filtered and delayed, and a code
+/// that can only be requested once turns any of those into a dead end.
+pub async fn send_verification(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let Some((_, account)) = current_account(&state, &headers).await else {
+        return Ok(redirect("/account/signin"));
+    };
+    let Some(address) = account.email.clone() else {
+        return Ok(redirect("/account?msg=err-there-is-no-address-to-confirm"));
+    };
+    if account.email_confirmed_at.is_some() {
+        return Ok(redirect("/account?msg=email-verified"));
+    }
+
+    let pool = state.reader.accounts().account_pool();
+    let token = crate::account::email_token::generate_code();
+    let expires = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
+    crate::account::email_token::insert(
+        &pool,
+        &token,
+        &account.did,
+        crate::account::email_token::PURPOSE_CONFIRM_EMAIL,
+        &expires,
+        None,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    let body = format!(
+        "Your confirmation code for this email address is:\n\n  {token}\n\n\
+         Enter it in your app to confirm the address. It expires in 1 hour."
+    );
+    if let Err(e) = state
+        .email
+        .send(&address, "Confirm your email address", &body)
+        .await
+    {
+        // The code is in storage and still redeemable, so the holder is not
+        // stuck -- but they should be told the mail did not go, rather than
+        // waiting for something that is not coming.
+        tracing::warn!(error = ?e, did = %account.did, "verification code send failed");
+        return Ok(redirect(
+            "/account?msg=err-the-code-could-not-be-emailed-check-the-server-logs",
+        ));
+    }
+    tracing::info!(did = %account.did, "verification code sent");
+    Ok(redirect("/account?msg=verification-sent"))
+}
+
+/// Form body for confirming the address already on the account.
+///
+/// Its own type rather than reusing `EmailForm`, whose `email` field is
+/// required: this form posts only a code, so sharing the type made axum reject
+/// the request before the handler ran, and the page redirected with no message
+/// at all.
+#[derive(Debug, Deserialize)]
+pub struct VerifyForm {
+    /// The code from the email.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// `POST /account/email/verify` — redeem a confirmation code.
+pub async fn verify_email(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<VerifyForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let Some((_, account)) = current_account(&state, &headers).await else {
+        return Ok(redirect("/account/signin"));
+    };
+    let manager = state
+        .account_manager
+        .as_ref()
+        .ok_or_else(|| XrpcError::new(StatusCode::NOT_FOUND, "NotFound", "no account manager"))?;
+
+    let Some(token) = form
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return Ok(redirect("/account?msg=err-enter-the-code-from-the-email"));
+    };
+    if crate::account::email_token::consume(
+        &manager.account_pool(),
+        token,
+        crate::account::email_token::PURPOSE_CONFIRM_EMAIL,
+        &account.did,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(redirect(
+            "/account?msg=err-that-code-is-not-valid-or-has-expired",
+        ));
+    }
+
+    manager
+        .set_email_confirmed_at(&account.did, Some(&chrono::Utc::now().to_rfc3339()))
+        .await
+        .map_err(XrpcError::from)?;
+    tracing::info!(did = %account.did, "email confirmed via the portal");
+    Ok(redirect("/account?msg=email-verified"))
 }
 
 /// `POST /account/email`.
