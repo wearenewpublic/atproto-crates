@@ -211,8 +211,14 @@ async fn import_repo_rejects_malformed_car() {
 /// acceptance: `requestEmailUpdate` writes a row into
 /// `email_token`; `confirmEmailUpdate` consumes it and updates
 /// `account.email`.
+/// The email-change flow as the lexicon defines it: `requestEmailUpdate`
+/// takes no input and reports whether a token is needed, then `updateEmail`
+/// carries the new address.
+///
+/// An unconfirmed address needs no token -- there is nothing to prove -- so
+/// this half exercises the direct path.
 #[tokio::test(flavor = "multi_thread")]
-async fn email_update_request_then_confirm() {
+async fn email_update_without_a_token_when_the_address_is_unconfirmed() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -238,44 +244,38 @@ async fn email_update_request_then_confirm() {
     .with_writer(writer);
     let app = build_router(state);
 
-    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
-
-    let (status, _) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.requestEmailUpdate",
-        json!({"email": "new@example.com"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Read the token + new_email from the email_token table.
-    let row: (String, String, String) = sqlx::query_as(
-        "SELECT token, did, new_email FROM email_token WHERE purpose = 'update_email'",
-    )
-    .fetch_one(&accounts_pool)
-    .await
-    .unwrap();
-    assert_eq!(row.1, "did:plc:alice");
-    assert_eq!(row.2, "new@example.com");
-    let confirm_token = row.0;
-
-    // Consume it via confirmEmailUpdate (no auth — token is the auth).
-    let (status, _) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.server.confirmEmailUpdate",
-        json!({"token": confirm_token}),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Verify the token row is gone (consumed) and the email was updated.
-    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM email_token")
-        .fetch_one(&accounts_pool)
+    let bearer = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    // An address on file but never confirmed: the account holder has stated it
+    // and not demonstrated it, which is the state a fresh signup is in.
+    manager
+        .set_email("did:plc:alice", Some("old@example.com"))
         .await
         .unwrap();
-    assert_eq!(remaining.0, 0);
+
+    // No body: the lexicon declares no input for this method. Demanding one
+    // is what made a spec-conformant client fail here.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.requestEmailUpdate",
+        json!({}),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["tokenRequired"], false,
+        "an unconfirmed address needs no token: {body}",
+    );
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.updateEmail",
+        json!({"email": "new@example.com"}),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
     let email: (Option<String>,) = sqlx::query_as("SELECT email FROM account WHERE did = ?")
         .bind("did:plc:alice")
         .fetch_one(&accounts_pool)
@@ -284,39 +284,110 @@ async fn email_update_request_then_confirm() {
     assert_eq!(email.0.as_deref(), Some("new@example.com"));
 }
 
-/// negative path: replaying a confirmation token after
-/// it's been used returns a 400 InvalidToken.
+/// A confirmed address needs a token, and the token is mailed to the address
+/// being moved *away from* -- so completing the change proves continued
+/// control of the mailbox on file, not merely of the destination.
 #[tokio::test(flavor = "multi_thread")]
-async fn confirm_email_update_rejects_replay() {
-    let (app, manager, _tmp) = build_app().await;
+async fn email_update_requires_a_token_when_the_address_is_confirmed() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let accounts_pool = accounts.pool().clone();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer);
+    let app = build_router(state);
+
     let bearer = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
-    post_json(
+    manager
+        .set_email("did:plc:alice", Some("old@example.com"))
+        .await
+        .unwrap();
+    manager
+        .set_email_confirmed_at("did:plc:alice", Some(&chrono::Utc::now().to_rfc3339()))
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.server.requestEmailUpdate",
-        json!({"email": "x@example.com"}),
+        json!({}),
         Some(&bearer),
     )
     .await;
-    let token = "manual-test-token";
-    // Replace any auto-generated token with our deterministic value so we
-    // can inject the replay attempt cleanly.
-    // (For brevity, we just call confirmEmailUpdate twice with the same
-    // generated token below.)
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["tokenRequired"], true, "body: {body}");
 
-    // Take the real generated token instead.
-    let app2 = app.clone();
-    let _ = token; // unused; keep symbol for documentation
-
-    // We can't easily fish out the generated token without the accounts
-    // pool here — so do it with a fresh pool.
-    let (status, _body) = post_json(
-        app2,
-        "/xrpc/com.atproto.server.confirmEmailUpdate",
-        json!({"token": "definitely-not-a-real-token"}),
-        None,
+    // Without the token the change is refused by the name the lexicon
+    // declares, so a client knows to go and get one.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.updateEmail",
+        json!({"email": "new@example.com"}),
+        Some(&bearer),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "TokenRequired", "body: {body}");
+
+    let row: (String,) =
+        sqlx::query_as("SELECT token FROM email_token WHERE purpose = 'update_email'")
+            .fetch_one(&accounts_pool)
+            .await
+            .unwrap();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.updateEmail",
+        json!({"email": "new@example.com", "token": row.0}),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The token is spent, and the new address is unconfirmed: it has been
+    // stated, not demonstrated.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.updateEmail",
+        json!({"email": "third@example.com", "token": row.0}),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a spent token changed the address again"
+    );
+
+    let account: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT email, email_confirmed_at FROM account WHERE did = ?")
+            .bind("did:plc:alice")
+            .fetch_one(&accounts_pool)
+            .await
+            .unwrap();
+    assert_eq!(account.0.as_deref(), Some("new@example.com"));
+    assert!(
+        account.1.is_none(),
+        "the new address should land unconfirmed, got {:?}",
+        account.1,
+    );
 }
 
 /// acceptance: setting `deleteAfter` to a past

@@ -148,29 +148,61 @@ async fn reserve_signing_key_returns_did_key() {
     );
 }
 
+/// The address is validated where it is now supplied.
+///
+/// `requestEmailUpdate` takes no input, so this moved to `updateEmail` — the
+/// method that actually receives an address.
 #[tokio::test(flavor = "multi_thread")]
-async fn request_email_update_validates_email_shape() {
+async fn update_email_validates_email_shape() {
     let (app, manager, _tmp) = build_app().await;
-    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let bearer = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    manager
+        .set_email("did:plc:alice", Some("old@example.com"))
+        .await
+        .unwrap();
 
     let (status, _) = post_json(
         app.clone(),
-        "/xrpc/com.atproto.server.requestEmailUpdate",
+        "/xrpc/com.atproto.server.updateEmail",
         json!({"email": "not-an-email"}),
-        Some(&token),
+        Some(&bearer),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let (status, body) = post_json(
         app,
-        "/xrpc/com.atproto.server.requestEmailUpdate",
+        "/xrpc/com.atproto.server.updateEmail",
         json!({"email": "alice@example.com"}),
-        Some(&token),
+        Some(&bearer),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["tokenRequired"], true);
+}
+
+/// `requestEmailUpdate` reports whether a token will be needed, and takes no
+/// input to do it.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_email_update_reports_whether_a_token_is_needed() {
+    let (app, manager, _tmp) = build_app().await;
+    let bearer = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    manager
+        .set_email("did:plc:alice", Some("old@example.com"))
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.requestEmailUpdate",
+        json!({}),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["tokenRequired"], false,
+        "an unconfirmed address needs no token: {body}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -210,8 +210,8 @@ pub fn build_router(state: HttpState) -> Router {
             post(auth_handlers::request_email_update),
         )
         .route(
-            "/xrpc/com.atproto.server.confirmEmailUpdate",
-            post(auth_handlers::confirm_email_update),
+            "/xrpc/com.atproto.server.updateEmail",
+            post(auth_handlers::update_email),
         )
         .route(
             "/xrpc/com.atproto.server.requestAccountDelete",

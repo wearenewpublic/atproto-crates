@@ -1352,19 +1352,31 @@ pub async fn reserve_signing_key(
     }))
 }
 
-/// Inputs for `com.atproto.server.requestEmailUpdate`.
-#[derive(Debug, Deserialize)]
-pub struct RequestEmailUpdateInput {
-    /// New email address.
-    pub email: String,
-}
-
 /// Output of `com.atproto.server.requestEmailUpdate`.
+///
+/// The lexicon declares **no input** for this method, so there is no matching
+/// input type. It previously took `{email}` and demanded a JSON body, so a
+/// spec-conformant client calling it with no body was answered
+/// `400 "request body must be sent with Content-Type: application/json"`.
 #[derive(Debug, Serialize)]
 pub struct RequestEmailUpdateResponse {
-    /// Whether confirmation is required (always true for now).
+    /// Whether `updateEmail` will require a confirmation token.
+    ///
+    /// True exactly when the current address is confirmed: moving away from an
+    /// address the account holder has proven they control requires proving
+    /// they still control it. An unconfirmed address has nothing to prove.
     #[serde(rename = "tokenRequired")]
     pub token_required: bool,
+}
+
+/// Inputs for `com.atproto.server.updateEmail`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateEmailInput {
+    /// The new address.
+    pub email: String,
+    /// Confirmation token from `requestEmailUpdate`. Required when the current
+    /// address is confirmed.
+    pub token: Option<String>,
 }
 
 /// Purpose tag for the email-update flow. `requestEmailUpdate` writes
@@ -1379,31 +1391,54 @@ const EMAIL_TOKEN_TTL_SECS: i64 = 60 * 60;
 
 /// `POST /xrpc/com.atproto.server.requestEmailUpdate`. Auth-required.
 ///
-/// Issues a one-time token bound to the caller's DID + the new email
-/// address. The token is persisted in `email_token` for 1 hour.
-///
-/// When SMTP is configured (per §3.1) the PDS sends a confirmation email
-/// containing the token URL; otherwise the token is logged at INFO with a
-/// `dev-only:` prefix so a developer can complete the flow against a
-/// localhost build.
+/// Reports whether `updateEmail` will need a confirmation token, and mails one
+/// when it will. Takes no input: the new address is supplied to `updateEmail`,
+/// not here, so the token authorises *a* change and the caller states which
+/// change when they make it.
 pub async fn request_email_update(
     State(state): State<HttpState>,
     parts: Parts,
-    Json(input): Json<RequestEmailUpdateInput>,
 ) -> Result<Json<RequestEmailUpdateResponse>, XrpcError> {
     let claims = require_access_jwt(&parts, &state)?;
     require_full_session(&claims, "com.atproto.server.requestEmailUpdate")?;
-    if !is_email_shape(&input.email) {
+    let manager = account_manager(&state)?;
+
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(&claims.sub)
+        .await
+        .map_err(XrpcError::from)?
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "account not found",
+            )
+        })?;
+
+    let Some(current) = account.email.clone() else {
         return Err(XrpcError::new(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
-            format!("invalid email: {}", input.email),
+            "account does not have an email address",
         ));
-    }
-    let manager = account_manager(&state)?;
+    };
 
-    // 32 random bytes → URL-safe base64 → 43-char token. Unique enough
-    // to avoid collisions even if the table accumulates millions of rows.
+    // A token is required only when the current address is confirmed, and it
+    // is mailed to that address. That is what gives it meaning: completing the
+    // change proves continued control of the mailbox being moved away from.
+    //
+    // The previous flow mailed its token to the *new* address, which proves
+    // control of the destination and nothing about the origin -- so a stolen
+    // session could redirect the account's recovery channel without ever
+    // touching the real inbox.
+    if account.email_confirmed_at.is_none() {
+        return Ok(Json(RequestEmailUpdateResponse {
+            token_required: false,
+        }));
+    }
+
     let token = {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use rand::RngExt;
@@ -1411,30 +1446,28 @@ pub async fn request_email_update(
         rand::rng().fill(&mut bytes);
         base64::Engine::encode(&URL_SAFE_NO_PAD, bytes)
     };
-    let now = chrono::Utc::now();
-    let expires_at = (now + chrono::Duration::seconds(EMAIL_TOKEN_TTL_SECS)).to_rfc3339();
+    let expires_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(EMAIL_TOKEN_TTL_SECS)).to_rfc3339();
     crate::account::email_token::insert(
         &manager.account_pool(),
         &token,
         &claims.sub,
         EMAIL_TOKEN_PURPOSE_UPDATE,
         &expires_at,
-        Some(&input.email),
+        None,
     )
     .await
     .map_err(XrpcError::from)?;
 
-    // Dispatch via EmailService — when SMTP is configured this sends a
-    // real message, otherwise the disabled stub logs the URL at INFO.
     let body = format!(
-        "Confirm your email update at:\n\n  /xrpc/com.atproto.server.confirmEmailUpdate?token={token}\n\nThis link expires in 1 hour."
+        "Your confirmation code for changing the email address on this account is:\n\n  {token}\n\nIt expires in 1 hour. If you did not request this, someone may have your password - change it."
     );
     if let Err(e) = state
         .email
-        .send(&input.email, "Confirm your email update", &body)
+        .send(&current, "Confirmation code for an email change", &body)
         .await
     {
-        tracing::warn!(error = ?e, did = %claims.sub, "email send failed; token still valid");
+        tracing::warn!(error = ?e, did = %claims.sub, "email-change code send failed; code still valid");
     }
 
     Ok(Json(RequestEmailUpdateResponse {
@@ -1442,75 +1475,104 @@ pub async fn request_email_update(
     }))
 }
 
-/// Inputs for `com.atproto.server.confirmEmailUpdate`.
-#[derive(Debug, Deserialize)]
-pub struct ConfirmEmailUpdateInput {
-    /// Token issued by `requestEmailUpdate`.
-    pub token: String,
-}
-
-/// `POST /xrpc/com.atproto.server.confirmEmailUpdate`. No auth — the token
-/// itself is the auth.
+/// `POST /xrpc/com.atproto.server.updateEmail`. Auth-required.
 ///
-/// Verifies the token (matching purpose, not expired), updates
-/// `account.email` to the recorded `new_email`, and consumes (deletes) the
-/// row so it can't be replayed. All in a single transaction.
-pub async fn confirm_email_update(
+/// Sets the account's email address. A token from `requestEmailUpdate` is
+/// required when the current address is confirmed, and the new address always
+/// lands unconfirmed.
+///
+/// # Errors
+///
+/// - `TokenRequired` when the current address is confirmed and no token was
+///   given. The lexicon declares this name and clients switch on it to know
+///   they must call `requestEmailUpdate` first.
+/// - `InvalidToken` for a token that does not verify, is for another purpose,
+///   belongs to another account, or has expired.
+/// - `InvalidRequest` for a malformed address.
+pub async fn update_email(
     State(state): State<HttpState>,
-    Json(input): Json<ConfirmEmailUpdateInput>,
+    parts: Parts,
+    Json(input): Json<UpdateEmailInput>,
 ) -> Result<axum::http::StatusCode, XrpcError> {
+    let claims = require_access_jwt(&parts, &state)?;
+    require_full_session(&claims, "com.atproto.server.updateEmail")?;
     let manager = account_manager(&state)?;
-    let pool = manager.account_pool();
 
-    let row = crate::account::email_token::lookup(&pool, &input.token)
+    if !is_email_shape(&input.email) {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!("invalid email: {}", input.email),
+        ));
+    }
+
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(&claims.sub)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
-            XrpcError::new(StatusCode::BAD_REQUEST, "InvalidToken", "token not found")
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "account not found",
+            )
         })?;
-    if row.purpose != EMAIL_TOKEN_PURPOSE_UPDATE {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            format!("token has wrong purpose: {}", row.purpose),
-        ));
-    }
-    let exp = chrono::DateTime::parse_from_rfc3339(&row.expires_at).map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("parse expires_at: {e}"),
-        )
-    })?;
-    if exp < chrono::Utc::now() {
-        return Err(XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "token expired",
-        ));
-    }
-    let new_email = row.new_email.ok_or_else(|| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            "email_token missing new_email",
-        )
-    })?;
 
-    // The legacy SQL path ran these two ops in a single transaction.
-    // With the dispatch routing through `AccountPool`, atomicity
-    // crosses the connection boundary; we accept best-effort semantic
-    // here — a partial failure leaves the email_token row consumable
-    // until expires_at, which the unified GC tick prunes.
+    match input.token.as_deref() {
+        None if account.email_confirmed_at.is_some() => {
+            return Err(XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "TokenRequired",
+                "the current address is confirmed; call requestEmailUpdate and supply the token",
+            ));
+        }
+        None => {}
+        Some(token) => {
+            // Consumed, so one token changes the address once. `consume`
+            // checks the purpose and expiry and binds it to this DID, so a
+            // token minted for another account or another flow does not apply.
+            // Mapped to the name the lexicon declares rather than passing the
+            // generic denial through. `consume` reports a missing, spent,
+            // wrong-purpose, wrong-account or expired token identically, and
+            // that arrives as `403 Forbidden` -- a name this method does not
+            // declare, so a client cannot tell a bad token from any other
+            // refusal. `ExpiredToken` is not signalled separately for the same
+            // reason: the helper does not distinguish it.
+            crate::account::email_token::consume(
+                &manager.account_pool(),
+                token,
+                EMAIL_TOKEN_PURPOSE_UPDATE,
+                &claims.sub,
+            )
+            .await
+            .map_err(|e| {
+                tracing::debug!(did = %claims.sub, error = ?e, "email-change token rejected");
+                XrpcError::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidToken",
+                    "the confirmation token is not valid for this account, or has expired",
+                )
+            })?;
+        }
+    }
+
     manager
-        .set_email(&row.did, Some(&new_email))
-        .await
-        .map_err(XrpcError::from)?;
-    crate::account::email_token::delete(&pool, &input.token)
+        .set_email(&claims.sub, Some(&input.email))
         .await
         .map_err(XrpcError::from)?;
 
-    tracing::info!(did = %row.did, new_email = %new_email, "email updated via confirmEmailUpdate");
+    // Unconfirmed by construction: the address has been stated, not
+    // demonstrated. Carrying the old confirmation over would mark an unproven
+    // address as verified, and would mean the next change demanded a token
+    // mailed somewhere nobody has been shown to read.
+    manager
+        .set_email_confirmed_at(&claims.sub, None)
+        .await
+        .map_err(XrpcError::from)?;
+
+    tracing::info!(did = %claims.sub, "email address updated");
     Ok(axum::http::StatusCode::OK)
 }
 
