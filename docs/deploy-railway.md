@@ -153,21 +153,59 @@ chain lets a caller forge their own address by prepending entries.
 
 ### Mail
 
+**Use port 2525.** Railway blocks outbound SMTP on the standard ports.
+
 ```
-PDS_EMAIL_SMTP_URL=smtps://postmaster%40mg.pyroclastic.cloud:<key>@smtp.mailgun.org:465
-PDS_EMAIL_FROM_ADDRESS=noreply@mg.pyroclastic.cloud
+PDS_EMAIL_SMTP_URL=smtp://postmaster%40pyroclastic.cloud:<key>@smtp.mailgun.org:2525?tls=required
+PDS_EMAIL_FROM_ADDRESS=noreply@pyroclastic.cloud
 ```
 
-`smtps://` on 465 is implicit TLS and unambiguous. Port 587 works too, as
-`smtp://…:587?tls=required` — but note that `smtp://` with no `tls` parameter
-at all is **plaintext**, and `?tls=none` is not a value lettre accepts.
+This one cost an afternoon, so it is worth stating plainly. Configured against
+`smtps://…:465` — which is the obvious choice, and which works from a
+workstation — the deployed server sent nothing at all. Everything else checked
+out: the domain verified in Mailgun, SPF and DKIM live, the credentials good,
+the same URL delivering mail from a laptop, and Mailgun accepting a hand-rolled
+message to the same recipient. Only the container could not reach the relay.
+
+Cloud platforms commonly block outbound 25, 465 and 587 to stop their address
+space being used for spam. 2525 is the alternative port mail providers offer
+for exactly this reason, and it is not blocked.
+
+Three things change together and all three are required:
+
+| | |
+|---|---|
+| `smtps://` → `smtp://` | 2525 is STARTTLS, not implicit TLS |
+| `465` → `2525` | the unblocked port |
+| `?tls=required` appended | `smtp://` with no `tls` parameter is **plaintext**, which Mailgun refuses |
+
+Half-changing it fails, and fails the same silent way. `smtps://` pointed at
+2525 gives `WRONG_VERSION_NUMBER`; `?tls=none` is not a value lettre accepts
+at all.
 
 Percent-encode the username: Mailgun's SMTP login is an email address, and the
-`@` in it will otherwise be read as the start of the host.
+`@` in it will otherwise be read as the start of the host. And use the domain
+Mailgun verified — if that is `example.com`, a `From:` on `mg.example.com` is
+a different domain and gets rejected.
 
 Both variables must be set. With either missing, the server logs a warning at
 boot and every mail-gated flow — password reset, email confirmation, account
 deletion — reports success and sends nothing.
+
+#### Telling the three failures apart
+
+Every one of these looks identical from the outside, because these endpoints
+deliberately report success whether or not mail went — otherwise a probe could
+use them to discover which addresses exist. The logs are the only signal:
+
+| log line | meaning |
+|---|---|
+| `email accepted by the relay … response=[…]` | delivered to the relay; the response carries the provider's queue id |
+| `SMTP send failed … Connection error` | the port is blocked, or the host is unreachable |
+| `email delivery is disabled; message not sent` | the two variables are not both reaching the container |
+
+If the first line appears and mail still does not arrive, the problem is past
+the relay and the provider's own log will say so.
 
 ---
 
