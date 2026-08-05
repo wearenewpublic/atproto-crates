@@ -48,8 +48,16 @@ pub struct DescribeServerResponse {
     /// This server's DID. Clients migrating an account read it to learn the
     /// `aud` for the service-auth token the old PDS must mint.
     pub did: String,
-    /// Handle suffixes this server will issue accounts under. Empty when the
-    /// operator has pinned none, which means any handle is accepted.
+    /// Handle suffixes this server will issue accounts under, each with a
+    /// leading dot. Empty when the operator has pinned none, which means any
+    /// handle is accepted.
+    ///
+    /// The dot is what clients concatenate against. The official client builds
+    /// its live preview as `<typed name><domain>`, so advertising
+    /// `example.com` rather than `.example.com` showed the account holder
+    /// `alice example.com` run together while the handle it actually created
+    /// was correct. The reference advertises the dotted form; matching it
+    /// costs nothing and every consumer here already tolerates either.
     #[serde(rename = "availableUserDomains")]
     pub available_user_domains: Vec<String>,
     /// Whether `createAccount` requires an invite code.
@@ -67,7 +75,14 @@ pub async fn describe_server(
 ) -> Result<Json<DescribeServerResponse>, XrpcError> {
     Ok(Json(DescribeServerResponse {
         did: state.service_did.clone(),
-        available_user_domains: state.service_handle_domains.clone(),
+        // Normalised on the way out rather than at configuration time, so an
+        // operator may write the domain with or without the dot and the wire
+        // form is the same either way.
+        available_user_domains: state
+            .service_handle_domains
+            .iter()
+            .map(|d| format!(".{}", d.trim_start_matches('.')))
+            .collect(),
         invite_code_required: state.invite_required,
         phone_verification_required: false,
     }))

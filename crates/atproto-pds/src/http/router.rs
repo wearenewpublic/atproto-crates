@@ -29,6 +29,7 @@ use axum::routing::{any, get, post};
 ///   `listAppPasswords`, `revokeAppPassword`, `createInviteCode`.
 pub fn build_router(state: HttpState) -> Router {
     Router::new()
+        .route("/", get(handlers::root))
         .route("/_alive", get(handlers::alive))
         .route("/_ready", get(handlers::ready))
         .route("/xrpc/_health", get(handlers::xrpc_health))

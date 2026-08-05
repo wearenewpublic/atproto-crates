@@ -20,6 +20,51 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// `GET /` — a plain-text description of this server.
+///
+/// A browser pointed at the host used to get an empty 404, which says nothing
+/// about what is running, whether it is healthy, or where to go next. The
+/// reference serves a short description for the same reason, and this is the
+/// first thing anyone sees when they type the hostname in.
+///
+/// Plain text, not HTML: it is read by people diagnosing a deployment as often
+/// as by browsers, and `curl` should show the same thing the browser does. The
+/// account portal is linked because it is the one page here a person can
+/// actually use.
+pub async fn root(State(state): State<HttpState>) -> impl axum::response::IntoResponse {
+    let host = state
+        .service_did
+        .strip_prefix("did:web:")
+        .unwrap_or(&state.service_did)
+        // A did:web may percent-encode a port as `%3A`.
+        .replace("%3A", ":");
+    let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), BUILD_REV);
+    let body = format!(
+        "This is an AT Protocol Personal Data Server (an atproto PDS).\n\
+         \n\
+         Host:     {host}\n\
+         DID:      {did}\n\
+         Software: atproto-pds {version}\n\
+         \n\
+         Most API routes are under /xrpc/\n\
+         Account portal:  /account\n\
+         Health:          /xrpc/_health\n\
+         \n\
+         Protocol: https://atproto.com\n",
+        host = host,
+        did = state.service_did,
+        version = version,
+    );
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        body,
+    )
+}
+
 /// Liveness probe — process up.
 pub async fn alive() -> StatusCode {
     StatusCode::OK

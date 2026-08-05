@@ -123,7 +123,10 @@ async fn describe_server_reports_did_and_domains() {
     // Migration reads `did` from here to learn the `aud` for the service-auth
     // token the old PDS must mint.
     assert_eq!(body["did"], "did:web:test.example");
-    assert_eq!(body["availableUserDomains"], json!(["test.example"]));
+    // Dotted, whichever way the operator configured it. The fixture pins
+    // `test.example`; the wire form carries the dot because that is what a
+    // client concatenates against when it previews `<name><domain>`.
+    assert_eq!(body["availableUserDomains"], json!([".test.example"]));
     assert_eq!(body["inviteCodeRequired"], false);
     assert_eq!(body["phoneVerificationRequired"], false);
 }
@@ -383,4 +386,45 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .as_str()
         .expect("createSession should return an access token")
         .to_string()
+}
+
+/// `GET /` describes the server in plain text.
+///
+/// A browser pointed at the host used to get an empty 404, which said nothing
+/// about what was running or where to go next.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_root_describes_the_server() {
+    let (app, _manager, _tmp) = build_app().await;
+    let req = axum::http::Request::builder()
+        .uri("/")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; charset=utf-8"),
+        "read by people diagnosing a deployment as often as by browsers"
+    );
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("atproto PDS"), "{body}");
+    assert!(body.contains("test.example"), "the host is named: {body}");
+    assert!(
+        body.contains("did:web:test.example"),
+        "the DID is named: {body}"
+    );
+    assert!(
+        body.contains("atproto-pds "),
+        "the version is named: {body}"
+    );
+    assert!(body.contains("/xrpc/"), "{body}");
+    assert!(body.contains("/account"), "the portal is findable: {body}");
 }
