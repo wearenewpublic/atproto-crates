@@ -88,6 +88,20 @@ struct Args {
     #[arg(long, env = "PDS_INVITE_REQUIRED", default_value_t = false)]
     invite_required: bool,
 
+    /// DIDs granted administrative authority on this server.
+    ///
+    /// An alternative to `--admin-password` for the endpoints that accept one.
+    /// The holder proves control by signing an inter-service auth token with
+    /// the `#atproto` key in their own DID document, so the request says who
+    /// made it -- which a shared password cannot -- and authority is withdrawn
+    /// by editing this list rather than rotating a secret every holder has a
+    /// copy of.
+    ///
+    /// The identity does not need an account on this server. A code minted by
+    /// one that has none is attributed to nobody.
+    #[arg(long, env = "PDS_ADMIN_DIDS", value_delimiter = ',')]
+    admin_dids: Vec<String>,
+
     /// Identifier of the policy document set new accounts must accept.
     ///
     /// Recorded verbatim in the `com.atproto-crates.pds.policyAcceptance`
@@ -794,6 +808,7 @@ async fn main() -> anyhow::Result<()> {
     .with_service_handle_domains(args.service_handle_domains.clone())
     .with_crawlers(args.crawlers.clone())
     .with_policy_documents(policy_documents)
+    .with_admin_dids(args.admin_dids.clone())
     // Persist OAuth in-flight state (PAR / auth-codes / refresh handles)
     // to the accounts DB so the lifecycle survives PDS restart. See
     // for the gap this closes.

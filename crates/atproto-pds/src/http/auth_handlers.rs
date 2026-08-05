@@ -968,6 +968,82 @@ pub struct InviteCodeIssued {
     pub code: String,
 }
 
+/// The NSID an admin service-auth token must be scoped to for invite issuance.
+const CREATE_INVITE_LXM: &str = "com.atproto.server.createInviteCode";
+
+/// Authenticate an administrative caller by DID, via inter-service auth.
+///
+/// The alternative to the admin password on this endpoint. The caller signs a
+/// short-lived token with the `#atproto` key in their own DID document, scoped
+/// to this server (`aud`) and to one method (`lxm`); this resolves that
+/// document and checks the signature. So the request proves *which* identity
+/// made it, which a shared password cannot, and authority is revoked by
+/// editing a list rather than rotating a secret every holder has a copy of.
+///
+/// Returns the issuer DID on success, or `None` when the request carries no
+/// service-auth token at all -- which is not a failure, because the caller may
+/// be presenting an ordinary session instead.
+async fn admin_did_from_service_auth(
+    parts: &Parts,
+    state: &HttpState,
+    lxm: &str,
+) -> Result<Option<String>, XrpcError> {
+    if state.admin_dids.is_empty() {
+        return Ok(None);
+    }
+    let Ok((_, token)) = authorization_token(parts) else {
+        return Ok(None);
+    };
+    // A session JWT is this server's own HMAC and will never verify as
+    // service auth; leave it to the session path rather than reporting a
+    // confusing signature failure.
+    if session::verify_access(token, &state.jwt_secret).is_ok() {
+        return Ok(None);
+    }
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(crate::user_agent())
+        .build()
+        .unwrap_or_default();
+    let plc_dir = state.plc_service.as_ref().map(|p| p.directory_hostname());
+    let claims = match crate::space::service_auth::verify_service_auth(
+        &http,
+        token,
+        plc_dir,
+        &state.service_did,
+        lxm,
+        state
+            .account_manager
+            .as_deref()
+            .map(crate::account::AccountManager::account_pool_ref),
+    )
+    .await
+    {
+        Ok(c) => c,
+        // Not service auth, or not valid service auth. Either way the session
+        // path is what should answer, including with its own refusal.
+        Err(e) => {
+            tracing::debug!(error = ?e, "not a valid admin service-auth token");
+            return Ok(None);
+        }
+    };
+
+    if !state.admin_dids.iter().any(|d| d == &claims.iss) {
+        tracing::warn!(
+            iss = %claims.iss,
+            "a valid service-auth token was presented by a DID that is not an admin"
+        );
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "this identity is not an administrator of this server",
+        ));
+    }
+    tracing::info!(iss = %claims.iss, lxm, "admin authenticated by DID");
+    Ok(Some(claims.iss))
+}
+
 /// Handler for `com.atproto.server.createInviteCode`. Auth-required.
 ///
 /// §4.6 — gated on `account.can_issue_invites`. Admins can flip the toggle
@@ -980,41 +1056,65 @@ pub async fn create_invite_code(
     parts: Parts,
     Json(input): Json<CreateInviteCodeInput>,
 ) -> Result<Json<InviteCodeIssued>, XrpcError> {
-    let claims = require_access_jwt(&parts, &state).await?;
     let manager = account_manager(&state)?;
-    let attribute_to = input.for_account.as_deref().unwrap_or(&claims.sub);
+
+    // An administrator identified by DID may mint a code without holding an
+    // account on this server at all, which is the point: the operator is not
+    // necessarily a user here.
+    let admin_did = admin_did_from_service_auth(&parts, &state, CREATE_INVITE_LXM).await?;
+    let admin_is_caller = admin_did.is_some();
+    let caller = match admin_did {
+        Some(did) => did,
+        None => require_access_jwt(&parts, &state).await?.sub,
+    };
+    // An admin DID need not have an account here, so a code it mints for no
+    // particular account is attributed to nobody. The column is a nullable FK
+    // for exactly this. When an admin names `forAccount`, that account is
+    // checked like any other.
+    let admin_without_account = admin_is_caller && input.for_account.is_none();
+    let attribute_to = input.for_account.as_deref().unwrap_or(&caller);
 
     // §4.6 toggle check — §5.4 : route through dispatch helper.
-    match manager
-        .lookup_can_issue_invites(attribute_to)
-        .await
-        .map_err(|e| {
-            XrpcError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                format!("can_issue_invites lookup: {e}"),
-            )
-        })? {
-        Some(false) => {
-            return Err(XrpcError::new(
-                StatusCode::FORBIDDEN,
-                "InviteIssuanceDisabled",
-                "invite-code issuance is disabled for this account",
-            ));
-        }
-        Some(true) => {}
-        None => {
-            return Err(XrpcError::new(
-                StatusCode::NOT_FOUND,
-                "AccountNotFound",
-                format!("account {attribute_to} not found"),
-            ));
+    if !admin_without_account {
+        match manager
+            .lookup_can_issue_invites(attribute_to)
+            .await
+            .map_err(|e| {
+                XrpcError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    format!("can_issue_invites lookup: {e}"),
+                )
+            })? {
+            Some(false) => {
+                return Err(XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "InviteIssuanceDisabled",
+                    "invite-code issuance is disabled for this account",
+                ));
+            }
+            Some(true) => {}
+            None => {
+                return Err(XrpcError::new(
+                    StatusCode::NOT_FOUND,
+                    "AccountNotFound",
+                    format!("account {attribute_to} not found"),
+                ));
+            }
         }
     }
 
-    let issued = invite::create(&manager.account_pool(), Some(attribute_to), input.use_count)
-        .await
-        .map_err(XrpcError::from)?;
+    let issued = invite::create(
+        &manager.account_pool(),
+        if admin_without_account {
+            None
+        } else {
+            Some(attribute_to)
+        },
+        input.use_count,
+    )
+    .await
+    .map_err(XrpcError::from)?;
     Ok(Json(InviteCodeIssued { code: issued.code }))
 }
 

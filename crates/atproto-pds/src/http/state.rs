@@ -98,6 +98,15 @@ pub struct HttpState {
     /// `PDS_EMAIL_SMTP_URL` + `PDS_EMAIL_FROM_ADDRESS` are set; otherwise a
     /// disabled stub that logs the would-be confirmation URL.
     pub email: EmailService,
+    /// Identities the operator has granted administrative authority, by DID.
+    ///
+    /// An alternative to the admin password for the endpoints that accept one.
+    /// A password is a shared secret that has to be transported to whoever
+    /// needs it and cannot say who used it; a DID is an identity that signs,
+    /// so the request carries proof of who made it and the operator can revoke
+    /// authority by editing a list rather than rotating a secret everyone
+    /// holds.
+    pub admin_dids: Vec<String>,
     /// Policy documents the account holder must accept, when the operator has
     /// configured a set.
     ///
@@ -186,6 +195,7 @@ impl HttpState {
             service_did: "did:web:localhost".to_string(),
             jwt_secret: Arc::new(b"dev-only-jwt-secret-32-bytes-min!".to_vec()),
             invite_required: false,
+            admin_dids: Vec::new(),
             policy: None,
             oauth: OAuthState::new(),
             admin_password: None,
@@ -235,6 +245,7 @@ impl HttpState {
             service_did,
             jwt_secret: Arc::new(jwt_secret),
             invite_required,
+            admin_dids: Vec::new(),
             policy: None,
             oauth: OAuthState::new(),
             admin_password: None,
@@ -326,6 +337,13 @@ impl HttpState {
     /// Attach the outbound email service. Default is the disabled stub
     /// that logs the would-be confirmation URL at INFO.
     #[must_use]
+    /// Configure the policy documents new accounts must accept.
+    /// Grant administrative authority to a set of DIDs.
+    pub fn with_admin_dids(mut self, dids: Vec<String>) -> Self {
+        self.admin_dids = dids;
+        self
+    }
+
     /// Configure the policy documents new accounts must accept.
     pub fn with_policy_documents(mut self, policy: Option<PolicyDocuments>) -> Self {
         self.policy = policy;
