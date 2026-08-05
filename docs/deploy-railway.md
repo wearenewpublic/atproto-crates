@@ -27,6 +27,13 @@ hand there.
 **Volume.** Attach one, mounted at `/data`. That path is the image's
 `PDS_DATA_DIRECTORY` default, so no variable is needed to match them.
 
+The Dockerfile carries no `VOLUME` instruction, deliberately: Railway refuses
+to build one that does — *"docker VOLUME at Line 40 is not supported, use
+Railway Volumes"* — and the instruction is unhelpful anyway. Its only effect
+when no volume is supplied is to create an anonymous one, so a misconfigured
+run writes a real database somewhere nobody will look for and nothing will
+reattach to.
+
 **Replicas.** One. `railway.toml` pins this, and it is a correctness setting
 rather than a capacity one: SQLite is the durable store, the volume attaches
 to a single instance, and two replicas would run against separate copies of

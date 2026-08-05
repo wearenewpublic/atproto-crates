@@ -33,11 +33,17 @@ FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /usr/src/app/target/release/pds /usr/local/bin/pds
 
-# The mount point. Declared so that running without a volume still starts and
-# keeps its data somewhere coherent -- and so `docker run -v` has an obvious
-# target. On Railway this is the volume's mount path.
+# Where durable state goes. Railway mounts its volume here; `docker run -v
+# <host>:/data` does the same thing locally.
+#
+# There is deliberately no `VOLUME` instruction. Railway refuses to build a
+# Dockerfile containing one -- "docker VOLUME at Line 40 is not supported, use
+# Railway Volumes" -- and it is not doing us a favour elsewhere either: its
+# only effect when no volume is supplied is to create an *anonymous* one, so a
+# misconfigured `docker run` writes a real database to a directory nobody will
+# think to look for and nothing will reattach to. Failing to persist loudly is
+# better than persisting somewhere invisible.
 ENV PDS_DATA_DIRECTORY=/data
-VOLUME ["/data"]
 
 # Containers are routed to from outside, so loopback -- the right default for
 # a process on a workstation -- is the wrong one here.
