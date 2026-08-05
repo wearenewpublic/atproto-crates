@@ -24,6 +24,8 @@ pub struct DidBuilder {
     verification_methods: HashMap<String, KeyData>,
     also_known_as: Vec<String>,
     services: HashMap<String, ServiceEndpoint>,
+    /// Which rotation key signs the genesis op. `None` means the first.
+    signing_rotation_key: Option<KeyData>,
 }
 
 impl DidBuilder {
@@ -34,6 +36,7 @@ impl DidBuilder {
             verification_methods: HashMap::new(),
             also_known_as: Vec::new(),
             services: HashMap::new(),
+            signing_rotation_key: None,
         }
     }
 
@@ -43,6 +46,27 @@ impl DidBuilder {
     /// control of the DID within a 72-hour window. Must be private keys.
     pub fn add_rotation_key(mut self, key_data: KeyData) -> Self {
         self.rotation_keys.push(key_data);
+        self
+    }
+
+    /// Nominate which key signs the genesis operation.
+    ///
+    /// Without this, `build` signs with `rotation_keys[0]`, which forces the
+    /// highest-authority rotation key to be one the builder holds privately.
+    /// That is the wrong constraint when a caller wants to list *someone
+    /// else's* key first: PLC gives earlier rotation keys authority over later
+    /// ones, so a server issuing an account on a holder's behalf should be able
+    /// to put the holder's key above its own -- and it cannot do that if being
+    /// first means surrendering the private half.
+    ///
+    /// PLC requires only that the signature come from *a* listed rotation key,
+    /// not the first, so signing with a lower-authority key is valid.
+    ///
+    /// The nominated key must appear in `rotation_keys` by its public form;
+    /// `build` refuses otherwise rather than producing an operation the
+    /// directory will reject.
+    pub fn sign_with(mut self, key_data: KeyData) -> Self {
+        self.signing_rotation_key = Some(key_data);
         self
     }
 
@@ -161,15 +185,35 @@ impl DidBuilder {
 
         // Create unsigned genesis operation
         let unsigned = UnsignedOperation::PlcOperation {
-            rotation_keys: rotation_key_strings,
+            rotation_keys: rotation_key_strings.clone(),
             verification_methods: verification_method_strings,
             also_known_as: self.also_known_as,
             services: self.services,
             prev: None,
         };
 
-        // Sign with the first rotation key
-        let signed = unsigned.sign(&self.rotation_keys[0])?;
+        // Sign with the nominated rotation key, or the first when none was
+        // named. The nominee must be listed -- PLC checks the signature against
+        // the operation's own `rotationKeys`, so signing with a key that is not
+        // there produces an operation the directory refuses.
+        let signing_key = match self.signing_rotation_key.as_ref() {
+            Some(key) => {
+                let nominee = key::to_public(key).map(|k| format!("{k}")).map_err(|e| {
+                    PLCDIDError::InvalidRotationKeys {
+                        details: format!("cannot derive the public form of the signing key: {e}"),
+                    }
+                })?;
+                if !rotation_key_strings.contains(&nominee) {
+                    return Err(PLCDIDError::InvalidRotationKeys {
+                        details: "the nominated signing key is not among the rotation keys"
+                            .to_string(),
+                    });
+                }
+                key
+            }
+            None => &self.rotation_keys[0],
+        };
+        let signed = unsigned.sign(signing_key)?;
 
         // Derive DID from the signed operation
         let did = Self::derive_did(&signed)?;
@@ -400,5 +444,69 @@ mod tests {
         assert!(keys.primary_rotation_key().is_some());
         assert!(keys.verification_method("atproto").is_some());
         assert!(keys.verification_method("nonexistent").is_none());
+    }
+
+    /// A key the builder does not hold privately can still be listed first.
+    ///
+    /// This is the whole point of `sign_with`: PLC gives earlier rotation keys
+    /// authority over later ones, so a server issuing an account for someone
+    /// else should be able to put that person's key above its own. Without a
+    /// nominated signer, being first would mean surrendering the private half.
+    #[test]
+    fn the_holders_key_can_rank_above_the_signers() {
+        let holder = crate::key::generate_key(crate::key::KeyType::P256Private).unwrap();
+        let holder_public = crate::key::to_public(&holder).unwrap();
+        let server = crate::key::generate_key(crate::key::KeyType::P256Private).unwrap();
+        let signing = crate::key::generate_key(crate::key::KeyType::P256Private).unwrap();
+
+        let (_did, op, _keys) = DidBuilder::new()
+            // Only the public form of the holder's key is given to the builder.
+            .add_rotation_key(holder_public.clone())
+            .add_rotation_key(server.clone())
+            .sign_with(server.clone())
+            .add_verification_method(
+                "atproto".to_string(),
+                crate::key::to_public(&signing).unwrap(),
+            )
+            .add_also_known_as("at://alice.example.com".to_string())
+            .build()
+            .expect("a genesis op signed by the second rotation key");
+
+        let Operation::PlcOperation { rotation_keys, .. } = &op else {
+            panic!("expected a PLC operation")
+        };
+        assert_eq!(
+            rotation_keys[0],
+            format!("{holder_public}"),
+            "the holder's key must rank first"
+        );
+        assert_eq!(
+            rotation_keys[1],
+            format!("{}", crate::key::to_public(&server).unwrap()),
+            "the server's key ranks below it"
+        );
+        // And no private key reached the operation.
+        for k in rotation_keys {
+            assert!(k.starts_with("did:key:zDna"), "not a P-256 public key: {k}");
+        }
+    }
+
+    /// Signing with a key that is not listed produces an operation the
+    /// directory would refuse, so the builder refuses first.
+    #[test]
+    fn the_nominated_signer_must_be_a_listed_rotation_key() {
+        let listed = crate::key::generate_key(crate::key::KeyType::P256Private).unwrap();
+        let stranger = crate::key::generate_key(crate::key::KeyType::P256Private).unwrap();
+        let err = DidBuilder::new()
+            .add_rotation_key(listed)
+            .sign_with(stranger)
+            .add_also_known_as("at://alice.example.com".to_string())
+            .build()
+            .map(|_| ())
+            .expect_err("a stranger's signature is not acceptable");
+        assert!(
+            format!("{err}").contains("not among the rotation keys"),
+            "{err}"
+        );
     }
 }

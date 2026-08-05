@@ -139,16 +139,48 @@ impl PlcService {
     /// returned `PlcGenesisOutcome` carries their refs ready for use by
     /// `AccountManager::create_account`.
     pub async fn genesis(&self, handle: &str) -> PdsResult<PlcGenesisOutcome> {
+        self.genesis_with_keys(handle, None, None).await
+    }
+
+    /// Create the account's DID, optionally using keys the holder supplied.
+    ///
+    /// `signing_key` becomes the account's `#atproto` verification method --
+    /// the key this server signs the holder's commits with -- so it must be a
+    /// private key. Absent, one is generated.
+    ///
+    /// `rotation_key` is listed **first**, ahead of this server's own. PLC
+    /// gives earlier rotation keys authority over later ones, so this is what
+    /// lets the holder overrule the server on their own identity: they can
+    /// move the account elsewhere, or undo an operation this server signs,
+    /// without needing its cooperation.
+    ///
+    /// Only the public form of that key is used, and it is never persisted.
+    /// The holder may hand over a private key -- `goat key generate` emits one
+    /// -- and this derives the public half, lists that, and discards the rest.
+    /// Storing it would hand back the authority the ordering just granted. The
+    /// genesis operation is signed with this server's own rotation key
+    /// instead, which PLC permits: it requires the signature to come from a
+    /// listed rotation key, not from the first one.
+    pub async fn genesis_with_keys(
+        &self,
+        handle: &str,
+        signing_key: Option<KeyData>,
+        rotation_key: Option<KeyData>,
+    ) -> PdsResult<PlcGenesisOutcome> {
         // 1. Generate keys.
         let rotation_priv = generate_key(self.config.rotation_key_type.clone()).map_err(|e| {
             PdsError::PlcRotationKey {
                 reason: format!("generate rotation key: {e}"),
             }
         })?;
-        let signing_priv =
-            generate_key(self.config.signing_key_type.clone()).map_err(|e| PdsError::Storage {
-                reason: format!("generate signing key: {e}"),
-            })?;
+        let signing_priv = match signing_key {
+            Some(k) => k,
+            None => generate_key(self.config.signing_key_type.clone()).map_err(|e| {
+                PdsError::Storage {
+                    reason: format!("generate signing key: {e}"),
+                }
+            })?,
+        };
         let signing_pub = to_public(&signing_priv).map_err(|e| PdsError::Storage {
             reason: format!("derive signing pub: {e}"),
         })?;
@@ -180,7 +212,20 @@ impl PlcService {
             format!("at://{handle}")
         };
 
-        let mut builder = DidBuilder::new().add_rotation_key(rotation_priv.clone());
+        // The holder's key first when they supplied one, so it outranks ours.
+        let mut builder = DidBuilder::new();
+        if let Some(holder) = rotation_key.as_ref() {
+            let holder_public =
+                atproto_identity::key::to_public(holder).map_err(|e| PdsError::PlcRotationKey {
+                    reason: format!("derive the public form of the supplied rotation key: {e}"),
+                })?;
+            builder = builder.add_rotation_key(holder_public);
+        }
+        let mut builder = builder
+            .add_rotation_key(rotation_priv.clone())
+            // Signed with our own key regardless of ordering -- we do not hold
+            // the holder's private half, and must not.
+            .sign_with(rotation_priv.clone());
         // §11d — when an externally-supplied PDS rotation key is configured,
         // list it as an additional rotation key on every genesis op. The
         // PDS then retains rotation authority for any account it issued

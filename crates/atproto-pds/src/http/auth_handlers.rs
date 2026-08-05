@@ -117,6 +117,20 @@ pub struct CreateAccountInput {
     /// Optional invite code (required if `PDS_INVITE_REQUIRED`).
     #[serde(rename = "inviteCode")]
     pub invite_code: Option<String>,
+    /// The account's `#atproto` signing key, if the holder brought their own.
+    ///
+    /// A local extension: the lexicon has no such field. Accepted as a
+    /// `did:key:` string or the bare multibase, and must be a *private* key --
+    /// this server signs the holder's commits with it.
+    #[serde(rename = "signingKey", default)]
+    pub signing_key: Option<String>,
+    /// A rotation key to list ahead of this server's own.
+    ///
+    /// Also a local extension. Only its public form is used and it is never
+    /// stored, so supplying the private key -- which is what `goat key
+    /// generate` emits -- costs the holder nothing.
+    #[serde(rename = "rotationKey", default)]
+    pub rotation_key: Option<String>,
     /// Plaintext password.
     pub password: String,
 }
@@ -332,8 +346,49 @@ pub async fn create_account(
                     "PLC genesis is not configured on this PDS; supply `did` directly",
                 )
             })?;
+            let parse_key =
+                |raw: &str, what: &str| -> Result<atproto_identity::key::KeyData, XrpcError> {
+                    // `did:key:z...` and a bare `z...` are the same key written two
+                    // ways; `goat` prints the first, people paste either.
+                    let trimmed = raw.trim();
+                    let bare = trimmed.strip_prefix("did:key:").unwrap_or(trimmed);
+                    atproto_identity::key::identify_key(bare).map_err(|e| {
+                        XrpcError::new(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidRequest",
+                            format!("{what} is not a usable key: {e}"),
+                        )
+                    })
+                };
+            let supplied_signing = match input.signing_key.as_deref() {
+                Some(raw) => {
+                    let key = parse_key(raw, "the supplied signing key")?;
+                    // We sign the holder's commits with this, so a public key
+                    // would leave the account unable to write anything.
+                    if matches!(
+                        key.key_type(),
+                        atproto_identity::key::KeyType::P256Public
+                            | atproto_identity::key::KeyType::P384Public
+                            | atproto_identity::key::KeyType::K256Public
+                            | atproto_identity::key::KeyType::Ed25519Public
+                    ) {
+                        return Err(XrpcError::new(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidRequest",
+                            "the signing key must be a private key; this server signs \
+                             your commits with it",
+                        ));
+                    }
+                    Some(key)
+                }
+                None => None,
+            };
+            let supplied_rotation = match input.rotation_key.as_deref() {
+                Some(raw) => Some(parse_key(raw, "the supplied rotation key")?),
+                None => None,
+            };
             let outcome = plc_service
-                .genesis(&handle)
+                .genesis_with_keys(&handle, supplied_signing, supplied_rotation)
                 .await
                 .map_err(XrpcError::from)?;
             (

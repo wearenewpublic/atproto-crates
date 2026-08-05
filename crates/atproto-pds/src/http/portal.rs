@@ -189,6 +189,8 @@ fn page(title: &str, body: &str) -> Html<String> {
             word-break: break-all; }}
   .muted {{ color: #777; font-size: 0.88em; }}
   nav {{ margin-bottom: 1.5em; font-size: 0.9em; }}
+  details {{ margin-top: 1em; border-top: 1px solid #e2e2e2; padding-top: 0.6em; }}
+  summary {{ cursor: pointer; font-size: 0.9em; font-weight: 500; }}
   a {{ color: #1c64f2; }}
   @media (prefers-color-scheme: dark) {{
     body {{ color: #e8e8e8; background: #141416; }}
@@ -515,6 +517,26 @@ fn sign_up_body(state: &HttpState, message: Option<&str>, prior: &PortalQuery) -
          autocomplete="new-password">
   {invite}
   {policy}
+  <details>
+    <summary>Advanced &mdash; bring your own keys</summary>
+    <p class="muted">Both optional. Generate either with
+      <code>goat key generate</code>, which prints a <code>did:key:&hellip;</code>
+      string; the bare multibase form works too.</p>
+    <label for="signing_key">Signing key (<code>#atproto</code>)</label>
+    <input id="signing_key" name="signing_key" type="text" autocomplete="off"
+           spellcheck="false" placeholder="did:key:z42tv&hellip;">
+    <p class="muted">Must be a <b>private</b> key &mdash; this server signs your
+      commits with it. Left empty, one is generated for you.</p>
+    <label for="rotation_key">Rotation key</label>
+    <input id="rotation_key" name="rotation_key" type="text" autocomplete="off"
+           spellcheck="false" placeholder="did:key:z42tp&hellip;">
+    <p class="muted">Listed <b>ahead of</b> this server&rsquo;s own rotation key,
+      so it outranks us: PLC gives earlier rotation keys authority over later
+      ones, and you can move or recover this identity without our cooperation.
+      Only the public half is used and it is never stored, so pasting the
+      private key costs you nothing. This server still adds its own key after
+      yours.</p>
+  </details>
   <button type="submit">Create account</button>
 </form>
 </section>
@@ -539,6 +561,12 @@ pub struct SignUpForm {
     /// Present and equal to `accept` when the policy checkbox was ticked.
     #[serde(default)]
     pub policy: Option<String>,
+    /// An `#atproto` signing key the holder brought, from the advanced panel.
+    #[serde(default)]
+    pub signing_key: Option<String>,
+    /// A rotation key to rank above this server's own.
+    #[serde(default)]
+    pub rotation_key: Option<String>,
 }
 
 /// `POST /account/signup`.
@@ -611,6 +639,18 @@ pub async fn sign_up(
         email: Some(form.email.trim().to_string()),
         handle: handle.clone(),
         did: None,
+        signing_key: form
+            .signing_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string),
+        rotation_key: form
+            .rotation_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string),
         invite_code: form
             .invite
             .as_deref()
