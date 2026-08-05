@@ -664,6 +664,7 @@ pub async fn space_collections(
         return Ok(redirect("/account/signin"));
     };
     let space = space_from_path(&host, &ty, &key)?;
+    require_member(&state, &space, &account.did).await?;
     let reader = space_reader(&state)?;
     let collections = reader
         .list_collections(&space, &account.did)
@@ -697,6 +698,7 @@ pub async fn space_collection_or_blob(
         return Ok(redirect("/account/signin"));
     };
     let space = space_from_path(&host, &ty, &key)?;
+    require_member(&state, &space, &account.did).await?;
 
     if looks_like_cid(&segment) {
         return Ok(redirect(&format!(
@@ -757,6 +759,7 @@ pub async fn space_record(
         return Ok(redirect("/account/signin"));
     };
     let space = space_from_path(&host, &ty, &key)?;
+    require_member(&state, &space, &account.did).await?;
     let reader = space_reader(&state)?;
     let found = reader
         .get_record(
@@ -807,6 +810,7 @@ pub async fn space_record_post(
         return Ok(redirect("/account/signin"));
     };
     let space = space_from_path(&host, &ty, &key)?;
+    require_member(&state, &space, &account.did).await?;
     let base = space_base(&host, &ty, &key);
 
     if form._method.as_deref() == Some("delete") {
@@ -858,6 +862,7 @@ pub async fn space_record_delete(
         return Ok(redirect("/account/signin"));
     };
     let space = space_from_path(&host, &ty, &key)?;
+    require_member(&state, &space, &account.did).await?;
     let base = space_base(&host, &ty, &key);
     Ok(delete_space(&state, &account.did, &space, &collection, &rkey, &base).await)
 }
@@ -901,6 +906,45 @@ fn decode_record(bytes: &[u8]) -> Result<serde_json::Value, XrpcError> {
             format!("decode record: {e}"),
         )
     })
+}
+
+/// Refuse a space this account is not a member of.
+///
+/// The XRPC path authorises space writes with OAuth scopes, which a portal
+/// session does not carry: it is a full-authority browser session, so
+/// `assert_space_scope` has nothing to assert against and the writer itself
+/// checks only that the space is not deleted -- and `ensure_space_live`
+/// returns `Ok` when the authority's store is not even local.
+///
+/// Nothing above this therefore stopped a crafted URL from writing records
+/// into the caller's own store scoped to a space they do not belong to, or to
+/// one that does not exist. The records would be real, would be theirs, and
+/// would sync nowhere. Membership is the check that belongs here.
+async fn require_member(state: &HttpState, space: &SpaceUri, did: &str) -> Result<(), XrpcError> {
+    let service = state.space_service.as_deref().ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            "spaces are not configured on this server",
+        )
+    })?;
+    if service
+        .is_member(space, did)
+        .await
+        .map_err(XrpcError::from)?
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        did = %did,
+        space = %space,
+        "refused a portal space request from a non-member"
+    );
+    Err(XrpcError::new(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "you are not a member of that space",
+    ))
 }
 
 fn space_reader(state: &HttpState) -> Result<&crate::space::reader::SpaceReader, XrpcError> {
