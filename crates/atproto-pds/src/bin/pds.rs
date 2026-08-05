@@ -1020,6 +1020,23 @@ async fn main() -> anyhow::Result<()> {
     let tracker = ctrl.tracker();
     tracker.spawn(heartbeat_loop(token.clone()));
 
+    // Announce to the configured crawlers now that the listener is up.
+    //
+    // Nothing discovers a PDS on its own. Without this the server runs
+    // correctly and is never read: writes commit, the repo serves, the firehose
+    // upgrades, and no relay has been told any of it exists. Setting
+    // PDS_CRAWLERS is the operator saying they want to be crawled, so it should
+    // be the whole of what they have to do.
+    //
+    // Spawned rather than awaited, and after the bind: a relay that is down or
+    // slow must not hold up a server that is otherwise ready to serve.
+    let announce_crawlers = args.crawlers.clone();
+    let announce_hostname =
+        atproto_pds::crawl::public_hostname(args.hostname.as_deref(), &args.service_did);
+    tracker.spawn(async move {
+        atproto_pds::crawl::announce(&announce_crawlers, &announce_hostname).await;
+    });
+
     // Spaces notifier worker — drains the `notify_attempt` DLQ on a fixed
     // cadence. G8.
     let notifier_interval = Duration::from_secs(args.notifier_interval_secs);

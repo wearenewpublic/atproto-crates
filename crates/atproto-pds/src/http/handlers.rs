@@ -439,38 +439,6 @@ pub async fn request_crawl(
                 .unwrap_or(&state.service_did)
                 .to_string()
         });
-    if state.crawlers.is_empty() {
-        tracing::info!(hostname = %hostname, "requestCrawl: no PDS_CRAWLERS configured; no-op");
-        return Ok(StatusCode::OK);
-    }
-    let http = reqwest::Client::builder()
-        .user_agent(crate::user_agent())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-    for base in &state.crawlers {
-        let endpoint = format!(
-            "{}/xrpc/com.atproto.sync.requestCrawl",
-            base.trim_end_matches('/')
-        );
-        let body = serde_json::json!({ "hostname": hostname });
-        let result = http
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_vec(&body).unwrap_or_default())
-            .send()
-            .await;
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::info!(crawler = %endpoint, hostname = %hostname, "requestCrawl: announced");
-            }
-            Ok(resp) => {
-                tracing::warn!(crawler = %endpoint, status = %resp.status(), "requestCrawl: non-2xx");
-            }
-            Err(e) => {
-                tracing::warn!(crawler = %endpoint, error = ?e, "requestCrawl: forward failed");
-            }
-        }
-    }
+    crate::crawl::announce(&state.crawlers, &hostname).await;
     Ok(StatusCode::OK)
 }

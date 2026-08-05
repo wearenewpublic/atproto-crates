@@ -39,6 +39,7 @@ pub mod blob;
 #[cfg(feature = "s3")]
 pub mod blob_s3;
 pub mod config;
+pub mod crawl;
 pub mod denylist;
 pub mod email;
 pub mod errors;

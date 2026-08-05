@@ -135,6 +135,46 @@ The DID above is `@ngerakines.me`. It needs no account on this server. With
 it set, that identity can mint invite codes by signing a service-auth token
 with the `#atproto` key in its own DID document — see §5.
 
+### Being crawled by the relay
+
+```
+PDS_CRAWLERS=https://bsky.network
+```
+
+**Set this or your server is invisible.** Nothing discovers a PDS on its own.
+Until a relay is told to crawl you, no AppView will ever see a record you host,
+including your own posts and profile.
+
+The server announces itself to each entry at startup, so setting this is the
+whole of what you have to do. It re-announces on every boot, which is harmless
+— `requestCrawl` is idempotent.
+
+Leave it unset only if you intend to stay off the public network. There is no
+warning when it is unset beyond a debug line, because a private PDS is a
+legitimate thing to run.
+
+What it looks like when it is missing is the reason it is worth checking. The
+server is completely healthy — writes commit, `putRecord` returns a real
+commit CID, third-party tools read your records straight out of the repo — and
+the AppView shows an empty profile, because it resolves your *identity* from
+PLC independently of ever having seen your repo. Confirm from outside:
+
+```
+curl "https://relay1.us-west.bsky.network/xrpc/com.atproto.sync.getLatestCommit?did=<your-did>"
+```
+
+`RepoNotFound` means you have not been crawled. Announce by hand with:
+
+```
+curl -X POST https://bsky.network/xrpc/com.atproto.sync.requestCrawl \
+  -H 'Content-Type: application/json' \
+  -d '{"hostname":"vesuvius.pyroclastic.cloud"}'
+```
+
+Announcing publishes your repo to the public network. The relay will ingest it
+and so will anyone consuming the firehose, and records may stay cached or
+indexed after you delete them.
+
 ### Behind Cloudflare
 
 ```
