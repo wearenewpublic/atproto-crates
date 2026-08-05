@@ -1533,3 +1533,68 @@ async fn authorize_is_refused_until_the_policy_is_accepted() {
         "an authorization code was issued anyway"
     );
 }
+
+/// A session minted before the policy existed cannot mint fresh credentials.
+///
+/// The session gate alone does not cover this: the token predates the policy,
+/// so it is still valid, and without a check on `createAppPassword` it could
+/// hand out a credential the gate was meant to withhold -- outliving the
+/// requirement rather than being subject to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_existing_session_cannot_mint_an_app_password_while_a_policy_is_owed() {
+    // Signed in first, on a server with no policy, exactly as an account that
+    // predates the policy would have been.
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let (status, session) = post_json(
+        app,
+        "/xrpc/com.atproto.server.createSession",
+        json!({ "identifier": "alice.example", "password": "pw" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {session}");
+    let token = session["accessJwt"]
+        .as_str()
+        .expect("accessJwt")
+        .to_string();
+
+    // The operator then introduces a policy. Same accounts, same tokens.
+    let (gated, _gated_manager, _tmp2) = build_app_with_policy().await;
+    create_account(&gated, &_gated_manager, "did:plc:alice", "alice.example").await;
+    let (status, fresh) = post_json(
+        gated.clone(),
+        "/xrpc/com.atproto.server.createSession",
+        json!({ "identifier": "alice.example", "password": "pw" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the session gate should already refuse: {fresh}"
+    );
+
+    // And a token that predates it cannot be spent on a new credential.
+    let req = axum::http::Request::builder()
+        .uri("/xrpc/com.atproto.server.createAppPassword")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&json!({ "name": "sneaky" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = gated.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "PolicyAcceptanceRequired", "body: {body}");
+    assert!(
+        body["password"].is_null(),
+        "an app password was issued anyway"
+    );
+}

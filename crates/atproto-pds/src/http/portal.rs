@@ -1177,6 +1177,13 @@ pub async fn change_password(
         .ok_or_else(|| XrpcError::new(StatusCode::NOT_FOUND, "NotFound", "no account manager"))?;
     let pool = manager.account_pool();
 
+    if crate::http::auth_handlers::require_policy_accepted(&state, &account.did)
+        .await
+        .is_err()
+    {
+        return Ok(redirect("/account"));
+    }
+
     // Proving the current password is what stops a borrowed session -- an
     // unattended browser, a stolen cookie -- from locking the holder out of
     // their own account.
@@ -1233,6 +1240,14 @@ pub async fn create_app_password(
     let Some((_, account)) = current_account(&state, &headers).await else {
         return Ok(redirect("/account/signin"));
     };
+    // The prompt hides these controls, but the route still exists and a
+    // direct POST would reach it. The UI is not the boundary.
+    if crate::http::auth_handlers::require_policy_accepted(&state, &account.did)
+        .await
+        .is_err()
+    {
+        return Ok(redirect("/account"));
+    }
     let pool = state.reader.accounts().account_pool();
     let name = form.name.trim();
     if name.is_empty() || name == "__primary__" {

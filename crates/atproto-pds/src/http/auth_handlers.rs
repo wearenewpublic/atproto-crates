@@ -803,6 +803,31 @@ pub struct AppPasswordCreated {
     pub created_at: String,
 }
 
+/// Refuse a credential-minting request from an account that owes an acceptance.
+///
+/// Session creation is already gated, but a session minted *before* the policy
+/// was introduced is still live and can call this. Without the same check
+/// here, that session could mint a fresh app password and hand out a
+/// credential the gate was supposed to withhold -- outliving the requirement
+/// rather than being subject to it.
+///
+/// Password *reset* is deliberately not gated. It is the recovery path for
+/// someone locked out, blocking it would strand them, and it gains an attacker
+/// nothing: the session they would then try to create is refused anyway.
+pub(crate) async fn require_policy_accepted(state: &HttpState, did: &str) -> Result<(), XrpcError> {
+    if crate::account::policy::acceptance_required(&state.reader, did, state.policy.as_ref()).await
+    {
+        tracing::info!(did, "credential creation refused: policy not accepted");
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "PolicyAcceptanceRequired",
+            "this account must accept the current policy before creating \
+             credentials; open /account on this server to do so",
+        ));
+    }
+    Ok(())
+}
+
 /// Handler for `com.atproto.server.createAppPassword`.
 pub async fn create_app_password(
     State(state): State<HttpState>,
@@ -811,6 +836,7 @@ pub async fn create_app_password(
 ) -> Result<Json<AppPasswordCreated>, XrpcError> {
     let claims = require_access_jwt(&parts, &state).await?;
     require_full_session(&claims, "com.atproto.server.createAppPassword")?;
+    require_policy_accepted(&state, &claims.sub).await?;
     let manager = account_manager(&state)?;
     // Deactivation is self-service and reversible; a takedown or suspension is
     // a moderation decision and must not be. `valid_transition` still permits
