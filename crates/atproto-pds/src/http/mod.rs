@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod auth_handlers;
 pub mod blob_handlers;
+pub mod browse;
 pub mod discovery_handlers;
 pub mod errors;
 pub mod extract;

@@ -3,6 +3,7 @@
 use crate::admin;
 use crate::http::auth_handlers;
 use crate::http::blob_handlers;
+use crate::http::browse;
 use crate::http::discovery_handlers;
 use crate::http::handlers;
 use crate::http::identity_handlers;
@@ -499,6 +500,37 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/account/signup", get(portal::sign_up_page))
         .route("/account/signup", post(portal::sign_up))
         .route("/account/handle", post(portal::change_handle))
+        // The repository browser. `{segment}` is a collection or a blob CID;
+        // `browse::looks_like_cid` decides, and nothing else needs to.
+        .route("/browse/", get(browse::index))
+        .route(
+            "/browse/public/",
+            get(browse::public_collections).post(browse::public_create),
+        )
+        .route(
+            "/browse/public/{segment}",
+            get(browse::public_collection_or_blob),
+        )
+        .route(
+            "/browse/public/{collection}/{rkey}",
+            get(browse::public_record)
+                .post(browse::public_record_post)
+                .delete(browse::public_record_delete),
+        )
+        .route(
+            "/browse/space/{host}/{space_type}/{space_key}",
+            get(browse::space_collections),
+        )
+        .route(
+            "/browse/space/{host}/{space_type}/{space_key}/{segment}",
+            get(browse::space_collection_or_blob),
+        )
+        .route(
+            "/browse/space/{host}/{space_type}/{space_key}/{collection}/{rkey}",
+            get(browse::space_record)
+                .post(browse::space_record_post)
+                .delete(browse::space_record_delete),
+        )
         .route("/account/email", post(portal::change_email))
         .route("/account/email/verify", post(portal::verify_email))
         .route(

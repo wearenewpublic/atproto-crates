@@ -86,7 +86,7 @@ fn is_secure(headers: &HeaderMap, state: &HttpState) -> bool {
 /// arrives with no session and fails regardless. This is the second lock: it
 /// refuses the request outright rather than as an authentication error, so the
 /// logs say what actually happened.
-fn require_same_origin(headers: &HeaderMap) -> Result<(), XrpcError> {
+pub(crate) fn require_same_origin(headers: &HeaderMap) -> Result<(), XrpcError> {
     let site = headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
@@ -111,7 +111,7 @@ fn require_same_origin(headers: &HeaderMap) -> Result<(), XrpcError> {
 }
 
 /// The signed-in account behind a request, or `None`.
-async fn current_account(
+pub(crate) async fn current_account(
     state: &HttpState,
     headers: &HeaderMap,
 ) -> Option<(String, crate::account::AccountRow)> {
@@ -137,7 +137,7 @@ async fn current_account(
 // ---------------------------------------------------------------------------
 
 /// Escape text for interpolation into HTML.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -146,7 +146,7 @@ fn esc(s: &str) -> String {
 }
 
 /// Shared chrome. Every portal page is this with a different body.
-fn page(title: &str, body: &str) -> Html<String> {
+pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html>
 <html lang="en">
@@ -213,7 +213,7 @@ fn page(title: &str, body: &str) -> Html<String> {
 }
 
 /// A one-line banner above the page body.
-fn notice(kind: &str, text: &str) -> String {
+pub(crate) fn notice(kind: &str, text: &str) -> String {
     format!(r#"<div class="notice {kind}">{}</div>"#, esc(text))
 }
 
@@ -410,7 +410,7 @@ pub async fn sign_out(
 }
 
 /// A 303 to `path`.
-fn redirect(path: &str) -> Response {
+pub(crate) fn redirect(path: &str) -> Response {
     (StatusCode::SEE_OTHER, [(header::LOCATION, path)]).into_response()
 }
 
@@ -1004,6 +1004,7 @@ pub async fn dashboard(
     <button class="quiet" type="submit">Sign out</button></form></nav>
 <h1>Account</h1>
 <p class="sub">Everything here applies to this account on this server.</p>
+<p><a href="/browse/">Browse your repository &rarr;</a></p>
 {banner}
 {fresh_secret}
 {handle_section}
