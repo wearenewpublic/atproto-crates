@@ -630,11 +630,11 @@ async fn denylisted_handle_blocks_create_account() {
     let accounts_pool = accounts.pool().clone();
     let account_pool = atproto_pds::account::AccountPool::Sqlite(accounts_pool.clone());
 
-    // Block "alice.example" before constructing the rest of the app.
+    // Block "alice.test" before constructing the rest of the app.
     atproto_pds::denylist::add(
         &account_pool,
         atproto_pds::denylist::KIND_HANDLE,
-        "alice.example",
+        "alice.test",
         Some("test"),
     )
     .await
@@ -666,7 +666,7 @@ async fn denylisted_handle_blocks_create_account() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "did": "did:plc:alice",
-                "handle": "alice.example",
+                "handle": "alice.test",
                 "password": "pw"
             }))
             .unwrap(),

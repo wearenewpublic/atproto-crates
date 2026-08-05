@@ -385,7 +385,7 @@ async fn migration_create_account_requires_service_auth() {
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.server.createAccount",
-        json!({"did": "did:plc:elsewhere", "handle": "elsewhere.example", "password": "pw"}),
+        json!({"did": "did:plc:elsewhere", "handle": "elsewhere.test", "password": "pw"}),
         None,
     )
     .await;

@@ -123,7 +123,7 @@ async fn create_account_with_an_unproven_did_is_refused() {
         "/xrpc/com.atproto.server.createAccount",
         json!({
             "did": "did:plc:victim",
-            "handle": "victim.example",
+            "handle": "victim.test",
             "password": "correct horse battery staple",
         }),
         None,
@@ -276,12 +276,78 @@ async fn refresh_with_access_jwt_rejected() {
 /// This harness attaches no `PlcService`, which makes the ordering observable
 /// without a directory: reaching genesis at all answers `503 PlcUnavailable`,
 /// so a `400` naming the conflict can only mean the check ran first.
+/// `createAccount` validates handle and email syntax, as the change paths do.
+///
+/// It did neither, so the same handle was refused by `updateHandle` and
+/// accepted at signup. A handle with a space in it was creatable, and the
+/// `alsoKnownAs` it produced -- `at://al ice.test` -- reached the PLC
+/// directory, where it does not parse as a URI and the operation is permanent.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_account_refuses_malformed_handles_and_emails() {
+    let (app, _manager, _tmp) = build_app(false).await;
+
+    for (label, handle, email, expected) in [
+        (
+            "a space in the handle",
+            "al ice.test",
+            "a@example.com",
+            "InvalidHandle",
+        ),
+        (
+            "an underscore",
+            "al_ice.test",
+            "a@example.com",
+            "InvalidHandle",
+        ),
+        (
+            "no domain at all",
+            "justalice",
+            "a@example.com",
+            "InvalidHandle",
+        ),
+        (
+            "an empty first label",
+            ".test",
+            "a@example.com",
+            "InvalidHandle",
+        ),
+        (
+            "a reserved TLD",
+            "alice.example",
+            "a@example.com",
+            "InvalidHandle",
+        ),
+        (
+            "an email with no @",
+            "ok1.test",
+            "not-an-email",
+            "InvalidRequest",
+        ),
+        (
+            "an email with no domain",
+            "ok2.test",
+            "alice@",
+            "InvalidRequest",
+        ),
+    ] {
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.server.createAccount",
+            json!({ "handle": handle, "email": email, "password": "correct horse battery staple" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: body: {body}");
+        assert_eq!(body["error"], expected, "{label}: body: {body}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn create_account_conflict_is_reported_before_plc_genesis() {
     let (app, manager, _tmp) = build_app(false).await;
     manager
         .create_account(
-            CreateAccountParams::new("did:plc:alice", "alice.example", "pw")
+            CreateAccountParams::new("did:plc:alice", "alice.test", "pw")
                 .with_email(Some("alice@example.com")),
         )
         .await
@@ -292,7 +358,7 @@ async fn create_account_conflict_is_reported_before_plc_genesis() {
         app.clone(),
         "/xrpc/com.atproto.server.createAccount",
         json!({
-            "handle": "bob.example",
+            "handle": "bob.test",
             "email": "alice@example.com",
             "password": "correct horse battery staple",
         }),
@@ -314,7 +380,7 @@ async fn create_account_conflict_is_reported_before_plc_genesis() {
         app,
         "/xrpc/com.atproto.server.createAccount",
         json!({
-            "handle": "alice.example",
+            "handle": "alice.test",
             "email": "bob@example.com",
             "password": "correct horse battery staple",
         }),
@@ -591,7 +657,7 @@ async fn invite_required_rejects_unknown_code_before_side_effects() {
         "/xrpc/com.atproto.server.createAccount",
         json!({
             "did": "did:plc:newuser",
-            "handle": "newuser.example",
+            "handle": "newuser.test",
             "password": "pw",
             "inviteCode": "pds-DOES-NOT-EXIST",
         }),

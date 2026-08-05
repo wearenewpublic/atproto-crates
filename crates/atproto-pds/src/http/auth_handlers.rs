@@ -169,11 +169,36 @@ pub async fn create_account(
     enforce_rate_limit(&state, &format!("createAccount:{}", input.handle)).await?;
     let manager = account_manager(&state)?;
 
+    // Handle syntax, before anything else looks at the string.
+    //
+    // `updateHandle` has always validated this and `createAccount` never did,
+    // so the same handle was refused when changed and accepted when the
+    // account was first made. A handle with a space in it was creatable, and
+    // the resulting `alsoKnownAs` -- `at://al ice.example.com` -- went into
+    // the PLC directory, where it does not parse as a URI and the operation
+    // is permanent. Normalising here also means the account is stored under
+    // the same lowercased form every other path expects.
+    let handle = crate::handle::normalize_and_validate(&input.handle)?;
+
+    // Email syntax, on the same principle: `updateEmail` refuses a malformed
+    // address and this did not, so an account could be created with
+    // `not-an-email` on file -- and an address that cannot receive mail is an
+    // account that can never reset its password or confirm anything.
+    if let Some(email) = input.email.as_deref()
+        && !is_email_shape(email)
+    {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!("invalid email: {email}"),
+        ));
+    }
+
     // §11e — when the operator pinned a list of allowed handle suffix
     // domains, reject handles that don't end with one of them. Empty list
     // means any handle is accepted (back-compat for dev / test).
     if !state.service_handle_domains.is_empty() {
-        let lower = input.handle.to_ascii_lowercase();
+        let lower = handle.to_ascii_lowercase();
         let allowed = state.service_handle_domains.iter().any(|d| {
             let needle = format!(".{}", d.trim_start_matches('.').to_ascii_lowercase());
             // Either exact-match or handle ends with `.<domain>`.
@@ -185,7 +210,7 @@ pub async fn create_account(
                 "InvalidHandle",
                 format!(
                     "handle {} is not under any of the allowed service handle domains",
-                    input.handle
+                    handle
                 ),
             ));
         }
@@ -197,7 +222,7 @@ pub async fn create_account(
     if crate::denylist::contains(
         &manager.account_pool(),
         crate::denylist::KIND_HANDLE,
-        &input.handle,
+        &handle,
     )
     .await
     .map_err(XrpcError::from)?
@@ -297,7 +322,7 @@ pub async fn create_account(
             // The DID is passed as `None` — there is nothing to check until
             // genesis mints one. `create_account` covers that column.
             manager
-                .ensure_available(None, &input.handle, input.email.as_deref())
+                .ensure_available(None, &handle, input.email.as_deref())
                 .await
                 .map_err(XrpcError::from)?;
             let plc_service = state.plc_service.as_ref().ok_or_else(|| {
@@ -308,7 +333,7 @@ pub async fn create_account(
                 )
             })?;
             let outcome = plc_service
-                .genesis(&input.handle)
+                .genesis(&handle)
                 .await
                 .map_err(XrpcError::from)?;
             (
@@ -331,7 +356,7 @@ pub async fn create_account(
                 AccountState::Active
             },
             did: &did,
-            handle: &input.handle,
+            handle: &handle,
             email: input.email.as_deref(),
             password: &input.password,
             pds_managed_rotation: true,
