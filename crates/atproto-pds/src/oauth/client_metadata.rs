@@ -66,6 +66,25 @@ pub struct ClientMetadata {
     /// URL of the client's JWKS, if published by reference.
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// The grant types this client declares it will use.
+    ///
+    /// Read because `response_type=code` is a request to use the
+    /// authorization-code grant, and a client that did not declare it is
+    /// asking for something it never registered for.
+    #[serde(default)]
+    pub grant_types: Vec<String>,
+    /// The scopes this client declares, space-separated.
+    ///
+    /// The bound on what it may request. Absent means it declared none, and a
+    /// request for any scope is then unregistered.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// How the client authenticates at the token endpoint.
+    ///
+    /// `none` is a public client. Anything else is a confidential one, which
+    /// has to publish keys to authenticate with.
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
 }
 
 /// Why a client could not be resolved or a redirect could not be accepted.
@@ -177,6 +196,12 @@ pub fn loopback_client_metadata(client_id: &str) -> Result<ClientMetadata, Clien
         redirect_uris,
         jwks: None,
         jwks_uri: None,
+        // The loopback development client declares nothing, and an empty
+        // declaration is read as "unconstrained" by the checks in `par` --
+        // which is right here: there is no document to contradict.
+        grant_types: Vec::new(),
+        scope: None,
+        token_endpoint_auth_method: None,
     })
 }
 
@@ -326,6 +351,9 @@ mod tests {
 
     fn metadata_with(uris: &[&str]) -> ClientMetadata {
         ClientMetadata {
+            grant_types: Vec::new(),
+            scope: None,
+            token_endpoint_auth_method: None,
             client_id: Some("https://app.example/client-metadata.json".to_string()),
             redirect_uris: uris.iter().map(|u| (*u).to_string()).collect(),
             jwks: None,

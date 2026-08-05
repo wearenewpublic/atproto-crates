@@ -66,6 +66,9 @@ pub struct ParInput {
     /// Optional handle/DID hint for prefilling consent.
     #[serde(default)]
     pub login_hint: Option<String>,
+    /// How the client wants the holder asked, if at all.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// Resolved + validated PAR fields after merging inline + request-object
@@ -82,6 +85,7 @@ struct ResolvedFields {
     code_challenge_method: String,
     dpop_jkt: Option<String>,
     login_hint: Option<String>,
+    prompt: Option<String>,
 }
 
 /// Decoded payload of a JAR-style request object (RFC 9101 §2.1).
@@ -102,6 +106,8 @@ struct RequestObjectClaims {
     dpop_jkt: Option<String>,
     #[serde(default)]
     login_hint: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     iat: Option<i64>,
@@ -217,6 +223,95 @@ pub async fn par_handler(
                 format!("client metadata could not be resolved: {err}"),
             )
         })?;
+    // Everything below is the client's own document contradicting its request.
+    // Each of these was accepted before, and each was refused by the reference
+    // implementation with a named error -- found by driving a real browser
+    // client at both.
+    let refuse = |error: &'static str, detail: String| {
+        tracing::warn!(client_id = %resolved.client_id, detail, "PAR rejected");
+        XrpcError::new(StatusCode::BAD_REQUEST, error, detail)
+    };
+
+    // `response_type=code` *is* the authorization-code grant.
+    if !metadata.grant_types.is_empty()
+        && !metadata
+            .grant_types
+            .iter()
+            .any(|g| g == "authorization_code")
+    {
+        return Err(refuse(
+            "invalid_client_metadata",
+            "the \"code\" response type requires that \"grant_types\" contains \"authorization_code\""
+                .to_string(),
+        ));
+    }
+
+    // A confidential client with nothing to authenticate with cannot ever
+    // complete the token exchange, so accepting the request only defers the
+    // failure to a point where it is harder to read.
+    if metadata
+        .token_endpoint_auth_method
+        .as_deref()
+        .is_some_and(|m| m != "none")
+        && metadata.jwks.is_none()
+        && metadata.jwks_uri.is_none()
+    {
+        return Err(refuse(
+            "invalid_client_metadata",
+            format!(
+                "{} auth method requires jwks or jwks_uri",
+                metadata.token_endpoint_auth_method.as_deref().unwrap_or("")
+            ),
+        ));
+    }
+
+    // The declared scope is the ceiling. Without this a client could request
+    // any scope it liked at authorization time regardless of what it
+    // published, and the consent screen would faithfully show the holder a
+    // permission the client never registered for.
+    if let Some(declared) = metadata.scope.as_deref() {
+        let allowed: Vec<&str> = declared.split_whitespace().collect();
+        if let Some(extra) = resolved
+            .scope
+            .split_whitespace()
+            .find(|s| !allowed.contains(s))
+        {
+            return Err(refuse(
+                "invalid_scope",
+                format!("scope \"{extra}\" is not declared in the client metadata"),
+            ));
+        }
+    }
+
+    // `prompt`. The atproto OAuth spec does not define it, but the reference
+    // acts on it and clients send it, so ignoring it is the one behaviour that
+    // cannot be right: `prompt=none` asks for a silent answer, and answering
+    // with an interactive login form leaves the client waiting for a redirect
+    // that needs a human.
+    if let Some(prompt) = resolved.prompt.as_deref() {
+        match prompt {
+            // No session is carried between authorization requests here --
+            // every one presents the login form -- so there is never an
+            // existing session to answer silently from.
+            "none" => {
+                return Err(refuse(
+                    "invalid_request",
+                    "public clients are not allowed to use silent-sign-on".to_string(),
+                ));
+            }
+            // These describe how to ask, and this server always asks.
+            "login" | "consent" | "select_account" => {}
+            other => {
+                return Err(refuse(
+                    "invalid_request",
+                    format!(
+                        "invalid prompt \"{other}\": expected none, login, consent or select_account"
+                    ),
+                ));
+            }
+        }
+    }
+
     assert_redirect_uri_registered(&resolved.client_id, &metadata, &resolved.redirect_uri)
         .map_err(|err| {
             tracing::warn!(
@@ -280,6 +375,7 @@ fn merge_inline_into_resolved(input: &ParInput) -> Result<ResolvedFields, XrpcEr
         code_challenge_method: req(&input.code_challenge_method, "code_challenge_method")?,
         dpop_jkt: input.dpop_jkt.clone(),
         login_hint: input.login_hint.clone(),
+        prompt: input.prompt.clone(),
     })
 }
 
@@ -296,6 +392,7 @@ fn merge_request_object_into_resolved(
         code_challenge_method: claims.code_challenge_method,
         dpop_jkt: claims.dpop_jkt,
         login_hint: claims.login_hint,
+        prompt: claims.prompt,
     })
 }
 
@@ -601,6 +698,7 @@ mod tests {
             code_challenge_method: Some("S256".to_string()),
             dpop_jkt: None,
             login_hint: None,
+            prompt: None,
         }
     }
 

@@ -56,17 +56,17 @@ pub async fn authorize_handler(
         )
     })?;
 
-    if !input.approve {
-        return Err(XrpcError::new(
-            StatusCode::FORBIDDEN,
-            "access_denied",
-            "user declined the authorization request",
-        ));
-    }
-
+    // Read without consuming.
+    //
+    // This used to `take_par` here, at the top, before the password had been
+    // looked at. So a single mistyped password destroyed the pushed request
+    // and the retry answered `request_uri unknown or expired` -- the flow was
+    // dead and the only way forward was to start again from the client. One
+    // typo, and the person is bounced out of an authorization they were in the
+    // middle of. It is consumed below, once the outcome is settled.
     let request = state
         .oauth
-        .take_par(&input.request_uri)
+        .peek_par(&input.request_uri)
         .await
         .map_err(XrpcError::from)?
         .ok_or_else(|| {
@@ -76,6 +76,23 @@ pub async fn authorize_handler(
                 "request_uri unknown or expired",
             )
         })?;
+
+    // A refusal is a settled outcome, so the request is spent. Previously this
+    // returned before the row was even read, which left a declined
+    // `request_uri` replayable -- the holder said no and the client could
+    // present it again.
+    if !input.approve {
+        state
+            .oauth
+            .take_par(&input.request_uri)
+            .await
+            .map_err(XrpcError::from)?;
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "user declined the authorization request",
+        ));
+    }
 
     // Resolve identifier → DID via the accounts directory.
     let directory = state.reader.accounts();
@@ -140,6 +157,23 @@ pub async fn authorize_handler(
             "access_denied",
             "this account must accept the current policy before authorizing an \
              application; open /account on this server to do so",
+        ));
+    }
+
+    // Everything has passed, so spend the request. Taking it here rather than
+    // earlier also settles the race: two requests arriving together, only one
+    // gets `Some`, and only that one issues a code.
+    if state
+        .oauth
+        .take_par(&input.request_uri)
+        .await
+        .map_err(XrpcError::from)?
+        .is_none()
+    {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "request_uri unknown or expired",
         ));
     }
 
