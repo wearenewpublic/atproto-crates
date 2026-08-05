@@ -72,6 +72,12 @@ impl SqlActorStore {
             // mmap and busy-timeout settings are conservative defaults; a
             // production deployment may tune these via PdsConfig.
             .pragma("mmap_size", "67108864") // 64 MiB
+            // Stated rather than inherited. sqlx turns this on by default, so
+            // it changes nothing today -- but the schema's foreign keys are
+            // only enforced because of it, and a driver swap or an options
+            // refactor that dropped the default would disable every one of
+            // them silently.
+            .pragma("foreign_keys", "ON")
             .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()

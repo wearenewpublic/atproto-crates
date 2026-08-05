@@ -100,7 +100,13 @@ impl AccountDirectory {
             })?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .pragma("mmap_size", "67108864");
+            .pragma("mmap_size", "67108864")
+            // Stated rather than inherited. sqlx turns this on by default, so
+            // this changes nothing today -- but the schema's fifteen foreign
+            // keys are only enforced because of it, and a driver swap or an
+            // options refactor that dropped the default would disable every
+            // one of them silently.
+            .pragma("foreign_keys", "ON");
         let pool = SqlitePoolOptions::new()
             .max_connections(if url == "sqlite::memory:" { 1 } else { 8 })
             .connect_with(opts)
