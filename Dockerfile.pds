@@ -1,0 +1,65 @@
+# The PDS as a single container.
+#
+#   docker build -f Dockerfile.pds -t atproto-pds .
+#
+# Separate from `Dockerfile`, which builds the fifteen CLI tools and does not
+# build `pds` at all. Deploying that image and expecting a server is a mistake
+# worth making impossible rather than documenting.
+#
+# One process, one writable volume. Everything durable -- the accounts
+# database, each actor's own SQLite store, blobs, and the key store -- lives
+# under `PDS_DATA_DIRECTORY`, so a single mount is the whole persistent state.
+
+FROM rust:1.90-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+COPY . .
+
+# `smtp` is not optional for a real deployment: without it `EmailService`
+# compiles down to `Disabled`, and password reset, email confirmation and
+# account deletion all report success and send nothing. `hickory-dns` is what
+# resolves handles by DNS TXT. lettre is pinned to rustls, so neither adds
+# OpenSSL to the runtime image.
+RUN cargo build --release --bin pds --features clap,smtp,hickory-dns
+
+# Distroless: no shell, no package manager. The build is static enough that
+# `cc` is all the runtime needs, and there is nothing here for someone who
+# reaches the container to pivot with.
+FROM gcr.io/distroless/cc-debian12
+
+COPY --from=builder /usr/src/app/target/release/pds /usr/local/bin/pds
+
+# The mount point. Declared so that running without a volume still starts and
+# keeps its data somewhere coherent -- and so `docker run -v` has an obvious
+# target. On Railway this is the volume's mount path.
+ENV PDS_DATA_DIRECTORY=/data
+VOLUME ["/data"]
+
+# Containers are routed to from outside, so loopback -- the right default for
+# a process on a workstation -- is the wrong one here.
+ENV PDS_BIND=0.0.0.0
+
+# `PDS_PORT` is deliberately NOT set.
+#
+# Setting it here looks harmless and is not: the binary prefers `PDS_PORT` over
+# the platform's `PORT`, so baking one into the image pins the listener to 4800
+# and every platform that assigns a port routes to somewhere nothing is
+# listening. The failure is a health check timing out with nothing in the log
+# to explain it -- which is what happened the first time this image ran.
+#
+# Unset, the binary falls back to `PORT` when the platform provides one and to
+# its own 4800 default when nobody does.
+EXPOSE 4800
+
+# distroless has no shell, so this is the exec form with no wrapper. Every
+# knob is an environment variable, which is what the platforms set anyway.
+ENTRYPOINT ["/usr/local/bin/pds"]
+
+LABEL org.opencontainers.image.title="atproto-pds"
+LABEL org.opencontainers.image.description="AT Protocol Personal Data Server"
+LABEL org.opencontainers.image.source="https://tangled.org/ngerakines.me/atproto-crates"
+LABEL org.opencontainers.image.licenses="MIT"

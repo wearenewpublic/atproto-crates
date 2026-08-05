@@ -450,7 +450,20 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Platform-assigned port. Railway, Fly, Heroku and the rest hand the
+    // container a port in `PORT` and route to it; a service that ignores it
+    // binds somewhere the platform is not looking and reads as failing its
+    // health check for reasons nothing explains.
+    //
+    // `PDS_PORT` still wins when set, so an operator who names a port gets it.
+    if std::env::var_os("PDS_PORT").is_none()
+        && let Ok(port) = std::env::var("PORT")
+        && let Ok(port) = port.parse::<u16>()
+    {
+        args.port = port;
+    }
     init_tracing(&args.log, args.otel_endpoint.as_deref());
 
     info!(

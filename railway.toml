@@ -1,0 +1,35 @@
+# Railway deployment for the PDS.
+#
+# Railway reads this from the repository root. It says three things Railway
+# cannot infer: build this Dockerfile rather than the CLI-tools one, ask
+# `/xrpc/_health` whether a deploy is good, and never run two of these at once.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.pds"
+
+[deploy]
+# `_health` reports readiness rather than mere liveness -- it opens the
+# accounts database. A deploy that cannot reach its volume fails here instead
+# of accepting traffic and answering every request with a storage error.
+healthcheckPath = "/xrpc/_health"
+healthcheckTimeout = 120
+
+# A restart is the right response to a crash: the state is on the volume, and
+# starting again is how the process rejoins it.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# One instance, deliberately.
+#
+# SQLite is the durable store and the volume holding it can only be attached
+# to one instance. Two replicas would either fail to start or -- worse -- run
+# against separate copies of the same repositories, both signing commits into
+# divergent histories under one DID. There is no read replica to scale onto
+# either: `numReplicas` above 1 is a data-loss setting here, not a throughput
+# one.
+numReplicas = 1
+
+# Overlap a new deploy with the old one and both hold the volume, so the new
+# one cannot mount it. Stop first.
+overlapSeconds = 0
