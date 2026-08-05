@@ -40,6 +40,10 @@ pub mod manager;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
+/// A grace window making a refresh idempotent for a few seconds, so a client
+/// racing two refreshes against itself is not logged out.
+pub mod refresh_grace;
+
 pub mod session;
 
 #[cfg(feature = "sqlite")]

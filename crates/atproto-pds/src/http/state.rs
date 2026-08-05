@@ -66,6 +66,9 @@ pub struct HttpState {
     pub plc_service: Option<Arc<PlcService>>,
     /// JWT-jti replay guard (always populated; in-memory by default).
     pub jti_guard: JtiReplayGuard,
+    /// Brief memory of what each rotated refresh token was exchanged for, so a
+    /// client with two refreshes in flight is not logged out by its own race.
+    pub refresh_grace: Arc<crate::account::refresh_grace::RefreshGrace>,
     /// Per-key sliding-window rate limiter (always populated).
     pub rate_limiter: SlidingWindowLimiter,
     /// In-process broadcast bus for `subscribeRepos` low-latency
@@ -169,6 +172,7 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             jti_guard: JtiReplayGuard::new(100_000),
+            refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
             event_bus: EventBus::default(),
             pds_signing_key: None,
@@ -216,6 +220,7 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             jti_guard: JtiReplayGuard::new(100_000),
+            refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
             event_bus: EventBus::default(),
             pds_signing_key: None,

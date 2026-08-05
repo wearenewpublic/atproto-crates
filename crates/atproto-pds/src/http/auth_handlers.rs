@@ -560,6 +560,37 @@ pub async fn refresh_session(
 ) -> Result<Json<SessionResponse>, XrpcError> {
     let raw = bearer_token(&parts)?;
     let claims = session::verify_refresh(raw, &state.jwt_secret).map_err(XrpcError::from)?;
+
+    // A client with two requests in flight can meet a 401 on both and refresh
+    // with the same stored token twice. One wins the replay check below; the
+    // other would get `AuthenticationRequired`, and the official client treats
+    // a refresh that yields no session as the session being gone and logs the
+    // account holder out. So a refresh is idempotent for a few seconds: the
+    // same token returns the same successor rather than an error.
+    //
+    // Outside that window the replay check still refuses it, which is what
+    // keeps rotation meaningful.
+    if let Some(existing) = state.refresh_grace.get(&claims.jti) {
+        tracing::debug!(
+            did = %claims.sub,
+            "refresh replayed inside the grace window; returning the same successor"
+        );
+        let account_handle = state
+            .reader
+            .accounts()
+            .lookup_did(&claims.sub)
+            .await
+            .map_err(XrpcError::from)?
+            .map(|a| a.handle)
+            .unwrap_or_default();
+        return Ok(Json(SessionResponse {
+            access_jwt: existing.access_jwt,
+            refresh_jwt: existing.refresh_jwt,
+            handle: account_handle,
+            did: claims.sub,
+        }));
+    }
+
     // JTI replay protection — single-use rotation defense in depth.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -617,6 +648,11 @@ pub async fn refresh_session(
         session::DEFAULT_REFRESH_TTL_SECS,
     )
     .map_err(XrpcError::from)?;
+
+    // Remember what this token bought, so a racing second request gets the
+    // same answer instead of a 401.
+    state.refresh_grace.insert(&claims.jti, &tokens);
+
     Ok(Json(SessionResponse {
         access_jwt: tokens.access_jwt,
         refresh_jwt: tokens.refresh_jwt,
