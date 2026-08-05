@@ -44,6 +44,38 @@ async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     (app, manager, tmp)
 }
 
+/// The same app, but with a policy set the account has not accepted.
+async fn build_app_with_policy() -> (axum::Router, Arc<AccountManager>, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_policy_documents(Some(atproto_pds::http::state::PolicyDocuments {
+        set_id: "2026-08-05-testpolicyset".to_string(),
+        url: "https://example.invalid/policies/2026-08-05".to_string(),
+    }));
+    let app = build_router(state);
+    (app, manager, tmp)
+}
+
 async fn create_account(_app: &axum::Router, manager: &AccountManager, did: &str, handle: &str) {
     // Created through the internal API rather than the XRPC endpoint. That
     // endpoint now requires a service-auth token proving control of the DID,
@@ -1448,4 +1480,56 @@ async fn account_lifecycle_endpoints_refuse_oauth_and_say_why() {
             "{path} should say OAuth is not accepted, not leak the JWT typ"
         );
     }
+}
+
+/// An account that owes a policy acceptance cannot complete an OAuth
+/// authorization.
+///
+/// `createSession` is gated the same way, and gating only that one would leave
+/// the requirement trivially avoidable: a client that wanted a credential
+/// would ask for an OAuth grant instead. The two are different doors into the
+/// same house.
+#[tokio::test(flavor = "multi_thread")]
+async fn authorize_is_refused_until_the_policy_is_accepted() {
+    let (app, manager, _tmp) = build_app_with_policy().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (_, challenge) = pkce_pair();
+    let (_, par_body) = post_json(
+        app.clone(),
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "atproto", "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par_body["request_uri"].as_str().expect("request_uri");
+
+    let (status, body) = post_json(
+        app,
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.example",
+            "password": "pw", "approve": true,
+        }),
+    )
+    .await;
+    // Refused *after* the password was accepted, so this is not a credential
+    // failure being mistaken for a policy one.
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"], "access_denied", "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("accept the current policy"),
+        "body: {body}"
+    );
+    assert!(
+        body["code"].is_null(),
+        "an authorization code was issued anyway"
+    );
 }

@@ -520,6 +520,30 @@ pub async fn create_session(
         }
     };
 
+    // The policy gate. Placed here, after the credential has been proved and
+    // before a token exists: refusing earlier would tell an unauthenticated
+    // caller which accounts are behind on the terms, and refusing later would
+    // mean handing out the token first.
+    //
+    // The portal sign-in path deliberately does *not* go through here -- see
+    // `account::policy` -- because the page that records the acceptance has to
+    // stay reachable or this is a deadlock rather than a gate.
+    if crate::account::policy::acceptance_required(
+        &state.reader,
+        &account.did,
+        state.policy.as_ref(),
+    )
+    .await
+    {
+        tracing::info!(did = %account.did, "session refused: policy not accepted");
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "PolicyAcceptanceRequired",
+            "this account must accept the current policy before signing in; \
+             open /account on this server to do so",
+        ));
+    }
+
     let tokens = session::issue_pair(
         &state.service_did,
         &account.did,

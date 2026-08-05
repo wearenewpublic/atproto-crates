@@ -755,6 +755,19 @@ pub async fn dashboard(
     };
     let pool = state.reader.accounts().account_pool();
 
+    // Signing in is allowed without having accepted -- this is the one page
+    // that can record an acceptance, so gating it would leave the holder with
+    // no way through the gate. Everything else on the account waits behind it.
+    if let Some(policy) = state.policy.clone()
+        && !crate::account::policy::has_accepted(&state.reader, &account.did, &policy).await
+    {
+        return Ok(page(
+            "Accept the policy",
+            &policy_prompt(&account, &policy, q.msg.as_deref()),
+        )
+        .into_response());
+    }
+
     let banner = match q.msg.as_deref() {
         Some("email-changed") => notice("ok", "Email address updated."),
         Some("email-code-sent") => notice(
@@ -766,6 +779,10 @@ pub async fn dashboard(
             "Password changed. Every other session was signed out.",
         ),
         Some("app-password-revoked") => notice("ok", "App password revoked."),
+        Some("policy-accepted") => notice(
+            "ok",
+            "Policy accepted. You can sign in to applications again.",
+        ),
         Some("signed-out-everywhere") => notice(
             "ok",
             "Every app password and OAuth session was signed out. Sessions already \
@@ -935,6 +952,87 @@ when they expire. This browser stays signed in.</p>
     );
     let _ = cookie;
     Ok(page("Account", &body).into_response())
+}
+
+/// The page a holder sees when they owe an acceptance.
+///
+/// Deliberately the whole page rather than a banner over the dashboard: this
+/// is a gate, and rendering the account controls behind it would suggest they
+/// work when the session that reaches them cannot be minted.
+fn policy_prompt(
+    account: &crate::account::AccountRow,
+    policy: &crate::http::state::PolicyDocuments,
+    message: Option<&str>,
+) -> String {
+    let banner = match message {
+        Some(m) if m.starts_with("err-") => notice("err", &m[4..].replace('-', " ")),
+        _ => String::new(),
+    };
+    format!(
+        r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
+  <form method="POST" action="/account/signout" style="display:inline;float:right">
+    <button class="quiet" type="submit">Sign out</button></form></nav>
+<h1>Accept the policy</h1>
+<p class="sub">This account cannot sign in to any application until the current
+policy is accepted.</p>
+{banner}
+<section>
+<form method="POST" action="/account/policy">
+  <div class="notice warn">
+    <label style="font-weight:400;margin:0">
+      <input type="checkbox" name="policy" value="accept" required
+             style="width:auto;margin-right:0.5em">
+      You must accept the policy <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> to continue.
+    </label>
+  </div>
+  <button type="submit">Accept and continue</button>
+</form>
+</section>"#,
+        handle = esc(&account.handle),
+        did = esc(&account.did),
+        url = esc(&policy.url),
+    )
+}
+
+/// Form body for an acceptance.
+#[derive(Debug, Deserialize)]
+pub struct PolicyForm {
+    /// Present and equal to `accept` when the box was ticked.
+    #[serde(default)]
+    pub policy: Option<String>,
+}
+
+/// `POST /account/policy`.
+pub async fn accept_policy(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<PolicyForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let Some((_, account)) = current_account(&state, &headers).await else {
+        return Ok(redirect("/account/signin"));
+    };
+    let Some(policy) = state.policy.clone() else {
+        return Ok(redirect("/account"));
+    };
+    if form.policy.as_deref() != Some("accept") {
+        return Ok(redirect(
+            "/account?msg=err-the-policy-must-be-accepted-to-continue",
+        ));
+    }
+
+    // Not best-effort here, unlike at signup. There the account already
+    // existed and failing the write cost nothing that could not be retried;
+    // here the write *is* the thing being asked for, and reporting success
+    // without it would send the holder back to a client that still refuses
+    // them, with no way to tell why.
+    record_policy_acceptance(&state, &account.did, &policy).await;
+    if !crate::account::policy::has_accepted(&state.reader, &account.did, &policy).await {
+        return Ok(redirect(
+            "/account?msg=err-the-acceptance-could-not-be-recorded-please-try-again",
+        ));
+    }
+    Ok(redirect("/account?msg=policy-accepted"))
 }
 
 // ---------------------------------------------------------------------------

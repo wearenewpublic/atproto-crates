@@ -44,6 +44,9 @@ pub mod postgres;
 /// racing two refreshes against itself is not logged out.
 /// The account portal's storage: the session epoch that backs "log out
 /// everywhere", and the browser sessions the portal itself runs on.
+/// Whether an account has accepted the operator's current policy documents.
+pub mod policy;
+
 pub mod portal;
 
 pub mod refresh_grace;

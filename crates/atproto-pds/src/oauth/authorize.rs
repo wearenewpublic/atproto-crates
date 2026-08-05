@@ -124,6 +124,25 @@ pub async fn authorize_handler(
         ));
     }
 
+    // Same gate as `createSession`. Without it here, a client could route
+    // around the policy requirement by asking for an OAuth grant instead of a
+    // session -- the two are different doors into the same house.
+    if crate::account::policy::acceptance_required(
+        &state.reader,
+        &account.did,
+        state.policy.as_ref(),
+    )
+    .await
+    {
+        tracing::info!(did = %account.did, "authorization refused: policy not accepted");
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "this account must accept the current policy before authorizing an \
+             application; open /account on this server to do so",
+        ));
+    }
+
     let code = random_code();
     let response = AuthorizeResponse {
         code: code.clone(),

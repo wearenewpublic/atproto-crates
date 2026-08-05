@@ -500,6 +500,7 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/account/email", post(portal::change_email))
         .route("/account/email/code", post(portal::email_code))
         .route("/account/password", post(portal::change_password))
+        .route("/account/policy", post(portal::accept_policy))
         .route("/account/app-passwords", post(portal::create_app_password))
         .route(
             "/account/app-passwords/revoke",
