@@ -151,6 +151,7 @@ pub async fn consent_page(
     // Best-effort: resolve the space-type NSIDs named in any `space:` scope to
     // their declaration `name` (spec line 434). Failures fall back to the NSID.
     let type_names = resolve_space_type_names(&state, &request.scope).await;
+    let permission_sets = resolve_permission_sets(&state, &request.scope).await;
 
     let html = render_consent(
         &q.request_uri,
@@ -158,6 +159,7 @@ pub async fn consent_page(
         &request.scope,
         &handles,
         &type_names,
+        &permission_sets,
     );
     // Never cached. The page is per-user and per-request: it names the client
     // asking, the scopes it wants, and the account being asked. A copy served
@@ -206,6 +208,108 @@ async fn resolve_space_owner_handles(state: &HttpState, scope: &str) -> BTreeMap
 /// scopes in `scope`, resolve each to its declaration `name` (spec line 434),
 /// and return the NSID→name map. NSIDs that fail to resolve are omitted
 /// (callers fall back to the raw NSID).
+/// Resolve every `include:` in `scope` to what its permission set says it is.
+///
+/// A permission set exists so a consent screen can say "Read and write your
+/// outlines" instead of reciting seven collections, and this page was showing
+/// the NSID — the one string in the document that means nothing to the person
+/// being asked. The set's own `title` and `detail` are written for exactly this
+/// moment.
+///
+/// Sets that do not resolve are omitted, and the caller falls back to naming
+/// the NSID. Showing the raw scope is poor; inventing a description for a
+/// record this server could not read would be worse.
+async fn resolve_permission_sets(state: &HttpState, scope: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(resolver) = state.lexicon_resolver.as_ref() else {
+        return out;
+    };
+    for token in scope.split_whitespace() {
+        let Ok(Scope::Include(inc)) = Scope::parse(token) else {
+            continue;
+        };
+        if out.contains_key(&inc.nsid) {
+            continue;
+        }
+        let Some(doc) = resolver.resolve(&inc.nsid).await else {
+            continue;
+        };
+        let main = &doc["defs"]["main"];
+        if main["type"].as_str() != Some("permission-set") {
+            continue;
+        }
+        let title = main["title"].as_str().unwrap_or(&inc.nsid);
+        let detail = main["detail"].as_str().unwrap_or_default();
+        let mut described = if detail.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} — {detail}")
+        };
+        // The permissions themselves, not only the summary. The description is
+        // the client's own words; this is what it actually gets, and the two
+        // are not obliged to agree.
+        let grants = summarise_permissions(main);
+        if !grants.is_empty() {
+            described.push_str(" Grants: ");
+            described.push_str(&grants.join("; "));
+            described.push('.');
+        }
+        out.insert(inc.nsid.clone(), described);
+    }
+    out
+}
+
+/// One readable line per permission a set declares.
+fn summarise_permissions(main: &serde_json::Value) -> Vec<String> {
+    let Some(permissions) = main["permissions"].as_array() else {
+        return Vec::new();
+    };
+    permissions
+        .iter()
+        .filter_map(|perm| {
+            let list = |k: &str| -> Vec<String> {
+                match &perm[k] {
+                    serde_json::Value::String(v) => vec![v.clone()],
+                    serde_json::Value::Array(a) => a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            match perm["resource"].as_str()? {
+                "repo" => {
+                    let mut actions = list("action");
+                    if actions.is_empty() {
+                        actions = vec!["create".into(), "update".into(), "delete".into()];
+                    }
+                    let collections = list("collection");
+                    if collections.is_empty() {
+                        return None;
+                    }
+                    Some(format!(
+                        "{} on {}",
+                        actions.join(", "),
+                        collections.join(", ")
+                    ))
+                }
+                "blob" => {
+                    let accept = list("accept");
+                    Some(if accept.is_empty() {
+                        "upload files of any type".to_string()
+                    } else {
+                        format!("upload {}", accept.join(", "))
+                    })
+                }
+                // Named rather than described: this server does not grant it,
+                // so claiming it does on the consent screen would be a lie in
+                // the one place that must not contain one.
+                other => Some(format!("{other} (not granted by this server)")),
+            }
+        })
+        .collect()
+}
+
 async fn resolve_space_type_names(state: &HttpState, scope: &str) -> BTreeMap<String, String> {
     let mut nsids: Vec<String> = Vec::new();
     for token in scope.split_whitespace() {
@@ -305,12 +409,13 @@ fn render_consent(
     scope: &str,
     handles: &BTreeMap<String, String>,
     type_names: &BTreeMap<String, String>,
+    permission_sets: &BTreeMap<String, String>,
 ) -> String {
     let scopes_list: String = scope
         .split_whitespace()
         .map(|s| {
             let raw = html_escape(s);
-            let description = describe_scope(s, handles, type_names);
+            let description = describe_scope(s, handles, type_names, permission_sets);
             format!(
                 "<li><code>{raw}</code><div class=\"scope-desc\">{}</div></li>",
                 html_escape(&description),
@@ -482,7 +587,19 @@ pub fn describe_scope(
     scope: &str,
     handles: &BTreeMap<String, String>,
     type_names: &BTreeMap<String, String>,
+    permission_sets: &BTreeMap<String, String>,
 ) -> String {
+    // A permission set describes itself, in words written for this screen.
+    if let Ok(Scope::Include(inc)) = Scope::parse(scope) {
+        return match permission_sets.get(&inc.nsid) {
+            Some(described) => described.clone(),
+            // Unresolved: name it plainly rather than dress it up.
+            None => format!(
+                "a permission set this server could not read ({}) — nothing is granted for it",
+                inc.nsid
+            ),
+        };
+    }
     if scope == "atproto" {
         return "core atproto session — sign in to your account".to_string();
     }
@@ -630,6 +747,7 @@ mod tests {
             "atproto transition:generic",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(html.contains("https://app.example/client-metadata.json"));
         assert!(html.contains("atproto"));
@@ -647,6 +765,7 @@ mod tests {
             "atproto",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         // The injected `<script>` substring must show up escaped in the
         // attacker-controlled positions (page title + body header). The page
@@ -661,19 +780,117 @@ mod tests {
 
     #[test]
     fn render_handles_empty_scope() {
-        let html = render_consent("uri", "client", "", &no_handles(), &no_names());
+        let html = render_consent("uri", "client", "", &no_handles(), &no_names(), &no_names());
         assert!(html.contains("Requested scopes"));
+    }
+
+    /// A permission set describes itself in the words written for this screen.
+    #[test]
+    fn describe_scope_renders_a_permission_set() {
+        let mut sets = BTreeMap::new();
+        sets.insert(
+            "app.bulleted.appAccess".to_string(),
+            "Bulleted — Read and write your outlines, bullets, and notes. \
+             Grants: create, update, delete on app.bulleted.outline."
+                .to_string(),
+        );
+
+        let d = describe_scope(
+            "include:app.bulleted.appAccess",
+            &no_handles(),
+            &no_names(),
+            &sets,
+        );
+
+        assert!(d.contains("Bulleted"), "the set's title is missing: {d}");
+        assert!(d.contains("Read and write your outlines"), "{d}");
+        assert!(
+            d.contains("app.bulleted.outline"),
+            "what is actually granted must be shown, not only the summary: {d}"
+        );
+        assert!(
+            !d.starts_with("include:"),
+            "the raw scope is what this replaced: {d}"
+        );
+    }
+
+    /// An unresolved set says so rather than inventing a description.
+    #[test]
+    fn describe_scope_admits_an_unresolved_permission_set() {
+        let d = describe_scope(
+            "include:app.example.unknown",
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
+
+        assert!(d.contains("could not read"), "{d}");
+        assert!(d.contains("app.example.unknown"), "{d}");
+        assert!(
+            d.contains("nothing is granted"),
+            "an unreadable set grants nothing and the page must say so: {d}"
+        );
+    }
+
+    /// The permission lines name collections and actions, not counts.
+    #[test]
+    fn permissions_are_summarised_in_full() {
+        let main = serde_json::json!({
+            "type": "permission-set",
+            "permissions": [
+                {"resource": "repo", "action": ["create", "update"],
+                 "collection": ["app.x.one", "app.x.two"]},
+                {"resource": "blob", "accept": ["image/png"]},
+                {"resource": "something-new"},
+            ],
+        });
+
+        let lines = summarise_permissions(&main);
+
+        assert!(
+            lines.iter().any(|l| l.contains("app.x.one, app.x.two")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("create, update")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("image/png")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("not granted by this server")),
+            "a resource this server ignores must not read as granted: {lines:?}"
+        );
+    }
+
+    /// An omitted action list is every action, and the page must say all three.
+    #[test]
+    fn an_omitted_action_list_is_shown_as_all_three() {
+        let main = serde_json::json!({
+            "type": "permission-set",
+            "permissions": [{"resource": "repo", "collection": ["app.x.one"]}],
+        });
+
+        let lines = summarise_permissions(&main);
+
+        assert!(lines[0].contains("create, update, delete"), "{lines:?}");
     }
 
     #[test]
     fn describe_scope_atproto_core() {
-        let d = describe_scope("atproto", &no_handles(), &no_names());
+        let d = describe_scope("atproto", &no_handles(), &no_names(), &no_names());
         assert!(d.contains("core atproto session"));
     }
 
     #[test]
     fn describe_scope_transition_generic() {
-        let d = describe_scope("transition:generic", &no_handles(), &no_names());
+        let d = describe_scope(
+            "transition:generic",
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
         assert!(d.contains("all atproto records"));
     }
 
@@ -685,6 +902,7 @@ mod tests {
             "space:app.bsky.group?action=read",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(d.contains("read access to"), "got: {d}");
         assert!(d.contains("app.bsky.group"), "got: {d}");
@@ -695,7 +913,12 @@ mod tests {
     fn describe_scope_space_default_actions() {
         // Bare `space:<type>` defaults to {read, create, update, delete} — no
         // manage (manage is a separate, none-by-default parameter).
-        let d = describe_scope("space:app.bsky.group", &no_handles(), &no_names());
+        let d = describe_scope(
+            "space:app.bsky.group",
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
         assert!(d.contains("read"), "got: {d}");
         assert!(d.contains("create"), "got: {d}");
         assert!(
@@ -711,6 +934,7 @@ mod tests {
             "space:app.bsky.group?manage=update&manage=delete",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(d.contains("manage the spaces"), "got: {d}");
         assert!(d.contains("update"), "got: {d}");
@@ -723,6 +947,7 @@ mod tests {
             "space:app.bsky.group?action=read_self&collection=app.bsky.feed.post",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(d.contains("read_self"), "got: {d}");
         assert!(d.contains("app.bsky.feed.post"), "got: {d}");
@@ -733,7 +958,12 @@ mod tests {
         // A resolved declaration name replaces the raw NSID (spec line 434).
         let mut names = BTreeMap::new();
         names.insert("app.bsky.group".to_string(), "Bluesky Group".to_string());
-        let d = describe_scope("space:app.bsky.group?action=read", &no_handles(), &names);
+        let d = describe_scope(
+            "space:app.bsky.group?action=read",
+            &no_handles(),
+            &names,
+            &no_names(),
+        );
         assert!(d.contains("Bluesky Group"), "got: {d}");
         assert!(
             !d.contains("app.bsky.group"),
@@ -749,6 +979,7 @@ mod tests {
             "space:app.bsky.group?did=did:plc:abc&action=read",
             &handles,
             &no_names(),
+            &no_names(),
         );
         assert!(d.contains("@alice.example"), "got: {d}");
         assert!(!d.contains("did:plc:abc"), "should prefer handle, got: {d}");
@@ -760,6 +991,7 @@ mod tests {
             "space:app.bsky.group?did=did:plc:xyz&action=read",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(d.contains("did:plc:xyz"), "got: {d}");
     }
@@ -770,6 +1002,7 @@ mod tests {
             "space:app.bsky.group?skey=team&collection=app.bsky.feed.post&action=create",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(d.contains("team"), "got: {d}");
         assert!(d.contains("app.bsky.feed.post"), "got: {d}");
@@ -779,13 +1012,18 @@ mod tests {
     #[test]
     fn describe_scope_space_malformed() {
         // A `space:` prefix with no positional type is invalid.
-        let d = describe_scope("space:", &no_handles(), &no_names());
+        let d = describe_scope("space:", &no_handles(), &no_names(), &no_names());
         assert!(d.contains("malformed"), "got: {d}");
     }
 
     #[test]
     fn describe_scope_unknown_falls_back() {
-        let d = describe_scope("custom:something:weird", &no_handles(), &no_names());
+        let d = describe_scope(
+            "custom:something:weird",
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
         assert!(d.contains("custom:something:weird"));
     }
 
@@ -799,6 +1037,7 @@ mod tests {
             "space:*?authority=*",
             &no_handles(),
             &no_names(),
+            &no_names(),
         );
         assert!(html.contains("every space on the network"));
         assert!(html.contains("space-warning"));
@@ -807,7 +1046,14 @@ mod tests {
         // must not raise the network-wide warning — a warning shown on a
         // narrow grant is a warning users learn to dismiss.
         assert!(!has_universal_space_scope("space:*"));
-        let own = render_consent("uri", "client", "space:*", &no_handles(), &no_names());
+        let own = render_consent(
+            "uri",
+            "client",
+            "space:*",
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
         assert!(!own.contains("every space on the network"));
     }
 
@@ -820,6 +1066,7 @@ mod tests {
             "client",
             "space:*?did=did:plc:abc",
             &no_handles(),
+            &no_names(),
             &no_names(),
         );
         assert!(!html.contains("every space on the network"));
@@ -837,6 +1084,7 @@ mod tests {
             "https://app.example/cm",
             "atproto space:app.bsky.group?action=read",
             &no_handles(),
+            &no_names(),
             &no_names(),
         );
         assert!(html.contains("core atproto session"));
