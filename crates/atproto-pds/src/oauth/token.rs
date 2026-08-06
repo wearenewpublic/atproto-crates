@@ -44,6 +44,10 @@ pub struct TokenInput {
     pub redirect_uri: Option<String>,
     /// PKCE verifier (for `authorization_code` grant).
     pub code_verifier: Option<String>,
+    /// RFC 7523 assertion type, for a confidential client.
+    pub client_assertion_type: Option<String>,
+    /// The signed assertion itself, for a confidential client.
+    pub client_assertion: Option<String>,
 }
 
 // Note: there is deliberately no `dpop_jkt` field. The DPoP binding is taken
@@ -230,6 +234,36 @@ async fn handle_code(
             "DPoP proof key does not match the key bound at authorization",
         ));
     }
+
+    // Authenticate the client the way its own metadata says it does, before
+    // anything is issued. A confidential client that presents no assertion is
+    // refused here rather than downgraded to a public one -- the declaration is
+    // what makes a stolen authorization code useless without the key.
+    let metadata = crate::oauth::client_metadata::resolve_client_metadata(
+        &auth.request.client_id,
+        &crate::user_agent(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            client_id = %auth.request.client_id,
+            error = ?e,
+            "could not resolve client metadata at token exchange"
+        );
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "this client's metadata could not be retrieved",
+        )
+    })?;
+    crate::oauth::client_auth::authenticate(
+        &metadata,
+        &auth.request.client_id,
+        input.client_assertion_type.as_deref(),
+        input.client_assertion.as_deref(),
+        &crate::user_agent(),
+    )
+    .await?;
 
     // Expand any `include:` here and nowhere else. The result is what both
     // tokens carry, so refresh below reuses it rather than re-resolving: the

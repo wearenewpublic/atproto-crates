@@ -17,6 +17,7 @@
 //! Askama-template refactor is documented in D-7.
 
 pub mod authorize;
+pub mod client_auth;
 pub mod client_metadata;
 pub mod consent;
 pub mod dpop;
