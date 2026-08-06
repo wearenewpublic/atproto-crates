@@ -37,6 +37,20 @@ pub struct AuthorizationServerMetadata {
     pub require_dpop_bound_access_tokens: bool,
     /// Supported client authentication methods.
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// Algorithms accepted for a signed client assertion.
+    ///
+    /// Required whenever `private_key_jwt` is offered (RFC 8414 §2), and AT
+    /// Protocol requires `ES256` among them. Omitting it is not a cosmetic
+    /// gap: a client cannot know what to sign with, and a validating one
+    /// refuses the server outright before making a single request --
+    /// `atproto-oauth` rejects the document with "Token endpoint auth signing
+    /// algorithm values must include 'ES256'", which is how this was found.
+    pub token_endpoint_auth_signing_alg_values_supported: Vec<String>,
+    /// Algorithms accepted for a PAR request object (RFC 9101).
+    ///
+    /// These are what `verify_request_object` actually checks, so the document
+    /// and the code agree by construction rather than by remembering to.
+    pub request_object_signing_alg_values_supported: Vec<String>,
     /// Whether a `client_id` may be the URL of a client metadata document.
     ///
     /// Not advisory in AT Protocol: clients are identified by the URL their
@@ -86,6 +100,17 @@ pub async fn oauth_authorization_server(
             "none".to_string(),
             "private_key_jwt".to_string(),
         ],
+        // What this server can verify. Advertising RS256 because the reference
+        // does would be worse than omitting it: a client would sign with a key
+        // this server cannot check.
+        token_endpoint_auth_signing_alg_values_supported: crate::oauth::par::SUPPORTED_JWS_ALGS
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect(),
+        request_object_signing_alg_values_supported: crate::oauth::par::SUPPORTED_JWS_ALGS
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect(),
         // AT Protocol has no client pre-registration; the client_id IS the
         // metadata URL, and this is how a client discovers that.
         client_id_metadata_document_supported: true,

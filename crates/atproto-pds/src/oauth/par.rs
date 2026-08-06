@@ -136,6 +136,13 @@ pub struct ParResponse {
     pub expires_in: u64,
 }
 
+/// JWS algorithms this server can verify on a client-supplied JWT.
+///
+/// One list so the advertised metadata and the code that enforces it cannot
+/// drift: `token_endpoint_auth_signing_alg_values_supported` and
+/// `request_object_signing_alg_values_supported` are both built from this.
+pub const SUPPORTED_JWS_ALGS: [&str; 3] = ["ES256", "ES256K", "ES384"];
+
 /// Handler for `POST /oauth/par`.
 pub async fn par_handler(
     State(state): State<HttpState>,
@@ -453,7 +460,7 @@ async fn verify_request_object(
             format!("parse header: {e}"),
         )
     })?;
-    if !matches!(header.alg.as_str(), "ES256" | "ES256K" | "ES384") {
+    if !SUPPORTED_JWS_ALGS.contains(&header.alg.as_str()) {
         return Err(XrpcError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_object",

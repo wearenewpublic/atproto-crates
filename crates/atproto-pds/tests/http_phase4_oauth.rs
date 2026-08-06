@@ -1598,3 +1598,38 @@ async fn an_existing_session_cannot_mint_an_app_password_while_a_policy_is_owed(
         "an app password was issued anyway"
     );
 }
+
+/// The authorization-server document declares what it accepts for signed
+/// client JWTs.
+///
+/// `private_key_jwt` is offered, and RFC 8414 requires the algorithm list
+/// alongside it; AT Protocol requires ES256 among them. Without it a client
+/// cannot know what to sign with, and a validating one refuses the server
+/// before issuing a single request -- which is exactly what happened: an
+/// OAuth login failed at metadata fetch with "Token endpoint auth signing
+/// algorithm values must include 'ES256'".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_metadata_declares_its_signing_algorithms() {
+    let (app, _mgr, _tmp) = build_app().await;
+
+    let (status, body) = get_json(app.clone(), "/.well-known/oauth-authorization-server").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let algs = body["token_endpoint_auth_signing_alg_values_supported"]
+        .as_array()
+        .expect("private_key_jwt is offered, so this list is required");
+    assert!(
+        algs.iter().any(|a| a == "ES256"),
+        "AT Protocol requires ES256 here; clients refuse the server without it: {algs:?}"
+    );
+
+    // The request-object list must match what verify_request_object enforces,
+    // or a client signs with something this server will reject.
+    let request_algs = body["request_object_signing_alg_values_supported"]
+        .as_array()
+        .expect("request objects are accepted, so this list belongs here");
+    assert!(
+        request_algs.iter().any(|a| a == "ES256"),
+        "{request_algs:?}"
+    );
+}
