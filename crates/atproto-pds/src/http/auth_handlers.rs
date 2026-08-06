@@ -135,8 +135,19 @@ pub struct CreateAccountInput {
     pub password: String,
 }
 
-/// Output of `com.atproto.server.createAccount` — also the shape of `createSession`.
+/// Output of `com.atproto.server.createAccount` — also the shape of
+/// `createSession` and `refreshSession`.
+///
+/// The account fields below are optional in the lexicon and were omitted,
+/// which is conformant and unusable. The reference returns them on every one
+/// of these endpoints, so clients read them straight off a login: `atpxrpc`
+/// refuses a session with `missing field \`email\`` and never gets as far as
+/// calling `getSession`, which is where this server did report them.
+///
+/// A response that satisfies the schema and not the ecosystem is the kind of
+/// difference a conformance suite cannot see -- both sides validate.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionResponse {
     /// Access token (JWT).
     #[serde(rename = "accessJwt")]
@@ -148,6 +159,32 @@ pub struct SessionResponse {
     pub handle: String,
     /// Account DID.
     pub did: String,
+    /// The account's email, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Whether that email has been confirmed.
+    pub email_confirmed: bool,
+    /// Whether the account is usable. `false` for anything but `active`.
+    pub active: bool,
+    /// Why the account is not usable. Absent while `active` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// The account half of a [`SessionResponse`], derived the same way
+/// `getSession` derives it so the two cannot disagree.
+fn session_account_fields(
+    account: &crate::account::AccountRow,
+) -> (Option<String>, bool, bool, Option<String>) {
+    let active = account.state == AccountState::Active;
+    (
+        account.email.clone(),
+        account.email_confirmed_at.is_some(),
+        active,
+        // The lexicon defines `status` as the reason a session is not usable,
+        // so "active" is expressed by its absence rather than by naming it.
+        (!active).then(|| account.state.as_str().to_string()),
+    )
 }
 
 fn account_manager(state: &HttpState) -> Result<&account::AccountManager, XrpcError> {
@@ -500,11 +537,16 @@ pub async fn create_account(
     )
     .map_err(XrpcError::from)?;
 
+    let (email, email_confirmed, active, status) = session_account_fields(&row);
     Ok(Json(SessionResponse {
         access_jwt: tokens.access_jwt,
         refresh_jwt: tokens.refresh_jwt,
         handle: row.handle,
         did: row.did,
+        email,
+        email_confirmed,
+        active,
+        status,
     }))
 }
 
@@ -613,11 +655,16 @@ pub async fn create_session(
     )
     .map_err(XrpcError::from)?;
 
+    let (email, email_confirmed, active, status) = session_account_fields(&account);
     Ok(Json(SessionResponse {
         access_jwt: tokens.access_jwt,
         refresh_jwt: tokens.refresh_jwt,
         handle: account.handle,
         did: account.did,
+        email,
+        email_confirmed,
+        active,
+        status,
     }))
 }
 
@@ -712,19 +759,27 @@ pub async fn refresh_session(
             did = %claims.sub,
             "refresh replayed inside the grace window; returning the same successor"
         );
-        let account_handle = state
+        let account_row = state
             .reader
             .accounts()
             .lookup_did(&claims.sub)
             .await
-            .map_err(XrpcError::from)?
-            .map(|a| a.handle)
-            .unwrap_or_default();
+            .map_err(XrpcError::from)?;
+        // The whole row, not just the handle: a replayed refresh has to answer
+        // with the same session shape as the request that won the race.
+        let (email, email_confirmed, active, status) = account_row
+            .as_ref()
+            .map(session_account_fields)
+            .unwrap_or((None, false, false, None));
         return Ok(Json(SessionResponse {
             access_jwt: existing.access_jwt,
             refresh_jwt: existing.refresh_jwt,
-            handle: account_handle,
+            handle: account_row.map(|a| a.handle).unwrap_or_default(),
             did: claims.sub,
+            email,
+            email_confirmed,
+            active,
+            status,
         }));
     }
 
@@ -797,11 +852,16 @@ pub async fn refresh_session(
     // same answer instead of a 401.
     state.refresh_grace.insert(&claims.jti, &tokens);
 
+    let (email, email_confirmed, active, status) = session_account_fields(&account);
     Ok(Json(SessionResponse {
         access_jwt: tokens.access_jwt,
         refresh_jwt: tokens.refresh_jwt,
         handle: account.handle,
         did: account.did,
+        email,
+        email_confirmed,
+        active,
+        status,
     }))
 }
 

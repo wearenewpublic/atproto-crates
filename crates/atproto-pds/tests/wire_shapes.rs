@@ -375,3 +375,48 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+/// A session response carries the account fields, not only the tokens.
+///
+/// They are optional in the lexicon, so omitting them validates — and makes
+/// the response unusable to clients that read the account off a login rather
+/// than calling `getSession` afterwards. `atpxrpc` refuses one with
+/// `missing field `email`` and never reaches `getSession`, which is where this
+/// server did report them.
+///
+/// Asserting the serialised shape rather than the type: what broke was what
+/// went on the wire.
+#[test]
+fn a_session_response_carries_the_account_fields() {
+    let json = serde_json::to_value(atproto_pds::http::auth_handlers::SessionResponse {
+        access_jwt: "a".into(),
+        refresh_jwt: "r".into(),
+        handle: "alice.test".into(),
+        did: "did:plc:alice".into(),
+        email: Some("alice@example.test".into()),
+        email_confirmed: true,
+        active: true,
+        status: None,
+    })
+    .expect("serialises");
+
+    for field in [
+        "accessJwt",
+        "refreshJwt",
+        "handle",
+        "did",
+        "email",
+        "emailConfirmed",
+        "active",
+    ] {
+        assert!(
+            json.get(field).is_some(),
+            "a session response without `{field}` is unusable to clients that \
+             read the account off a login: {json}"
+        );
+    }
+    assert_eq!(json["email"], "alice@example.test");
+    assert_eq!(json["emailConfirmed"], true);
+    // `status` names why a session is unusable, so an active one omits it.
+    assert!(json.get("status").is_none(), "{json}");
+}
