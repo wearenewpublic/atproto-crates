@@ -139,6 +139,7 @@ with the `#atproto` key in its own DID document — see §5.
 
 ```
 PDS_CRAWLERS=https://bsky.network
+PDS_CRAWLER_ANNOUNCE_DELAY_SECS=15
 ```
 
 **Set this or your server is invisible.** Nothing discovers a PDS on its own.
@@ -156,6 +157,15 @@ container is listening locally while Railway is still health-checking it and
 draining the old one, so the moment the server naturally announces is the
 moment it is least reachable. Attempts run at 0s, 15s, 1m, 3m and 15m, and
 stop at the first acceptance.
+
+The delay is why the first attempt is the one that succeeds. Without it,
+attempt 1 fires the moment the listener binds — while Railway is still
+health-checking the new container — and the relay refuses it with a `400`
+saying it could not reach the host. The retry recovers a few seconds later, so
+nothing breaks either way; what the delay removes is a warning on every
+healthy deploy, which is the kind an operator learns to scroll past.
+
+Set it to `0` if this server is reachable the instant it starts.
 
 Watch for `requestCrawl: announced` in the logs. A refusal logs the relay's
 own explanation, not just the status, and giving up entirely logs the `curl`

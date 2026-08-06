@@ -129,13 +129,32 @@ pub async fn announce(crawlers: &[String], hostname: &str) {
 /// rest. Never fails: a crawler that will not accept is logged and abandoned,
 /// because a PDS that refused to run because a relay was down would be trading
 /// a working server for an unreachable one.
-pub async fn announce_with_retry(crawlers: &[String], hostname: &str) {
+pub async fn announce_with_retry(crawlers: &[String], hostname: &str, initial_delay: Duration) {
     if crawlers.is_empty() {
         tracing::debug!(
             hostname = %hostname,
             "no crawlers configured; this server will not be crawled until one is"
         );
         return;
+    }
+
+    // Wait before the first attempt, when an operator has asked to.
+    //
+    // The retry already recovers from a refusal at t=0, so this changes no
+    // outcome -- what it removes is the warning. On a platform that swaps
+    // containers, attempt 1 lands during the swap and is refused every single
+    // deploy, and a warning that fires on every healthy deploy is one an
+    // operator learns to scroll past. Waiting until the deployment is actually
+    // reachable makes the first attempt the one that succeeds.
+    //
+    // Costed against a restart of a server the relay can already reach, where
+    // this is dead time and nothing else.
+    if !initial_delay.is_zero() {
+        tracing::debug!(
+            delay_secs = initial_delay.as_secs(),
+            "holding the crawl announcement until the deployment should be reachable"
+        );
+        tokio::time::sleep(initial_delay).await;
     }
 
     let http = client();
@@ -286,7 +305,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn no_crawlers_is_not_an_error() {
         announce(&[], "pds.example").await;
-        announce_with_retry(&[], "pds.example").await;
+        announce_with_retry(&[], "pds.example", Duration::ZERO).await;
+    }
+
+    /// The delay must not become a way to skip announcing.
+    ///
+    /// It sits ahead of the schedule rather than replacing part of it, so a
+    /// configured delay still leaves all five attempts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delay_still_announces() {
+        let (base, hits) = flaky_crawler(0).await;
+
+        announce_with_retry(&[base], "pds.example", Duration::from_millis(20)).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a configured delay swallowed the announcement"
+        );
     }
 
     /// The first delay must be zero, or every restart of an already-reachable

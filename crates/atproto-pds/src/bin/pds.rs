@@ -363,6 +363,19 @@ struct Args {
     #[arg(long, env = "PDS_CRAWLERS", value_delimiter = ',')]
     crawlers: Vec<String>,
 
+    /// Seconds to wait before the first crawl announcement.
+    ///
+    /// A relay checks that it can reach this host before accepting, and on a
+    /// platform that swaps containers the first attempt lands during the swap
+    /// and is refused every deploy. The retry recovers, so this changes no
+    /// outcome -- it moves the first attempt to when the deployment is
+    /// actually reachable, so a healthy deploy stops logging a warning.
+    ///
+    /// `0` announces immediately, which is right when the host is already
+    /// reachable at process start. Around `15` suits a rolling deploy.
+    #[arg(long, env = "PDS_CRAWLER_ANNOUNCE_DELAY_SECS", default_value_t = 0)]
+    crawler_announce_delay_secs: u64,
+
     /// AppView DID for `app.bsky.*` request proxying.
     /// When both `--bsky-app-view-did` and `--bsky-app-view-url` are set,
     /// the PDS proxies inbound `app.bsky.*` XRPC calls to that AppView
@@ -1039,8 +1052,14 @@ async fn main() -> anyhow::Result<()> {
     let announce_crawlers = args.crawlers.clone();
     let announce_hostname =
         atproto_pds::crawl::public_hostname(args.hostname.as_deref(), &args.service_did);
+    let announce_delay = Duration::from_secs(args.crawler_announce_delay_secs);
     tracker.spawn(async move {
-        atproto_pds::crawl::announce_with_retry(&announce_crawlers, &announce_hostname).await;
+        atproto_pds::crawl::announce_with_retry(
+            &announce_crawlers,
+            &announce_hostname,
+            announce_delay,
+        )
+        .await;
     });
 
     // Spaces notifier worker — drains the `notify_attempt` DLQ on a fixed
