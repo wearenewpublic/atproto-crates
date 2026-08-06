@@ -547,7 +547,7 @@ async fn verify_request_object(
             format!("decode sig: {e}"),
         )
     })?;
-    validate_signature(&signing_key, signing_input.as_bytes(), &sig_bytes).map_err(|e| {
+    validate_signature(&signing_key, &sig_bytes, signing_input.as_bytes()).map_err(|e| {
         XrpcError::new(
             StatusCode::BAD_REQUEST,
             "invalid_request_object",
@@ -781,6 +781,36 @@ mod tests {
         let jwk_value = serde_json::to_value(&jwk).unwrap();
         let recovered = jwk_to_key_data(&jwk_value).unwrap();
         assert_eq!(recovered.bytes(), pub_key.bytes());
+    }
+
+    /// A signature this crate produced must verify through the same call the
+    /// verifiers use.
+    ///
+    /// `validate` takes `(key, signature, content)`. Both verifiers passed
+    /// `(key, content, signature)`, so every signature check attempted to
+    /// parse the signing input as an ECDSA signature and failed -- meaning
+    /// request-object verification never succeeded once, and neither did the
+    /// first confidential client to try.
+    ///
+    /// Nothing caught it because nothing here had ever signed something and
+    /// then verified it. The round-trip tests covered key encoding only.
+    #[test]
+    fn a_real_signature_verifies_through_the_verifier_call() {
+        use atproto_identity::key::{KeyType, generate_key, sign, to_public};
+
+        let priv_key = generate_key(KeyType::P256Private).unwrap();
+        let pub_key = to_public(&priv_key).unwrap();
+        let content = b"header.payload";
+        let signature = sign(&priv_key, content).unwrap();
+
+        validate_signature(&pub_key, &signature, content)
+            .expect("a signature this crate just produced must verify");
+
+        // And the swap must not pass, or the argument order is unpinned.
+        assert!(
+            validate_signature(&pub_key, content, &signature).is_err(),
+            "arguments in the wrong order must fail rather than quietly verify"
+        );
     }
 
     /// A real JWK carries more than the curve members, and must still parse.

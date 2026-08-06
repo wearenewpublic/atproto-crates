@@ -172,7 +172,7 @@ async fn verify_assertion(
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[2])
             .map_err(|e| format!("decode signature: {e}"))?;
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    atproto_identity::key::validate(&key, signing_input.as_bytes(), &signature)
+    atproto_identity::key::validate(&key, &signature, signing_input.as_bytes())
         .map_err(|e| format!("signature verify: {e}"))?;
 
     let claims: serde_json::Value = decode_part(parts[1], "payload")?;
