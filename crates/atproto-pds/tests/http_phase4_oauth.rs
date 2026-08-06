@@ -1633,3 +1633,94 @@ async fn the_metadata_declares_its_signing_algorithms() {
         "{request_algs:?}"
     );
 }
+
+/// Our metadata satisfies every check the atproto OAuth client makes.
+///
+/// Three separate logins failed here in sequence, each on a different missing
+/// field, because the document was compared against the spec by eye and the
+/// checks live in `atproto_oauth::resources::oauth_authorization_server`.
+/// Deserialising into that crate's own `AuthorizationServer` and asserting its
+/// twelve conditions turns the next omission into a test failure rather than
+/// another round trip through a browser.
+///
+/// The type matters as much as the assertions: a field renamed here stops
+/// deserialising there, which is the same failure a client would see.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_metadata_satisfies_the_atproto_oauth_client() {
+    use atproto_oauth::resources::AuthorizationServer;
+
+    let (app, _mgr, _tmp) = build_app().await;
+    let (status, body) = get_json(app.clone(), "/.well-known/oauth-authorization-server").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let meta: AuthorizationServer =
+        serde_json::from_value(body.clone()).expect("must deserialise as the client's own type");
+
+    // auth-server-1..5
+    assert!(!meta.issuer.is_empty(), "{body}");
+    assert!(
+        meta.response_types_supported.iter().any(|v| v == "code"),
+        "{body}"
+    );
+    assert!(
+        meta.grant_types_supported
+            .iter()
+            .any(|v| v == "authorization_code"),
+        "{body}"
+    );
+    assert!(
+        meta.grant_types_supported
+            .iter()
+            .any(|v| v == "refresh_token"),
+        "{body}"
+    );
+    assert!(
+        meta.code_challenge_methods_supported
+            .iter()
+            .any(|v| v == "S256"),
+        "{body}"
+    );
+    // auth-server-6..8
+    assert!(
+        meta.token_endpoint_auth_methods_supported
+            .iter()
+            .any(|v| v == "none"),
+        "{body}"
+    );
+    assert!(
+        meta.token_endpoint_auth_methods_supported
+            .iter()
+            .any(|v| v == "private_key_jwt"),
+        "{body}"
+    );
+    assert!(
+        meta.token_endpoint_auth_signing_alg_values_supported
+            .iter()
+            .any(|v| v == "ES256"),
+        "{body}"
+    );
+    // auth-server-9..11
+    assert!(
+        meta.scopes_supported.iter().any(|v| v == "atproto"),
+        "{body}"
+    );
+    assert!(
+        meta.scopes_supported
+            .iter()
+            .any(|v| v == "transition:generic"),
+        "{body}"
+    );
+    assert!(
+        meta.dpop_signing_alg_values_supported
+            .iter()
+            .any(|v| v == "ES256"),
+        "{body}"
+    );
+    // auth-server-12 — the three that must all be true together.
+    assert!(
+        meta.authorization_response_iss_parameter_supported
+            && meta.require_pushed_authorization_requests
+            && meta.client_id_metadata_document_supported,
+        "the client refuses a server missing any of these: {body}"
+    );
+}

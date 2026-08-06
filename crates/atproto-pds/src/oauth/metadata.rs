@@ -51,6 +51,15 @@ pub struct AuthorizationServerMetadata {
     /// These are what `verify_request_object` actually checks, so the document
     /// and the code agree by construction rather than by remembering to.
     pub request_object_signing_alg_values_supported: Vec<String>,
+    /// Whether the authorization response carries an `iss` parameter.
+    ///
+    /// RFC 9207. This server has always sent it -- `authorize_handler` returns
+    /// it and the consent page appends it to the redirect -- and never
+    /// declared it, which is the inverse of an unimplemented advertisement and
+    /// fails just as hard: a client that requires the mix-up defence reads
+    /// this flag rather than waiting to see whether the parameter shows up,
+    /// and refuses the server before starting the flow.
+    pub authorization_response_iss_parameter_supported: bool,
     /// Whether a `client_id` may be the URL of a client metadata document.
     ///
     /// Not advisory in AT Protocol: clients are identified by the URL their
@@ -111,6 +120,8 @@ pub async fn oauth_authorization_server(
             .iter()
             .map(|a| (*a).to_string())
             .collect(),
+        // Sent on every authorization response; see `authorize::AuthorizeOutput`.
+        authorization_response_iss_parameter_supported: true,
         // AT Protocol has no client pre-registration; the client_id IS the
         // metadata URL, and this is how a client discovers that.
         client_id_metadata_document_supported: true,
