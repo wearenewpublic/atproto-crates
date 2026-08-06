@@ -54,9 +54,28 @@ fn cookie_value(headers: &HeaderMap) -> Option<String> {
 /// travel in clear text -- but pinning `Secure` unconditionally would make the
 /// portal unusable on `http://localhost`, which is how it is developed
 /// against.
+///
+/// `Path=/` because the portal is no longer one subtree. It was `/account`,
+/// which was tighter than needed and correct while every page lived there; the
+/// repository browser sits at `/browse`, and a browser simply does not send a
+/// cookie to a path outside its scope. The result was a signed-in holder being
+/// redirected to sign in, from a server that had never seen their session
+/// because it was never sent one.
+///
+/// The narrower path was defence in depth rather than a control: no XRPC route
+/// reads this cookie, and authentication there is `Authorization` and `DPoP`
+/// only, so widening it grants a request nothing it could not already do. What
+/// it costs is reach -- the cookie now accompanies every request to this
+/// origin, including ones that have no use for it. `HttpOnly` and
+/// `SameSite=Strict` are what actually keep it out of a page's hands and off a
+/// cross-site request.
+///
+/// A second cookie scoped to `/browse` would keep the old narrowness, at the
+/// price of two credentials to revoke in a page whose whole purpose is
+/// revoking credentials.
 fn set_cookie(value: &str, secure: bool, max_age: i64) -> String {
     format!(
-        "{COOKIE}={value}; Path=/account; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        "{COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
         if secure { "; Secure" } else { "" }
     )
 }
@@ -1676,9 +1695,38 @@ mod tests {
         // primary CSRF defence, and Path scopes it to the portal.
         assert!(c.contains("HttpOnly"), "{c}");
         assert!(c.contains("SameSite=Strict"), "{c}");
-        assert!(c.contains("Path=/account"), "{c}");
+        // Must cover every portal route, not only `/account`: the repository
+        // browser is at `/browse`, and a cookie scoped to `/account` is not
+        // sent there at all.
+        assert!(c.contains("Path=/;"), "{c}");
         assert!(c.contains("Secure"), "{c}");
         assert!(!set_cookie("v", false, 100).contains("Secure"));
+    }
+
+    /// Every portal route must sit inside the cookie's `Path`.
+    ///
+    /// A browser sends a cookie only to paths under its scope, so a portal
+    /// page outside that scope receives no session and redirects a signed-in
+    /// holder to sign in -- from a server that was never sent the session it
+    /// is asking for. That is what `Path=/account` did to `/browse`.
+    ///
+    /// Asserting the property rather than the literal: a later route added
+    /// somewhere new fails here instead of in a browser.
+    #[test]
+    fn the_cookie_reaches_every_portal_route() {
+        let cookie = set_cookie("v", true, 3600);
+        let path = cookie
+            .split(';')
+            .map(str::trim)
+            .find_map(|a| a.strip_prefix("Path="))
+            .expect("the cookie must scope itself");
+
+        for route in ["/account", "/account/signin", "/browse/", "/browse/public/"] {
+            assert!(
+                route.starts_with(path),
+                "a browser will not send the session cookie (Path={path}) to {route}"
+            );
+        }
     }
 
     #[test]
