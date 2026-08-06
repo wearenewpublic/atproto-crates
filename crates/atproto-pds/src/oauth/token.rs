@@ -269,6 +269,7 @@ async fn handle_code(
         &auth.request.client_id,
         input.client_assertion_type.as_deref(),
         input.client_assertion.as_deref(),
+        &state.jti_guard,
     )
     .await?;
 

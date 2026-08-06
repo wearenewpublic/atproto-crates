@@ -70,6 +70,7 @@ pub async fn authenticate(
     client_id: &str,
     assertion_type: Option<&str>,
     assertion: Option<&str>,
+    jti_guard: &crate::security::JtiReplayGuard,
 ) -> Result<(), XrpcError> {
     let refused = |detail: &str| {
         XrpcError::new(
@@ -127,7 +128,7 @@ pub async fn authenticate(
     // Fail closed. A client that cannot be authenticated is not a client that
     // may skip authentication -- key resolution failures surface as refusals
     // from inside verify_assertion.
-    verify_assertion(assertion, client_id)
+    verify_assertion(assertion, client_id, jti_guard)
         .await
         .map_err(|detail| {
             tracing::warn!(client_id = %client_id, detail = %detail, "client assertion refused");
@@ -144,7 +145,11 @@ pub async fn authenticate(
 /// Claims are checked after the signature, deliberately: reading claims out of
 /// a JWT nobody has authenticated is how an unsigned token gets treated as
 /// evidence of anything.
-async fn verify_assertion(assertion: &str, client_id: &str) -> Result<(), String> {
+async fn verify_assertion(
+    assertion: &str,
+    client_id: &str,
+    jti_guard: &crate::security::JtiReplayGuard,
+) -> Result<(), String> {
     let parts: Vec<&str> = assertion.split('.').collect();
     if parts.len() != 3 {
         return Err("client assertion is not a compact JWS".to_string());
@@ -202,9 +207,28 @@ async fn verify_assertion(assertion: &str, client_id: &str) -> Result<(), String
     let exp = claims["exp"]
         .as_i64()
         .ok_or_else(|| "client assertion has no exp".to_string())?;
-    if exp <= chrono::Utc::now().timestamp() {
+    let now = chrono::Utc::now().timestamp();
+    if exp <= now {
         return Err("client assertion has expired".to_string());
     }
+
+    // Single use, per RFC 7523 §3. An assertion is not bound to the code it
+    // accompanies -- nothing in it names one -- so without this a captured
+    // assertion authenticates this client for *any* code an attacker holds,
+    // for as long as `exp` allows. Spending the `jti` makes one capture worth
+    // one redemption rather than a credential reusable for the window.
+    //
+    // Held until the assertion expires and no longer: past `exp` the check
+    // above refuses it anyway, so a longer entry only spends memory to
+    // re-refuse something already refused.
+    let jti = claims["jti"]
+        .as_str()
+        .ok_or_else(|| "client assertion has no jti".to_string())?;
+    let remaining = u64::try_from(exp - now).unwrap_or(0).saturating_add(1);
+    jti_guard
+        .check_and_insert(jti, std::time::Duration::from_secs(remaining))
+        .await
+        .map_err(|e| format!("client assertion replay: {e}"))?;
 
     Ok(())
 }
@@ -248,6 +272,10 @@ pub fn set_expected_audience(values: Vec<String>) {
 mod tests {
     use super::*;
 
+    fn guard() -> crate::security::JtiReplayGuard {
+        crate::security::JtiReplayGuard::new(64)
+    }
+
     fn metadata(method: Option<&str>) -> ClientMetadata {
         let mut m = crate::oauth::client_metadata::loopback_client_metadata("http://localhost")
             .expect("loopback metadata");
@@ -258,7 +286,7 @@ mod tests {
     /// A malformed assertion is refused before anything is read from it.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_assertion_that_is_not_a_jws_is_refused() {
-        let err = verify_assertion("not-a-jws", "https://app.example/x")
+        let err = verify_assertion("not-a-jws", "https://app.example/x", &guard())
             .await
             .expect_err("three segments or nothing");
         assert!(err.contains("compact JWS"), "{err}");
@@ -271,9 +299,13 @@ mod tests {
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
             br#"{"alg":"none"}"#,
         );
-        let err = verify_assertion(&format!("{header}.e30.sig"), "https://app.example/x")
-            .await
-            .expect_err("`none` must never verify");
+        let err = verify_assertion(
+            &format!("{header}.e30.sig"),
+            "https://app.example/x",
+            &guard(),
+        )
+        .await
+        .expect_err("`none` must never verify");
         assert!(err.contains("unsupported client assertion alg"), "{err}");
     }
 
@@ -299,10 +331,44 @@ mod tests {
         let err = verify_assertion(
             &format!("{header}.e30.sig"),
             "https://nonexistent.invalid/client-metadata.json",
+            &guard(),
         )
         .await
         .expect_err("unreachable keys must fail closed");
         assert!(err.contains("resolve client key"), "{err}");
+    }
+
+    /// The guard spends a `jti` once, so a captured assertion is worth one
+    /// redemption rather than every code an attacker later steals.
+    ///
+    /// Exercised against the guard directly: reaching it through
+    /// `verify_assertion` needs a real signature from a reachable client, and
+    /// the property worth pinning is that the second presentation is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_jti_is_spent_once() {
+        let g = guard();
+        let ttl = std::time::Duration::from_secs(60);
+
+        g.check_and_insert("assertion-jti", ttl)
+            .await
+            .expect("first use is the legitimate one");
+
+        assert!(
+            g.check_and_insert("assertion-jti", ttl).await.is_err(),
+            "a replayed client assertion was accepted"
+        );
+    }
+
+    /// Distinct assertions are unaffected by each other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_assertions_do_not_collide() {
+        let g = guard();
+        let ttl = std::time::Duration::from_secs(60);
+
+        g.check_and_insert("one", ttl).await.unwrap();
+        g.check_and_insert("two", ttl)
+            .await
+            .expect("a different assertion must not be refused as a replay");
     }
 
     /// A client that declared nothing is public, per RFC 7591.
@@ -324,6 +390,7 @@ mod tests {
             "https://app.example/client-metadata.json",
             None,
             None,
+            &guard(),
         )
         .await
         .expect_err("a declared method must be enforced");
@@ -335,9 +402,15 @@ mod tests {
     /// A public client is unaffected, which is every client today.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_public_client_is_unchanged() {
-        authenticate(&metadata(None), "https://app.example/x", None, None)
-            .await
-            .expect("public clients must keep working");
+        authenticate(
+            &metadata(None),
+            "https://app.example/x",
+            None,
+            None,
+            &guard(),
+        )
+        .await
+        .expect("public clients must keep working");
     }
 
     /// An unknown assertion type is refused rather than read as absent.
@@ -348,6 +421,7 @@ mod tests {
             "https://app.example/x",
             Some("urn:example:something-else"),
             Some("ey.."),
+            &guard(),
         )
         .await
         .expect_err("an unrecognised assertion type must not pass");
@@ -367,6 +441,7 @@ mod tests {
             "https://app.example/x",
             Some(JWT_BEARER_ASSERTION),
             Some("ey.."),
+            &guard(),
         )
         .await
         .expect_err("nothing can verify an assertion for a client with no keys");
