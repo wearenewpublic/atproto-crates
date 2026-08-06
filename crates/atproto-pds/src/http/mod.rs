@@ -23,6 +23,7 @@ pub mod proxy_target;
 pub mod rate_limit;
 pub mod router;
 pub mod service_auth_handlers;
+pub mod service_describe;
 pub mod space_auth;
 pub mod space_handlers;
 pub mod state;

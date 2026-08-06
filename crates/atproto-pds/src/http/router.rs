@@ -90,6 +90,13 @@ pub fn build_router(state: HttpState) -> Router {
             get(handlers::get_repo_status),
         )
         .route("/xrpc/com.atproto.sync.getRepo", get(handlers::get_repo))
+        // What this service is and which methods it serves. Unauthenticated:
+        // a caller deciding whether it can talk to this server at all has
+        // nothing to authenticate with yet.
+        .route(
+            "/xrpc/community.lexicon.service.describe",
+            get(crate::http::service_describe::describe),
+        )
         // A proof of one record's presence or absence, and the only fetch an
         // authorization server makes when resolving a permission set.
         .route(
