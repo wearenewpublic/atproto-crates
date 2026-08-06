@@ -655,8 +655,24 @@ fn jwk_to_key_data(jwk: &serde_json::Value) -> Result<KeyData, String> {
     use elliptic_curve::JwkEcKey;
     use elliptic_curve::sec1::ToEncodedPoint;
 
-    let parsed: JwkEcKey =
-        serde_json::from_value(jwk.clone()).map_err(|e| format!("parse JwkEcKey: {e}"))?;
+    // Only the curve members, because `JwkEcKey` rejects anything else and a
+    // real JWK is never only those. `alg`, `kid`, `use` and `key_ops` are all
+    // standard JWK members (RFC 7517 §4) and clients publish them as a matter
+    // of course -- `kid` is required to pick a key from a set at all. Handing
+    // the document straight to a deserialiser that refuses unknown fields
+    // meant this server could parse only the keys it generated itself.
+    //
+    // Dropping them is safe here because none of them change what the key
+    // *is*: `alg` is checked against the JWS header before this, and `kid`
+    // selected this JWK before this. What is left is the curve point.
+    let mut minimal = serde_json::Map::new();
+    for member in ["kty", "crv", "x", "y", "d"] {
+        if let Some(value) = jwk.get(member) {
+            minimal.insert(member.to_string(), value.clone());
+        }
+    }
+    let parsed: JwkEcKey = serde_json::from_value(serde_json::Value::Object(minimal))
+        .map_err(|e| format!("parse JwkEcKey: {e}"))?;
     match parsed.crv() {
         "P-256" => {
             let pk: p256::PublicKey =
@@ -765,6 +781,37 @@ mod tests {
         let jwk_value = serde_json::to_value(&jwk).unwrap();
         let recovered = jwk_to_key_data(&jwk_value).unwrap();
         assert_eq!(recovered.bytes(), pub_key.bytes());
+    }
+
+    /// A real JWK carries more than the curve members, and must still parse.
+    ///
+    /// `alg`, `kid` and `use` are standard (RFC 7517 §4) and clients publish
+    /// them routinely — `kid` is required to select a key from a set at all.
+    /// Handing the whole document to a deserialiser that refuses unknown
+    /// fields meant this server could parse only keys it had generated itself,
+    /// which is how a confidential client's assertion was refused with
+    /// "unknown field `alg`".
+    #[test]
+    fn a_jwk_with_standard_metadata_still_parses() {
+        use atproto_identity::key::{KeyType, generate_key, to_public};
+        use elliptic_curve::JwkEcKey;
+        let priv_key = generate_key(KeyType::P256Private).unwrap();
+        let pub_key = to_public(&priv_key).unwrap();
+        let jwk: JwkEcKey = (&pub_key).try_into().unwrap();
+        let mut jwk_value = serde_json::to_value(&jwk).unwrap();
+
+        // What a client actually publishes alongside the curve point.
+        jwk_value["alg"] = serde_json::json!("ES256");
+        jwk_value["kid"] = serde_json::json!("key-1");
+        jwk_value["use"] = serde_json::json!("sig");
+        jwk_value["key_ops"] = serde_json::json!(["verify"]);
+
+        let recovered = jwk_to_key_data(&jwk_value).expect("a standards-compliant JWK must parse");
+        assert_eq!(
+            recovered.bytes(),
+            pub_key.bytes(),
+            "the metadata must be ignored, not allowed to change the key"
+        );
     }
 
     #[test]
