@@ -256,12 +256,19 @@ async fn handle_code(
             "this client's metadata could not be retrieved",
         )
     })?;
+    // Both spellings an assertion may name: the issuer identifier and the
+    // token endpoint itself. Implementations differ on which they mint, and
+    // rejecting the other would refuse a correctly-signed assertion.
+    let issuer = format!("https://{}", state.service_did.replace("did:web:", ""));
+    crate::oauth::client_auth::set_expected_audience(vec![
+        issuer.clone(),
+        token_endpoint_url(&state),
+    ]);
     crate::oauth::client_auth::authenticate(
         &metadata,
         &auth.request.client_id,
         input.client_assertion_type.as_deref(),
         input.client_assertion.as_deref(),
-        &crate::user_agent(),
     )
     .await?;
 

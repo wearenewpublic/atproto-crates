@@ -580,7 +580,7 @@ async fn verify_request_object(
 /// Fetch the client's metadata document at `client_id`, extract `jwks` or
 /// `jwks_uri`, and resolve a matching `KeyData` by `kid`. Falls back to the
 /// first EC key when `kid` is absent.
-async fn resolve_client_signing_key(
+pub(crate) async fn resolve_client_signing_key(
     client_id: &str,
     kid: Option<&str>,
 ) -> Result<KeyData, KeyResolveError> {
@@ -635,7 +635,7 @@ async fn resolve_client_signing_key(
 }
 
 #[derive(Debug)]
-struct KeyResolveError(String);
+pub(crate) struct KeyResolveError(String);
 
 impl std::fmt::Display for KeyResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

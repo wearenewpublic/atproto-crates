@@ -26,7 +26,7 @@
 //! gets back in.
 
 use crate::http::errors::XrpcError;
-use crate::oauth::client_metadata::{ClientMetadata, resolve_client_jwks};
+use crate::oauth::client_metadata::ClientMetadata;
 use axum::http::StatusCode;
 
 /// The only assertion type RFC 7523 defines for this.
@@ -70,7 +70,6 @@ pub async fn authenticate(
     client_id: &str,
     assertion_type: Option<&str>,
     assertion: Option<&str>,
-    user_agent: &str,
 ) -> Result<(), XrpcError> {
     let refused = |detail: &str| {
         XrpcError::new(
@@ -126,39 +125,123 @@ pub async fn authenticate(
     };
 
     // Fail closed. A client that cannot be authenticated is not a client that
-    // may skip authentication.
-    let jwks = resolve_client_jwks(client_id, metadata, user_agent)
+    // may skip authentication -- key resolution failures surface as refusals
+    // from inside verify_assertion.
+    verify_assertion(assertion, client_id)
         .await
-        .map_err(|e| {
-            tracing::warn!(
-                client_id = %client_id,
-                error = ?e,
-                "could not reach a confidential client's keys; refusing rather than downgrading"
-            );
-            refused("this client's signing keys could not be retrieved")
-        })?;
+        .map_err(|detail| {
+            tracing::warn!(client_id = %client_id, detail = %detail, "client assertion refused");
+            refused(&detail)
+        })
+}
 
-    verify_assertion(assertion, client_id, &jwks).map_err(|detail| {
-        tracing::warn!(client_id = %client_id, detail = %detail, "client assertion refused");
-        refused(&detail)
+/// Verify a client assertion: signature first, then claims.
+///
+/// RFC 7523 §3. The signature is checked against the key the client publishes
+/// at its own `client_id`, resolved by `kid` — the same path a PAR request
+/// object takes, so a client that can sign one can sign the other.
+///
+/// Claims are checked after the signature, deliberately: reading claims out of
+/// a JWT nobody has authenticated is how an unsigned token gets treated as
+/// evidence of anything.
+async fn verify_assertion(assertion: &str, client_id: &str) -> Result<(), String> {
+    let parts: Vec<&str> = assertion.split('.').collect();
+    if parts.len() != 3 {
+        return Err("client assertion is not a compact JWS".to_string());
+    }
+
+    let header: serde_json::Value = decode_part(parts[0], "header")?;
+    let alg = header["alg"].as_str().unwrap_or_default();
+    if !crate::oauth::par::SUPPORTED_JWS_ALGS.contains(&alg) {
+        return Err(format!(
+            "unsupported client assertion alg {alg}; want one of {:?}",
+            crate::oauth::par::SUPPORTED_JWS_ALGS
+        ));
+    }
+
+    let key = crate::oauth::par::resolve_client_signing_key(client_id, header["kid"].as_str())
+        .await
+        .map_err(|e| format!("resolve client key: {e}"))?;
+
+    let signature =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[2])
+            .map_err(|e| format!("decode signature: {e}"))?;
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    atproto_identity::key::validate(&key, signing_input.as_bytes(), &signature)
+        .map_err(|e| format!("signature verify: {e}"))?;
+
+    let claims: serde_json::Value = decode_part(parts[1], "payload")?;
+
+    // `iss` and `sub` are both the client, which is what distinguishes a client
+    // assertion from every other JWT this server accepts. A mismatch means the
+    // assertion was minted for something else and is being replayed here.
+    for field in ["iss", "sub"] {
+        match claims[field].as_str() {
+            Some(v) if v == client_id => {}
+            Some(other) => {
+                return Err(format!(
+                    "client assertion {field} is {other}, not {client_id}"
+                ));
+            }
+            None => return Err(format!("client assertion has no {field}")),
+        }
+    }
+
+    // Audience must name this server, or an assertion minted for a different
+    // authorization server would be accepted here -- the mix-up this claim
+    // exists to prevent.
+    let audience_ok = match &claims["aud"] {
+        serde_json::Value::String(a) => is_self(a),
+        serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).any(is_self_str),
+        _ => false,
+    };
+    if !audience_ok {
+        return Err("client assertion aud does not name this server".to_string());
+    }
+
+    let exp = claims["exp"]
+        .as_i64()
+        .ok_or_else(|| "client assertion has no exp".to_string())?;
+    if exp <= chrono::Utc::now().timestamp() {
+        return Err("client assertion has expired".to_string());
+    }
+
+    Ok(())
+}
+
+/// Decode one base64url JWS segment as JSON.
+fn decode_part(part: &str, what: &str) -> Result<serde_json::Value, String> {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, part)
+        .map_err(|e| format!("decode {what}: {e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("parse {what}: {e}"))
+}
+
+/// Whether an `aud` value names this server.
+///
+/// Set by the caller before verification runs. A thread-local rather than a
+/// parameter only because the expected audience is a property of the
+/// deployment, not of the assertion.
+fn is_self(aud: &str) -> bool {
+    is_self_str(aud)
+}
+
+fn is_self_str(aud: &str) -> bool {
+    EXPECTED_AUDIENCE.with(|a| {
+        let expected = a.borrow();
+        expected.iter().any(|e| e == aud)
     })
 }
 
-/// Check an assertion's claims. Signature verification is not yet wired.
-///
-/// The claim checks are the cheap half and are done here; what is missing is
-/// the signature check against `jwks`, which needs a JWS verifier keyed by
-/// `kid` across the algorithms this server accepts.
-///
-/// Until that lands this returns an error for any confidential client, so the
-/// gap is a refusal rather than an acceptance — a half-checked assertion that
-/// was treated as valid would be worse than the state this replaced.
-fn verify_assertion(
-    _assertion: &str,
-    _client_id: &str,
-    _jwks: &serde_json::Value,
-) -> Result<(), String> {
-    Err("client assertion verification is not implemented on this server".to_string())
+thread_local! {
+    /// Values an assertion's `aud` may name: this server's issuer and its
+    /// token endpoint, which are both in use across implementations.
+    static EXPECTED_AUDIENCE: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Set the audiences an assertion may name, for the duration of a request.
+pub fn set_expected_audience(values: Vec<String>) {
+    EXPECTED_AUDIENCE.with(|a| *a.borrow_mut() = values);
 }
 
 #[cfg(test)]
@@ -170,6 +253,56 @@ mod tests {
             .expect("loopback metadata");
         m.token_endpoint_auth_method = method.map(str::to_string);
         m
+    }
+
+    /// A malformed assertion is refused before anything is read from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_assertion_that_is_not_a_jws_is_refused() {
+        let err = verify_assertion("not-a-jws", "https://app.example/x")
+            .await
+            .expect_err("three segments or nothing");
+        assert!(err.contains("compact JWS"), "{err}");
+    }
+
+    /// An algorithm this server cannot verify is refused by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_alg_is_refused() {
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"alg":"none"}"#,
+        );
+        let err = verify_assertion(&format!("{header}.e30.sig"), "https://app.example/x")
+            .await
+            .expect_err("`none` must never verify");
+        assert!(err.contains("unsupported client assertion alg"), "{err}");
+    }
+
+    /// The audience gate: an assertion naming another server is refused.
+    #[test]
+    fn an_audience_naming_another_server_is_refused() {
+        set_expected_audience(vec!["https://pds.example".to_string()]);
+        assert!(is_self("https://pds.example"));
+        assert!(
+            !is_self("https://someone-else.example"),
+            "an assertion minted for another authorization server must not verify here"
+        );
+    }
+
+    /// A client that publishes no keys cannot be authenticated, so it is
+    /// refused rather than allowed through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_with_unreachable_keys_is_refused() {
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"alg":"ES256"}"#,
+        );
+        let err = verify_assertion(
+            &format!("{header}.e30.sig"),
+            "https://nonexistent.invalid/client-metadata.json",
+        )
+        .await
+        .expect_err("unreachable keys must fail closed");
+        assert!(err.contains("resolve client key"), "{err}");
     }
 
     /// A client that declared nothing is public, per RFC 7591.
@@ -191,7 +324,6 @@ mod tests {
             "https://app.example/client-metadata.json",
             None,
             None,
-            "test",
         )
         .await
         .expect_err("a declared method must be enforced");
@@ -203,7 +335,7 @@ mod tests {
     /// A public client is unaffected, which is every client today.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_public_client_is_unchanged() {
-        authenticate(&metadata(None), "https://app.example/x", None, None, "test")
+        authenticate(&metadata(None), "https://app.example/x", None, None)
             .await
             .expect("public clients must keep working");
     }
@@ -216,7 +348,6 @@ mod tests {
             "https://app.example/x",
             Some("urn:example:something-else"),
             Some("ey.."),
-            "test",
         )
         .await
         .expect_err("an unrecognised assertion type must not pass");
@@ -236,7 +367,6 @@ mod tests {
             "https://app.example/x",
             Some(JWT_BEARER_ASSERTION),
             Some("ey.."),
-            "test",
         )
         .await
         .expect_err("nothing can verify an assertion for a client with no keys");
