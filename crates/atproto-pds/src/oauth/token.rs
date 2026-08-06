@@ -231,11 +231,20 @@ async fn handle_code(
         ));
     }
 
+    // Expand any `include:` here and nowhere else. The result is what both
+    // tokens carry, so refresh below reuses it rather than re-resolving: the
+    // permission-set record lives in the *client's* repository, and a client
+    // that could re-expand on every refresh could widen a grant the account
+    // holder approved once and never sees again.
+    let granted =
+        crate::oauth::permission_set::expand(state.lexicon_resolver.as_ref(), &auth.request.scope)
+            .await;
+
     issue_pair(
         &state,
         &auth.did,
         &auth.request.client_id,
-        &auth.request.scope,
+        &granted,
         &proof_jkt,
     )
     .await

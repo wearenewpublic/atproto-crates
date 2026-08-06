@@ -24,6 +24,7 @@ pub mod extract;
 pub mod jwks;
 pub mod metadata;
 pub mod par;
+pub mod permission_set;
 pub mod revoke;
 pub mod state;
 pub mod token;
