@@ -465,7 +465,7 @@ pub async fn public_record(
     Ok(record_view(
         &rkey,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="/browse/public/">Public</a> &middot; <a href="/browse/public/{}/">{}</a>"#,
+            r#"<a href="/browse/">Repository</a> &middot; <a href="/browse/public/">Public</a> &middot; <a href="/browse/public/{}">{}</a>"#,
             urlenc(&collection),
             esc(&collection)
         ),
@@ -736,7 +736,8 @@ pub async fn space_collection_or_blob(
     Ok(records_view(
         &segment,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="{base}">{}</a> &middot; {}"#,
+            r#"<a href="/browse/">Repository</a> &middot; <a href="{}">{}</a> &middot; {}"#,
+            base.trim_end_matches('/'),
             esc(&space.to_string()),
             esc(&segment)
         ),
@@ -785,7 +786,8 @@ pub async fn space_record(
     Ok(record_view(
         &rkey,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="{base}">{}</a> &middot; <a href="{base}{}/">{}</a>"#,
+            r#"<a href="/browse/">Repository</a> &middot; <a href="{}">{}</a> &middot; <a href="{base}{}">{}</a>"#,
+            base.trim_end_matches('/'),
             esc(&space.to_string()),
             urlenc(&collection),
             esc(&collection)

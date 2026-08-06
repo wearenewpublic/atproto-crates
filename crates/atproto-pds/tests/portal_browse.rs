@@ -366,3 +366,69 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
+
+/// Every link the browser renders must resolve.
+///
+/// Three breadcrumbs pointed at a collection listing with a trailing slash --
+/// `/browse/public/app.bsky.feed.post/` -- and axum treats that as a different
+/// path from the route, so following one 404ed. The pages that *contained* the
+/// links all rendered fine, which is why the existing tests passed: they
+/// assert what a page says, never that what it points at exists.
+///
+/// So this follows them. Anything reachable from the browser has to answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_link_the_browser_renders_resolves() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    let pages = [
+        "/browse/".to_string(),
+        "/browse/public/".to_string(),
+        format!("/browse/public/{COLLECTION}"),
+        format!("/browse/public/{COLLECTION}/{RKEY}"),
+    ];
+
+    let mut checked = 0;
+    for page in &pages {
+        let (status, body, _) = get(&app, &cookie, page).await;
+        assert_eq!(status, StatusCode::OK, "{page} did not render");
+
+        for href in hrefs(&body) {
+            if !href.starts_with("/browse") {
+                continue;
+            }
+            let (status, _, location) = get(&app, &cookie, &href).await;
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{page} links to {href}, which does not resolve"
+            );
+            // A link that bounces to sign-in is a link the session cannot
+            // follow, which is the same dead end from the holder's side.
+            assert_ne!(
+                location.as_deref(),
+                Some("/account/signin"),
+                "{page} links to {href}, which rejects the session that rendered it"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 6,
+        "only {checked} links were followed; the crawl is not covering the pages"
+    );
+}
+
+/// Pull the `href` values out of rendered HTML.
+fn hrefs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("href=\"") {
+        rest = &rest[i + 6..];
+        if let Some(end) = rest.find('"') {
+            out.push(rest[..end].replace("&amp;", "&"));
+            rest = &rest[end..];
+        }
+    }
+    out
+}
