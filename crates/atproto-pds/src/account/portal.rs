@@ -418,6 +418,120 @@ pub async fn delete_sessions_for(
 /// # Errors
 ///
 /// [`PdsError::Storage`] on write failure.
+/// Stash a freshly minted secret for the next page render.
+///
+/// The portal previously carried a new app password back through the redirect
+/// query string. A live credential in a URL is written to browser history, the
+/// address bar, this server's access log and every proxy's on the way, and
+/// leaves in a `Referer` the moment the page links anywhere -- none of which
+/// can be un-written. It goes here instead, bound to the session that asked
+/// for it.
+pub async fn set_flash_secret(
+    pool: &AccountPool,
+    cookie_value: &str,
+    secret: &str,
+) -> PdsResult<()> {
+    let id = session_id(cookie_value);
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query("UPDATE portal_session SET flash_secret = ? WHERE id = ?")
+                .bind(secret)
+                .bind(&id)
+                .execute(pool.as_sqlite())
+                .await
+                .map(|_| ())
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query("UPDATE portal_session SET flash_secret = $1 WHERE id = $2")
+                .bind(secret)
+                .bind(&id)
+                .execute(pool.as_postgres())
+                .await
+                .map(|_| ())
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+    .map_err(|e| PdsError::Storage {
+        reason: format!("set flash secret: {e}"),
+    })
+}
+
+/// Read a stashed secret and clear it, so it is handed over exactly once.
+///
+/// A transaction rather than `UPDATE ... RETURNING`: both engines return the
+/// row as it is *after* the update, so a statement that clears the column and
+/// returns it hands back the `NULL` it just wrote. That is what the first
+/// version of this did, and the round-trip test is what caught it.
+pub async fn take_flash_secret(
+    pool: &AccountPool,
+    cookie_value: &str,
+) -> PdsResult<Option<String>> {
+    let id = session_id(cookie_value);
+    let fail = |e: sqlx::Error| PdsError::Storage {
+        reason: format!("take flash secret: {e}"),
+    };
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            let mut tx = pool.as_sqlite().begin().await.map_err(fail)?;
+            let found: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT flash_secret FROM portal_session WHERE id = ?")
+                    .bind(&id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(fail)?;
+            let secret = found.and_then(|(v,)| v);
+            if secret.is_some() {
+                sqlx::query("UPDATE portal_session SET flash_secret = NULL WHERE id = ?")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(fail)?;
+            }
+            tx.commit().await.map_err(fail)?;
+            Ok(secret)
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            let mut tx = pool.as_postgres().begin().await.map_err(fail)?;
+            let found: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT flash_secret FROM portal_session WHERE id = $1 FOR UPDATE")
+                    .bind(&id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(fail)?;
+            let secret = found.and_then(|(v,)| v);
+            if secret.is_some() {
+                sqlx::query("UPDATE portal_session SET flash_secret = NULL WHERE id = $1")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(fail)?;
+            }
+            tx.commit().await.map_err(fail)?;
+            Ok(secret)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+}
+
+/// Move a session forward to a new epoch.
+///
+/// What keeps "sign out everywhere" from signing out the browser that pressed
+/// it: every other session is deleted and this one is restamped, so it alone
+/// survives the epoch bump.
 pub async fn restamp_session(pool: &AccountPool, cookie_value: &str, epoch: i64) -> PdsResult<()> {
     let id = session_id(cookie_value);
     match pool.kind() {
@@ -472,6 +586,30 @@ mod tests {
         .await
         .unwrap();
         AccountPool::Sqlite(dir.pool().clone())
+    }
+
+    /// The stashed secret comes back once, and only once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flash_secret_is_handed_over_exactly_once() {
+        let pool = pool_with_account("did:plc:flash").await;
+        create_session(&pool, "cookie", "did:plc:flash", 0, None)
+            .await
+            .unwrap();
+
+        set_flash_secret(&pool, "cookie", "the-secret")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            take_flash_secret(&pool, "cookie").await.unwrap().as_deref(),
+            Some("the-secret"),
+            "the secret was not handed back"
+        );
+        assert_eq!(
+            take_flash_secret(&pool, "cookie").await.unwrap(),
+            None,
+            "the secret survived being read"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

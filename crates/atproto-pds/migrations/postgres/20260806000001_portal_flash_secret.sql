@@ -1,0 +1,12 @@
+-- A one-shot slot for a freshly minted app password.
+--
+-- The portal used to hand the new secret back through the redirect it issues
+-- after minting: `/account?secret=<the password>`. A query string is the worst
+-- available carrier for a live credential. It lands in browser history, in the
+-- address bar, in this server's access logs and in every proxy's and CDN's on
+-- the way, and it leaves in a `Referer` header the moment the page links
+-- anywhere. None of those are places a credential can be withdrawn from.
+--
+-- The secret is written here instead, read once by the page that displays it,
+-- and cleared in the same statement. It exists for the width of one redirect.
+ALTER TABLE portal_session ADD COLUMN flash_secret TEXT;

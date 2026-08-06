@@ -246,10 +246,8 @@ pub struct PortalQuery {
     /// A short status word set by the route that redirected here.
     #[serde(default)]
     pub msg: Option<String>,
-    /// A freshly minted app password, shown once and never stored anywhere
-    /// this page can read it again.
-    #[serde(default)]
-    pub secret: Option<String>,
+    // A freshly minted app password is deliberately absent here. It is
+    // carried in the session row instead -- see `portal::set_flash_secret`.
     /// Handle re-typed into the signup form after a refusal.
     #[serde(default)]
     pub name: Option<String>,
@@ -848,6 +846,8 @@ pub async fn dashboard(
             "Password changed. Every other session was signed out.",
         ),
         Some("app-password-revoked") => notice("ok", "App password revoked."),
+        // The secret itself is rendered from the session, not from here.
+        Some("app-password-created") => String::new(),
         Some("policy-accepted") => notice(
             "ok",
             "Policy accepted. You can sign in to applications again.",
@@ -862,8 +862,9 @@ pub async fn dashboard(
     };
 
     // Shown exactly once, immediately after minting.
-    let fresh_secret = q
-        .secret
+    let fresh_secret = portal::take_flash_secret(&pool, &cookie)
+        .await
+        .map_err(XrpcError::from)?
         .as_deref()
         .map(|s| {
             format!(
@@ -1580,7 +1581,7 @@ pub async fn create_app_password(
     Form(form): Form<AppPasswordForm>,
 ) -> Result<Response, XrpcError> {
     require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
+    let Some((cookie, account)) = current_account(&state, &headers).await else {
         return Ok(redirect("/account/signin"));
     };
     // The prompt hides these controls, but the route still exists and a
@@ -1599,11 +1600,15 @@ pub async fn create_app_password(
     let created = app_password::create(&pool, &account.did, name, false)
         .await
         .map_err(XrpcError::from)?;
+    // Handed over through the session, never through the URL. A query string
+    // is written to browser history, the address bar, this server's access log
+    // and every proxy's on the way, and leaves in a `Referer` the moment the
+    // page links anywhere -- none of which can be un-written afterwards.
+    portal::set_flash_secret(&pool, &cookie, &created.plaintext)
+        .await
+        .map_err(XrpcError::from)?;
     tracing::info!(did = %account.did, name, "portal app-password created");
-    Ok(redirect(&format!(
-        "/account?secret={}",
-        urlencoding_encode(&created.plaintext)
-    )))
+    Ok(redirect("/account?msg=app-password-created"))
 }
 
 /// `POST /account/app-passwords/revoke`.
