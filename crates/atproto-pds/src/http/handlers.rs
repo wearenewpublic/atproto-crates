@@ -406,6 +406,59 @@ pub async fn get_blocks(
     Ok(response)
 }
 
+/// Query for `com.atproto.sync.getRecord`.
+#[derive(Debug, serde::Deserialize)]
+pub struct SyncGetRecordParams {
+    /// Repository DID.
+    pub did: String,
+    /// NSID collection.
+    pub collection: String,
+    /// Record key.
+    pub rkey: String,
+}
+
+/// Handler for `GET /xrpc/com.atproto.sync.getRecord`.
+///
+/// A proof, not a lookup. The CAR carries the signed commit, the MST nodes
+/// along the path to the key, and the record block when there is one, so a
+/// caller can check the record belongs to this repository without trusting
+/// this server. `com.atproto.repo.getRecord` hands over the value and asks to
+/// be believed.
+///
+/// That distinction is why this being absent broke more than sync. It is the
+/// only fetch `@atproto/lex-resolver` makes when an authorization server
+/// resolves an OAuth permission set, so a lexicon published to a repository
+/// here could not be resolved by any server running the reference stack --
+/// surfacing to the user as `invalid_scope`, naming no method and no host.
+///
+/// Unauthenticated, per the lexicon: the caller is an authorization server
+/// that has never seen this one.
+pub async fn sync_get_record(
+    State(state): State<HttpState>,
+    Query(params): Query<SyncGetRecordParams>,
+) -> Result<axum::response::Response, XrpcError> {
+    use crate::actor_store::sql::SqlActorStore;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    // Same gate as `getRepo` and `getBlocks`, which is where the lexicon's
+    // takendown / suspended / deactivated errors come from.
+    let did = state.reader.require_available(&params.did).await?.did;
+
+    let data_dir = state.reader.data_dir().clone();
+    let store = SqlActorStore::open(&data_dir, &did).await?;
+    let car_bytes =
+        crate::repo::car_export::export_record_proof_car(&store, &params.collection, &params.rkey)
+            .await?;
+
+    let mut response = (StatusCode::OK, car_bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/vnd.ipld.car".parse().unwrap(),
+    );
+    Ok(response)
+}
+
 // ---------------------------------------------------------------------------
 //  §11b — requestCrawl.
 // ---------------------------------------------------------------------------

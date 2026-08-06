@@ -90,6 +90,12 @@ pub fn build_router(state: HttpState) -> Router {
             get(handlers::get_repo_status),
         )
         .route("/xrpc/com.atproto.sync.getRepo", get(handlers::get_repo))
+        // A proof of one record's presence or absence, and the only fetch an
+        // authorization server makes when resolving a permission set.
+        .route(
+            "/xrpc/com.atproto.sync.getRecord",
+            get(handlers::sync_get_record),
+        )
         .route(
             "/xrpc/com.atproto.sync.getBlocks",
             get(handlers::get_blocks),

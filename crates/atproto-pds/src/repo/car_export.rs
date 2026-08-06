@@ -573,6 +573,128 @@ pub async fn export_blocks_car(store: &SqlActorStore, cids: &[String]) -> PdsRes
     Ok(buffer)
 }
 
+/// CAR proving the presence — or absence — of one record in the current commit.
+///
+/// Backs `com.atproto.sync.getRecord`, which is a *proof*, not a lookup. The
+/// caller gets the signed commit, the MST nodes along the path to the key, and
+/// the record block when there is one, so it can check the record belongs to
+/// this repository without trusting this server. `com.atproto.repo.getRecord`
+/// hands over the value and asks to be believed; this is the one an
+/// authorization server uses when resolving a permission set, for exactly that
+/// reason.
+///
+/// Absence is a success. A key that is not in the tree still has a covering
+/// proof — the nodes that would contain it, showing it does not — and
+/// returning an error for that would refuse to answer a question this server
+/// can answer. `RecordNotFound` is for repositories whose absence cannot be
+/// proved, not for records that are absent.
+pub async fn export_record_proof_car(
+    store: &SqlActorStore,
+    collection: &str,
+    rkey: &str,
+) -> PdsResult<Vec<u8>> {
+    use atproto_repo::mst::Mst;
+    use std::str::FromStr;
+
+    let pool = store.pool();
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT cid, data_cid FROM commit_obj ORDER BY rev DESC LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("latest commit: {e}"),
+            })?;
+    let (commit_cid_str, data_cid_str) = row.ok_or_else(|| PdsError::NotFound {
+        what: "no commits in repo".to_string(),
+    })?;
+    let commit_cid = cid::Cid::from_str(&commit_cid_str).map_err(|e| PdsError::Storage {
+        reason: format!("parse commit CID: {e}"),
+    })?;
+    let data_cid = cid::Cid::from_str(&data_cid_str).map_err(|e| PdsError::Storage {
+        reason: format!("parse data CID: {e}"),
+    })?;
+
+    let storage = SqlBlockStorage::open(pool.clone())
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("open block storage: {e}"),
+        })?;
+
+    // The key as the MST holds it.
+    let key = format!("{collection}/{rkey}");
+    // A second handle rather than a clone: `SqlBlockStorage` wraps the pool,
+    // and the Mst takes ownership of the one it walks.
+    let mst_storage = SqlBlockStorage::open(pool.clone())
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("open block storage: {e}"),
+        })?;
+    let mst = Mst::from_root(data_cid, mst_storage, atproto_repo::RepoConfig::default());
+    let proof = mst
+        .covering_proof(&key)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("covering proof for {key}: {e}"),
+        })?;
+
+    let mut blocks: Vec<CarBlock> = Vec::with_capacity(proof.len() + 2);
+
+    // The commit is the root, and the thing the proof hangs from.
+    let commit_bytes = storage
+        .get(&commit_cid)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("read commit block: {e}"),
+        })?
+        .ok_or_else(|| PdsError::Storage {
+            reason: "commit block missing from storage".to_string(),
+        })?;
+    blocks.push(CarBlock {
+        cid: commit_cid,
+        data: commit_bytes,
+    });
+
+    for (cid, data) in proof {
+        blocks.push(CarBlock { cid, data });
+    }
+
+    // The record itself, when present. Absent is not an error -- the proof
+    // above is what says so, and it is already in the CAR.
+    if let Some(record_cid) = mst.get(&key).await.map_err(|e| PdsError::Storage {
+        reason: format!("mst get {key}: {e}"),
+    })? && let Some(data) = storage
+        .get(&record_cid)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("read record block: {e}"),
+        })?
+    {
+        blocks.push(CarBlock {
+            cid: record_cid.into(),
+            data,
+        });
+    }
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.data.len() + 64).sum());
+    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(commit_cid)])
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("CarWriter::new: {e}"),
+        })?;
+    for block in &blocks {
+        writer
+            .write_block(block)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("CarWriter::write_block: {e}"),
+            })?;
+    }
+    writer.finish().await.map_err(|e| PdsError::Storage {
+        reason: format!("CarWriter::finish: {e}"),
+    })?;
+    Ok(buffer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
