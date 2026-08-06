@@ -281,17 +281,75 @@ fn records_view(
     )
 }
 
+/// Every CID a record links to, in document order and without repeats.
+///
+/// A blob reference is `{"$type":"blob","ref":{"$link":"bafkrei…"}}`, but
+/// `$link` is the general cid-link form and appears outside blobs too, so the
+/// walk keys on `$link` rather than on the blob shape -- a record referencing a
+/// CID some other way is still referencing it.
+///
+/// Nested because records nest: a blob three levels inside an array is as much
+/// a reference as one at the top.
+fn linked_cids(value: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, v) in map {
+                    if key == "$link"
+                        && let Some(cid) = v.as_str()
+                        && !out.iter().any(|c| c == cid)
+                    {
+                        out.push(cid.to_string());
+                    }
+                    walk(v, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out);
+    out
+}
+
 /// Render one record, with its JSON in an editable form.
+#[allow(clippy::too_many_arguments)]
 fn record_view(
     title: &str,
     crumbs: &str,
     action: &str,
+    blob_base: &str,
     uri: &str,
     cid: &str,
     value: &serde_json::Value,
     msg: Option<&str>,
 ) -> Response {
     let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+
+    // The CIDs this record points at, as links. Reading one out of the JSON and
+    // pasting it into a URL is work the page can do.
+    let cids = linked_cids(value);
+    let linked = if cids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="muted" style="margin-top:0.8em">Linked content</p><table>{}</table>"#,
+            cids.iter()
+                .map(|cid| format!(
+                    r#"<tr><td><a href="{}{}"><code>{}</code></a></td></tr>"#,
+                    blob_base,
+                    esc(&urlenc(cid)),
+                    esc(cid)
+                ))
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
     browse_page(
         title,
         crumbs,
@@ -300,6 +358,7 @@ fn record_view(
 <section>
 <p><code>{uri}</code></p>
 <p class="muted">CID <code>{cid}</code></p>
+{linked}
 <form method="POST" action="{action}">
   <label for="value">Record JSON</label>
   <textarea id="value" name="value" rows="20" spellcheck="false"
@@ -318,6 +377,7 @@ fn record_view(
 </form>
 </section>"#,
             banner = banner(msg),
+            linked = linked,
             uri = esc(uri),
             cid = esc(cid),
             json = esc(&pretty),
@@ -470,6 +530,7 @@ pub async fn public_record(
             esc(&collection)
         ),
         &format!("/browse/public/{}/{}", urlenc(&collection), urlenc(&rkey)),
+        "/browse/public/",
         &record.uri,
         &record.cid,
         &record.value,
@@ -793,6 +854,7 @@ pub async fn space_record(
             esc(&collection)
         ),
         &format!("{base}{}/{}", urlenc(&collection), urlenc(&rkey)),
+        &base,
         &format!("{space}/{collection}/{rkey}"),
         &record.cid,
         &decode_record(&record.value)?,
@@ -972,6 +1034,51 @@ fn space_writer(state: &HttpState) -> Result<&crate::space::writer::SpaceWriter,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blob reference, as records actually carry one.
+    #[test]
+    fn a_blob_reference_is_found() {
+        let record = serde_json::json!({
+            "$type": "app.bulleted.outline",
+            "image": {
+                "$type": "blob",
+                "mimeType": "image/jpeg",
+                "ref": {"$link": "bafkreicfngbcd3osqxa7oaufocet2j7jytwv526xwtrgruvphxsacrfrk4"},
+                "size": 123037,
+            },
+        });
+
+        assert_eq!(
+            linked_cids(&record),
+            vec!["bafkreicfngbcd3osqxa7oaufocet2j7jytwv526xwtrgruvphxsacrfrk4".to_string()]
+        );
+    }
+
+    /// Nested and repeated references: records nest, and the same blob can be
+    /// referenced twice without earning two rows.
+    #[test]
+    fn nested_references_are_found_once_each() {
+        let record = serde_json::json!({
+            "items": [
+                {"ref": {"$link": "bafkone"}},
+                {"deep": {"deeper": {"ref": {"$link": "bafktwo"}}}},
+                {"again": {"$link": "bafkone"}},
+            ],
+        });
+
+        assert_eq!(
+            linked_cids(&record),
+            vec!["bafkone".to_string(), "bafktwo".to_string()],
+            "document order, no repeats"
+        );
+    }
+
+    /// A record with no references contributes no list.
+    #[test]
+    fn a_record_without_references_links_nothing() {
+        let record = serde_json::json!({"$type": "app.bsky.feed.post", "text": "hi"});
+        assert!(linked_cids(&record).is_empty());
+    }
 
     /// The one ambiguity in the URL scheme, decided without asking storage.
     #[test]
