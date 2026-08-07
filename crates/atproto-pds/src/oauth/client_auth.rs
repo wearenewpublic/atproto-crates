@@ -71,6 +71,7 @@ pub async fn authenticate(
     assertion_type: Option<&str>,
     assertion: Option<&str>,
     jti_guard: &crate::security::JtiReplayGuard,
+    expected_audience: &[String],
 ) -> Result<(), XrpcError> {
     let refused = |detail: &str| {
         XrpcError::new(
@@ -128,7 +129,7 @@ pub async fn authenticate(
     // Fail closed. A client that cannot be authenticated is not a client that
     // may skip authentication -- key resolution failures surface as refusals
     // from inside verify_assertion.
-    verify_assertion(assertion, client_id, jti_guard)
+    verify_assertion(assertion, client_id, jti_guard, expected_audience)
         .await
         .map_err(|detail| {
             tracing::warn!(client_id = %client_id, detail = %detail, "client assertion refused");
@@ -149,6 +150,7 @@ async fn verify_assertion(
     assertion: &str,
     client_id: &str,
     jti_guard: &crate::security::JtiReplayGuard,
+    expected_audience: &[String],
 ) -> Result<(), String> {
     let parts: Vec<&str> = assertion.split('.').collect();
     if parts.len() != 3 {
@@ -195,12 +197,7 @@ async fn verify_assertion(
     // Audience must name this server, or an assertion minted for a different
     // authorization server would be accepted here -- the mix-up this claim
     // exists to prevent.
-    let audience_ok = match &claims["aud"] {
-        serde_json::Value::String(a) => is_self(a),
-        serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).any(is_self_str),
-        _ => false,
-    };
-    if !audience_ok {
+    if !names_this_server(&claims["aud"], expected_audience) {
         return Err("client assertion aud does not name this server".to_string());
     }
 
@@ -240,37 +237,39 @@ fn decode_part(part: &str, what: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("parse {what}: {e}"))
 }
 
-/// Whether an `aud` value names this server.
+/// Whether an assertion's `aud` names this server.
 ///
-/// Set by the caller before verification runs. A thread-local rather than a
-/// parameter only because the expected audience is a property of the
-/// deployment, not of the assertion.
-fn is_self(aud: &str) -> bool {
-    is_self_str(aud)
-}
-
-fn is_self_str(aud: &str) -> bool {
-    EXPECTED_AUDIENCE.with(|a| {
-        let expected = a.borrow();
-        expected.iter().any(|e| e == aud)
-    })
-}
-
-thread_local! {
-    /// Values an assertion's `aud` may name: this server's issuer and its
-    /// token endpoint, which are both in use across implementations.
-    static EXPECTED_AUDIENCE: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Set the audiences an assertion may name, for the duration of a request.
-pub fn set_expected_audience(values: Vec<String>) {
-    EXPECTED_AUDIENCE.with(|a| *a.borrow_mut() = values);
+/// Passed in rather than held in a thread-local, which is what this was and
+/// why it failed intermittently. `verify_assertion` awaits a key fetch, tokio
+/// may move the task to a different worker across that await, and a value set
+/// before it is not there afterwards -- so a correctly-signed assertion was
+/// refused for naming an audience the server had, on that thread, no record of
+/// accepting. The client saw a refusal it could not reproduce, and retrying
+/// sometimes worked, which is the worst shape a failure can take.
+///
+/// A thread-local is never the right carrier for request state in async code:
+/// the task, not the thread, is the thing the state belongs to.
+///
+/// RFC 7519 allows `aud` to be a string or an array; one matching entry is
+/// enough.
+fn names_this_server(aud: &serde_json::Value, expected: &[String]) -> bool {
+    match aud {
+        serde_json::Value::String(a) => expected.iter().any(|e| e == a),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|a| expected.iter().any(|e| e == a)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audiences() -> Vec<String> {
+        vec!["https://pds.example".to_string()]
+    }
 
     fn guard() -> crate::security::JtiReplayGuard {
         crate::security::JtiReplayGuard::new(64)
@@ -286,7 +285,7 @@ mod tests {
     /// A malformed assertion is refused before anything is read from it.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_assertion_that_is_not_a_jws_is_refused() {
-        let err = verify_assertion("not-a-jws", "https://app.example/x", &guard())
+        let err = verify_assertion("not-a-jws", "https://app.example/x", &guard(), &audiences())
             .await
             .expect_err("three segments or nothing");
         assert!(err.contains("compact JWS"), "{err}");
@@ -303,21 +302,40 @@ mod tests {
             &format!("{header}.e30.sig"),
             "https://app.example/x",
             &guard(),
+            &audiences(),
         )
         .await
         .expect_err("`none` must never verify");
         assert!(err.contains("unsupported client assertion alg"), "{err}");
     }
 
-    /// The audience gate: an assertion naming another server is refused.
+    /// The audience gate, and the shapes RFC 7519 allows.
     #[test]
-    fn an_audience_naming_another_server_is_refused() {
-        set_expected_audience(vec!["https://pds.example".to_string()]);
-        assert!(is_self("https://pds.example"));
+    fn only_an_audience_naming_this_server_passes() {
+        let expected = audiences();
+
+        assert!(names_this_server(
+            &serde_json::json!("https://pds.example"),
+            &expected
+        ));
         assert!(
-            !is_self("https://someone-else.example"),
+            !names_this_server(
+                &serde_json::json!("https://someone-else.example"),
+                &expected
+            ),
             "an assertion minted for another authorization server must not verify here"
         );
+        // `aud` may be an array; one matching entry is enough.
+        assert!(names_this_server(
+            &serde_json::json!(["https://other.example", "https://pds.example"]),
+            &expected
+        ));
+        assert!(!names_this_server(
+            &serde_json::json!(["https://other.example"]),
+            &expected
+        ));
+        // Absent, or any other shape, is not a match.
+        assert!(!names_this_server(&serde_json::Value::Null, &expected));
     }
 
     /// A client that publishes no keys cannot be authenticated, so it is
@@ -332,6 +350,7 @@ mod tests {
             &format!("{header}.e30.sig"),
             "https://nonexistent.invalid/client-metadata.json",
             &guard(),
+            &audiences(),
         )
         .await
         .expect_err("unreachable keys must fail closed");
@@ -391,6 +410,7 @@ mod tests {
             None,
             None,
             &guard(),
+            &audiences(),
         )
         .await
         .expect_err("a declared method must be enforced");
@@ -408,6 +428,7 @@ mod tests {
             None,
             None,
             &guard(),
+            &audiences(),
         )
         .await
         .expect("public clients must keep working");
@@ -422,6 +443,7 @@ mod tests {
             Some("urn:example:something-else"),
             Some("ey.."),
             &guard(),
+            &audiences(),
         )
         .await
         .expect_err("an unrecognised assertion type must not pass");
@@ -442,6 +464,7 @@ mod tests {
             Some(JWT_BEARER_ASSERTION),
             Some("ey.."),
             &guard(),
+            &audiences(),
         )
         .await
         .expect_err("nothing can verify an assertion for a client with no keys");
