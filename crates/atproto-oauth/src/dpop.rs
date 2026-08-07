@@ -301,6 +301,29 @@ pub fn request_dpop(
     build_dpop(key_data, http_method, http_uri, Some(oauth_access_token))
 }
 
+/// The `htu` claim: the target URI without query or fragment (RFC 9449 §4.2).
+///
+/// Stripped here rather than asked of callers. Every caller passes the URL it
+/// is about to request, which is the natural thing to pass and the wrong thing
+/// to sign: a server recomputes `htu` from the request it received and strips,
+/// so a proof carrying the query is compared against a string it was never
+/// signed over. The proof is valid, the key is right, the clock is right, and
+/// it is rejected -- as `InvalidDpopProof`, which names none of that.
+///
+/// Both delimiters in one pass, whichever comes first. A fragment before a
+/// query is not a thing a real URL does, but scanning for both cannot get the
+/// order wrong and is no harder than scanning for one.
+///
+/// Applies to every proof this crate mints, because `build_dpop` is the only
+/// place that builds the claim. Authorization and PAR URLs carry no query
+/// today, so nothing there was broken -- but the claim has one definition, and
+/// putting it on the path rather than at selected call sites is what keeps it
+/// that way.
+fn htu_of(http_uri: &str) -> &str {
+    let end = http_uri.find(['?', '#']).unwrap_or(http_uri.len());
+    &http_uri[..end]
+}
+
 fn build_dpop(
     key_data: &KeyData,
     http_method: &str,
@@ -331,7 +354,7 @@ fn build_dpop(
         auth,
         expiration,
         http_method: Some(http_method.to_string()),
-        http_uri: Some(http_uri.to_string()),
+        http_uri: Some(htu_of(http_uri).to_string()),
         issued_at,
         json_web_token_id: Some(Ulid::new().to_string()),
         ..Default::default()
@@ -1458,6 +1481,100 @@ mod tests {
         let thumbprint = validate_dpop_jwt(&dpop_token, &config)?;
         assert_eq!(thumbprint.len(), 43);
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod htu_tests {
+    use super::*;
+    use atproto_identity::key::{KeyType, generate_key};
+
+    /// Decode a minted proof's claims, so the assertion is on what was signed
+    /// rather than on what was passed to a helper. A test asserting the latter
+    /// would pass against a helper nothing calls.
+    fn claims_of(token: &str) -> serde_json::Value {
+        use base64::Engine as _;
+        let payload = token.split('.').nth(1).expect("a compact JWS");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url payload");
+        serde_json::from_slice(&bytes).expect("claims json")
+    }
+
+    /// The failure this fixes: a query in the signed `htu`.
+    ///
+    /// The server recomputes `htu` from the request and strips, so a proof
+    /// carrying the query is checked against a string it was never signed
+    /// over. Every authenticated GET that takes parameters is affected, which
+    /// is most of them -- and POST procedures are not, which is why it took
+    /// this long to notice.
+    #[test]
+    fn htu_excludes_the_query() -> Result<()> {
+        let key = generate_key(KeyType::P256Private)?;
+        let url = "https://pds.example/xrpc/com.atproto.repo.getRecord?repo=did:plc:x&collection=a.b.c&rkey=k";
+
+        let (token, _, _) = request_dpop(&key, "GET", url, "token")?;
+
+        assert_eq!(
+            claims_of(&token)["htu"],
+            "https://pds.example/xrpc/com.atproto.repo.getRecord"
+        );
+        Ok(())
+    }
+
+    /// A fragment goes too, and a URL with neither is untouched.
+    #[test]
+    fn htu_excludes_a_fragment_and_leaves_a_bare_url_alone() -> Result<()> {
+        let key = generate_key(KeyType::P256Private)?;
+
+        for (input, want) in [
+            (
+                "https://pds.example/xrpc/a.b.c#frag",
+                "https://pds.example/xrpc/a.b.c",
+            ),
+            (
+                "https://pds.example/xrpc/a.b.c",
+                "https://pds.example/xrpc/a.b.c",
+            ),
+            // A trailing slash is part of the path and must survive.
+            ("https://pds.example/xrpc/", "https://pds.example/xrpc/"),
+        ] {
+            let (token, _, _) = request_dpop(&key, "GET", input, "token")?;
+            assert_eq!(claims_of(&token)["htu"], want, "input: {input}");
+        }
+        Ok(())
+    }
+
+    /// An encoded `?` inside the path is not a delimiter.
+    ///
+    /// Scanning the raw string is only safe because `%3F` is not `?`. If this
+    /// ever moves to a URL parser, that parser must not decode the path first.
+    #[test]
+    fn an_encoded_question_mark_in_the_path_survives() -> Result<()> {
+        let key = generate_key(KeyType::P256Private)?;
+        let url = "https://pds.example/xrpc/a.b.c/weird%3Fkey?q=1";
+
+        let (token, _, _) = request_dpop(&key, "GET", url, "token")?;
+
+        assert_eq!(
+            claims_of(&token)["htu"],
+            "https://pds.example/xrpc/a.b.c/weird%3Fkey"
+        );
+        Ok(())
+    }
+
+    /// Authorization proofs go through the same funnel.
+    ///
+    /// Those URLs carry no query today, so this is not fixing a break -- it
+    /// pins that the claim has one definition rather than one per call site.
+    #[test]
+    fn authorization_proofs_strip_too() -> Result<()> {
+        let key = generate_key(KeyType::P256Private)?;
+
+        let (token, _, _) = auth_dpop(&key, "POST", "https://pds.example/oauth/par?x=1")?;
+
+        assert_eq!(claims_of(&token)["htu"], "https://pds.example/oauth/par");
         Ok(())
     }
 }
