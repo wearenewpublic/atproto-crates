@@ -35,6 +35,7 @@ const RKEY: &str = "3kaaaaaaaaaa2";
 
 struct Fixture {
     app: axum::Router,
+    svc: Arc<SpaceService>,
     cookie: String,
     space: SpaceUri,
     _tmp: TempDir,
@@ -111,6 +112,7 @@ async fn fixture() -> Fixture {
 
     Fixture {
         app,
+        svc: svc.clone(),
         cookie,
         space,
         _tmp: tmp,
@@ -184,6 +186,38 @@ async fn the_index_lists_a_space_with_records() {
 
 fn self_space_type() -> &'static str {
     SPACE_TYPE
+}
+
+/// A space with no records is still listed.
+///
+/// The index used to read the distinct values in `space_record`, so a space
+/// that had just been created — before anything was written to it — did not
+/// appear at all. The holder had made it moments earlier and the page said
+/// they had none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_with_no_records_is_listed() {
+    let f = fixture().await;
+
+    // A second space, deliberately left empty.
+    let empty = f
+        .svc
+        .create_space(DID, SPACE_TYPE, "emptyone", SpaceConfig::default())
+        .await
+        .expect("second space");
+
+    let (status, body, _) = f.get("/browse/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("emptyone"),
+        "a space with no records was omitted from the index"
+    );
+    // And the one that does have records is still there.
+    assert!(
+        body.contains(SPACE_KEY),
+        "the populated space vanished: {}",
+        empty.uri
+    );
 }
 
 /// Collections holding space records are listed.

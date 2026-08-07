@@ -117,14 +117,14 @@ pub async fn index(
         return Ok(redirect("/account/signin"));
     };
 
-    // Spaces this account is a member of *and* holds records in, read from its
-    // own per-actor store. A space with no records of theirs is not something
-    // they can browse, so listing it would be an empty promise.
-    let spaces = spaces_with_records(&state, &account.did)
-        .await
-        .unwrap_or_default();
+    // Every space this account holds, not only the ones it has written to. An
+    // empty space is a real thing -- newly created, or emptied -- and omitting
+    // it made a space the holder had just made themselves look like it had
+    // never existed. "What do I have" is the question this list answers, and a
+    // filter on record count answers a different one.
+    let spaces = all_spaces(&state, &account.did).await.unwrap_or_default();
     let space_rows = if spaces.is_empty() {
-        r#"<tr><td class="muted">No spaces with records.</td></tr>"#.to_string()
+        r#"<tr><td class="muted">No spaces.</td></tr>"#.to_string()
     } else {
         spaces
             .iter()
@@ -160,23 +160,36 @@ pub async fn index(
     Ok(browse_page("Repository", "Repository", &body))
 }
 
-/// Distinct spaces this account holds records in.
-async fn spaces_with_records(state: &HttpState, did: &str) -> Result<Vec<String>, XrpcError> {
-    let store = crate::actor_store::sql::SqlActorStore::open(state.reader.data_dir(), did)
-        .await
-        .map_err(XrpcError::from)?;
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT space FROM space_record ORDER BY space ASC")
-            .fetch_all(store.pool())
+/// Every space this account owns or belongs to.
+///
+/// Reads the `space` table through the same service `listSpaces` uses, rather
+/// than the distinct values in `space_record`: a space exists once it is
+/// created, and not having written to it yet is not the same as not having it.
+/// Tombstoned spaces stay excluded -- that is the one exclusion which belongs
+/// here, and the service already makes it.
+///
+/// Paginates to exhaustion. The portal renders one list, and a holder with more
+/// spaces than a page should see all of them rather than the first hundred.
+async fn all_spaces(state: &HttpState, did: &str) -> Result<Vec<String>, XrpcError> {
+    let Some(service) = state.space_service.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = service
+            .list_spaces(did, None, None, cursor.as_deref(), 100)
             .await
-            .map_err(|e| {
-                XrpcError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    format!("list spaces: {e}"),
-                )
-            })?;
-    Ok(rows.into_iter().map(|(s,)| s).collect())
+            .map_err(XrpcError::from)?;
+        out.extend(page.spaces.into_iter().map(|s| s.uri));
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Render a paginated collection listing for either realm.
