@@ -132,6 +132,45 @@ impl SpaceDeclarationResolver for NetworkSpaceDeclarationResolver {
     }
 }
 
+/// Reads space declarations through the shared [`LexiconResolver`] chain.
+///
+/// A space declaration *is* a lexicon document — `defs.main` with
+/// `type: "space"` — so there is no reason for it to have its own way of
+/// finding one. [`NetworkSpaceDeclarationResolver`] walks DNS, PLC and
+/// `getRecord` itself, which duplicates the lexicon resolver's job and, more to
+/// the point, sees only what is on the network: a schema bundled with the
+/// binary or supplied on disk is invisible to it.
+///
+/// That gap had teeth. A PDS writing genesis operations to a local PLC
+/// directory cannot resolve a DID registered in the production one, so an
+/// application's own space type would not resolve — and `declared_collections`
+/// is fail-closed, so a bare `space:` grant silently conferred no write
+/// collections and space creation was refused. Configuring `PDS_LEXICON_DIR`
+/// with the very document that would have answered changed nothing, because
+/// this path never consulted it.
+///
+/// Going through the chain fixes all of that at once: bundled, then disk, then
+/// network, in one order, with one cache, for both kinds of lookup.
+pub struct LexiconSpaceDeclarationResolver {
+    lexicons: Arc<dyn crate::repo::lexicon::LexiconResolver>,
+}
+
+impl LexiconSpaceDeclarationResolver {
+    /// Wrap a lexicon resolver.
+    #[must_use]
+    pub fn new(lexicons: Arc<dyn crate::repo::lexicon::LexiconResolver>) -> Self {
+        Self { lexicons }
+    }
+}
+
+#[async_trait::async_trait]
+impl SpaceDeclarationResolver for LexiconSpaceDeclarationResolver {
+    async fn resolve(&self, nsid: &str) -> Option<SpaceDeclaration> {
+        let document = self.lexicons.resolve(nsid).await?;
+        parse_space_declaration(&document)
+    }
+}
+
 /// Parse a `com.atproto.lexicon.schema` record `value` into a
 /// [`SpaceDeclaration`] when its `defs.main` is a `space` declaration.
 ///
@@ -387,5 +426,63 @@ mod tests {
         let decl = resolver.resolve("com.atmoboards.forum").await.unwrap();
         assert_eq!(decl.collections.len(), 2);
         assert!(resolver.resolve("com.unknown.type").await.is_none());
+    }
+
+    /// A declaration held by the lexicon resolver resolves through the chain.
+    ///
+    /// The regression: `NetworkSpaceDeclarationResolver` walked DNS, PLC and
+    /// `getRecord` on its own, so a declaration the lexicon chain could already
+    /// answer for -- a bundled one, or one an operator supplied -- was invisible
+    /// to it while resolving fine for every other lookup. On a PDS whose PLC
+    /// directory does not hold the authority DID, resolution fails outright --
+    /// and because `declared_collections` is fail-closed, that comes out as a
+    /// bare `space:` grant with no write collections and a space the holder
+    /// cannot create.
+    ///
+    /// The document is the one `app.bulleted.space` actually ships.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_declaration_resolves_through_the_lexicon_chain() {
+        struct OneDocument(serde_json::Value);
+
+        #[async_trait::async_trait]
+        impl crate::repo::lexicon::LexiconResolver for OneDocument {
+            async fn resolve(&self, nsid: &str) -> Option<serde_json::Value> {
+                (nsid == "app.bulleted.space").then(|| self.0.clone())
+            }
+        }
+
+        let document = serde_json::json!({
+            "lexicon": 1,
+            "id": "app.bulleted.space",
+            "defs": {"main": {
+                "type": "space",
+                "name": "Bulleted outline",
+                "key": "any",
+                "description": "An outline shared with a named set of people.",
+                "collections": [
+                    "app.bulleted.node", "app.bulleted.note", "app.bulleted.outline",
+                    "app.bulleted.mirror", "app.bulleted.comment", "app.bulleted.commentPolicy"
+                ]
+            }}
+        });
+
+        let resolver = LexiconSpaceDeclarationResolver::new(Arc::new(OneDocument(document)));
+        let decl = resolver
+            .resolve("app.bulleted.space")
+            .await
+            .expect("the chain holds this declaration and must resolve it");
+
+        assert_eq!(decl.name, "Bulleted outline");
+        assert_eq!(decl.key, "any");
+        // These six are what a bare `space:` grant expands to; an empty list
+        // here is the fail-closed path that refuses space creation.
+        assert_eq!(decl.collections.len(), 6, "{:?}", decl.collections);
+        assert!(
+            decl.collections
+                .contains(&"app.bulleted.outline".to_string())
+        );
+
+        // A type the chain does not hold still resolves to nothing.
+        assert!(resolver.resolve("app.bulleted.nosuch").await.is_none());
     }
 }

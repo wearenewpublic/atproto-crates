@@ -32,8 +32,8 @@ pub mod writer;
 
 pub use config::{AppAccess, MintPolicy, SpaceConfig, SpaceConfigPatch};
 pub use declaration::{
-    CachingSpaceDeclarationResolver, NetworkSpaceDeclarationResolver, SpaceDeclaration,
-    SpaceDeclarationResolver,
+    CachingSpaceDeclarationResolver, LexiconSpaceDeclarationResolver,
+    NetworkSpaceDeclarationResolver, SpaceDeclaration, SpaceDeclarationResolver,
 };
 pub use reader::SpaceReader;
 pub use service::{GetSpaceOutput, SpaceInfo, SpaceService};

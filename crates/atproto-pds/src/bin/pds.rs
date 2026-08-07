@@ -923,31 +923,11 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "hickory-dns")]
     {
-        // Space-type declaration resolver (NSID → declared `collections`) for
-        // the bare `space:` grant default (spec line 413). Reuses the same
-        // DNS resolver + PLC hostname as handle resolution; results are
-        // TTL-cached to avoid resolving on every authorization check.
-        let plc_hostname = args
+        let lexicon_plc_hostname = args
             .plc_directory
             .as_deref()
             .and_then(|url| url.split("://").nth(1).map(|h| h.to_string()))
             .unwrap_or_else(|| "plc.directory".to_string());
-        let lexicon_plc_hostname = plc_hostname.clone();
-        let decl_http = reqwest::Client::builder()
-            .user_agent(user_agent())
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        let network = atproto_pds::space::NetworkSpaceDeclarationResolver::new(
-            dns_resolver.clone(),
-            plc_hostname,
-            decl_http,
-        );
-        let cached = atproto_pds::space::CachingSpaceDeclarationResolver::new(
-            Arc::new(network),
-            std::time::Duration::from_secs(300),
-        );
-        state = state.with_space_declaration_resolver(Arc::new(cached));
 
         // Application lexicons -- anything outside the bundled vocabulary --
         // are resolved over the same path space declarations use, so network
@@ -1033,9 +1013,29 @@ async fn main() -> anyhow::Result<()> {
         if let Some(network) = network_lexicon_resolver {
             chain.push(network);
         }
-        state = state.with_lexicon_resolver(Arc::new(
+        let lexicons: Arc<dyn atproto_pds::repo::lexicon::LexiconResolver> = Arc::new(
             atproto_pds::repo::lexicon::ChainedLexiconResolver::new(chain),
+        );
+
+        // Space-type declarations (NSID → declared `collections`, for the bare
+        // `space:` grant default, spec line 413) come off the same chain.
+        //
+        // A declaration is a lexicon document, so resolving it a second way was
+        // always duplication -- and the second way was network-only, which made
+        // it a different answer rather than the same one twice. A space type
+        // this build ships, or one an operator supplies, was invisible here
+        // while resolving fine everywhere else; `declared_collections` is
+        // fail-closed, so that surfaced as a space the holder could not create,
+        // with the resolution failure several log lines away from the refusal.
+        state = state.with_space_declaration_resolver(Arc::new(
+            atproto_pds::space::CachingSpaceDeclarationResolver::new(
+                Arc::new(atproto_pds::space::LexiconSpaceDeclarationResolver::new(
+                    lexicons.clone(),
+                )),
+                std::time::Duration::from_secs(300),
+            ),
         ));
+        state = state.with_lexicon_resolver(lexicons);
     }
 
     if let (Some(did), Some(url)) = (

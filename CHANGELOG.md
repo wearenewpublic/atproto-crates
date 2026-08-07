@@ -28,6 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing and leave a server that looks configured and resolves exactly as it did before. A single
   malformed document is warned about and skipped, since one bad comma should not keep the server down.
 
+### Fixed
+- `atproto-pds`: space-type declarations now resolve through the shared lexicon resolver chain
+  instead of a second, network-only implementation of the same lookup.
+
+  A declaration *is* a lexicon document — `defs.main` with `type: "space"` — but
+  `NetworkSpaceDeclarationResolver` walked DNS, PLC and `getRecord` itself. So a space type the
+  binary bundles, or one an operator supplies, was invisible to it while resolving fine for every
+  other lookup, and on a server whose PLC directory does not hold the authority DID it did not
+  resolve at all.
+
+  That had teeth, because `declared_collections` is fail-closed: a bare `space:` grant (one omitting
+  `collection`, which defaults to the type's declared collections per spec line 413) expanded to *no*
+  write collections, and creating the first record in a new space was refused with
+  `InsufficientScope` — several log lines away from the resolution that failed.
+
+  `NetworkSpaceDeclarationResolver` is kept; it is still what the chain's network tier does. What
+  changes is that declarations and lexicons now resolve through one chain, in one order, behind one
+  cache.
+
+
 
 ## [0.15.0-rc.2] - 2026-08-07
 ### Changed
