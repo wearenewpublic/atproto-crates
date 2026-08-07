@@ -12,6 +12,8 @@
 
 use atproto_identity::key::KeyType;
 use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams, portal};
+use atproto_pds::actor_store::sql::SqlActorStore;
+use atproto_pds::blob;
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter, WriteAction, WriteOp};
@@ -130,11 +132,11 @@ async fn the_index_links_the_public_repository() {
     let (app, manager, writer, _tmp) = build_app().await;
     let cookie = signed_in_with_a_record(&manager, &writer).await;
 
-    let (status, body, _) = get(&app, &cookie, "/browse/").await;
+    let (status, body, _) = get(&app, &cookie, "/account/repository").await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("/browse/public/"),
+        body.contains("/account/repository/public/"),
         "no link to public records"
     );
     assert!(body.contains("Spaces"), "spaces are not offered");
@@ -146,7 +148,7 @@ async fn collections_are_listed() {
     let (app, manager, writer, _tmp) = build_app().await;
     let cookie = signed_in_with_a_record(&manager, &writer).await;
 
-    let (status, body, _) = get(&app, &cookie, "/browse/public/").await;
+    let (status, body, _) = get(&app, &cookie, "/account/repository/public/").await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -154,7 +156,7 @@ async fn collections_are_listed() {
         "the collection holding a record was not listed"
     );
     assert!(
-        body.contains(&format!("/browse/public/{COLLECTION}")),
+        body.contains(&format!("/account/repository/public/{COLLECTION}")),
         "the collection does not link to its records"
     );
 }
@@ -165,7 +167,12 @@ async fn records_are_listed() {
     let (app, manager, writer, _tmp) = build_app().await;
     let cookie = signed_in_with_a_record(&manager, &writer).await;
 
-    let (status, body, _) = get(&app, &cookie, &format!("/browse/public/{COLLECTION}")).await;
+    let (status, body, _) = get(
+        &app,
+        &cookie,
+        &format!("/account/repository/public/{COLLECTION}"),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(RKEY), "the record was not listed");
@@ -180,7 +187,7 @@ async fn a_record_shows_its_json() {
     let (status, body, _) = get(
         &app,
         &cookie,
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
     )
     .await;
 
@@ -210,21 +217,21 @@ async fn editing_a_record_rewrites_it() {
     let location = post(
         &app,
         &cookie,
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
         &format!("value={}", urlencode(&edited)),
     )
     .await;
 
     assert_eq!(
         location.as_deref(),
-        Some(format!("/browse/public/{COLLECTION}/{RKEY}?msg=saved").as_str()),
+        Some(format!("/account/repository/public/{COLLECTION}/{RKEY}?msg=saved").as_str()),
         "the edit was not accepted"
     );
 
     let (_, body, _) = get(
         &app,
         &cookie,
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
     )
     .await;
     assert!(
@@ -246,20 +253,25 @@ async fn a_broken_edit_is_refused_without_touching_the_record() {
     let location = post(
         &app,
         &cookie,
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
         "value=not+json+at+all",
     )
     .await;
 
     assert_eq!(
         location.as_deref(),
-        Some(format!("/browse/public/{COLLECTION}/{RKEY}?msg=err-that-is-not-valid-json").as_str())
+        Some(
+            format!(
+                "/account/repository/public/{COLLECTION}/{RKEY}?msg=err-that-is-not-valid-json"
+            )
+            .as_str()
+        )
     );
 
     let (_, body, _) = get(
         &app,
         &cookie,
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
     )
     .await;
     assert!(
@@ -277,17 +289,22 @@ async fn deleting_from_the_form_removes_the_record() {
     let location = post(
         &app,
         &cookie,
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
         "_method=delete",
     )
     .await;
 
     assert_eq!(
         location.as_deref(),
-        Some(format!("/browse/public/{COLLECTION}?msg=deleted").as_str())
+        Some(format!("/account/repository/public/{COLLECTION}?msg=deleted").as_str())
     );
 
-    let (_, body, _) = get(&app, &cookie, &format!("/browse/public/{COLLECTION}")).await;
+    let (_, body, _) = get(
+        &app,
+        &cookie,
+        &format!("/account/repository/public/{COLLECTION}"),
+    )
+    .await;
     assert!(
         !body.contains(RKEY),
         "the record is still listed after being deleted"
@@ -301,7 +318,7 @@ async fn the_delete_method_removes_the_record() {
     let cookie = signed_in_with_a_record(&manager, &writer).await;
 
     let req = Request::builder()
-        .uri(format!("/browse/public/{COLLECTION}/{RKEY}"))
+        .uri(format!("/account/repository/public/{COLLECTION}/{RKEY}"))
         .method("DELETE")
         .header("sec-fetch-site", "same-origin")
         .header("cookie", format!("atproto_pds_portal={cookie}"))
@@ -309,7 +326,12 @@ async fn the_delete_method_removes_the_record() {
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
 
-    let (_, body, _) = get(&app, &cookie, &format!("/browse/public/{COLLECTION}")).await;
+    let (_, body, _) = get(
+        &app,
+        &cookie,
+        &format!("/account/repository/public/{COLLECTION}"),
+    )
+    .await;
     assert!(!body.contains(RKEY), "DELETE did not remove the record");
 }
 
@@ -321,7 +343,7 @@ async fn a_cid_in_the_collection_position_is_treated_as_a_blob() {
     let cookie = signed_in_with_a_record(&manager, &writer).await;
     let cid = "bafkreigcsk44torjvfr6rvmixv23vsmp2ey4c6z2yftuqecmqgvsyk4uye";
 
-    let (_, _, location) = get(&app, &cookie, &format!("/browse/public/{cid}")).await;
+    let (_, _, location) = get(&app, &cookie, &format!("/account/repository/public/{cid}")).await;
 
     let location = location.expect("a CID should route to the blob endpoint");
     assert!(
@@ -338,10 +360,10 @@ async fn the_browser_requires_a_session() {
     let _ = signed_in_with_a_record(&manager, &writer).await;
 
     for path in [
-        "/browse/",
-        "/browse/public/",
-        &format!("/browse/public/{COLLECTION}"),
-        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+        "/account/repository",
+        "/account/repository/public/",
+        &format!("/account/repository/public/{COLLECTION}"),
+        &format!("/account/repository/public/{COLLECTION}/{RKEY}"),
     ] {
         let (_, _, location) = get(&app, "not-a-real-session", path).await;
         assert_eq!(
@@ -367,25 +389,30 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Every link the browser renders must resolve.
+/// Every portal link the browser renders must resolve.
 ///
 /// Three breadcrumbs pointed at a collection listing with a trailing slash --
-/// `/browse/public/app.bsky.feed.post/` -- and axum treats that as a different
-/// path from the route, so following one 404ed. The pages that *contained* the
-/// links all rendered fine, which is why the existing tests passed: they
-/// assert what a page says, never that what it points at exists.
+/// `/account/repository/public/app.bsky.feed.post/` -- and axum treats that as
+/// a different path from the route, so following one 404ed. The pages that
+/// *contained* the links all rendered fine, which is why the existing tests
+/// passed: they assert what a page says, never that what it points at exists.
 ///
-/// So this follows them. Anything reachable from the browser has to answer.
+/// So this follows them. Anything reachable from the browser has to answer --
+/// which now includes the section nav, so a section named on every page but
+/// mounted at a path nobody routed fails here rather than in a browser.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_link_the_browser_renders_resolves() {
     let (app, manager, writer, _tmp) = build_app().await;
     let cookie = signed_in_with_a_record(&manager, &writer).await;
 
     let pages = [
-        "/browse/".to_string(),
-        "/browse/public/".to_string(),
-        format!("/browse/public/{COLLECTION}"),
-        format!("/browse/public/{COLLECTION}/{RKEY}"),
+        "/account".to_string(),
+        "/account/sessions".to_string(),
+        "/account/delegation".to_string(),
+        "/account/repository".to_string(),
+        "/account/repository/public/".to_string(),
+        format!("/account/repository/public/{COLLECTION}"),
+        format!("/account/repository/public/{COLLECTION}/{RKEY}"),
     ];
 
     let mut checked = 0;
@@ -394,7 +421,9 @@ async fn every_link_the_browser_renders_resolves() {
         assert_eq!(status, StatusCode::OK, "{page} did not render");
 
         for href in hrefs(&body) {
-            if !href.starts_with("/browse") {
+            // `/xrpc/...` blob links are followed by their own tests; this one
+            // is about the portal's own pages.
+            if !href.starts_with("/account") {
                 continue;
             }
             let (status, _, location) = get(&app, &cookie, &href).await;
@@ -414,9 +443,217 @@ async fn every_link_the_browser_renders_resolves() {
         }
     }
     assert!(
-        checked >= 6,
+        checked >= 20,
         "only {checked} links were followed; the crawl is not covering the pages"
     );
+}
+
+/// Every section names every other one, on every page.
+///
+/// The property that makes this a navigated set rather than four pages that
+/// happen to exist: no section is reachable only by knowing its URL. Asserting
+/// on the rendered pages rather than on `Section::ALL`, because a section can
+/// be in that table and still be missing from a page that builds its own
+/// header.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_section_carries_the_nav() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    let sections = [
+        "/account",
+        "/account/sessions",
+        "/account/repository",
+        "/account/delegation",
+    ];
+
+    for page in sections {
+        let (status, body, _) = get(&app, &cookie, page).await;
+        assert_eq!(status, StatusCode::OK, "{page} did not render");
+        for label in ["Settings", "Access", "Repository", "Delegation"] {
+            assert!(body.contains(label), "{page} does not name {label}");
+        }
+        for other in sections {
+            if other == page {
+                continue;
+            }
+            assert!(
+                body.contains(&format!(r#"href="{other}""#)),
+                "{page} does not link {other}"
+            );
+        }
+    }
+}
+
+/// The Delegation placeholder says it does nothing, in as many words.
+///
+/// A section about letting other identities act as you is the last place to
+/// leave a reader unsure whether it is switched on, and an empty table under a
+/// plausible heading reads as a feature with no entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn delegation_says_it_is_not_implemented() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    let (status, body, _) = get(&app, &cookie, "/account/delegation").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Not implemented"),
+        "the placeholder does not say it is a placeholder"
+    );
+    assert!(
+        body.contains("authenticate on its behalf"),
+        "the placeholder does not say what delegation would be"
+    );
+}
+
+/// App passwords, OAuth sessions and revocation live on Access, not Settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_holds_the_credentials_and_settings_does_not() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+    // The revoke control only exists next to a row, so there has to be one.
+    post(&app, &cookie, "/account/app-passwords", "name=phone").await;
+
+    let (_, access, _) = get(&app, &cookie, "/account/sessions").await;
+    for control in [
+        r#"action="/account/app-passwords""#,
+        r#"action="/account/app-passwords/revoke""#,
+        r#"action="/account/signout-everywhere""#,
+        "OAuth sessions",
+    ] {
+        assert!(access.contains(control), "Access is missing {control}");
+    }
+
+    let (_, settings, _) = get(&app, &cookie, "/account").await;
+    for control in [
+        r#"action="/account/app-passwords""#,
+        r#"action="/account/signout-everywhere""#,
+    ] {
+        assert!(
+            !settings.contains(control),
+            "Settings still carries {control}"
+        );
+    }
+    // And what Settings does keep.
+    for control in [
+        r#"action="/account/email""#,
+        r#"action="/account/handle""#,
+        r#"action="/account/password""#,
+    ] {
+        assert!(settings.contains(control), "Settings is missing {control}");
+    }
+}
+
+/// A freshly minted app password is shown once, on the page that minted it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_app_password_lands_on_access() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    let location = post(&app, &cookie, "/account/app-passwords", "name=phone").await;
+    assert_eq!(
+        location.as_deref(),
+        Some("/account/sessions?msg=app-password-created"),
+        "creating an app password did not land on Access"
+    );
+
+    let (_, body, _) = get(&app, &cookie, "/account/sessions").await;
+    assert!(
+        body.contains("Your new app password"),
+        "the secret was not shown"
+    );
+    assert!(body.contains("phone"), "the app password was not listed");
+
+    // Exactly once: a reload must not repeat a live credential.
+    let (_, again, _) = get(&app, &cookie, "/account/sessions").await;
+    assert!(
+        !again.contains("Your new app password"),
+        "the secret survived being shown"
+    );
+    assert!(
+        again.contains("phone"),
+        "the app password stopped being listed"
+    );
+}
+
+/// The Repository index lists the blobs a public record references.
+///
+/// Through the same enumeration `com.atproto.sync.listBlobs` serves, so what
+/// the holder is shown here is what the network can fetch. Asserting both
+/// directions: an uploaded-but-unreferenced blob is not public and must not be
+/// listed, which is the property a naive "every CID in `repo_blob`" listing
+/// would break.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_index_lists_publicly_referenced_blobs_only() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    let store = SqlActorStore::open(manager.data_dir(), DID)
+        .await
+        .expect("actor store");
+    let referenced = blob::put_blob(&store, b"referenced bytes", "image/png", 1024)
+        .await
+        .expect("referenced blob");
+    let orphan = blob::put_blob(&store, b"nothing points here", "image/png", 1024)
+        .await
+        .expect("orphan blob");
+
+    // A record carrying the blob envelope is what makes the first one public;
+    // the writer records the reference as part of the write.
+    writer
+        .apply_writes(
+            DID,
+            vec![WriteOp {
+                action: WriteAction::Create,
+                collection: COLLECTION.to_string(),
+                rkey: "3kaaaaaaaaaa3".to_string(),
+                value: Some(serde_json::json!({
+                    "$type": COLLECTION,
+                    "text": "with an image",
+                    "createdAt": "2026-08-05T00:00:00Z",
+                    "image": serde_json::to_value(&referenced).unwrap(),
+                })),
+                swap_record: None,
+            }],
+        )
+        .await
+        .expect("record referencing the blob");
+
+    let (status, body, _) = get(&app, &cookie, "/account/repository").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&referenced.inner.ref_.link),
+        "a publicly referenced blob was not listed"
+    );
+    assert!(
+        !body.contains(&orphan.inner.ref_.link),
+        "an unreferenced blob was listed as public"
+    );
+    assert!(
+        body.contains("com.atproto.sync.getBlob"),
+        "the listed blob does not link to its bytes"
+    );
+}
+
+/// `/browse/*` is gone rather than redirected. Single user, and the URLs were
+/// never load-bearing -- a redirect would be a second name for every page.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_old_browse_paths_are_gone() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    for path in [
+        "/browse/",
+        "/browse/public/",
+        &format!("/browse/public/{COLLECTION}"),
+        &format!("/browse/public/{COLLECTION}/{RKEY}"),
+    ] {
+        let (status, _, _) = get(&app, &cookie, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path} still answers");
+    }
 }
 
 /// Pull the `href` values out of rendered HTML.

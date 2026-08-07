@@ -206,63 +206,37 @@ pub async fn list_blobs(
 ) -> Result<axum::Json<ListBlobsResponse>, XrpcError> {
     // Same gate and the same ordering as `getBlob`.
     let did = state.reader.require_available(&q.did).await?.did;
-    // The cursor must advance over CIDs *scanned*, not CIDs *kept*. A page in
-    // which every blob turned out to be permissioned would otherwise yield an
-    // empty `cids` and no cursor, which a client reads as "end of list" while
-    // there is more behind it — or, if it restarts from the beginning, as a
-    // loop.
-    let last_scanned: Option<String>;
-    let cids = if let Some(backend) = state.public_realm_backend.as_ref() {
-        // The trait cannot express the join — on the fjall profile the bytes are
-        // not in a database that knows about records — so the page is filtered
-        // after the fact. A page may therefore come back shorter than `limit`;
-        // the cursor still advances over the underlying CIDs, so pagination
-        // terminates. The SQLite path below joins in SQL and keeps full pages.
-        let manager = state.account_manager.as_deref().ok_or_else(|| {
-            XrpcError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "AccountManagementUnavailable",
-                "account manager not configured",
-            )
-        })?;
-        let store = SqlActorStore::open(manager.data_dir(), &did)
-            .await
-            .map_err(XrpcError::from)?;
-        let all = backend
-            .blob
-            .list_all_cids(&did, q.cursor.as_deref(), q.limit.unwrap_or(500))
-            .await
-            .map_err(XrpcError::from)?;
-        last_scanned = all.last().cloned();
-        let mut kept = Vec::with_capacity(all.len());
-        for cid in all {
-            if crate::blob::is_publicly_referenced(&store, &cid)
-                .await
-                .map_err(XrpcError::from)?
-            {
-                kept.push(cid);
-            }
-        }
-        kept
-    } else {
-        let manager = state.account_manager.as_deref().ok_or_else(|| {
-            XrpcError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "AccountManagementUnavailable",
-                "account manager not configured",
-            )
-        })?;
-        let store = SqlActorStore::open(manager.data_dir(), &did)
-            .await
-            .map_err(XrpcError::from)?;
-        // This path joins in SQL, so every row returned is kept and the last
-        // row is both the last scanned and the last kept.
-        let page = crate::blob::list_all(&store, q.cursor.as_deref(), q.limit.unwrap_or(500))
-            .await
-            .map_err(XrpcError::from)?;
-        last_scanned = page.last().cloned();
-        page
-    };
-    let cursor = last_scanned;
-    Ok(axum::Json(ListBlobsResponse { cids, cursor }))
+    let manager = state.account_manager.as_deref().ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AccountManagementUnavailable",
+            "account manager not configured",
+        )
+    })?;
+    let store = SqlActorStore::open(manager.data_dir(), &did)
+        .await
+        .map_err(XrpcError::from)?;
+
+    // The two-backend enumeration lives in `crate::blob` so the portal's
+    // repository browser lists exactly what this method serves. A second copy
+    // would be a second place for a permissioned CID to leak.
+    //
+    // The cursor it returns advances over CIDs *scanned*, not CIDs *kept*. A
+    // page in which every blob turned out to be permissioned would otherwise
+    // yield an empty `cids` and no cursor, which a client reads as "end of list"
+    // while there is more behind it — or, if it restarts, as a loop.
+    let page = crate::blob::list_public(
+        &store,
+        state.public_realm_backend.as_ref().map(|b| b.blob.as_ref()),
+        &did,
+        q.cursor.as_deref(),
+        q.limit.unwrap_or(500),
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    Ok(axum::Json(ListBlobsResponse {
+        cids: page.cids,
+        cursor: page.cursor,
+    }))
 }

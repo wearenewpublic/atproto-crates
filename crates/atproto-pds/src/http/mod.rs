@@ -7,7 +7,6 @@
 pub mod auth;
 pub mod auth_handlers;
 pub mod blob_handlers;
-pub mod browse;
 pub mod discovery_handlers;
 pub mod errors;
 pub mod extract;
@@ -21,6 +20,8 @@ pub mod preference_handlers;
 pub mod proxy_handlers;
 pub mod proxy_target;
 pub mod rate_limit;
+/// The Repository section of the portal -- a browser over this account's records.
+pub mod repository;
 pub mod router;
 pub mod service_auth_handlers;
 pub mod service_describe;

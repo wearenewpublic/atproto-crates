@@ -21,6 +21,15 @@
 //! to the session. The first two are what actually stop the attack in any
 //! current browser, and the token is what still stops it if a future one
 //! relaxes them.
+//!
+//! # Four sections
+//!
+//! The portal is a navigated set rather than one page: [`Section::Settings`] at
+//! `/account`, [`Section::Access`] at `/account/sessions`,
+//! [`Section::Repository`] at `/account/repository` (see
+//! [`crate::http::repository`]) and [`Section::Delegation`] at
+//! `/account/delegation`. Every page carries [`nav`], so each section is one
+//! click from any other and none of them is reachable only by knowing its URL.
 
 use crate::account::{app_password, portal};
 use crate::http::errors::XrpcError;
@@ -55,12 +64,15 @@ fn cookie_value(headers: &HeaderMap) -> Option<String> {
 /// portal unusable on `http://localhost`, which is how it is developed
 /// against.
 ///
-/// `Path=/` because the portal is no longer one subtree. It was `/account`,
-/// which was tighter than needed and correct while every page lived there; the
-/// repository browser sits at `/browse`, and a browser simply does not send a
-/// cookie to a path outside its scope. The result was a signed-in holder being
-/// redirected to sign in, from a server that had never seen their session
-/// because it was never sent one.
+/// `Path=/` since F-COOKIEPATH-87, when the repository browser sat at
+/// `/browse` and a browser simply does not send a cookie to a path outside its
+/// scope. The result was a signed-in holder being redirected to sign in, from a
+/// server that had never seen their session because it was never sent one.
+///
+/// The browser has since moved under `/account`, so every portal page would be
+/// covered by the old `/account` scope again. The wider scope stays anyway: the
+/// narrower one is what made a page unreachable the last time the layout
+/// changed, and re-tightening it would set the same trap for the next move.
 ///
 /// The narrower path was defence in depth rather than a control: no XRPC route
 /// reads this cookie, and authentication there is `Authorization` and `DPoP`
@@ -70,9 +82,9 @@ fn cookie_value(headers: &HeaderMap) -> Option<String> {
 /// `SameSite=Strict` are what actually keep it out of a page's hands and off a
 /// cross-site request.
 ///
-/// A second cookie scoped to `/browse` would keep the old narrowness, at the
-/// price of two credentials to revoke in a page whose whole purpose is
-/// revoking credentials.
+/// A second cookie per subtree would keep the old narrowness, at the price of
+/// two credentials to revoke in a page whose whole purpose is revoking
+/// credentials.
 fn set_cookie(value: &str, secure: bool, max_age: i64) -> String {
     format!(
         "{COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
@@ -208,6 +220,9 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
             word-break: break-all; }}
   .muted {{ color: #777; font-size: 0.88em; }}
   nav {{ margin-bottom: 1.5em; font-size: 0.9em; }}
+  nav .sections {{ margin-top: 0.7em; padding-top: 0.6em; border-top: 1px solid #e2e2e2; }}
+  nav .here {{ font-weight: 600; color: #1a1a1a; }}
+  nav .crumbs {{ margin: 0.6em 0 0; color: #666; }}
   details {{ margin-top: 1em; border-top: 1px solid #e2e2e2; padding-top: 0.6em; }}
   summary {{ cursor: pointer; font-size: 0.9em; font-weight: 500; }}
   a {{ color: #1c64f2; }}
@@ -217,6 +232,9 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     h2 {{ border-color: #2e2e33; }}
     th {{ color: #aaa; border-color: #2e2e33; }}
     td {{ border-color: #232326; }}
+    nav .sections {{ border-color: #2e2e33; }}
+    nav .here {{ color: #e8e8e8; }}
+    nav .crumbs {{ color: #aaa; }}
     input[type=text], input[type=email], input[type=password] {{
       background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
     code {{ background: #232326; }}
@@ -234,6 +252,73 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
 /// A one-line banner above the page body.
 pub(crate) fn notice(kind: &str, text: &str) -> String {
     format!(r#"<div class="notice {kind}">{}</div>"#, esc(text))
+}
+
+// ---------------------------------------------------------------------------
+//  Navigation
+// ---------------------------------------------------------------------------
+
+/// One of the portal's four sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    /// `/account` — email, handle, password.
+    Settings,
+    /// `/account/sessions` — app passwords and live sessions.
+    Access,
+    /// `/account/repository` — the repository browser.
+    Repository,
+    /// `/account/delegation` — not implemented yet.
+    Delegation,
+}
+
+impl Section {
+    /// Every section, in the order the nav lists them.
+    ///
+    /// The single source of both the paths and the labels: a section added
+    /// here appears on every page at once, which is the property that stops a
+    /// page from being reachable only by typing its URL.
+    const ALL: [(Self, &'static str, &'static str); 4] = [
+        (Self::Settings, "/account", "Settings"),
+        (Self::Access, "/account/sessions", "Access"),
+        (Self::Repository, "/account/repository", "Repository"),
+        (Self::Delegation, "/account/delegation", "Delegation"),
+    ];
+}
+
+/// The header every signed-in portal page carries.
+///
+/// Identifies the account, offers sign-out, and links the four sections. The
+/// current section is text rather than a link — a link to the page you are on
+/// is a control that does nothing.
+///
+/// `crumbs` is the trail *within* a section, and is omitted when empty; only
+/// the repository browser goes deep enough to need one.
+pub(crate) fn nav(current: Section, account: &crate::account::AccountRow, crumbs: &str) -> String {
+    let links = Section::ALL
+        .iter()
+        .map(|(section, path, label)| {
+            if *section == current {
+                format!(r#"<span class="here">{label}</span>"#)
+            } else {
+                format!(r#"<a href="{path}">{label}</a>"#)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" &middot; ");
+    let crumb_line = if crumbs.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p class="crumbs">{crumbs}</p>"#)
+    };
+    format!(
+        r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
+  <form method="POST" action="/account/signout" style="display:inline;float:right">
+    <button class="quiet" type="submit">Sign out</button></form>
+  <div class="sections">{links}</div>
+  {crumb_line}</nav>"#,
+        handle = esc(&account.handle),
+        did = esc(&account.did),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -798,34 +883,16 @@ fn slugify(message: &str) -> String {
 const POLICY_ACCEPTANCE_NSID: &str = "com.atproto-crates.pds.policyAcceptance";
 
 // ---------------------------------------------------------------------------
-//  Dashboard
+//  Section pages
 // ---------------------------------------------------------------------------
 
-/// `GET /account`. The portal itself.
-pub async fn dashboard(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<PortalQuery>,
-) -> Result<Response, XrpcError> {
-    let Some((cookie, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
-    };
-    let pool = state.reader.accounts().account_pool();
-
-    // Signing in is allowed without having accepted -- this is the one page
-    // that can record an acceptance, so gating it would leave the holder with
-    // no way through the gate. Everything else on the account waits behind it.
-    if let Some(policy) = state.policy.clone()
-        && !crate::account::policy::has_accepted(&state.reader, &account.did, &policy).await
-    {
-        return Ok(page(
-            "Accept the policy",
-            &policy_prompt(&account, &policy, q.msg.as_deref()),
-        )
-        .into_response());
-    }
-
-    let banner = match q.msg.as_deref() {
+/// The banner for a `?msg=` word, whichever section it lands on.
+///
+/// One table rather than one per page. A message is chosen by the handler that
+/// redirected, so a page that did not know a word would render nothing at all
+/// and the holder would see their action complete in silence.
+pub(crate) fn banner_for(msg: Option<&str>) -> String {
+    match msg {
         Some("email-changed") => notice(
             "ok",
             "Email address updated. A confirmation code was sent to the new \
@@ -859,80 +926,54 @@ pub async fn dashboard(
         ),
         Some(e) if e.starts_with("err-") => notice("err", &e[4..].replace('-', " ")),
         _ => String::new(),
+    }
+}
+
+/// The account behind a request to a section other than Settings.
+///
+/// `Err` carries the response to send instead: sign-in for a request with no
+/// session, and Settings for a holder who owes a policy acceptance. Settings is
+/// the one page that can record one, so a section serving its own controls to
+/// someone who cannot use them would only be offering dead buttons.
+pub(crate) async fn section_account(
+    state: &HttpState,
+    headers: &HeaderMap,
+) -> Result<(String, crate::account::AccountRow), Response> {
+    let Some((cookie, account)) = current_account(state, headers).await else {
+        return Err(redirect("/account/signin"));
+    };
+    if let Some(policy) = state.policy.clone()
+        && !crate::account::policy::has_accepted(&state.reader, &account.did, &policy).await
+    {
+        return Err(redirect("/account"));
+    }
+    Ok((cookie, account))
+}
+
+/// `GET /account` — Settings: email, handle, password.
+pub async fn dashboard(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<PortalQuery>,
+) -> Result<Response, XrpcError> {
+    let Some((_, account)) = current_account(&state, &headers).await else {
+        return Ok(redirect("/account/signin"));
     };
 
-    // Shown exactly once, immediately after minting.
-    let fresh_secret = portal::take_flash_secret(&pool, &cookie)
-        .await
-        .map_err(XrpcError::from)?
-        .as_deref()
-        .map(|s| {
-            format!(
-                r#"<div class="notice warn"><b>Your new app password</b>
-                <div class="secret">{}</div>
-                This is the only time it is shown. Store it now.</div>"#,
-                esc(s)
-            )
-        })
-        .unwrap_or_default();
+    // Signing in is allowed without having accepted -- this is the one page
+    // that can record an acceptance, so gating it would leave the holder with
+    // no way through the gate. Everything else on the account waits behind it.
+    if let Some(policy) = state.policy.clone()
+        && !crate::account::policy::has_accepted(&state.reader, &account.did, &policy).await
+    {
+        return Ok(page(
+            "Accept the policy",
+            &policy_prompt(&account, &policy, q.msg.as_deref()),
+        )
+        .into_response());
+    }
 
-    let app_passwords = app_password::list(&pool, &account.did)
-        .await
-        .map_err(XrpcError::from)?;
-    // `__primary__` is the account password's own row, not something the
-    // holder created or can revoke, so it does not belong in this list.
-    let listed: Vec<_> = app_passwords
-        .iter()
-        .filter(|p| p.name != "__primary__")
-        .collect();
-    let app_rows = if listed.is_empty() {
-        r#"<tr><td colspan="4" class="muted">No app passwords.</td></tr>"#.to_string()
-    } else {
-        listed
-            .iter()
-            .map(|p| {
-                format!(
-                    r#"<tr><td><code>{}</code></td><td class="muted">{}</td>
-                    <td class="muted">{}</td>
-                    <td style="text-align:right">
-                      <form method="POST" action="/account/app-passwords/revoke" style="display:inline">
-                        <input type="hidden" name="name" value="{}">
-                        <button class="quiet" type="submit">Revoke</button>
-                      </form></td></tr>"#,
-                    esc(&p.name),
-                    esc(&p.created_at),
-                    // An app password that has never signed in is worth
-                    // seeing as such rather than as a blank cell.
-                    p.last_used_at
-                        .as_deref()
-                        .map(esc)
-                        .unwrap_or_else(|| "never used".to_string()),
-                    esc(&p.name),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
-
-    let grants = portal::list_oauth_grants(&pool, &account.did)
-        .await
-        .map_err(XrpcError::from)?;
-    let grant_rows = if grants.is_empty() {
-        r#"<tr><td colspan="3" class="muted">No OAuth sessions.</td></tr>"#.to_string()
-    } else {
-        grants
-            .iter()
-            .map(|(client, scope, issued)| {
-                format!(
-                    r#"<tr><td><code>{}</code></td><td class="muted">{}</td><td class="muted">{}</td></tr>"#,
-                    esc(client),
-                    esc(scope),
-                    esc(issued)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
+    let banner = banner_for(q.msg.as_deref());
 
     let email = account.email.clone().unwrap_or_default();
     let confirmed = account.email_confirmed_at.is_some();
@@ -1019,14 +1060,10 @@ pub async fn dashboard(
     );
 
     let body = format!(
-        r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
-  <form method="POST" action="/account/signout" style="display:inline;float:right">
-    <button class="quiet" type="submit">Sign out</button></form></nav>
-<h1>Account</h1>
-<p class="sub">Everything here applies to this account on this server.</p>
-<p><a href="/browse/">Browse your repository &rarr;</a></p>
+        r#"{nav}
+<h1>Settings</h1>
+<p class="sub">How this account identifies itself and how you sign in to it.</p>
 {banner}
-{fresh_secret}
 {handle_section}
 
 <section>
@@ -1052,10 +1089,124 @@ pub async fn dashboard(
   <p class="muted">Changing your password signs out every other session.</p>
   <button type="submit">Change password</button>
 </form>
-</section>
+</section>"#,
+        nav = nav(Section::Settings, &account, ""),
+        email_display = if email.is_empty() {
+            r#"<span class="muted">No email address on file.</span>"#.to_string()
+        } else {
+            format!("<code>{}</code>", esc(&email))
+        },
+    );
+    Ok(page("Settings", &body).into_response())
+}
+
+/// `GET /account/sessions` — Access: app passwords, live sessions, revocation.
+///
+/// # Live only
+///
+/// Nothing here is a history. An app password's row *is* the standing grant,
+/// and its last-used stamp is the only trace an app-password session leaves —
+/// both credential kinds are stateless JWTs (see [`crate::account::portal`]),
+/// so there is no session row to list and none to keep after one ends. The page
+/// therefore answers "what can reach this account right now", and answering
+/// anything more would mean recording sessions this server has no reason to
+/// record.
+pub async fn sessions(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<PortalQuery>,
+) -> Result<Response, XrpcError> {
+    let (cookie, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+    let pool = state.reader.accounts().account_pool();
+
+    // Shown exactly once, immediately after minting.
+    let fresh_secret = portal::take_flash_secret(&pool, &cookie)
+        .await
+        .map_err(XrpcError::from)?
+        .as_deref()
+        .map(|s| {
+            format!(
+                r#"<div class="notice warn"><b>Your new app password</b>
+                <div class="secret">{}</div>
+                This is the only time it is shown. Store it now.</div>"#,
+                esc(s)
+            )
+        })
+        .unwrap_or_default();
+
+    let app_passwords = app_password::list(&pool, &account.did)
+        .await
+        .map_err(XrpcError::from)?;
+    // `__primary__` is the account password's own row, not something the
+    // holder created or can revoke, so it does not belong in this list.
+    let listed: Vec<_> = app_passwords
+        .iter()
+        .filter(|p| p.name != "__primary__")
+        .collect();
+    let app_rows = if listed.is_empty() {
+        r#"<tr><td colspan="4" class="muted">No app passwords.</td></tr>"#.to_string()
+    } else {
+        listed
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"<tr><td><code>{}</code></td><td class="muted">{}</td>
+                    <td class="muted">{}</td>
+                    <td style="text-align:right">
+                      <form method="POST" action="/account/app-passwords/revoke" style="display:inline">
+                        <input type="hidden" name="name" value="{}">
+                        <button class="quiet" type="submit">Revoke</button>
+                      </form></td></tr>"#,
+                    esc(&p.name),
+                    esc(&p.created_at),
+                    // An app password that has never signed in is worth
+                    // seeing as such rather than as a blank cell.
+                    p.last_used_at
+                        .as_deref()
+                        .map(esc)
+                        .unwrap_or_else(|| "never used".to_string()),
+                    esc(&p.name),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let grants = portal::list_oauth_grants(&pool, &account.did)
+        .await
+        .map_err(XrpcError::from)?;
+    let grant_rows = if grants.is_empty() {
+        r#"<tr><td colspan="3" class="muted">No OAuth sessions.</td></tr>"#.to_string()
+    } else {
+        grants
+            .iter()
+            .map(|(client, scope, issued)| {
+                format!(
+                    r#"<tr><td><code>{}</code></td><td class="muted">{}</td><td class="muted">{}</td></tr>"#,
+                    esc(client),
+                    esc(scope),
+                    esc(issued)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let body = format!(
+        r#"{nav}
+<h1>Access</h1>
+<p class="sub">What can reach this account right now, and how to stop it.</p>
+{banner}
+{fresh_secret}
 
 <section>
 <h2 style="margin-top:0">App passwords</h2>
+<p class="muted">Each row is a standing grant. A session minted from one is a
+stateless token with no row of its own, so "last used" is the only sign one is
+in use.</p>
 <table><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead>
 <tbody>{app_rows}</tbody></table>
 <form method="POST" action="/account/app-passwords">
@@ -1067,6 +1218,7 @@ pub async fn dashboard(
 
 <section>
 <h2 style="margin-top:0">OAuth sessions</h2>
+<p class="muted">Applications currently holding a grant on this account.</p>
 <table><thead><tr><th>Client</th><th>Scope</th><th>Granted</th></tr></thead>
 <tbody>{grant_rows}</tbody></table>
 </section>
@@ -1080,23 +1232,62 @@ when they expire. This browser stays signed in.</p>
   <button class="danger" type="submit">Sign out everywhere</button>
 </form>
 </section>"#,
-        handle = esc(&account.handle),
-        did = esc(&account.did),
-        email_display = if email.is_empty() {
-            r#"<span class="muted">No email address on file.</span>"#.to_string()
-        } else {
-            format!("<code>{}</code>", esc(&email))
-        },
+        nav = nav(Section::Access, &account, ""),
+        banner = banner_for(q.msg.as_deref()),
     );
-    let _ = cookie;
-    Ok(page("Account", &body).into_response())
+    Ok(page("Access", &body).into_response())
+}
+
+/// `GET /account/delegation` — a placeholder that says so.
+///
+/// Account delegation is one identity naming others that may authenticate on
+/// its behalf and act as it. None of that is built, and this page exists to
+/// hold the space in the nav rather than to do anything.
+///
+/// It says "nothing is delegated" and "this does nothing yet" in as many words,
+/// deliberately. A section about letting other identities act as you is the
+/// last place to leave a reader guessing whether it is switched on — an empty
+/// table under a plausible heading reads as a feature with no entries, which is
+/// exactly the wrong conclusion.
+pub async fn delegation(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> Result<Response, XrpcError> {
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+
+    let body = format!(
+        r#"{nav}
+<h1>Delegation</h1>
+<p class="sub">Letting other identities act as this one.</p>
+<section>
+<div class="notice warn"><b>Not implemented.</b> Nothing on this page is switched
+on, and no identity can act as this account.</div>
+<p>Account delegation would let <code>{did}</code> name other identities that may
+authenticate on its behalf and act as it — signing in as themselves and
+operating with this account's authority, without holding its password or any app
+password.</p>
+<p class="muted">There is nothing to configure here yet. Until this section
+offers a control, the only credentials that can reach this account are the ones
+listed under <a href="/account/sessions">Access</a>.</p>
+</section>"#,
+        nav = nav(Section::Delegation, &account, ""),
+        did = esc(&account.did),
+    );
+    Ok(page("Delegation", &body).into_response())
 }
 
 /// The page a holder sees when they owe an acceptance.
 ///
-/// Deliberately the whole page rather than a banner over the dashboard: this
-/// is a gate, and rendering the account controls behind it would suggest they
-/// work when the session that reaches them cannot be minted.
+/// Deliberately the whole page rather than a banner over Settings: this is a
+/// gate, and rendering the account controls behind it would suggest they work
+/// when the session that reaches them cannot be minted.
+///
+/// It carries no section nav for the same reason. Every other section redirects
+/// here while an acceptance is owed, so offering links to them would be four
+/// controls that all lead back to this page.
 fn policy_prompt(
     account: &crate::account::AccountRow,
     policy: &crate::http::state::PolicyDocuments,
@@ -1595,7 +1786,9 @@ pub async fn create_app_password(
     let pool = state.reader.accounts().account_pool();
     let name = form.name.trim();
     if name.is_empty() || name == "__primary__" {
-        return Ok(redirect("/account?msg=err-that-name-cannot-be-used"));
+        return Ok(redirect(
+            "/account/sessions?msg=err-that-name-cannot-be-used",
+        ));
     }
     let created = app_password::create(&pool, &account.did, name, false)
         .await
@@ -1608,7 +1801,7 @@ pub async fn create_app_password(
         .await
         .map_err(XrpcError::from)?;
     tracing::info!(did = %account.did, name, "portal app-password created");
-    Ok(redirect("/account?msg=app-password-created"))
+    Ok(redirect("/account/sessions?msg=app-password-created"))
 }
 
 /// `POST /account/app-passwords/revoke`.
@@ -1623,13 +1816,15 @@ pub async fn revoke_app_password(
     };
     let pool = state.reader.accounts().account_pool();
     if form.name.trim() == "__primary__" {
-        return Ok(redirect("/account?msg=err-that-name-cannot-be-used"));
+        return Ok(redirect(
+            "/account/sessions?msg=err-that-name-cannot-be-used",
+        ));
     }
     app_password::revoke(&pool, &account.did, form.name.trim())
         .await
         .map_err(XrpcError::from)?;
     tracing::info!(did = %account.did, name = %form.name, "portal app-password revoked");
-    Ok(redirect("/account?msg=app-password-revoked"))
+    Ok(redirect("/account/sessions?msg=app-password-revoked"))
 }
 
 /// `POST /account/signout-everywhere`.
@@ -1656,7 +1851,7 @@ pub async fn sign_out_everywhere(
         .await
         .map_err(XrpcError::from)?;
     tracing::info!(did = %account.did, epoch, "portal sign-out everywhere");
-    Ok(redirect("/account?msg=signed-out-everywhere"))
+    Ok(redirect("/account/sessions?msg=signed-out-everywhere"))
 }
 
 /// Percent-encode a value for a query string.
@@ -1700,9 +1895,6 @@ mod tests {
         // primary CSRF defence, and Path scopes it to the portal.
         assert!(c.contains("HttpOnly"), "{c}");
         assert!(c.contains("SameSite=Strict"), "{c}");
-        // Must cover every portal route, not only `/account`: the repository
-        // browser is at `/browse`, and a cookie scoped to `/account` is not
-        // sent there at all.
         assert!(c.contains("Path=/;"), "{c}");
         assert!(c.contains("Secure"), "{c}");
         assert!(!set_cookie("v", false, 100).contains("Secure"));
@@ -1716,7 +1908,9 @@ mod tests {
     /// is asking for. That is what `Path=/account` did to `/browse`.
     ///
     /// Asserting the property rather than the literal: a later route added
-    /// somewhere new fails here instead of in a browser.
+    /// somewhere new fails here instead of in a browser. The four section
+    /// paths come from `Section::ALL`, so a section added there is covered
+    /// without this test being touched.
     #[test]
     fn the_cookie_reaches_every_portal_route() {
         let cookie = set_cookie("v", true, 3600);
@@ -1726,10 +1920,51 @@ mod tests {
             .find_map(|a| a.strip_prefix("Path="))
             .expect("the cookie must scope itself");
 
-        for route in ["/account", "/account/signin", "/browse/", "/browse/public/"] {
+        let sections = Section::ALL.iter().map(|(_, route, _)| *route);
+        for route in sections.chain([
+            "/account/signin",
+            "/account/repository/public/",
+            "/account/repository/space/did%3Aplc%3Ax/app.bsky.group/default",
+        ]) {
             assert!(
                 route.starts_with(path),
                 "a browser will not send the session cookie (Path={path}) to {route}"
+            );
+        }
+    }
+
+    /// The nav names every section, and does not link the one being rendered.
+    #[test]
+    fn the_nav_carries_every_section_and_does_not_link_itself() {
+        let account = crate::account::AccountRow {
+            did: "did:plc:navtest".to_string(),
+            handle: "nav.pds.test".to_string(),
+            email: None,
+            email_confirmed_at: None,
+            password_hash: String::new(),
+            created_at: String::new(),
+            state: crate::account::AccountState::Active,
+            signing_key_ref: String::new(),
+            pds_managed_rotation: true,
+        };
+
+        for (section, path, label) in Section::ALL {
+            let rendered = nav(section, &account, "");
+            for (_, other_path, other_label) in Section::ALL {
+                assert!(
+                    rendered.contains(other_label),
+                    "{label} omits {other_label} from the nav"
+                );
+                if other_path != path {
+                    assert!(
+                        rendered.contains(&format!(r#"href="{other_path}""#)),
+                        "{label} does not link {other_label}"
+                    );
+                }
+            }
+            assert!(
+                !rendered.contains(&format!(r#"href="{path}""#)),
+                "{label} links to itself"
             );
         }
     }

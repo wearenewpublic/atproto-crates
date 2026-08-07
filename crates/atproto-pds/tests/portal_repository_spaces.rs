@@ -123,7 +123,7 @@ impl Fixture {
     /// Browser URL prefix for this space.
     fn base(&self) -> String {
         format!(
-            "/browse/space/{}/{}/{}",
+            "/account/repository/space/{}/{}/{}",
             urlenc(&self.space.space_did),
             urlenc(self.space.space_type.as_str()),
             urlenc(self.space.space_key.as_str())
@@ -171,7 +171,7 @@ impl Fixture {
 async fn the_index_lists_a_space_with_records() {
     let f = fixture().await;
 
-    let (status, body, _) = f.get("/browse/").await;
+    let (status, body, _) = f.get("/account/repository").await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -205,7 +205,7 @@ async fn a_space_with_no_records_is_listed() {
         .await
         .expect("second space");
 
-    let (status, body, _) = f.get("/browse/").await;
+    let (status, body, _) = f.get("/account/repository").await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -381,7 +381,7 @@ async fn a_malformed_space_uri_is_refused() {
     let f = fixture().await;
 
     let (status, _, _) = f
-        .get("/browse/space/not-a-did/app.bsky.group/default")
+        .get("/account/repository/space/not-a-did/app.bsky.group/default")
         .await;
 
     assert_eq!(
@@ -426,7 +426,7 @@ async fn space_browsing_requires_a_session() {
 async fn a_space_the_account_does_not_belong_to_is_refused() {
     let f = fixture().await;
     let stranger = format!(
-        "/browse/space/{}/{SPACE_TYPE}/{SPACE_KEY}",
+        "/account/repository/space/{}/{SPACE_TYPE}/{SPACE_KEY}",
         urlenc("did:plc:someoneelsesspace0000000000")
     );
 
@@ -452,7 +452,7 @@ async fn a_space_the_account_does_not_belong_to_is_refused() {
 async fn a_non_member_cannot_write_to_a_space() {
     let f = fixture().await;
     let path = format!(
-        "/browse/space/{}/{SPACE_TYPE}/{SPACE_KEY}/{COLLECTION}/{RKEY}",
+        "/account/repository/space/{}/{SPACE_TYPE}/{SPACE_KEY}/{COLLECTION}/{RKEY}",
         urlenc("did:plc:someoneelsesspace0000000000")
     );
 
@@ -481,7 +481,7 @@ async fn a_non_member_cannot_write_to_a_space() {
 async fn a_non_member_cannot_delete_from_a_space() {
     let f = fixture().await;
     let path = format!(
-        "/browse/space/{}/{SPACE_TYPE}/{SPACE_KEY}/{COLLECTION}/{RKEY}",
+        "/account/repository/space/{}/{SPACE_TYPE}/{SPACE_KEY}/{COLLECTION}/{RKEY}",
         urlenc("did:plc:someoneelsesspace0000000000")
     );
 

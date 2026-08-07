@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- `atproto-pds`: the account portal is four navigated sections rather than one page —
+  **Settings** (`/account`: handle, email, password), **Access** (`/account/sessions`: app passwords,
+  OAuth sessions, sign out everywhere), **Repository** (`/account/repository`: the record browser)
+  and **Delegation** (`/account/delegation`). Every page carries the same nav, so no section is
+  reachable only by knowing its URL, and `Section::ALL` is the single place the four paths and labels
+  are written.
+
+  **`/browse/*` is removed, not redirected.** The repository browser moves wholesale under
+  `/account/repository`; the old URLs were not load-bearing and a redirect would be a second name for
+  every page. Every URL the browser generates now hangs off one `ROOT` constant — it was spelled out
+  in a dozen `format!` strings and three breadcrumb trails, and the link-crawl test is what caught the
+  ones a move missed. That test now follows every `/account` link on every section, so a section named
+  in the nav but mounted at a path nobody routed fails there rather than in a browser.
+
+  **Access lists live credentials only.** Both credential kinds are stateless JWTs, so a session has
+  no row to list and nothing needs recording after one ends; an app password's row *is* the standing
+  grant and its last-used stamp is the only trace a session leaves. `delete_sessions_for` is unchanged.
+
+  **Delegation is a placeholder that says so.** It states in as many words that nothing is switched on
+  and no identity can act as the account. A section about letting other identities act as you is the
+  last place to leave a reader unsure — an empty table under a plausible heading reads as a feature
+  with no entries.
+
+  The Repository index now lists the account's blobs. The two-backend enumeration that was inline in
+  `blob_handlers::list_blobs` — SQLite joins the public-reference check in SQL, fjall filters the page
+  after the fact — is extracted to `blob::list_public`, so the portal shows exactly what
+  `com.atproto.sync.listBlobs` serves and a permissioned CID has one place to leak from rather than
+  two. The returned page carries `scanned` alongside `cids`, which is the only honest way to tell a
+  short page that ended the list from a short page whose blobs were permissioned.
+
 ### Added
 - `atproto-pds`: `com.atproto.space.notifyWrite` carries the repo's commit `hash`, and
   `listRepos#repo` reports it. The lexicon marks `hash` required on `notifyWrite` and says why —

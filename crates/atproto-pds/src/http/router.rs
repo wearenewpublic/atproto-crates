@@ -3,7 +3,6 @@
 use crate::admin;
 use crate::http::auth_handlers;
 use crate::http::blob_handlers;
-use crate::http::browse;
 use crate::http::discovery_handlers;
 use crate::http::handlers;
 use crate::http::identity_handlers;
@@ -11,6 +10,7 @@ use crate::http::moderation_handlers;
 use crate::http::portal;
 use crate::http::preference_handlers;
 use crate::http::proxy_handlers;
+use crate::http::repository;
 use crate::http::service_auth_handlers;
 use crate::http::space_handlers;
 use crate::http::state::HttpState;
@@ -506,6 +506,10 @@ pub fn build_router(state: HttpState) -> Router {
         // Operator HTML dashboard (Basic-auth gated, same as JSON admin API).
         // The account portal. Not XRPC: these are HTML pages and form posts,
         // the only way to use this server with nothing but a browser.
+        //
+        // Four sections, each a page in its own right and all four in the nav
+        // every page carries: Settings here, then Access, Repository and
+        // Delegation below.
         .route("/account", get(portal::dashboard))
         .route("/account/signin", get(portal::sign_in_page))
         .route("/account/signin", post(portal::sign_in))
@@ -513,36 +517,45 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/account/signup", get(portal::sign_up_page))
         .route("/account/signup", post(portal::sign_up))
         .route("/account/handle", post(portal::change_handle))
-        // The repository browser. `{segment}` is a collection or a blob CID;
-        // `browse::looks_like_cid` decides, and nothing else needs to.
-        .route("/browse/", get(browse::index))
+        .route("/account/sessions", get(portal::sessions))
+        .route("/account/delegation", get(portal::delegation))
+        // The Repository section: a browser over this account's records.
+        // `{segment}` is a collection or a blob CID; `looks_like_cid` decides,
+        // and nothing else needs to.
+        //
+        // Both spellings of the index. A section named in a nav is also a URL
+        // people type, and axum matches paths literally -- `/account/repository`
+        // and `/account/repository/` are two different routes, and mounting only
+        // one makes the other a 404 for no reason a reader could guess.
+        .route("/account/repository", get(repository::index))
+        .route("/account/repository/", get(repository::index))
         .route(
-            "/browse/public/",
-            get(browse::public_collections).post(browse::public_create),
+            "/account/repository/public/",
+            get(repository::public_collections).post(repository::public_create),
         )
         .route(
-            "/browse/public/{segment}",
-            get(browse::public_collection_or_blob),
+            "/account/repository/public/{segment}",
+            get(repository::public_collection_or_blob),
         )
         .route(
-            "/browse/public/{collection}/{rkey}",
-            get(browse::public_record)
-                .post(browse::public_record_post)
-                .delete(browse::public_record_delete),
+            "/account/repository/public/{collection}/{rkey}",
+            get(repository::public_record)
+                .post(repository::public_record_post)
+                .delete(repository::public_record_delete),
         )
         .route(
-            "/browse/space/{host}/{space_type}/{space_key}",
-            get(browse::space_collections),
+            "/account/repository/space/{host}/{space_type}/{space_key}",
+            get(repository::space_collections),
         )
         .route(
-            "/browse/space/{host}/{space_type}/{space_key}/{segment}",
-            get(browse::space_collection_or_blob),
+            "/account/repository/space/{host}/{space_type}/{space_key}/{segment}",
+            get(repository::space_collection_or_blob),
         )
         .route(
-            "/browse/space/{host}/{space_type}/{space_key}/{collection}/{rkey}",
-            get(browse::space_record)
-                .post(browse::space_record_post)
-                .delete(browse::space_record_delete),
+            "/account/repository/space/{host}/{space_type}/{space_key}/{collection}/{rkey}",
+            get(repository::space_record)
+                .post(repository::space_record_post)
+                .delete(repository::space_record_delete),
         )
         .route("/account/email", post(portal::change_email))
         .route("/account/email/verify", post(portal::verify_email))

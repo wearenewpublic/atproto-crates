@@ -339,6 +339,78 @@ pub async fn list_all(
     Ok(rows.into_iter().map(|(c,)| c).collect())
 }
 
+/// One page of publicly-referenced blob CIDs.
+#[derive(Debug, Clone)]
+pub struct PublicBlobPage {
+    /// The CIDs on this page that a public record references.
+    pub cids: Vec<String>,
+    /// Cursor for the next page: the last CID **scanned**, not the last kept.
+    ///
+    /// `None` when the scan found nothing at all, which is the end of the list.
+    pub cursor: Option<String>,
+    /// How many CIDs the scan returned before the public filter ran.
+    ///
+    /// The only honest way to tell "this page was short because the list ended"
+    /// from "this page was short because its blobs were permissioned" — the two
+    /// look identical from `cids` alone, and a caller deciding whether to fetch
+    /// another page needs to distinguish them.
+    pub scanned: usize,
+}
+
+/// One page of the blobs a public record references, on either storage profile.
+///
+/// Both callers — `com.atproto.sync.listBlobs` and the portal's repository
+/// browser — need the same answer, and it is not a single query: on the SQLite
+/// profile the join runs in SQL and every row returned is kept, while on the
+/// fjall profile the bytes live in a keyspace that knows nothing about records,
+/// so the page is enumerated first and filtered afterwards through
+/// [`is_publicly_referenced`]. Reimplementing that split per caller would be a
+/// second place for a permissioned CID to leak.
+///
+/// `backend` is the `BlobStorage` handle when one is wired up, and `None` for
+/// the SQLite-direct path. `store` is required either way: on the fjall profile
+/// it is what answers the public-reference question.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] on backend failure.
+pub async fn list_public(
+    store: &SqlActorStore,
+    backend: Option<&dyn crate::actor_store::traits::BlobStorage>,
+    did: &str,
+    cursor: Option<&str>,
+    limit: u32,
+) -> PdsResult<PublicBlobPage> {
+    let Some(backend) = backend else {
+        // This path joins in SQL, so every row returned is kept and the last
+        // row is both the last scanned and the last kept.
+        let page = list_all(store, cursor, limit).await?;
+        return Ok(PublicBlobPage {
+            cursor: page.last().cloned(),
+            scanned: page.len(),
+            cids: page,
+        });
+    };
+
+    // The trait cannot express the join, so the page is filtered after the fact.
+    // A page may therefore come back shorter than `limit`; the cursor still
+    // advances over the underlying CIDs, so pagination terminates.
+    let all = backend.list_all_cids(did, cursor, limit).await?;
+    let scanned = all.len();
+    let last_scanned = all.last().cloned();
+    let mut kept = Vec::with_capacity(all.len());
+    for cid in all {
+        if is_publicly_referenced(store, &cid).await? {
+            kept.push(cid);
+        }
+    }
+    Ok(PublicBlobPage {
+        cids: kept,
+        cursor: last_scanned,
+        scanned,
+    })
+}
+
 /// List blobs that are *referenced* but absent from `repo_blob`.
 ///
 /// `cursor` is an opaque "last cid seen" pointer; `limit` is clamped to

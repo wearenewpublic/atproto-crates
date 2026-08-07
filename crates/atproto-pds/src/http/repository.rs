@@ -1,4 +1,4 @@
-//! A repository browser for the account portal.
+//! The Repository section of the account portal: a repository browser.
 //!
 //! The portal could manage the *account* — email, password, handle, app
 //! passwords — but showed nothing of what the account actually holds. An
@@ -13,11 +13,11 @@
 //!
 //! # Reading `[collection]` and `[cid]` from the same position
 //!
-//! `/browse/public/{x}` is a collection listing when `x` is an NSID and a blob
-//! when `x` is a CID. Nothing needs to be guessed to tell them apart: an NSID
-//! is reverse-DNS and always contains a dot, and a base32 CIDv1 is a single
-//! run of `[a-z2-7]` with no dot in it. [`looks_like_cid`] is that rule, and
-//! it is the only place the ambiguity is resolved.
+//! `/account/repository/public/{x}` is a collection listing when `x` is an NSID
+//! and a blob when `x` is a CID. Nothing needs to be guessed to tell them
+//! apart: an NSID is reverse-DNS and always contains a dot, and a base32 CIDv1
+//! is a single run of `[a-z2-7]` with no dot in it. [`looks_like_cid`] is that
+//! rule, and it is the only place the ambiguity is resolved.
 //!
 //! # Deleting from a browser
 //!
@@ -26,9 +26,19 @@
 //! anything driving these routes programmatically, and a `POST` carrying
 //! `_method=delete` is what the button in the page sends. The alternative was
 //! a delete that only worked from `curl`.
+//!
+//! # One place the paths are written
+//!
+//! Every URL this module emits hangs off [`ROOT`]. The browser previously lived
+//! at `/browse/`, spelled out in a dozen `format!` strings and three breadcrumb
+//! trails; moving it meant editing all of them, and the link-crawl test is what
+//! caught the ones that were missed. It is a constant now, so the next move is
+//! one line.
 
 use crate::http::errors::XrpcError;
-use crate::http::portal::{current_account, esc, notice, page, redirect, require_same_origin};
+use crate::http::portal::{
+    Section, esc, nav, notice, page, redirect, require_same_origin, section_account,
+};
 use crate::http::state::HttpState;
 use atproto_space::types::SpaceUri;
 use axum::extract::{Form, Path, Query, State};
@@ -36,11 +46,17 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
+/// Where the browser is mounted. Every URL it generates starts here.
+pub const ROOT: &str = "/account/repository";
+
 /// Records listed per page.
 const PAGE_SIZE: u32 = 50;
 
 /// Collections listed per page.
 const COLLECTIONS_PER_PAGE: usize = 50;
+
+/// Blob CIDs listed per page on the index.
+const BLOBS_PER_PAGE: u32 = 50;
 
 /// Query for a listing — a records cursor, a collections page, and a message.
 #[derive(Debug, Deserialize, Default)]
@@ -51,6 +67,13 @@ pub struct BrowseQuery {
     /// Zero-based page for the in-memory collection listings.
     #[serde(default)]
     pub page: Option<usize>,
+    /// Blob-listing cursor on the index — the last CID of the previous page.
+    ///
+    /// Separate from `cursor` because the index paginates blobs while the
+    /// listings below it paginate records, and a single parameter would make
+    /// "next page of blobs" and "next page of records" the same link.
+    #[serde(default)]
+    pub blobs: Option<String>,
     /// Status word set by whatever redirected here.
     #[serde(default)]
     pub msg: Option<String>,
@@ -95,26 +118,37 @@ fn banner(msg: Option<&str>) -> String {
 }
 
 /// Shared page chrome for the browser.
-fn browse_page(title: &str, crumbs: &str, body: &str) -> Response {
+///
+/// The portal nav rather than a bare "back to account" link: this is one of
+/// four sections, and a page that offers only the way it came makes the other
+/// three reachable only by typing their URLs.
+fn browse_page(
+    account: &crate::account::AccountRow,
+    title: &str,
+    crumbs: &str,
+    body: &str,
+) -> Response {
     page(
         title,
         &format!(
-            r#"<nav><a href="/account">&larr; Account</a> &middot; {crumbs}</nav>
+            r#"{}
 <h1>{title}</h1>
-{body}"#
+{body}"#,
+            nav(Section::Repository, account, crumbs)
         ),
     )
     .into_response()
 }
 
-/// `GET /browse/` — the two realms this account can browse.
+/// `GET /account/repository` — the realms this account holds, and its blobs.
 pub async fn index(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
 
     // Every space this account holds, not only the ones it has written to. An
@@ -131,7 +165,7 @@ pub async fn index(
             .filter_map(|uri| SpaceUri::parse(uri).ok().map(|s| (uri, s)))
             .map(|(raw, s)| {
                 format!(
-                    r#"<tr><td><a href="/browse/space/{}/{}/{}">{}</a></td></tr>"#,
+                    r#"<tr><td><a href="{ROOT}/space/{}/{}/{}">{}</a></td></tr>"#,
                     esc(&urlenc(&s.space_did)),
                     esc(&urlenc(s.space_type.as_str())),
                     esc(&urlenc(s.space_key.as_str())),
@@ -147,17 +181,105 @@ pub async fn index(
 <section>
 <h2 style="margin-top:0">Public repository</h2>
 <p class="muted">Records anyone can read, published to the network.</p>
-<p><a href="/browse/public/">Browse public records</a></p>
+<p><a href="{ROOT}/public/">Browse public records</a></p>
 </section>
 
 <section>
 <h2 style="margin-top:0">Spaces</h2>
 <p class="muted">Permissioned records, readable only by the members of each space.</p>
 <table>{space_rows}</table>
-</section>"#,
+</section>
+
+{blobs}"#,
         banner = banner(q.msg.as_deref()),
+        blobs = blob_section(&state, &account.did, q.blobs.as_deref()).await?,
     );
-    Ok(browse_page("Repository", "Repository", &body))
+    Ok(browse_page(&account, "Repository", "", &body))
+}
+
+/// The index's blob listing.
+///
+/// Public blobs only, through the same enumeration
+/// `com.atproto.sync.listBlobs` serves -- [`crate::blob::list_public`] -- so
+/// what the holder sees here is what the network can fetch, and the two cannot
+/// drift. A blob referenced only from a permissioned record is deliberately
+/// absent: it is not public, and listing it here under a heading that says
+/// "anyone holding the CID can fetch these" would be false.
+///
+/// Each row links to `getBlob` rather than to a page of its own. That endpoint
+/// already streams the bytes under the stored MIME type with the headers that
+/// keep a blob from rendering as a document on this origin; a second path to
+/// the same bytes would be a second place to get those headers wrong.
+async fn blob_section(
+    state: &HttpState,
+    did: &str,
+    cursor: Option<&str>,
+) -> Result<String, XrpcError> {
+    // Said rather than omitted. A section that vanishes reads as "this account
+    // has no blobs", which is a different claim from "this server cannot answer
+    // the question".
+    let Some(manager) = state.account_manager.as_deref() else {
+        return Ok(r#"<section>
+<h2 style="margin-top:0">Blobs</h2>
+<p class="muted">This server has no account manager configured, so blob storage
+cannot be read from here.</p>
+</section>"#
+            .to_string());
+    };
+    let store = crate::actor_store::sql::SqlActorStore::open(manager.data_dir(), did)
+        .await
+        .map_err(XrpcError::from)?;
+    let listed = crate::blob::list_public(
+        &store,
+        state.public_realm_backend.as_ref().map(|b| b.blob.as_ref()),
+        did,
+        cursor,
+        BLOBS_PER_PAGE,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    let rows = if listed.cids.is_empty() {
+        r#"<tr><td class="muted">No public blobs.</td></tr>"#.to_string()
+    } else {
+        listed
+            .cids
+            .iter()
+            .map(|cid| {
+                format!(
+                    r#"<tr><td><a href="/xrpc/com.atproto.sync.getBlob?did={}&amp;cid={}"><code>{}</code></a></td></tr>"#,
+                    esc(&urlenc(did)),
+                    esc(&urlenc(cid)),
+                    esc(cid)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    // On `scanned`, not on `cids`. The cursor advances over CIDs *scanned*
+    // rather than CIDs *kept*, so a full page whose blobs were all permissioned
+    // comes back with no rows and more behind it -- and a short scan is the end
+    // of the list even when every CID in it was kept. Keying the link on the
+    // rows shown would hide the rest in the first case and offer an empty page
+    // forever in the second.
+    let next = match listed.cursor.as_deref() {
+        Some(c) if listed.scanned == BLOBS_PER_PAGE as usize => format!(
+            r#"<p><a href="{ROOT}?blobs={}">Next &rarr;</a></p>"#,
+            esc(&urlenc(c))
+        ),
+        _ => String::new(),
+    };
+
+    Ok(format!(
+        r#"<section>
+<h2 style="margin-top:0">Blobs</h2>
+<p class="muted">Images and other binaries referenced by a public record. Anyone
+holding the CID can fetch these; a blob referenced only from a space is not
+listed and is not public.</p>
+<table>{rows}</table>
+{next}
+</section>"#
+    ))
 }
 
 /// Every space this account owns or belongs to.
@@ -195,6 +317,7 @@ async fn all_spaces(state: &HttpState, did: &str) -> Result<Vec<String>, XrpcErr
 /// Render a paginated collection listing for either realm.
 #[allow(clippy::too_many_arguments)]
 fn collections_view(
+    account: &crate::account::AccountRow,
     title: &str,
     crumbs: &str,
     self_url: &str,
@@ -227,32 +350,35 @@ fn collections_view(
             .join("")
     };
 
-    let mut nav = String::new();
+    let mut pager = String::new();
     if page_no > 0 {
-        nav.push_str(&format!(
+        pager.push_str(&format!(
             r#"<a href="{self_url}?page={}">&larr; Previous</a> "#,
             page_no - 1
         ));
     }
     if start + COLLECTIONS_PER_PAGE < collections.len() {
-        nav.push_str(&format!(
+        pager.push_str(&format!(
             r#"<a href="{self_url}?page={}">Next &rarr;</a>"#,
             page_no + 1
         ));
     }
 
     browse_page(
+        account,
         title,
         crumbs,
         &format!(
-            r#"{}<section><table>{rows}</table><p>{nav}</p></section>{create_form}"#,
+            r#"{}<section><table>{rows}</table><p>{pager}</p></section>{create_form}"#,
             banner(msg)
         ),
     )
 }
 
 /// Render a paginated record listing for either realm.
+#[allow(clippy::too_many_arguments)]
 fn records_view(
+    account: &crate::account::AccountRow,
     title: &str,
     crumbs: &str,
     self_url: &str,
@@ -277,7 +403,7 @@ fn records_view(
             .collect::<Vec<_>>()
             .join("")
     };
-    let nav = match cursor {
+    let pager = match cursor {
         Some(c) => format!(
             r#"<a href="{self_url}?cursor={}">Next &rarr;</a>"#,
             esc(&urlenc(c))
@@ -285,10 +411,11 @@ fn records_view(
         None => String::new(),
     };
     browse_page(
+        account,
         title,
         crumbs,
         &format!(
-            r#"{}<section><table>{rows}</table><p>{nav}</p></section>"#,
+            r#"{}<section><table>{rows}</table><p>{pager}</p></section>"#,
             banner(msg)
         ),
     )
@@ -333,6 +460,7 @@ fn linked_cids(value: &serde_json::Value) -> Vec<String> {
 /// Render one record, with its JSON in an editable form.
 #[allow(clippy::too_many_arguments)]
 fn record_view(
+    account: &crate::account::AccountRow,
     title: &str,
     crumbs: &str,
     action: &str,
@@ -364,6 +492,7 @@ fn record_view(
         )
     };
     browse_page(
+        account,
         title,
         crumbs,
         &format!(
@@ -416,14 +545,15 @@ fn urlenc(s: &str) -> String {
 //  Public realm
 // ---------------------------------------------------------------------------
 
-/// `GET /browse/public/` — collections holding public records.
+/// `GET /account/repository/public/` — collections holding public records.
 pub async fn public_collections(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let described = state
         .reader
@@ -431,9 +561,12 @@ pub async fn public_collections(
         .await
         .map_err(XrpcError::from)?;
 
-    let create = r#"<section>
+    // `{{}}` is a literal pair of braces: the empty JSON object the textarea
+    // starts from, not a placeholder.
+    let create = format!(
+        r#"<section>
 <h2 style="margin-top:0">Create a record</h2>
-<form method="POST" action="/browse/public/">
+<form method="POST" action="{ROOT}/public/">
   <label for="collection">Collection</label>
   <input id="collection" name="collection" type="text" spellcheck="false"
          placeholder="app.bsky.feed.post" required>
@@ -443,32 +576,35 @@ pub async fn public_collections(
   <textarea id="value" name="value" rows="10" spellcheck="false"
             style="width:100%;font-family:ui-monospace,monospace;font-size:0.85em;
                    padding:0.55em;border:1px solid #c8c8c8;border-radius:5px;
-                   box-sizing:border-box">{}</textarea>
+                   box-sizing:border-box">{{}}</textarea>
   <button type="submit">Create record</button>
 </form>
-</section>"#;
+</section>"#
+    );
 
     Ok(collections_view(
+        &account,
         "Public records",
-        r#"<a href="/browse/">Repository</a> &middot; Public"#,
-        "/browse/public/",
-        "/browse/public/",
+        &format!(r#"<a href="{ROOT}">Repository</a> &middot; Public"#),
+        &format!("{ROOT}/public/"),
+        &format!("{ROOT}/public/"),
         &described.collections,
         q.page.unwrap_or(0),
         q.msg.as_deref(),
-        create,
+        &create,
     ))
 }
 
-/// `GET /browse/public/{segment}` — records in a collection, or a blob.
+/// `GET /account/repository/public/{segment}` — records in a collection, or a blob.
 pub async fn public_collection_or_blob(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path(segment): Path<String>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
 
     if looks_like_cid(&segment) {
@@ -506,28 +642,30 @@ pub async fn public_collection_or_blob(
         .collect();
 
     Ok(records_view(
+        &account,
         &segment,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="/browse/public/">Public</a> &middot; {}"#,
+            r#"<a href="{ROOT}">Repository</a> &middot; <a href="{ROOT}/public/">Public</a> &middot; {}"#,
             esc(&segment)
         ),
-        &format!("/browse/public/{}", urlenc(&segment)),
-        &format!("/browse/public/{}/", urlenc(&segment)),
+        &format!("{ROOT}/public/{}", urlenc(&segment)),
+        &format!("{ROOT}/public/{}/", urlenc(&segment)),
         &rows,
         listed.cursor.as_deref(),
         q.msg.as_deref(),
     ))
 }
 
-/// `GET /browse/public/{collection}/{rkey}` — one record.
+/// `GET /account/repository/public/{collection}/{rkey}` — one record.
 pub async fn public_record(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((collection, rkey)): Path<(String, String)>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let record = state
         .reader
@@ -536,14 +674,15 @@ pub async fn public_record(
         .map_err(XrpcError::from)?;
 
     Ok(record_view(
+        &account,
         &rkey,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="/browse/public/">Public</a> &middot; <a href="/browse/public/{}">{}</a>"#,
+            r#"<a href="{ROOT}">Repository</a> &middot; <a href="{ROOT}/public/">Public</a> &middot; <a href="{ROOT}/public/{}">{}</a>"#,
             urlenc(&collection),
             esc(&collection)
         ),
-        &format!("/browse/public/{}/{}", urlenc(&collection), urlenc(&rkey)),
-        "/browse/public/",
+        &format!("{ROOT}/public/{}/{}", urlenc(&collection), urlenc(&rkey)),
+        &format!("{ROOT}/public/"),
         &record.uri,
         &record.cid,
         &record.value,
@@ -551,15 +690,16 @@ pub async fn public_record(
     ))
 }
 
-/// `POST /browse/public/` — create a record.
+/// `POST /account/repository/public/` — create a record.
 pub async fn public_create(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Form(form): Form<RecordForm>,
 ) -> Result<Response, XrpcError> {
     require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let Some(collection) = form
         .collection
@@ -567,11 +707,13 @@ pub async fn public_create(
         .map(str::trim)
         .filter(|c| !c.is_empty())
     else {
-        return Ok(redirect("/browse/public/?msg=err-name-a-collection"));
+        return Ok(redirect(&format!(
+            "{ROOT}/public/?msg=err-name-a-collection"
+        )));
     };
     let value = match parse_value(form.value.as_deref()) {
         Ok(v) => v,
-        Err(m) => return Ok(redirect(&format!("/browse/public/?msg={m}"))),
+        Err(m) => return Ok(redirect(&format!("{ROOT}/public/?msg={m}"))),
     };
 
     let op = crate::repo::WriteOp {
@@ -588,14 +730,14 @@ pub async fn public_create(
     };
     match apply(&state, &account.did, op).await {
         Ok(()) => Ok(redirect(&format!(
-            "/browse/public/{}?msg=created",
+            "{ROOT}/public/{}?msg=created",
             urlenc(collection)
         ))),
-        Err(m) => Ok(redirect(&format!("/browse/public/?msg={m}"))),
+        Err(m) => Ok(redirect(&format!("{ROOT}/public/?msg={m}"))),
     }
 }
 
-/// `POST /browse/public/{collection}/{rkey}` — edit, or delete via `_method`.
+/// `POST /account/repository/public/{collection}/{rkey}` — edit, or delete via `_method`.
 pub async fn public_record_post(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -603,8 +745,9 @@ pub async fn public_record_post(
     Form(form): Form<RecordForm>,
 ) -> Result<Response, XrpcError> {
     require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
 
     if form._method.as_deref() == Some("delete") {
@@ -615,7 +758,7 @@ pub async fn public_record_post(
         Ok(v) => v,
         Err(m) => {
             return Ok(redirect(&format!(
-                "/browse/public/{}/{}?msg={m}",
+                "{ROOT}/public/{}/{}?msg={m}",
                 urlenc(&collection),
                 urlenc(&rkey)
             )));
@@ -633,21 +776,22 @@ pub async fn public_record_post(
         Err(m) => m,
     };
     Ok(redirect(&format!(
-        "/browse/public/{}/{}?msg={msg}",
+        "{ROOT}/public/{}/{}?msg={msg}",
         urlenc(&collection),
         urlenc(&rkey)
     )))
 }
 
-/// `DELETE /browse/public/{collection}/{rkey}`.
+/// `DELETE /account/repository/public/{collection}/{rkey}`.
 pub async fn public_record_delete(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((collection, rkey)): Path<(String, String)>,
 ) -> Result<Response, XrpcError> {
     require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     Ok(delete_public(&state, &account.did, &collection, &rkey).await)
 }
@@ -661,12 +805,9 @@ async fn delete_public(state: &HttpState, did: &str, collection: &str, rkey: &st
         swap_record: None,
     };
     match apply(state, did, op).await {
-        Ok(()) => redirect(&format!(
-            "/browse/public/{}?msg=deleted",
-            urlenc(collection)
-        )),
+        Ok(()) => redirect(&format!("{ROOT}/public/{}?msg=deleted", urlenc(collection))),
         Err(m) => redirect(&format!(
-            "/browse/public/{}/{}?msg={m}",
+            "{ROOT}/public/{}/{}?msg={m}",
             urlenc(collection),
             urlenc(rkey)
         )),
@@ -720,22 +861,23 @@ fn space_from_path(host: &str, ty: &str, key: &str) -> Result<SpaceUri, XrpcErro
 /// Base URL for a space's browse routes.
 fn space_base(host: &str, ty: &str, key: &str) -> String {
     format!(
-        "/browse/space/{}/{}/{}/",
+        "{ROOT}/space/{}/{}/{}/",
         urlenc(host),
         urlenc(ty),
         urlenc(key)
     )
 }
 
-/// `GET /browse/space/{host}/{type}/{key}` — collections in the space.
+/// `GET /account/repository/space/{host}/{type}/{key}` — collections in the space.
 pub async fn space_collections(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((host, ty, key)): Path<(String, String, String)>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let space = space_from_path(&host, &ty, &key)?;
     require_member(&state, &space, &account.did).await?;
@@ -747,9 +889,10 @@ pub async fn space_collections(
 
     let base = space_base(&host, &ty, &key);
     Ok(collections_view(
+        &account,
         &format!("{ty}/{key}"),
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; {}"#,
+            r#"<a href="{ROOT}">Repository</a> &middot; {}"#,
             esc(&space.to_string())
         ),
         base.trim_end_matches('/'),
@@ -761,15 +904,16 @@ pub async fn space_collections(
     ))
 }
 
-/// `GET /browse/space/{host}/{type}/{key}/{segment}` — records, or a blob.
+/// `GET /account/repository/space/{host}/{type}/{key}/{segment}` — records, or a blob.
 pub async fn space_collection_or_blob(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((host, ty, key, segment)): Path<(String, String, String, String)>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let space = space_from_path(&host, &ty, &key)?;
     require_member(&state, &space, &account.did).await?;
@@ -808,9 +952,10 @@ pub async fn space_collection_or_blob(
 
     let base = space_base(&host, &ty, &key);
     Ok(records_view(
+        &account,
         &segment,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="{}">{}</a> &middot; {}"#,
+            r#"<a href="{ROOT}">Repository</a> &middot; <a href="{}">{}</a> &middot; {}"#,
             base.trim_end_matches('/'),
             esc(&space.to_string()),
             esc(&segment)
@@ -823,15 +968,16 @@ pub async fn space_collection_or_blob(
     ))
 }
 
-/// `GET /browse/space/{host}/{type}/{key}/{collection}/{rkey}`.
+/// `GET /account/repository/space/{host}/{type}/{key}/{collection}/{rkey}`.
 pub async fn space_record(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((host, ty, key, collection, rkey)): Path<(String, String, String, String, String)>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response, XrpcError> {
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let space = space_from_path(&host, &ty, &key)?;
     require_member(&state, &space, &account.did).await?;
@@ -858,9 +1004,10 @@ pub async fn space_record(
 
     let base = space_base(&host, &ty, &key);
     Ok(record_view(
+        &account,
         &rkey,
         &format!(
-            r#"<a href="/browse/">Repository</a> &middot; <a href="{}">{}</a> &middot; <a href="{base}{}">{}</a>"#,
+            r#"<a href="{ROOT}">Repository</a> &middot; <a href="{}">{}</a> &middot; <a href="{base}{}">{}</a>"#,
             base.trim_end_matches('/'),
             esc(&space.to_string()),
             urlenc(&collection),
@@ -875,7 +1022,7 @@ pub async fn space_record(
     ))
 }
 
-/// `POST /browse/space/.../{collection}/{rkey}` — edit, or delete.
+/// `POST /account/repository/space/.../{collection}/{rkey}` — edit, or delete.
 pub async fn space_record_post(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -883,8 +1030,9 @@ pub async fn space_record_post(
     Form(form): Form<RecordForm>,
 ) -> Result<Response, XrpcError> {
     require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let space = space_from_path(&host, &ty, &key)?;
     require_member(&state, &space, &account.did).await?;
@@ -928,15 +1076,16 @@ pub async fn space_record_post(
     )))
 }
 
-/// `DELETE /browse/space/.../{collection}/{rkey}`.
+/// `DELETE /account/repository/space/.../{collection}/{rkey}`.
 pub async fn space_record_delete(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((host, ty, key, collection, rkey)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, XrpcError> {
     require_same_origin(&headers)?;
-    let Some((_, account)) = current_account(&state, &headers).await else {
-        return Ok(redirect("/account/signin"));
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
     };
     let space = space_from_path(&host, &ty, &key)?;
     require_member(&state, &space, &account.did).await?;
