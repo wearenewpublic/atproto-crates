@@ -1,6 +1,6 @@
 [package]
 name = "atproto-oauth-aip"
-version = "0.15.0-rc.1"
+version = "0.15.0-rc.2"
 description = "ATProtocol AIP OAuth tools"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

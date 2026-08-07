@@ -1,6 +1,6 @@
 [package]
 name = "atproto-attestation"
-version = "0.15.0-rc.1"
+version = "0.15.0-rc.2"
 description = "AT Protocol attestation utilities for creating and verifying record signatures"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

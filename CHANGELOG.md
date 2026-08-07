@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.15.0-rc.2] - 2026-08-07
 ### Changed
 - `atproto-pds`: the account portal is four navigated sections rather than one page —
   **Settings** (`/account`: handle, email, password), **Access** (`/account/sessions`: app passwords,
@@ -2306,6 +2308,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.15.0-rc.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.2
 [0.15.0-rc.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.1
 [0.15.0-alpha.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.2
 [0.15.0-alpha.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.1

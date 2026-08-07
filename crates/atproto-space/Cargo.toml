@@ -1,6 +1,6 @@
 [package]
 name = "atproto-space"
-version = "0.15.0-rc.1"
+version = "0.15.0-rc.2"
 description = "AT Protocol permissioned-data spaces — primitives for the 0016 Permissioned Data draft (LtHash, signed commits, delegation-token/space-credential JWTs)"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

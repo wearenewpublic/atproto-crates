@@ -35,7 +35,7 @@ reload = ["dep:minijinja-autoreload", "minijinja/loader"]
 minijinja-embed = { version = "2.7" }
 
 [dependencies]
-# ── In-tree AT Protocol crates (PATH deps, unpublished 0.15.0-rc.1) ──
+# ── In-tree AT Protocol crates (PATH deps, unpublished 0.15.0-rc.2) ──
 atproto-identity = { path = "../crates/atproto-identity", features = ["hickory-dns", "lru"] }
 atproto-oauth = { path = "../crates/atproto-oauth" }
 atproto-oauth-axum = { path = "../crates/atproto-oauth-axum" }
