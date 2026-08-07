@@ -157,6 +157,7 @@ pub async fn consent_page(
         &q.request_uri,
         &request.client_id,
         &request.scope,
+        request.login_hint.as_deref(),
         &handles,
         &type_names,
         &permission_sets,
@@ -403,10 +404,61 @@ fn dns_resolver_ref(state: &HttpState) -> Option<&dyn atproto_identity::traits::
     state.dns_resolver.as_deref()
 }
 
+/// The identifier to prefill the sign-in field with, from a client's
+/// `login_hint`, or `None` to leave it empty.
+///
+/// A client that already knows who is signing in says so at PAR time, and the
+/// holder should not have to type it again — they arrive at this page from an
+/// application that just asked them for exactly this.
+///
+/// # Why the hint is validated rather than echoed
+///
+/// `login_hint` is chosen by the client and lands in an HTML attribute on the
+/// one page whose whole job is collecting a password. Escaping stops it being
+/// markup; validating stops it being *text*. An unvalidated hint renders
+/// attacker-chosen prose inside the sign-in box — "type your password here to
+/// continue" is a legal string — on a page carrying this server's name and
+/// styling. A handle or a DID cannot say anything.
+///
+/// # Why an email is not prefilled
+///
+/// The field accepts one, and `login_hint` is a handle or DID by the AT
+/// Protocol OAuth spec. Filling in an address a third-party client supplied
+/// would also put an email this server never disclosed onto the screen, which
+/// is a claim about the account rather than a convenience.
+///
+/// Handles come back normalized (lowercased, `at://` and `@` stripped) because
+/// that is what [`is_valid_handle`] returns and what the account lookup will do
+/// anyway; a DID is returned as given, since case is not ours to change.
+fn prefill_identifier(hint: Option<&str>) -> Option<String> {
+    use atproto_identity::validation::{
+        is_valid_did_method_plc, is_valid_did_method_web, is_valid_did_method_webvh,
+        is_valid_handle,
+    };
+
+    let hint = hint?.trim();
+    if hint.is_empty() {
+        return None;
+    }
+
+    if hint.starts_with("did:") {
+        // Non-strict for `did:web`/`did:webvh`: this decides whether to fill a
+        // text box, not whether to trust an identity. A path-bearing did:web is
+        // a real DID and refusing to type it back helps nobody.
+        let known_method = is_valid_did_method_plc(hint)
+            || is_valid_did_method_web(hint, false)
+            || is_valid_did_method_webvh(hint, false);
+        return known_method.then(|| hint.to_string());
+    }
+
+    is_valid_handle(hint)
+}
+
 fn render_consent(
     request_uri: &str,
     client_id: &str,
     scope: &str,
+    login_hint: Option<&str>,
     handles: &BTreeMap<String, String>,
     type_names: &BTreeMap<String, String>,
     permission_sets: &BTreeMap<String, String>,
@@ -430,6 +482,21 @@ fn render_consent(
         r#"<div class="space-warning"><strong>Warning:</strong> this application is requesting access to <b>every space on the network</b>. This is an extremely broad permission. Only grant it to applications you deeply trust.</div>"#
     } else {
         ""
+    };
+
+    // Prefilled from `login_hint` when the client named a handle or DID.
+    // Focus follows the value: with the identifier already filled, the first
+    // thing left to do is type the password, and landing the cursor on a field
+    // that is already correct makes the holder check it rather than use it.
+    let prefill = prefill_identifier(login_hint);
+    let identifier_value = prefill
+        .as_deref()
+        .map(|v| format!(r#" value="{}""#, html_escape(v)))
+        .unwrap_or_default();
+    let (identifier_autofocus, password_autofocus) = if prefill.is_some() {
+        ("", " autofocus")
+    } else {
+        (" autofocus", "")
     };
 
     format!(
@@ -487,10 +554,10 @@ fn render_consent(
     <fieldset>
       <legend>Sign in</legend>
       <label for="identifier">Handle, DID, or email</label>
-      <input id="identifier" name="identifier" type="text" autocomplete="username" required>
+      <input id="identifier" name="identifier" type="text" autocomplete="username" required{identifier_value}{identifier_autofocus}>
 
       <label for="password">Password (account or app password)</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <input id="password" name="password" type="password" autocomplete="current-password" required{password_autofocus}>
 
       <input type="hidden" name="request_uri" value="{request_uri_safe}">
     </fieldset>
@@ -745,6 +812,7 @@ mod tests {
             "urn:ietf:params:oauth:request_uri:abcd",
             "https://app.example/client-metadata.json",
             "atproto transition:generic",
+            None,
             &no_handles(),
             &no_names(),
             &no_names(),
@@ -763,6 +831,7 @@ mod tests {
             "uri",
             "https://evil/<script>",
             "atproto",
+            None,
             &no_handles(),
             &no_names(),
             &no_names(),
@@ -780,7 +849,15 @@ mod tests {
 
     #[test]
     fn render_handles_empty_scope() {
-        let html = render_consent("uri", "client", "", &no_handles(), &no_names(), &no_names());
+        let html = render_consent(
+            "uri",
+            "client",
+            "",
+            None,
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
         assert!(html.contains("Requested scopes"));
     }
 
@@ -1035,6 +1112,7 @@ mod tests {
             "uri",
             "client",
             "space:*?authority=*",
+            None,
             &no_handles(),
             &no_names(),
             &no_names(),
@@ -1050,6 +1128,7 @@ mod tests {
             "uri",
             "client",
             "space:*",
+            None,
             &no_handles(),
             &no_names(),
             &no_names(),
@@ -1065,6 +1144,7 @@ mod tests {
             "uri",
             "client",
             "space:*?did=did:plc:abc",
+            None,
             &no_handles(),
             &no_names(),
             &no_names(),
@@ -1083,11 +1163,166 @@ mod tests {
             "uri",
             "https://app.example/cm",
             "atproto space:app.bsky.group?action=read",
+            None,
             &no_handles(),
             &no_names(),
             &no_names(),
         );
         assert!(html.contains("core atproto session"));
         assert!(html.contains("read access to"));
+    }
+
+    // --- login_hint prefill --------------------------------------------------
+
+    /// A handle hint fills the field, normalized.
+    #[test]
+    fn a_handle_hint_prefills_the_identifier() {
+        let html = render_consent(
+            "uri",
+            "client",
+            "atproto",
+            Some("Alice.Example.com"),
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
+        assert!(
+            html.contains(r#"value="alice.example.com""#),
+            "the handle was not prefilled: {html}"
+        );
+    }
+
+    /// `at://` and `@` forms are what clients actually send.
+    #[test]
+    fn decorated_handle_hints_are_stripped() {
+        for hint in ["at://alice.example.com", "@alice.example.com"] {
+            assert_eq!(
+                prefill_identifier(Some(hint)).as_deref(),
+                Some("alice.example.com"),
+                "{hint}"
+            );
+        }
+    }
+
+    /// A DID hint fills the field as given -- case is not ours to change.
+    #[test]
+    fn did_hints_prefill_across_methods() {
+        for hint in [
+            "did:plc:f6ousnmkackzyuei5iiosom6",
+            "did:web:example.com",
+            "did:web:example.com:path",
+        ] {
+            assert_eq!(
+                prefill_identifier(Some(hint)).as_deref(),
+                Some(hint),
+                "{hint}"
+            );
+        }
+    }
+
+    /// Anything that is not a handle or a DID leaves the field empty.
+    ///
+    /// The email case is deliberate: the field accepts one, but `login_hint` is
+    /// a handle or DID per the spec, and echoing an address a third-party client
+    /// supplied is a claim about the account rather than a convenience.
+    #[test]
+    fn a_hint_that_is_neither_handle_nor_did_is_ignored() {
+        for hint in [
+            "alice@example.com",    // email
+            "not a handle",         // spaces
+            "localhost",            // no dot
+            "did:unknown:whatever", // unsupported method
+            "did:plc:",             // malformed
+            "",                     // empty
+            "   ",                  // whitespace only
+        ] {
+            assert_eq!(
+                prefill_identifier(Some(hint)),
+                None,
+                "{hint:?} should not prefill"
+            );
+        }
+        assert_eq!(prefill_identifier(None), None);
+    }
+
+    /// A hostile hint cannot break out of the attribute, and cannot speak.
+    ///
+    /// Two defences, and the test asserts both: validation refuses the value
+    /// outright, so the markup never carries it. A hint that *is* a valid handle
+    /// still goes through `html_escape` on the way into the attribute.
+    #[test]
+    fn a_hostile_hint_never_reaches_the_page() {
+        let hostile = [
+            r#"" autofocus onfocus="alert(1)"#,
+            "<script>alert(1)</script>",
+            "type your password here to continue",
+        ];
+        for hint in hostile {
+            assert_eq!(
+                prefill_identifier(Some(hint)),
+                None,
+                "{hint:?} was accepted"
+            );
+            let html = render_consent(
+                "uri",
+                "client",
+                "atproto",
+                Some(hint),
+                &no_handles(),
+                &no_names(),
+                &no_names(),
+            );
+            assert!(!html.contains("onfocus"), "{hint:?} injected an attribute");
+            assert!(
+                !html.contains("<script>alert"),
+                "{hint:?} injected a script"
+            );
+            assert!(
+                !html.contains("type your password here"),
+                "{hint:?} put attacker prose on the page"
+            );
+        }
+    }
+
+    /// With no hint the identifier keeps focus; with one, focus moves on.
+    #[test]
+    fn focus_follows_the_prefill() {
+        let without = render_consent(
+            "uri",
+            "client",
+            "atproto",
+            None,
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
+        assert!(
+            without.contains(r#"id="identifier""#) && without.contains("autofocus"),
+            "the identifier should be focused when empty"
+        );
+        assert_eq!(without.matches("autofocus").count(), 1);
+
+        let with = render_consent(
+            "uri",
+            "client",
+            "atproto",
+            Some("alice.example.com"),
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
+        assert_eq!(
+            with.matches("autofocus").count(),
+            1,
+            "exactly one field focused"
+        );
+        let password_line = with
+            .lines()
+            .find(|l| l.contains(r#"id="password""#))
+            .expect("password field");
+        assert!(
+            password_line.contains("autofocus"),
+            "focus should move to the password once the identifier is filled"
+        );
     }
 }

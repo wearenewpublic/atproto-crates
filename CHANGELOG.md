@@ -28,6 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing and leave a server that looks configured and resolves exactly as it did before. A single
   malformed document is warned about and skipped, since one bad comma should not keep the server down.
 
+- `atproto-pds`: the OAuth consent screen prefills its sign-in field from the client's `login_hint`
+  when the hint is a valid handle or DID.
+
+  The hint was already captured at PAR and persisted on the authorization request; nothing read it
+  back. A client that already knows who is signing in says so, and the holder should not have to
+  retype it — they arrived from an application that just asked them for exactly this. Handles are
+  normalized (lowercased, `at://` and `@` stripped); DIDs are prefilled as given, across `plc`, `web`
+  and `webvh`. Focus moves to the password field when the identifier is filled.
+
+  **The hint is validated, not merely escaped.** It is chosen by the client and lands in an HTML
+  attribute on the one page whose job is collecting a password. Escaping stops it being markup;
+  validating stops it being *text* — an unvalidated hint renders attacker-chosen prose inside the
+  sign-in box, on a page carrying this server's name and styling, and "type your password here to
+  continue" is a legal string. A handle or a DID cannot say anything.
+
+  An email is deliberately not prefilled even though the field accepts one: `login_hint` is a handle
+  or DID per the AT Protocol OAuth spec, and filling in an address a third-party client supplied puts
+  an email this server never disclosed on the screen — a claim about the account rather than a
+  convenience.
+
 ### Fixed
 - `atproto-pds`: space-type declarations now resolve through the shared lexicon resolver chain
   instead of a second, network-only implementation of the same lookup.
@@ -46,8 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NetworkSpaceDeclarationResolver` is kept; it is still what the chain's network tier does. What
   changes is that declarations and lexicons now resolve through one chain, in one order, behind one
   cache.
-
-
 
 ## [0.15.0-rc.2] - 2026-08-07
 ### Changed
