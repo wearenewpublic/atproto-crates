@@ -389,6 +389,149 @@ impl LexiconResolver for BundledLexiconResolver {
     }
 }
 
+/// Schemas an operator supplied on disk, read once at startup.
+///
+/// The bundled corpus covers the vocabulary the protocol itself defines, and
+/// the network resolver covers everything published on the open network. This
+/// covers the gap between them: a schema that is real but not reachable from
+/// where this server is standing.
+///
+/// That gap is not hypothetical. A rig whose PDS writes genesis operations to a
+/// *local* PLC directory cannot resolve any DID registered in the production
+/// one — including the DID that publishes an application's own lexicons. The
+/// symptom is remote from the cause: `include:` scopes silently expand to
+/// nothing, and every write is refused with `InsufficientScope` long after the
+/// resolution that failed. Pointing this at the application's `lexicons/`
+/// directory answers the question locally and takes the network out of it.
+///
+/// # NSID from the document, not the path
+///
+/// A lexicon document carries its own `id`, and that is what is used. The
+/// bundled corpus derives NSIDs from file paths because it is generated from a
+/// vendored tree whose layout is known; an operator's directory is not this
+/// server's to arrange, and a document that says what it is should be believed
+/// over its location. The path is the fallback for a document with no `id`.
+///
+/// # Read once
+///
+/// Loaded at startup, like the bundled corpus. Editing a file needs a restart —
+/// which is the honest behaviour: re-reading per request would make two
+/// consecutive writes validate against different schemas with nothing in the
+/// logs to say so.
+pub struct DirectoryLexiconResolver {
+    schemas: HashMap<String, serde_json::Value>,
+}
+
+impl DirectoryLexiconResolver {
+    /// Read every `*.json` under `dir`, recursively.
+    ///
+    /// Returns the resolver and the paths that could not be used, so the caller
+    /// can report them. A malformed file is skipped rather than fatal: one bad
+    /// schema in a directory of twenty should not keep the server down.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] when `dir` cannot be read at all. That *is* fatal, and
+    /// deliberately so — a mistyped path would otherwise load nothing and leave
+    /// a server that looks configured and resolves exactly as it did before.
+    pub fn load(
+        dir: &std::path::Path,
+    ) -> std::io::Result<(Self, Vec<(std::path::PathBuf, String)>)> {
+        let mut schemas = HashMap::new();
+        let mut skipped = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        // Iterative rather than recursive: a directory tree is operator input,
+        // and a symlink loop should not be a stack overflow.
+        let mut seen_dirs = HashSet::new();
+        while let Some(current) = stack.pop() {
+            let canonical = current.canonicalize().unwrap_or_else(|_| current.clone());
+            if !seen_dirs.insert(canonical) {
+                continue;
+            }
+            for entry in std::fs::read_dir(&current)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let raw = match std::fs::read_to_string(&path) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        skipped.push((path, e.to_string()));
+                        continue;
+                    }
+                };
+                let doc: serde_json::Value = match serde_json::from_str(&raw) {
+                    Ok(doc) => doc,
+                    Err(e) => {
+                        skipped.push((path, e.to_string()));
+                        continue;
+                    }
+                };
+                let nsid = doc["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| nsid_from_path(dir, &path));
+                let Some(nsid) = nsid else {
+                    skipped.push((
+                        path,
+                        "no `id` and no NSID derivable from the path".to_string(),
+                    ));
+                    continue;
+                };
+                schemas.insert(nsid, doc);
+            }
+        }
+        Ok((Self { schemas }, skipped))
+    }
+
+    /// How many schemas were loaded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.schemas.len()
+    }
+
+    /// Whether the directory yielded nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.schemas.is_empty()
+    }
+
+    /// The NSIDs this resolver answers for, sorted.
+    ///
+    /// Used at startup to report what was picked up, and to warn about any that
+    /// the bundled corpus already covers and will therefore answer first.
+    #[must_use]
+    pub fn nsids(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.schemas.keys().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Derive an NSID from a file's path relative to the corpus root.
+fn nsid_from_path(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let nsid = rel
+        .with_extension("")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(".");
+    (!nsid.is_empty()).then_some(nsid)
+}
+
+#[async_trait::async_trait]
+impl LexiconResolver for DirectoryLexiconResolver {
+    async fn resolve(&self, nsid: &str) -> Option<serde_json::Value> {
+        self.schemas.get(nsid).cloned()
+    }
+}
+
 /// Tries each resolver in order and takes the first answer.
 ///
 /// Used to put the bundled corpus in front of the network: a bundled schema is
@@ -705,5 +848,138 @@ mod tests {
             resolve_catalog(&StubResolver(map), "com.example.post").await,
             CatalogOutcome::Ready(_)
         ));
+    }
+
+    // --- the on-disk corpus ------------------------------------------------
+
+    /// Write a lexicon document into a temp tree and read it back.
+    fn write(dir: &std::path::Path, rel: &str, body: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// The document's own `id` decides the NSID, not where the file sits.
+    ///
+    /// An operator's directory is not this server's to arrange, and the two
+    /// disagreeing is the case that matters: a file at `weird/place.json`
+    /// carrying `"id": "app.bulleted.authFull"` has to answer for the NSID it
+    /// claims, or configuring the directory silently does nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_document_is_keyed_by_its_own_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "weird/place.json",
+            r#"{"lexicon":1,"id":"app.bulleted.authFull","defs":{}}"#,
+        );
+
+        let (resolver, skipped) = DirectoryLexiconResolver::load(tmp.path()).unwrap();
+
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(resolver.resolve("app.bulleted.authFull").await.is_some());
+        assert!(
+            resolver.resolve("weird.place").await.is_none(),
+            "the path must not shadow the id"
+        );
+    }
+
+    /// A document with no `id` still resolves, by path, like the bundled corpus.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_document_without_an_id_falls_back_to_its_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "app/bulleted/note.json",
+            r#"{"lexicon":1,"defs":{}}"#,
+        );
+
+        let (resolver, _) = DirectoryLexiconResolver::load(tmp.path()).unwrap();
+
+        assert!(resolver.resolve("app.bulleted.note").await.is_some());
+    }
+
+    /// Nested directories are walked, and non-JSON is left alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tree_is_walked_and_only_json_is_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "app/bulleted/node.json",
+            r#"{"lexicon":1,"id":"app.bulleted.node","defs":{}}"#,
+        );
+        write(
+            tmp.path(),
+            "app/bulleted/admin/deny.json",
+            r#"{"lexicon":1,"id":"app.bulleted.admin.deny","defs":{}}"#,
+        );
+        write(tmp.path(), "README.md", "not a lexicon");
+
+        let (resolver, skipped) = DirectoryLexiconResolver::load(tmp.path()).unwrap();
+
+        assert_eq!(resolver.len(), 2, "{:?}", resolver.nsids());
+        assert!(
+            skipped.is_empty(),
+            "a non-JSON file is not a skipped lexicon"
+        );
+        assert!(resolver.resolve("app.bulleted.admin.deny").await.is_some());
+    }
+
+    /// One malformed file costs its own schema and nothing else.
+    ///
+    /// Fatal would be the wrong call: a directory of twenty schemas with one
+    /// bad comma should not keep the server down. It is reported rather than
+    /// swallowed, which is what `skipped` is for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_document_is_skipped_not_fatal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "good.json",
+            r#"{"lexicon":1,"id":"app.bulleted.good","defs":{}}"#,
+        );
+        write(tmp.path(), "bad.json", "{not json");
+
+        let (resolver, skipped) = DirectoryLexiconResolver::load(tmp.path()).unwrap();
+
+        assert!(resolver.resolve("app.bulleted.good").await.is_some());
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].0.ends_with("bad.json"), "{skipped:?}");
+    }
+
+    /// A directory that cannot be read is an error, not an empty corpus.
+    ///
+    /// A mistyped path would otherwise leave a server that looks configured and
+    /// resolves exactly as it did before -- the failure this whole knob exists
+    /// to make visible.
+    #[test]
+    fn an_unreadable_directory_is_an_error() {
+        assert!(DirectoryLexiconResolver::load(std::path::Path::new("/no/such/lexicons")).is_err());
+    }
+
+    /// The chain prefers disk over network, and the bundle over both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chain_prefers_the_earlier_resolver() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "a.json",
+            r#"{"lexicon":1,"id":"app.example.thing","defs":{"from":"disk"}}"#,
+        );
+        let (disk, _) = DirectoryLexiconResolver::load(tmp.path()).unwrap();
+
+        let mut net = HashMap::new();
+        net.insert(
+            "app.example.thing".to_string(),
+            serde_json::json!({"defs": {"from": "network"}}),
+        );
+
+        let chain = ChainedLexiconResolver::new(vec![Arc::new(disk), Arc::new(StubResolver(net))]);
+
+        let doc = chain.resolve("app.example.thing").await.expect("resolved");
+        assert_eq!(
+            doc["defs"]["from"], "disk",
+            "the network answered ahead of disk"
+        );
     }
 }

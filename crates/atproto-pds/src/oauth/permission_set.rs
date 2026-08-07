@@ -293,4 +293,67 @@ mod tests {
         assert!(!out.contains("repo:"), "{out}");
         assert!(out.contains("atproto"), "{out}");
     }
+
+    /// A permission set served from disk expands, exactly as a network one does.
+    ///
+    /// The regression this guards is not in the expansion at all -- it is that
+    /// the resolver never answered. A PDS writing genesis operations to a local
+    /// PLC directory cannot resolve a DID registered in the production one, so
+    /// `app.bulleted.authFull` came back `None`, expanded to nothing, and every
+    /// write was refused with `InsufficientScope` several steps later.
+    /// `DirectoryLexiconResolver` is what closes that, and this asserts the two
+    /// halves meet: a document read off disk yields concrete `repo:` grants.
+    ///
+    /// The document is the one `lexicons.bulleted.app` actually publishes,
+    /// verified byte-identical against the record on 2026-08-07.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_set_read_from_disk_expands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("authFull.json"),
+            r#"{
+              "lexicon": 1,
+              "id": "app.bulleted.authFull",
+              "defs": {"main": {
+                "type": "permission-set",
+                "title": "Bulleted",
+                "detail": "Read and write your outlines, bullets, and notes.",
+                "permissions": [{
+                  "type": "permission",
+                  "resource": "repo",
+                  "collection": [
+                    "app.bulleted.node", "app.bulleted.note", "app.bulleted.outline",
+                    "app.bulleted.mirror", "app.bulleted.comment", "app.bulleted.commentPolicy"
+                  ]
+                }]
+              }}
+            }"#,
+        )
+        .unwrap();
+        let (disk, skipped) =
+            crate::repo::lexicon::DirectoryLexiconResolver::load(tmp.path()).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(disk);
+        let expanded = expand(Some(&resolver), "include:app.bulleted.authFull").await;
+
+        // The `include:` survives so the token still records what was asked for.
+        assert!(
+            expanded.contains("include:app.bulleted.authFull"),
+            "{expanded}"
+        );
+        for collection in [
+            "app.bulleted.node",
+            "app.bulleted.note",
+            "app.bulleted.outline",
+            "app.bulleted.mirror",
+            "app.bulleted.comment",
+            "app.bulleted.commentPolicy",
+        ] {
+            assert!(
+                expanded.contains(collection),
+                "{collection} was not granted: {expanded}"
+            );
+        }
+    }
 }

@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `atproto-pds`: `PDS_LEXICON_DIR` — resolve lexicon documents from a directory on disk, searched
+  after the bundled corpus and before the network.
+
+  For schemas that are real but not reachable from where the server is standing. A PDS writing genesis
+  operations to a *local* PLC directory cannot resolve any DID registered in the production one —
+  including the DID that publishes an application's own lexicons. The symptom is remote from the
+  cause: an `include:` scope silently expands to nothing and every write is refused with
+  `InsufficientScope`, long after the resolution that actually failed.
+
+  Each document is keyed by its own `id`, falling back to its path. The bundled corpus derives NSIDs
+  from paths because it is generated from a vendored tree whose layout is known; an operator's
+  directory is not the server's to arrange, and a document that says what it is should be believed
+  over its location. A file naming an NSID the bundle already answers for is reported as shadowed
+  rather than silently ignored.
+
+  Read once at startup, like the bundled corpus — editing a file needs a restart, because re-reading
+  per request would let two consecutive writes validate against different schemas with nothing in the
+  logs to say so. A directory that cannot be read is fatal: a mistyped path would otherwise load
+  nothing and leave a server that looks configured and resolves exactly as it did before. A single
+  malformed document is warned about and skipped, since one bad comma should not keep the server down.
+
 
 ## [0.15.0-rc.2] - 2026-08-07
 ### Changed

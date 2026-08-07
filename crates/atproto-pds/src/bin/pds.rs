@@ -16,6 +16,7 @@ use atproto_pds::keys::{FileKeyStore, KeyStore};
 use atproto_pds::notifier::Notifier;
 use atproto_pds::oauth::state::OAuthState;
 use atproto_pds::plc::{PlcConfig, PlcService};
+use atproto_pds::repo::lexicon::LexiconResolver as _;
 use atproto_pds::repo::{RepoReader, RepoWriter};
 use atproto_pds::shutdown::ShutdownController;
 use atproto_pds::space::{SpaceReader, SpaceService, SpaceSync, SpaceWriter};
@@ -26,7 +27,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 /// AT Protocol Personal Data Server.
 #[derive(Parser, Debug)]
@@ -353,6 +354,23 @@ struct Args {
     /// accepted (back-compat for dev / test deployments).
     #[arg(long, env = "PDS_SERVICE_HANDLE_DOMAINS", value_delimiter = ',')]
     service_handle_domains: Vec<String>,
+
+    /// Directory of lexicon documents to resolve from disk, searched after the
+    /// bundled corpus and before the network.
+    ///
+    /// For schemas that are real but not reachable from where this server is
+    /// standing — most often an application's own lexicons, published under a
+    /// DID in the production PLC directory by a server configured against a
+    /// local one. Without them an `include:` scope expands to nothing and every
+    /// write is refused with `InsufficientScope`.
+    ///
+    /// `*.json` is read recursively; each document is keyed by its own `id`,
+    /// falling back to its path. Read once at startup — editing a file needs a
+    /// restart. A path that cannot be read is fatal rather than empty, because
+    /// a typo would otherwise leave a server that looks configured and resolves
+    /// exactly as it did before.
+    #[arg(long, env = "PDS_LEXICON_DIR")]
+    lexicon_dir: Option<std::path::PathBuf>,
 
     /// Comma-separated list of crawler hostnames to notify via
     /// `com.atproto.sync.requestCrawl`. Each
@@ -966,7 +984,52 @@ async fn main() -> anyhow::Result<()> {
             network = network_lexicon_resolver.is_some(),
             "lexicon corpus loaded for record validation"
         );
-        let mut chain: Vec<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>> = vec![bundled];
+        let mut chain: Vec<Arc<dyn atproto_pds::repo::lexicon::LexiconResolver>> =
+            vec![bundled.clone()];
+
+        // Between the bundle and the network. The bundle stays first because it
+        // is the vocabulary this build was tested against, and an operator's
+        // directory is the wrong place for `com.atproto.*` to come from; the
+        // directory goes ahead of the network because answering locally is the
+        // whole point of configuring it.
+        if let Some(dir) = args.lexicon_dir.as_deref() {
+            let (from_disk, skipped) =
+                atproto_pds::repo::lexicon::DirectoryLexiconResolver::load(dir).map_err(|e| {
+                    anyhow::anyhow!("PDS_LEXICON_DIR: cannot read {}: {e}", dir.display())
+                })?;
+            for (path, reason) in &skipped {
+                warn!(path = %path.display(), reason = %reason, "skipped a lexicon document");
+            }
+            // A schema the bundle already answers for is never reached, and
+            // silently ignoring it would look like it had taken effect.
+            let mut shadowed = Vec::new();
+            for nsid in from_disk.nsids() {
+                if bundled.resolve(nsid).await.is_some() {
+                    shadowed.push(nsid.to_string());
+                }
+            }
+            if !shadowed.is_empty() {
+                warn!(
+                    nsids = ?shadowed,
+                    "these lexicons are also bundled; the bundled copy answers and the file on disk is ignored"
+                );
+            }
+            if from_disk.is_empty() {
+                warn!(
+                    dir = %dir.display(),
+                    "PDS_LEXICON_DIR is set but no lexicon documents were found"
+                );
+            } else {
+                info!(
+                    dir = %dir.display(),
+                    lexicons = from_disk.len(),
+                    skipped = skipped.len(),
+                    "lexicons loaded from disk"
+                );
+            }
+            chain.push(Arc::new(from_disk));
+        }
+
         if let Some(network) = network_lexicon_resolver {
             chain.push(network);
         }
