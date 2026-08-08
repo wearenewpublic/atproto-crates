@@ -174,8 +174,7 @@ async fn verify_assertion(
         base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[2])
             .map_err(|e| format!("decode signature: {e}"))?;
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    atproto_identity::key::validate(&key, &signature, signing_input.as_bytes())
-        .map_err(|e| format!("signature verify: {e}"))?;
+    verify_jws_signature(&key, &signature, signing_input.as_bytes())?;
 
     let claims: serde_json::Value = decode_part(parts[1], "payload")?;
 
@@ -261,6 +260,41 @@ fn names_this_server(aud: &serde_json::Value, expected: &[String]) -> bool {
             .any(|a| expected.iter().any(|e| e == a)),
         _ => false,
     }
+}
+
+/// Verify the signature over a client assertion's signing input.
+///
+/// `AnyS`, not the AT Protocol default, and that is the whole point of this
+/// function existing separately.
+///
+/// A client assertion is an ordinary ES256 JWS produced by whatever client is
+/// talking to us. RFC 7515 defines its signature as the raw `r || s` pair and
+/// imposes no low-S constraint, and WebCrypto -- every browser, and Node's
+/// `crypto.subtle` -- does not normalise `s`. About half of all assertions from
+/// a conforming client therefore carry the high-S form. Refusing them does not
+/// make anything stricter; it fails authentication at random for clients doing
+/// nothing wrong, and reports it as signature malleability, which sends whoever
+/// reads the error looking for an attack rather than a coin flip.
+///
+/// Low-S belongs to the signatures AT Protocol itself specifies -- repository
+/// commits, service auth, PLC operations -- where a unique byte string per
+/// signature is a property something depends on. Nothing here depends on it.
+///
+/// `dpop.rs` and `jwt.rs` make the same call for the same reason. This site was
+/// missed when those were fixed, so it is a named function now: the policy is
+/// the thing worth asserting, and it cannot be asserted inline.
+fn verify_jws_signature(
+    key: &atproto_identity::key::KeyData,
+    signature: &[u8],
+    signing_input: &[u8],
+) -> Result<(), String> {
+    atproto_identity::key::validate_with_policy(
+        key,
+        signature,
+        signing_input,
+        atproto_identity::key::SignaturePolicy::AnyS,
+    )
+    .map_err(|e| format!("signature verify: {e}"))
 }
 
 #[cfg(test)]
@@ -470,5 +504,63 @@ mod tests {
         .expect_err("nothing can verify an assertion for a client with no keys");
 
         assert_eq!(err.name, "invalid_client");
+    }
+
+    /// A high-S client assertion verifies.
+    ///
+    /// The regression: this path called the bare `validate`, which is
+    /// `LowSOnly`, so a conforming client whose signature happened to land in
+    /// the upper half of the curve order was refused with
+    /// "Signature is malleable" -- for roughly half of its attempts, at random,
+    /// having done nothing wrong. The DPoP and JWT paths were fixed for this in
+    /// 7977b26; this one was missed.
+    ///
+    /// The high-S twin is constructed rather than hunted for: for any valid
+    /// `(r, s)`, `(r, n - s)` verifies over the same message, so negating `s`
+    /// flips the form deterministically.
+    #[test]
+    fn a_high_s_client_assertion_is_accepted() {
+        use atproto_identity::key::{KeyType, generate_key, sign, to_public};
+        use p256::elliptic_curve::scalar::IsHigh;
+
+        let signing_input = b"eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FwcC5leGFtcGxlIn0";
+
+        // Repeated because `sign` normalises: the flip below is what
+        // guarantees a high-S case rather than waiting for one to occur.
+        for _ in 0..8 {
+            let private_key = generate_key(KeyType::P256Private).unwrap();
+            let public_key = to_public(&private_key).unwrap();
+            let low_s = sign(&private_key, signing_input).unwrap();
+
+            let parsed = p256::ecdsa::Signature::from_slice(&low_s).unwrap();
+            let high_s =
+                p256::ecdsa::Signature::from_scalars(parsed.r().to_owned(), -parsed.s().to_owned())
+                    .unwrap();
+            assert!(
+                bool::from(high_s.s().is_high()),
+                "negating s must yield the high-S twin"
+            );
+
+            verify_jws_signature(&public_key, &low_s, signing_input)
+                .expect("a low-S assertion must verify");
+            verify_jws_signature(&public_key, &high_s.to_vec(), signing_input)
+                .expect("a high-S assertion must verify -- JWS imposes no low-S constraint");
+        }
+    }
+
+    /// A signature that is simply wrong is still refused.
+    ///
+    /// Accepting high-S widens which encodings verify, not which keys do.
+    #[test]
+    fn a_signature_from_another_key_is_still_refused() {
+        use atproto_identity::key::{KeyType, generate_key, sign, to_public};
+
+        let signing_input = b"eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FwcC5leGFtcGxlIn0";
+        let signer = generate_key(KeyType::P256Private).unwrap();
+        let impostor = to_public(&generate_key(KeyType::P256Private).unwrap()).unwrap();
+        let signature = sign(&signer, signing_input).unwrap();
+
+        assert!(verify_jws_signature(&impostor, &signature, signing_input).is_err());
+        assert!(verify_jws_signature(&impostor, b"not a signature", signing_input).is_err());
     }
 }

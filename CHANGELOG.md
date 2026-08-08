@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `atproto-pds`: OAuth client assertions signed with a high-S ECDSA signature are accepted. The
+  `private_key_jwt` verification path called the AT Protocol default (`SignaturePolicy::LowSOnly`),
+  so a conforming client was refused with *"Signature is malleable: S value is in the upper half of
+  the curve order"* — roughly half the time, at random, having done nothing wrong.
+
+  A client assertion is an ordinary ES256 JWS. RFC 7515 defines its signature as the raw `r || s`
+  pair and imposes no low-S constraint, and WebCrypto — every browser, and Node's `crypto.subtle` —
+  does not normalise `s`. Low-S belongs to the signatures AT Protocol itself specifies (repository
+  commits, service auth, PLC operations), where a unique byte string per signature is a property
+  something depends on; nothing here depends on it.
+
+  `7977b26` made this fix for the DPoP proof and JWT paths and missed this one. The check is now a
+  named `verify_jws_signature`, so the policy is something a test can assert rather than an argument
+  buried in a call.
+
 ### Removed
 - `atproto-oauth-aip` — the AIP (Identity Provider) OAuth implementation. No crate in the workspace
   depended on it and nothing in the repository used it.
