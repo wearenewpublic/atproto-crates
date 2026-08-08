@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `atproto-pds`: `include:` scopes expand the `rpc` permissions in a permission set, when the
+  `include:` names an audience. The PDS has always *enforced* `rpc:` scopes on the proxy path
+  (`assert_rpc`) while never being able to *grant* one, so a client asking for
+  `include:app.bsky.authCreatePosts` received that set's three `repo:` grants and none of its rpc
+  ones — posting text worked and video upload did not.
+
+  `inheritAud: true` takes the audience from `include:<nsid>?aud=<did>`. A permission naming its own
+  concrete audience is refused: a set is published once and reused by every client, so an audience
+  baked into it would be the publisher deciding which services a holder's tokens may call.
+
+  **An audience is required.** A bare `rpc:<lxm>` parses with `aud=*`, granting the method at every
+  service — the PDS signs each proxied call with the holder's own key, so the upstream sees a request
+  the account genuinely authorised. A permission that cannot be given a concrete audience is
+  therefore skipped, with a warning naming what to add. The consequence, stated plainly: a client
+  writing `include:app.bsky.authCreatePosts` with no `?aud=` still gets no rpc grants. Granting too
+  little fails loudly with `InsufficientScope`; granting too much fails silently, forever.
+
 ### Fixed
 - `atproto-pds`: OAuth client assertions signed with a high-S ECDSA signature are accepted. The
   `private_key_jwt` verification path called the AT Protocol default (`SignaturePolicy::LowSOnly`),

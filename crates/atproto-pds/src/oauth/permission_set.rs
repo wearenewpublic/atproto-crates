@@ -46,8 +46,12 @@ pub async fn expand(resolver: Option<&Arc<dyn LexiconResolver>>, granted: &str) 
     let mut out: Vec<String> = Vec::new();
     for raw in granted.split_whitespace() {
         out.push(raw.to_string());
-        let nsid = match Scope::parse(raw) {
-            Ok(Scope::Include(inc)) => inc.nsid.clone(),
+        // The audience travels with the `include:`, not with the permission
+        // set: a set is published once and reused by every client, so it cannot
+        // know which service any particular grant is for. `inheritAud` is how a
+        // permission says "take it from the scope that pulled me in".
+        let (nsid, include_aud) = match Scope::parse(raw) {
+            Ok(Scope::Include(inc)) => (inc.nsid.clone(), inc.aud.clone()),
             _ => continue,
         };
         let Some(resolver) = resolver else {
@@ -61,7 +65,7 @@ pub async fn expand(resolver: Option<&Arc<dyn LexiconResolver>>, granted: &str) 
             tracing::warn!(nsid = %nsid, "permission set did not resolve; granting nothing for it");
             continue;
         };
-        let expanded = permissions_from(&doc, &nsid);
+        let expanded = permissions_from(&doc, &nsid, include_aud.as_deref());
         if expanded.is_empty() {
             tracing::warn!(nsid = %nsid, "permission set declared nothing this server understands");
         } else {
@@ -81,7 +85,7 @@ pub async fn expand(resolver: Option<&Arc<dyn LexiconResolver>>, granted: &str) 
 }
 
 /// Read the concrete scopes out of a `permission-set` record.
-fn permissions_from(doc: &serde_json::Value, nsid: &str) -> Vec<String> {
+fn permissions_from(doc: &serde_json::Value, nsid: &str, include_aud: Option<&str>) -> Vec<String> {
     let main = &doc["defs"]["main"];
     if main["type"].as_str() != Some("permission-set") {
         tracing::warn!(
@@ -100,6 +104,7 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str) -> Vec<String> {
         match perm["resource"].as_str() {
             Some("repo") => out.extend(repo_scopes(perm)),
             Some("blob") => out.extend(blob_scopes(perm)),
+            Some("rpc") => out.extend(rpc_scopes(perm, nsid, include_aud)),
             other => {
                 // Deliberately not guessed at. See the module note.
                 tracing::warn!(
@@ -111,6 +116,84 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `rpc:<lxm>?aud=<audience>` for each method the permission names.
+///
+/// # An audience is required
+///
+/// A bare `rpc:<lxm>` parses with `aud=*`, which grants the method at *every*
+/// service: the PDS signs each proxied call with the holder's own key, so the
+/// upstream sees a request the account genuinely authorised. Emitting that from
+/// a permission set would hand out a grant far wider than the consent screen
+/// implied, and — unlike granting too little — nothing would ever report it.
+/// Too few scopes fails loudly with `InsufficientScope`; too many fails
+/// silently, forever.
+///
+/// So a permission that cannot be given a concrete audience is skipped, with
+/// the same warning an unknown resource gets. The consequence is worth stating
+/// plainly: a client writing `include:app.bsky.authCreatePosts` with no `?aud=`
+/// gets that set's `repo:` grants and none of its `rpc:` ones, exactly as
+/// before this function existed. It has to name the service it intends to call.
+///
+/// # Where the audience comes from
+///
+/// `inheritAud: true` takes it from the `include:<nsid>?aud=<did>` scope that
+/// pulled the set in. A permission naming its own concrete `aud` is refused
+/// outright, matching the reference (`oauth-scopes`, `include-scope.ts`): a set
+/// is published once and reused by every client, so an audience baked into it
+/// would be the publisher choosing who a holder's tokens may talk to.
+fn rpc_scopes(perm: &serde_json::Value, nsid: &str, include_aud: Option<&str>) -> Vec<String> {
+    // `aud: "*"` is the one self-named audience that is not a claim about a
+    // particular service, and the reference lets it through to be treated like
+    // an absent one. It still needs an inherited audience to expand.
+    let own_aud = perm["aud"].as_str().filter(|a| *a != "*");
+    if let Some(own) = own_aud {
+        tracing::warn!(
+            nsid = %nsid,
+            aud = %own,
+            "skipping an rpc permission that names its own audience; a permission set may not choose \
+             which service a holder's token may call"
+        );
+        return Vec::new();
+    }
+
+    let inherits = perm["inheritAud"].as_bool().unwrap_or(false);
+    let aud = match (inherits, include_aud.filter(|a| !a.is_empty())) {
+        (true, Some(aud)) => aud,
+        (true, None) => {
+            tracing::warn!(
+                nsid = %nsid,
+                "skipping an rpc permission: it inherits its audience and the include: scope named \
+                 none. Add `?aud=<did>` to the include: scope to grant it"
+            );
+            return Vec::new();
+        }
+        (false, _) => {
+            tracing::warn!(
+                nsid = %nsid,
+                "skipping an rpc permission with no audience: granting it would mean every service, \
+                 which is wider than this set describes"
+            );
+            return Vec::new();
+        }
+    };
+
+    let methods = string_list(&perm["lxm"]);
+    if methods.is_empty() {
+        // No `lxm` means every method, which with a concrete audience is still
+        // "anything at that one service" -- broader than any set here declares.
+        tracing::warn!(
+            nsid = %nsid,
+            "skipping an rpc permission that names no methods; it would grant every method at its audience"
+        );
+        return Vec::new();
+    }
+
+    methods
+        .into_iter()
+        .map(|lxm| format!("rpc:{lxm}?aud={aud}"))
+        .collect()
 }
 
 /// `repo:<collection>?action=…` for each collection the permission names.
@@ -355,5 +438,176 @@ mod tests {
                 "{collection} was not granted: {expanded}"
             );
         }
+    }
+
+    // --- rpc permissions ----------------------------------------------------
+
+    /// The real `app.bsky.authCreatePosts`, which is what surfaced this.
+    ///
+    /// Its rpc permission covers the three video methods and carries
+    /// `inheritAud: true`; its repo permission covers the three post
+    /// collections. Both halves have to come out.
+    fn auth_create_posts() -> serde_json::Value {
+        serde_json::json!({
+          "lexicon": 1,
+          "id": "app.bsky.authCreatePosts",
+          "defs": {"main": {
+            "type": "permission-set",
+            "title": "Create Bluesky Posts",
+            "detail": "Can not update or delete posts.",
+            "permissions": [
+              {
+                "type": "permission",
+                "resource": "rpc",
+                "inheritAud": true,
+                "lxm": [
+                  "app.bsky.video.uploadVideo",
+                  "app.bsky.video.getJobStatus",
+                  "app.bsky.video.getUploadLimits"
+                ]
+              },
+              {
+                "type": "permission",
+                "resource": "repo",
+                "action": ["create"],
+                "collection": [
+                  "app.bsky.feed.post",
+                  "app.bsky.feed.postgate",
+                  "app.bsky.feed.threadgate"
+                ]
+              }
+            ]
+          }}
+        })
+    }
+
+    /// With an audience on the `include:`, the rpc methods expand.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inherited_audience_expands_the_rpc_methods() {
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Fixed(auth_create_posts()));
+        let expanded = expand(
+            Some(&resolver),
+            "include:app.bsky.authCreatePosts?aud=did:web:api.bsky.app%23bsky_appview",
+        )
+        .await;
+
+        for method in [
+            "app.bsky.video.uploadVideo",
+            "app.bsky.video.getJobStatus",
+            "app.bsky.video.getUploadLimits",
+        ] {
+            assert!(
+                expanded.contains(&format!(
+                    "rpc:{method}?aud=did:web:api.bsky.app#bsky_appview"
+                )),
+                "{method} did not expand: {expanded}"
+            );
+        }
+        // The repo half is unaffected.
+        assert!(
+            expanded.contains("repo:app.bsky.feed.post?action=create"),
+            "{expanded}"
+        );
+    }
+
+    /// Without one, the rpc methods are skipped and the repo half survives.
+    ///
+    /// This is the deliberate cost of requiring an audience: a client that does
+    /// not name a service gets the repository grants and no proxy rights. The
+    /// alternative is `aud=*`, which grants the method at *every* service and
+    /// would never be reported to anyone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_an_audience_the_rpc_methods_are_skipped() {
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Fixed(auth_create_posts()));
+        let expanded = expand(Some(&resolver), "include:app.bsky.authCreatePosts").await;
+
+        assert!(
+            !expanded.contains("rpc:"),
+            "an rpc scope was granted with no audience: {expanded}"
+        );
+        assert!(
+            !expanded.contains("aud=*"),
+            "the wildcard audience must never be emitted: {expanded}"
+        );
+        assert!(
+            expanded.contains("repo:app.bsky.feed.post?action=create"),
+            "{expanded}"
+        );
+    }
+
+    /// A set naming its own audience is refused.
+    ///
+    /// A set is published once and reused by every client, so an audience baked
+    /// into it would be the publisher deciding which services a holder's tokens
+    /// may call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_naming_its_own_audience_is_refused() {
+        let doc = serde_json::json!({
+          "lexicon": 1, "id": "com.example.set",
+          "defs": {"main": {"type": "permission-set", "permissions": [
+            {"type": "permission", "resource": "rpc",
+             "aud": "did:web:elsewhere.example", "lxm": ["com.example.method"]}
+          ]}}
+        });
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Fixed(doc));
+        let expanded = expand(
+            Some(&resolver),
+            "include:com.example.set?aud=did:web:api.bsky.app",
+        )
+        .await;
+
+        assert!(!expanded.contains("rpc:"), "{expanded}");
+        assert!(!expanded.contains("elsewhere.example"), "{expanded}");
+    }
+
+    /// An rpc permission naming no methods is skipped even with an audience.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_rpc_permission_with_no_methods_is_skipped() {
+        let doc = serde_json::json!({
+          "lexicon": 1, "id": "com.example.set",
+          "defs": {"main": {"type": "permission-set", "permissions": [
+            {"type": "permission", "resource": "rpc", "inheritAud": true}
+          ]}}
+        });
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Fixed(doc));
+        let expanded = expand(
+            Some(&resolver),
+            "include:com.example.set?aud=did:web:api.bsky.app",
+        )
+        .await;
+
+        assert!(!expanded.contains("rpc:"), "{expanded}");
+    }
+
+    /// The expansion is what enforcement asks for, not merely a similar string.
+    ///
+    /// `assert_rpc` is the check on the proxy path; a scope that expands but
+    /// does not satisfy it would be the same class of bug in a new place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_expansion_satisfies_the_proxy_assertion() {
+        use atproto_oauth::scopes::ScopesSet;
+
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Fixed(auth_create_posts()));
+        let expanded = expand(
+            Some(&resolver),
+            "include:app.bsky.authCreatePosts?aud=did:web:api.bsky.app",
+        )
+        .await;
+
+        let granted = ScopesSet::from_scope_string(&expanded);
+        granted
+            .assert_rpc("app.bsky.video.uploadVideo", "did:web:api.bsky.app")
+            .expect("the granted scope must satisfy the proxy check");
+        // Not a method the set names, and not another audience.
+        assert!(
+            granted
+                .assert_rpc("app.bsky.feed.getTimeline", "did:web:api.bsky.app")
+                .is_err()
+        );
+        assert!(
+            granted
+                .assert_rpc("app.bsky.video.uploadVideo", "did:web:elsewhere.example")
+                .is_err()
+        );
     }
 }
