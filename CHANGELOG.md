@@ -22,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   None of this is reachable from any remaining crate: the workspace builds, clippy is clean, and all
   2637 tests pass with the four directories gone.
 
+### Fixed
+- `atproto-oauth`: `repo` scopes written in the query form granted nothing. `collection` is the
+  positional parameter — `repo:foo` is shorthand for `repo?collection=foo` — and it is multi-valued,
+  so `repo?collection=a&collection=b` names two collections in one scope. The parser read only the
+  positional form: the empty string before the `?` became a collection NSID of `""`, and the
+  `collection=` parameters were never looked at. A client granted
+  `repo?collection=app.example.one&collection=app.example.two` was then refused on every write with
+  `InsufficientScope`, naming a collection its token appeared to carry.
+
+  `RepoScope::collection` becomes `RepoScope::collections`, a set — a single field could only ever
+  hold the shorthand. Matching, rendering and scope-coverage all read the set; a scope with more than
+  one collection renders in the query form, since the shorthand cannot express it, and round-trips
+  through that form. Nothing outside `scopes.rs` constructed or read the old field.
+
+
 ### Added
 - `atproto-pds`: `PDS_LEXICON_DIR` — resolve lexicon documents from a directory on disk, searched
   after the bundled corpus and before the network.

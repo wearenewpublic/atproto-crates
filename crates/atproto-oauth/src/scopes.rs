@@ -141,14 +141,19 @@ pub enum MimePattern {
 /// Repository scope with collection and action constraints
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepoScope {
-    /// Collection NSID or wildcard
-    pub collection: RepoCollection,
+    /// Collections this scope covers.
+    ///
+    /// A set, because `collection` is multi-valued:
+    /// `repo?collection=a&collection=b` names two in one scope, and
+    /// `repo:a` is shorthand for `repo?collection=a`. A single field could
+    /// only hold the shorthand.
+    pub collections: BTreeSet<RepoCollection>,
     /// Allowed actions
     pub actions: BTreeSet<RepoAction>,
 }
 
 /// Repository collection identifier
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RepoCollection {
     /// All collections (wildcard)
     All,
@@ -476,25 +481,45 @@ impl Scope {
     }
 
     fn parse_repo(suffix: Option<&str>) -> Result<Self, ParseError> {
-        let (collection_str, params) = match suffix {
-            Some(s) => {
-                if let Some(pos) = s.find('?') {
-                    (Some(&s[..pos]), Some(&s[pos + 1..]))
-                } else {
-                    (Some(s), None)
-                }
-            }
+        // `collection` is the positional parameter, so `repo:foo` is shorthand
+        // for `repo?collection=foo` -- and it is multi-valued, so
+        // `repo?collection=a&collection=b` names both in one scope. Reading
+        // only the positional form left every query-form scope granting
+        // nothing: the empty string before the `?` became a collection NSID of
+        // `""`, which matches no collection, and the `collection=` parameters
+        // were never looked at.
+        let (positional, params) = match suffix {
+            // `repo?...` arrives with the `?` still attached, so the positional
+            // part is empty rather than absent. Both mean "not given".
+            Some(s) => match s.find('?') {
+                Some(pos) => (
+                    Some(&s[..pos]).filter(|p| !p.is_empty()),
+                    Some(&s[pos + 1..]),
+                ),
+                None => (Some(s).filter(|p| !p.is_empty()), None),
+            },
             None => (None, None),
         };
 
-        let collection = match collection_str {
-            Some("*") | None => RepoCollection::All,
-            Some(nsid) => RepoCollection::Nsid(nsid.to_string()),
-        };
+        let mut collections = BTreeSet::new();
+        if let Some(nsid) = positional {
+            collections.insert(match nsid {
+                "*" => RepoCollection::All,
+                other => RepoCollection::Nsid(other.to_string()),
+            });
+        }
 
         let mut actions = BTreeSet::new();
         if let Some(params) = params {
             let parsed_params = parse_query_string(params);
+            if let Some(values) = parsed_params.get("collection") {
+                for value in values {
+                    collections.insert(match value.as_str() {
+                        "*" => RepoCollection::All,
+                        other => RepoCollection::Nsid(other.to_string()),
+                    });
+                }
+            }
             if let Some(values) = parsed_params.get("action") {
                 for value in values {
                     match value.as_str() {
@@ -518,6 +543,11 @@ impl Scope {
             }
         }
 
+        // Naming no collection at all means every collection, which is how a
+        // bare `repo` scope has always parsed.
+        if collections.is_empty() {
+            collections.insert(RepoCollection::All);
+        }
         if actions.is_empty() {
             actions.insert(RepoAction::Create);
             actions.insert(RepoAction::Update);
@@ -525,7 +555,7 @@ impl Scope {
         }
 
         Ok(Scope::Repo(RepoScope {
-            collection,
+            collections,
             actions,
         }))
     }
@@ -722,23 +752,42 @@ impl Scope {
                 }
             }
             Scope::Repo(scope) => {
-                let collection = match &scope.collection {
-                    RepoCollection::All => "*",
-                    RepoCollection::Nsid(nsid) => nsid,
+                let name = |c: &RepoCollection| match c {
+                    RepoCollection::All => "*".to_string(),
+                    RepoCollection::Nsid(nsid) => nsid.clone(),
                 };
 
-                if scope.actions.len() == 3 {
-                    format!("repo:{}", collection)
+                let mut params = Vec::new();
+                // One collection keeps the positional shorthand, which is what
+                // every existing scope string looks like; more than one has to
+                // use the query form, since the shorthand cannot express them.
+                let single = if scope.collections.len() == 1 {
+                    scope.collections.iter().next().map(name)
                 } else {
-                    let mut params = Vec::new();
-                    for action in &scope.actions {
-                        match action {
-                            RepoAction::Create => params.push("action=create"),
-                            RepoAction::Update => params.push("action=update"),
-                            RepoAction::Delete => params.push("action=delete"),
-                        }
+                    for collection in &scope.collections {
+                        params.push(format!("collection={}", name(collection)));
                     }
-                    format!("repo:{}?{}", collection, params.join("&"))
+                    None
+                };
+
+                if scope.actions.len() < 3 {
+                    for action in &scope.actions {
+                        params.push(
+                            match action {
+                                RepoAction::Create => "action=create",
+                                RepoAction::Update => "action=update",
+                                RepoAction::Delete => "action=delete",
+                            }
+                            .to_string(),
+                        );
+                    }
+                }
+
+                match (single, params.is_empty()) {
+                    (Some(collection), true) => format!("repo:{collection}"),
+                    (Some(collection), false) => format!("repo:{collection}?{}", params.join("&")),
+                    (None, true) => "repo".to_string(),
+                    (None, false) => format!("repo?{}", params.join("&")),
                 }
             }
             Scope::Rpc(scope) => {
@@ -875,13 +924,13 @@ impl Scope {
                 true
             }
             (Scope::Repo(a), Scope::Repo(b)) => {
-                let collection_match = match (&a.collection, &b.collection) {
-                    (RepoCollection::All, _) => true,
-                    (RepoCollection::Nsid(a_nsid), RepoCollection::Nsid(b_nsid)) => {
-                        a_nsid == b_nsid
-                    }
-                    _ => false,
-                };
+                // `a` covers `b` only if every collection `b` names is one `a`
+                // already grants -- a scope naming two collections is not
+                // covered by one naming a single member of that pair.
+                let collection_match = a.collections.contains(&RepoCollection::All)
+                    || b.collections
+                        .iter()
+                        .all(|wanted| a.collections.contains(wanted));
 
                 if !collection_match {
                     return false;
@@ -1188,10 +1237,10 @@ impl ScopesSet {
         self.has_legacy_generic()
             || self.scopes.iter().any(|scope| match Scope::parse(scope) {
                 Ok(Scope::Repo(repo)) => {
-                    let collection_ok = match &repo.collection {
+                    let collection_ok = repo.collections.iter().any(|granted| match granted {
                         RepoCollection::All => true,
                         RepoCollection::Nsid(nsid) => nsid == collection,
-                    };
+                    });
                     collection_ok && repo.actions.contains(action)
                 }
                 _ => false,
@@ -1534,7 +1583,7 @@ mod tests {
         assert_eq!(
             scope,
             Scope::Repo(RepoScope {
-                collection: RepoCollection::All,
+                collections: BTreeSet::from([RepoCollection::All]),
                 actions,
             })
         );
@@ -1546,7 +1595,7 @@ mod tests {
         assert_eq!(
             scope,
             Scope::Repo(RepoScope {
-                collection: RepoCollection::Nsid("foo.bar".to_string()),
+                collections: BTreeSet::from([RepoCollection::Nsid("foo.bar".to_string())]),
                 actions,
             })
         );
@@ -1559,7 +1608,7 @@ mod tests {
         assert_eq!(
             scope,
             Scope::Repo(RepoScope {
-                collection: RepoCollection::Nsid("foo.bar".to_string()),
+                collections: BTreeSet::from([RepoCollection::Nsid("foo.bar".to_string())]),
                 actions,
             })
         );
@@ -1753,7 +1802,7 @@ mod tests {
         assert_eq!(
             scope,
             Scope::Repo(RepoScope {
-                collection: RepoCollection::Nsid("foo.bar".to_string()),
+                collections: BTreeSet::from([RepoCollection::Nsid("foo.bar".to_string())]),
                 actions,
             })
         );
@@ -1894,7 +1943,7 @@ mod tests {
         assert_eq!(
             scopes[1],
             Scope::Repo(RepoScope {
-                collection: RepoCollection::All,
+                collections: BTreeSet::from([RepoCollection::All]),
                 actions: {
                     let mut actions = BTreeSet::new();
                     actions.insert(RepoAction::Create);
@@ -1948,7 +1997,7 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert!(scopes.contains(&Scope::Atproto));
         assert!(scopes.contains(&Scope::Repo(RepoScope {
-            collection: RepoCollection::All,
+            collections: BTreeSet::from([RepoCollection::All]),
             actions: {
                 let mut actions = BTreeSet::new();
                 actions.insert(RepoAction::Create);
@@ -1963,7 +2012,7 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert!(scopes.contains(&Scope::Atproto));
         assert!(scopes.contains(&Scope::Repo(RepoScope {
-            collection: RepoCollection::All,
+            collections: BTreeSet::from([RepoCollection::All]),
             actions: {
                 let mut actions = BTreeSet::new();
                 actions.insert(RepoAction::Create);
@@ -2009,7 +2058,7 @@ mod tests {
         assert_eq!(
             scopes[0],
             Scope::Repo(RepoScope {
-                collection: RepoCollection::Nsid("foo.bar".to_string()),
+                collections: BTreeSet::from([RepoCollection::Nsid("foo.bar".to_string())]),
                 actions: {
                     let mut actions = BTreeSet::new();
                     actions.insert(RepoAction::Create);
@@ -2082,7 +2131,7 @@ mod tests {
             action: AccountAction::Read,
         })));
         assert!(scopes.contains(&Scope::Repo(RepoScope {
-            collection: RepoCollection::All,
+            collections: BTreeSet::from([RepoCollection::All]),
             actions: {
                 let mut actions = BTreeSet::new();
                 actions.insert(RepoAction::Create);
@@ -2408,7 +2457,7 @@ mod tests {
         assert_eq!(
             scope,
             Scope::Repo(RepoScope {
-                collection: RepoCollection::Nsid("app.bsky.feed.*".to_string()),
+                collections: BTreeSet::from([RepoCollection::Nsid("app.bsky.feed.*".to_string())]),
                 actions: {
                     let mut actions = BTreeSet::new();
                     actions.insert(RepoAction::Create);
@@ -2439,7 +2488,7 @@ mod tests {
         assert_eq!(
             scope_with_create,
             Scope::Repo(RepoScope {
-                collection: RepoCollection::Nsid("app.bsky.feed.*".to_string()),
+                collections: BTreeSet::from([RepoCollection::Nsid("app.bsky.feed.*".to_string())]),
                 actions: {
                     let mut actions = BTreeSet::new();
                     actions.insert(RepoAction::Create);
@@ -3016,5 +3065,100 @@ mod tests {
             s.assert_identity_handle().unwrap_err().scope,
             "identity:handle"
         );
+    }
+
+    /// `collection` is the positional parameter, so the query form is the same
+    /// scope written out longhand.
+    #[test]
+    fn a_repo_scope_reads_the_collection_parameter() {
+        assert_eq!(
+            Scope::parse("repo?collection=app.offprint.publication").unwrap(),
+            Scope::parse("repo:app.offprint.publication").unwrap(),
+        );
+    }
+
+    /// `collection` is multi-valued: one scope may name several.
+    ///
+    /// This is the form a real client sent, and every collection in it granted
+    /// nothing. The empty string before the `?` was read as the collection
+    /// NSID -- a collection literally named `""` -- and the `collection=`
+    /// parameters were never looked at, so a token carrying this scope was
+    /// refused on every write with `InsufficientScope`.
+    #[test]
+    fn every_collection_named_in_one_scope_is_granted() {
+        let granted = ScopesSet::from_scope_string(
+            "repo?collection=app.offprint.document.article\
+&collection=app.offprint.publication\
+&collection=app.offprint.actor.profile\
+&collection=app.offprint.page\
+&collection=app.offprint.component",
+        );
+
+        for collection in [
+            "app.offprint.document.article",
+            "app.offprint.publication",
+            "app.offprint.actor.profile",
+            "app.offprint.page",
+            "app.offprint.component",
+        ] {
+            for action in [RepoAction::Create, RepoAction::Update, RepoAction::Delete] {
+                assert!(
+                    granted.allows_repo(collection, &action),
+                    "{collection} {action:?} was not granted"
+                );
+            }
+        }
+
+        // And nothing it did not name.
+        assert!(!granted.allows_repo("app.bsky.feed.post", &RepoAction::Create));
+        // Least of all the empty collection the old parser invented.
+        assert!(!granted.allows_repo("", &RepoAction::Create));
+    }
+
+    /// Actions still apply across every collection in the scope.
+    #[test]
+    fn actions_bind_all_collections_in_the_scope() {
+        let granted =
+            ScopesSet::from_scope_string("repo?collection=a.b.c&collection=d.e.f&action=create");
+        for collection in ["a.b.c", "d.e.f"] {
+            assert!(granted.allows_repo(collection, &RepoAction::Create));
+            assert!(!granted.allows_repo(collection, &RepoAction::Delete));
+        }
+    }
+
+    /// A bare `repo` still means every collection.
+    #[test]
+    fn a_bare_repo_scope_still_covers_everything() {
+        let granted = ScopesSet::from_scope_string("repo");
+        assert!(granted.allows_repo("anything.at.all", &RepoAction::Delete));
+        assert_eq!(
+            Scope::parse("repo?collection=*").unwrap(),
+            Scope::parse("repo:*").unwrap()
+        );
+    }
+
+    /// A multi-collection scope survives a round trip through its string form.
+    ///
+    /// The positional shorthand cannot express more than one collection, so
+    /// rendering has to fall back to the query form -- and a scope that parsed
+    /// but could not be written back would be lost the moment a token was
+    /// re-read.
+    #[test]
+    fn a_multi_collection_scope_round_trips() {
+        for original in [
+            "repo:foo.bar",
+            "repo:foo.bar?action=create",
+            "repo?collection=a.b.c&collection=d.e.f",
+            "repo?collection=a.b.c&collection=d.e.f&action=create",
+            "repo:*",
+        ] {
+            let parsed = Scope::parse(original).unwrap();
+            let rendered = parsed.to_string();
+            assert_eq!(
+                Scope::parse(&rendered).unwrap(),
+                parsed,
+                "{original} rendered as {rendered}, which parses differently"
+            );
+        }
     }
 }
