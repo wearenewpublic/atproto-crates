@@ -60,7 +60,6 @@ All CLI tools now use clap for consistent command-line argument processing. Use 
 #### Streaming and OAuth
 - **Jetstream consumer**: `cargo run --features clap --bin atproto-jetstream-consumer -- <hostname> <zstd_dictionary>`
 - **OAuth tool**: `cargo run --features clap --bin atproto-oauth-tool -- login <private_signing_key> <subject>`
-- **XRPCS service**: `cargo run --features clap --bin atproto-xrpcs-helloworld`
 
 ## Architecture
 
@@ -73,11 +72,9 @@ A comprehensive Rust workspace with multiple crates:
 - **atproto-client**: HTTP client with OAuth and identity integration
 - **atproto-jetstream**: WebSocket event streaming with compression
 - **atproto-oauth**: OAuth workflow implementation with DPoP, PKCE, JWT, and storage abstractions
-- **atproto-oauth-aip**: AT Protocol OAuth AIP (Identity Provider) implementation with PAR support
 - **atproto-oauth-axum**: Axum web framework integration for OAuth
 - **atproto-oauth-dioxus**: Dioxus fullstack integration for OAuth
 - **atproto-xrpcs**: XRPC service framework
-- **atproto-xrpcs-helloworld**: Complete example XRPC service
 
 Features:
 - **14 CLI tools** with consistent clap-based command-line interfaces (optional via `clap` feature)
@@ -203,7 +200,6 @@ struct Args {
 - **`crates/atproto-jetstream/src/bin/atproto-jetstream-consumer.rs`**: Consume AT Protocol events via WebSocket streaming
 - **`crates/atproto-oauth/src/bin/atproto-oauth-service-token.rs`**: OAuth service token management tool for AT Protocol authentication workflows
 - **`crates/atproto-oauth-axum/src/bin/atproto-oauth-tool.rs`**: OAuth authentication workflow management
-- **`crates/atproto-xrpcs-helloworld/src/main.rs`**: Complete example XRPC service with DID web functionality
 
 ## Documentation
 

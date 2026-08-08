@@ -8,7 +8,6 @@
 //!
 //! Complete example services demonstrating framework usage:
 //!
-//! - **`atproto-xrpcs-helloworld`**: Complete example XRPC service with DID:web functionality and authorization
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

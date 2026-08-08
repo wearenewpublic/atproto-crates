@@ -25,7 +25,6 @@ COPY . .
 # - atproto-oauth: 1 binary (service-token)
 # - atproto-oauth-axum: 1 binary (oauth-tool)
 # - atproto-jetstream: 1 binary (jetstream-consumer)
-# - atproto-xrpcs-helloworld: 1 binary (xrpcs-helloworld)
 # - atproto-lexicon: 1 binary (lexicon-resolve)
 # Note: atproto-identity-resolve and atproto-lexicon-resolve require hickory-dns feature
 # `smtp` is required for the image to deliver mail at all: without it the
@@ -53,7 +52,6 @@ COPY --from=builder /usr/src/app/target/release/atproto-client-app-password .
 COPY --from=builder /usr/src/app/target/release/atproto-client-dpop .
 COPY --from=builder /usr/src/app/target/release/atproto-oauth-service-token .
 COPY --from=builder /usr/src/app/target/release/atproto-oauth-tool .
-COPY --from=builder /usr/src/app/target/release/atproto-xrpcs-helloworld .
 COPY --from=builder /usr/src/app/target/release/atproto-jetstream-consumer .
 COPY --from=builder /usr/src/app/target/release/atproto-lexicon-resolve .
 
@@ -67,7 +65,6 @@ COPY --from=builder /usr/src/app/target/release/atproto-lexicon-resolve .
 #   docker run <image> atproto-client-auth --help
 #   docker run <image> atproto-oauth-service-token --help
 #   docker run <image> atproto-oauth-tool --help
-#   docker run <image> atproto-xrpcs-helloworld --help
 #   docker run <image> atproto-jetstream-consumer --help
 #   docker run <image> atproto-lexicon-resolve --help
 CMD ["atproto-identity-resolve", "--help"]
@@ -81,4 +78,4 @@ LABEL org.opencontainers.image.version="0.15.0-rc.2"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Document available binaries
-LABEL binaries="atproto-identity-resolve,atproto-identity-key,atproto-identity-sign,atproto-identity-validate,atproto-attestation-sign,atproto-attestation-verify,atproto-record-cid,atproto-client-auth,atproto-client-app-password,atproto-client-dpop,atproto-oauth-service-token,atproto-oauth-tool,atproto-jetstream-consumer,atproto-xrpcs-helloworld,atproto-lexicon-resolve"
+LABEL binaries="atproto-identity-resolve,atproto-identity-key,atproto-identity-sign,atproto-identity-validate,atproto-attestation-sign,atproto-attestation-verify,atproto-record-cid,atproto-client-auth,atproto-client-app-password,atproto-client-dpop,atproto-oauth-service-token,atproto-oauth-tool,atproto-jetstream-consumer,atproto-lexicon-resolve"

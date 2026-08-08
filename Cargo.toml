@@ -6,7 +6,6 @@ members = [
     "crates/atproto-extras",
     "crates/atproto-identity",
     "crates/atproto-jetstream",
-    "crates/atproto-oauth-aip",
     "crates/atproto-oauth-axum",
     "crates/atproto-oauth",
     "crates/atproto-pds",
@@ -14,7 +13,6 @@ members = [
     "crates/atproto-repo",
     "crates/atproto-space",
     "crates/atproto-tap",
-    "crates/atproto-xrpcs-helloworld",
     "crates/atproto-xrpcs",
     "crates/atproto-lexicon",
     "crates/atproto-attestation",
@@ -43,7 +41,6 @@ atproto-identity = { version = "0.15.0-rc.2", path = "crates/atproto-identity" }
 atproto-jetstream = { version = "0.15.0-rc.2", path = "crates/atproto-jetstream" }
 atproto-lexicon = { version = "0.15.0-rc.2", path = "crates/atproto-lexicon" }
 atproto-oauth = { version = "0.15.0-rc.2", path = "crates/atproto-oauth" }
-atproto-oauth-aip = { version = "0.15.0-rc.2", path = "crates/atproto-oauth-aip" }
 atproto-oauth-axum = { version = "0.15.0-rc.2", path = "crates/atproto-oauth-axum" }
 atproto-pds = { version = "0.15.0-rc.2", path = "crates/atproto-pds" }
 atproto-record = { version = "0.15.0-rc.2", path = "crates/atproto-record" }

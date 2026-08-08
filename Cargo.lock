@@ -400,22 +400,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atproto-oauth-aip"
-version = "0.15.0-rc.2"
-dependencies = [
- "anyhow",
- "atproto-identity",
- "atproto-oauth",
- "chrono",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "zeroize",
-]
-
-[[package]]
 name = "atproto-oauth-axum"
 version = "0.15.0-rc.2"
 dependencies = [
@@ -603,32 +587,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "elliptic-curve",
- "hickory-resolver",
- "http 1.4.2",
- "rand 0.10.2",
- "reqwest",
- "reqwest-chain",
- "reqwest-middleware",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "atproto-xrpcs-helloworld"
-version = "0.15.0-rc.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "atproto-identity",
- "atproto-oauth",
- "atproto-xrpcs",
- "axum",
- "chrono",
- "clap",
  "elliptic-curve",
  "hickory-resolver",
  "http 1.4.2",

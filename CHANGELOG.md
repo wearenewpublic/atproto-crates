@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Removed
+- `atproto-oauth-aip` — the AIP (Identity Provider) OAuth implementation. No crate in the workspace
+  depended on it and nothing in the repository used it.
+- `atproto-xrpcs-helloworld` — the example XRPC service, and the `atproto-xrpcs-helloworld` binary
+  from the container image. `atproto-xrpcs` remains; its documentation no longer points at an example
+  that is not there.
+- `walking-club-appview`, `walking-club-cluster-plan.md` and `walking-club-cluster-plan-review.md` —
+  an application built on these crates rather than part of them.
+- `deploy/` — the Walking Club cluster compose stack, named as such in its own `Makefile` and added
+  in the same commit as the AppView it exists to run. Four of its five services were `atproto-pds`,
+  so this does cost the repository its only containerized multi-PDS deployment; keeping it would have
+  meant maintaining a cluster definition for an application no longer in the tree.
+
+  None of this is reachable from any remaining crate: the workspace builds, clippy is clean, and all
+  2637 tests pass with the four directories gone.
+
 ### Added
 - `atproto-pds`: `PDS_LEXICON_DIR` — resolve lexicon documents from a directory on disk, searched
   after the bundled corpus and before the network.

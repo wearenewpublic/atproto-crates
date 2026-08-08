@@ -16,7 +16,7 @@ Build AT Protocol services with JWT authorization, DID resolution, and cryptogra
 
 ## CLI Tools
 
-This crate does not provide standalone CLI tools. It serves as a foundational library for building XRPC services. See `atproto-xrpcs-helloworld` for a complete example service implementation.
+This crate does not provide standalone CLI tools. It serves as a foundational library for building XRPC services.
 
 ## Usage
 

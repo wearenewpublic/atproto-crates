@@ -6,7 +6,7 @@ A Rust workspace of crates for building AT Protocol applications. This collectio
 
 ## Components
 
-This workspace contains 17 crates that work together to provide complete AT Protocol application development capabilities:
+This workspace contains 16 crates that work together to provide complete AT Protocol application development capabilities:
 
 ### Data Foundations
 
@@ -26,7 +26,6 @@ This workspace contains 17 crates that work together to provide complete AT Prot
 ### Authentication & Authorization
 
 - **[`atproto-oauth`](crates/atproto-oauth/)** - Complete OAuth 2.0 implementation with AT Protocol security extensions including DPoP (RFC 9449), PKCE (RFC 7636), JWT operations, and secure storage abstractions. *Includes 1 CLI tool.*
-- **[`atproto-oauth-aip`](crates/atproto-oauth-aip/)** - OAuth AIP (Identity Provider) implementation providing complete authorization code flow with PAR, token exchange, and AT Protocol session management.
 - **[`atproto-oauth-axum`](crates/atproto-oauth-axum/)** - Production-ready Axum web handlers for OAuth endpoints including authorization callbacks, JWKS endpoints, and client metadata. *Includes 1 CLI tool.*
 - **[`atproto-oauth-dioxus`](crates/atproto-oauth-dioxus/)** - Dioxus fullstack integration for AT Protocol OAuth authentication flow components, hooks, and server functions.
 
@@ -34,7 +33,6 @@ This workspace contains 17 crates that work together to provide complete AT Prot
 
 - **[`atproto-client`](crates/atproto-client/)** - HTTP client library supporting multiple authentication methods (DPoP, Bearer tokens, sessions) with native XRPC protocol operations and repository management. *Includes 4 CLI tools.*
 - **[`atproto-xrpcs`](crates/atproto-xrpcs/)** - XRPC service framework providing JWT authorization extractors, DID resolution integration, and Axum middleware for building AT Protocol services.
-- **[`atproto-xrpcs-helloworld`](crates/atproto-xrpcs-helloworld/)** - Complete example XRPC service demonstrating DID:web identity, service document generation, and JWT authentication patterns. *Includes 1 service binary.*
 - **[`atpxrpc`](crates/atpxrpc/)** - XRPC CLI client with persistent session management for making authenticated AT Protocol API calls. *Includes 1 CLI tool.*
 
 ### Real-time Event Processing
@@ -63,7 +61,6 @@ atproto-record = "0.15.0-rc.2"
 atproto-repo = "0.15.0-rc.2"
 atproto-lexicon = "0.15.0-rc.2"
 atproto-oauth = "0.15.0-rc.2"
-atproto-oauth-aip = "0.15.0-rc.2"
 atproto-client = "0.15.0-rc.2"
 atproto-extras = "0.15.0-rc.2"
 atproto-tap = "0.15.0-rc.2"
@@ -285,9 +282,6 @@ cargo run --package atproto-oauth --features clap --bin atproto-oauth-service-to
 
 # OAuth operations (atproto-oauth-axum crate)
 cargo run --package atproto-oauth-axum --features clap --bin atproto-oauth-tool -- login did:key:... alice.bsky.social
-
-# XRPC service (atproto-xrpcs-helloworld crate)
-cargo run --bin atproto-xrpcs-helloworld
 
 # Event streaming (atproto-jetstream crate)
 cargo run --features clap --bin atproto-jetstream-consumer -- jetstream1.us-east.bsky.network dictionary.zstd
