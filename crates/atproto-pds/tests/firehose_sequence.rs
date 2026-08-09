@@ -277,6 +277,102 @@ async fn seq_increases_strictly_in_wire_order() {
     }
 }
 
+/// Every committed event reaches a connected subscriber, exactly once.
+///
+/// `seq_increases_strictly_in_wire_order` awaits each write before starting the
+/// next, so the publish path never overlapped with itself and this was
+/// invisible to it. Ordering was also the wrong property to assert: a stream
+/// missing an event is still strictly increasing. What has to hold is that
+/// nothing is dropped and nothing is repeated.
+///
+/// The defect needed two writes in flight at once, anywhere on the server —
+/// not even to the same repository. The publisher re-read the newest row for
+/// its own DID starting from the server-global `MAX(seq)`, so when another
+/// account's insert landed first, the filter matched nothing and the write
+/// published no event at all, while the other handler published its own. A
+/// subscriber advanced its cursor to what it received and then read `seq >`
+/// that, so the skipped event was never delivered by the poll path either.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_writes_deliver_every_event_exactly_once() {
+    const ACCOUNTS: usize = 4;
+    const PER_ACCOUNT: usize = 5;
+
+    let (app, manager, _tmp) = build_app().await;
+    let mut dids = Vec::new();
+    let mut tokens = Vec::new();
+    for index in 0..ACCOUNTS {
+        let did = format!("did:plc:concurrentwriter{index}");
+        tokens.push(create_account(&app, &manager, &did, &format!("cw{index}.seq.example")).await);
+        dids.push(did);
+    }
+
+    // Connect before any of the writes, and with no cursor, so the frames that
+    // arrive are exactly the ones these writes produce.
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor")
+        .parse()
+        .unwrap();
+    let (mut socket, response) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    // Every write in flight at once. The per-DID lock still serialises the
+    // commits themselves; what overlaps is the publish that follows each.
+    let mut handles = Vec::new();
+    for (did, token) in dids.iter().zip(tokens.iter()) {
+        for round in 0..PER_ACCOUNT {
+            let app = app.clone();
+            let did = did.clone();
+            let token = token.clone();
+            handles.push(tokio::spawn(async move {
+                write_record(&app, &did, &token, &format!("round {round}")).await;
+            }));
+        }
+    }
+    for handle in handles {
+        handle.await.expect("a write task should not panic");
+    }
+
+    let expected = ACCOUNTS * PER_ACCOUNT;
+    let mut seqs = Vec::new();
+    while seqs.len() < expected {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of {expected} events were delivered; the rest are lost, \
+                     not late -- the poll path reads past a cursor the broadcast \
+                     already advanced. got {seqs:?}",
+                    seqs.len()
+                )
+            })
+            .expect("the socket should stay open")
+            .expect("the frame should not be a protocol error");
+        if message.is_binary() {
+            seqs.push(frame_seq(message.as_payload()));
+        }
+    }
+
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    let mut unique = sorted.clone();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        sorted.len(),
+        "an event was delivered more than once: {seqs:?}"
+    );
+
+    // Contiguous: the stream is one number space and these writes are all of
+    // it, so first..=last with nothing missing is the whole claim.
+    let first = *sorted.first().expect("at least one event");
+    let last = *sorted.last().expect("at least one event");
+    assert_eq!(
+        last - first + 1,
+        expected as i64,
+        "the delivered range has a hole in it: {sorted:?}"
+    );
+}
+
 /// A number the stream has issued is never issued again.
 ///
 /// An account created after the stream is already running must continue it, not

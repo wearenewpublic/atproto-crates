@@ -123,18 +123,31 @@ async fn run_subscriber(
     // any commit that lands while we're draining the log.
     let mut live_rx = state.event_bus.subscribe();
 
+    // A wakeup for a DID this subscriber filters out is the one case where
+    // there is nothing to go and look for, so it waits again instead of
+    // querying. Every other path through the select drains.
+    let mut drain = true;
+
     loop {
         // Drain the log up to its current head. `read_after` caps each read, so
         // a subscriber resuming from far behind catches up over several passes
         // rather than buffering the whole backlog.
-        loop {
+        //
+        // This is the only place frames are sent. Everything below decides
+        // when to come back here, never what to deliver, so what a subscriber
+        // receives is the log's contents in the log's order by construction.
+        while drain {
             let rows = match sequencer
                 .read_after(cursor, did_filter.as_deref(), 100)
                 .await
             {
                 Ok(rows) => rows,
                 Err(e) => {
+                    // Stop and wait rather than re-entering the read
+                    // immediately: `drain` is the loop condition now, so
+                    // leaving it set would spin against a failing database.
                     tracing::warn!(error = %e, "subscribeRepos: stream read failed");
+                    drain = false;
                     break;
                 }
             };
@@ -148,13 +161,25 @@ async fn run_subscriber(
                     &row.payload,
                     &row.created_at,
                 ) else {
-                    tracing::warn!(
+                    // Ending the subscription is the honest response. Skipping
+                    // the row and advancing past it removes an event from this
+                    // consumer's stream permanently while the socket stays up
+                    // and healthy-looking, which is the same silent gap the
+                    // broadcast path used to produce. A closed connection is
+                    // something a consumer reconnects from and an operator can
+                    // see.
+                    tracing::error!(
                         did = %row.did,
                         seq = row.seq,
-                        "subscribeRepos: failed to encode frame; dropping event"
+                        "subscribeRepos: failed to encode frame; closing the subscription"
                     );
-                    cursor = Some(row.seq);
-                    continue;
+                    let (bytes, is_text) = encode_error(
+                        encoding,
+                        "InternalServerError",
+                        "an event in the stream could not be encoded",
+                    );
+                    let _ = send_frame(&mut socket, bytes, is_text).await;
+                    return;
                 };
                 if !send_frame(&mut socket, bytes, is_text).await {
                     tracing::debug!("subscribeRepos: client closed");
@@ -163,48 +188,34 @@ async fn run_subscriber(
                 cursor = Some(row.seq);
             }
             if drained < 100 {
+                drain = false;
                 break;
             }
         }
 
-        // Wait for either a live broadcast event, the poll-interval timer,
-        // or the client closing the socket.
+        // `drain` is false on every path out of the loop above, so each arm
+        // below states its own answer to "is this a reason to read the log
+        // again". An inbound frame that is not a close says nothing, and
+        // therefore leaves it false.
+        //
+        // Wait for either a live wakeup, the poll-interval timer, or the
+        // client closing the socket.
         tokio::select! {
             ev = live_rx.recv() => {
                 match ev {
                     Ok(event) => {
-                        if did_filter.as_deref().is_some_and(|did| did != event.did) {
-                            continue;
-                        }
-                        // Skip if the poll path already sent this one.
-                        if cursor.is_some_and(|c| event.seq <= c) {
-                            continue;
-                        }
-                        let Some((bytes, is_text)) = encode_event(
-                            encoding,
-                            &event.event_type,
-                            event.seq,
-                            &event.did,
-                            &event.payload,
-                            &event.created_at,
-                        ) else {
-                            tracing::warn!(
-                                did = %event.did,
-                                seq = event.seq,
-                                "subscribeRepos: failed to encode broadcast frame; dropping"
-                            );
-                            continue;
-                        };
-                        if !send_frame(&mut socket, bytes, is_text).await {
-                            return;
-                        }
-                        cursor = Some(event.seq);
+                        // The signal says the stream moved, not what it moved
+                        // to; the drain above decides that. All this arm can
+                        // do is skip the query when the write cannot concern
+                        // a DID-filtered subscriber.
+                        drain = did_filter.as_deref().is_none_or(|did| did == event.did);
                     }
                     Err(RecvError::Lagged(n)) => {
-                        // Subscriber fell behind by `n` events; skip the
-                        // broadcast slot and let the next poll cycle backfill
-                        // from the durable log.
-                        tracing::warn!(lagged = n, "subscribeRepos: broadcast lag, falling back to poll");
+                        // Missed signals are not missed events. The drain reads
+                        // from the cursor, so however many wakeups were dropped
+                        // it still reads everything after what it last sent.
+                        tracing::debug!(lagged = n, "subscribeRepos: missed wakeups; draining from the cursor");
+                        drain = true;
                     }
                     Err(RecvError::Closed) => {
                         // Bus dropped (PDS shutting down).
@@ -212,7 +223,7 @@ async fn run_subscriber(
                     }
                 }
             }
-            _ = sleep(poll_interval) => {}
+            _ = sleep(poll_interval) => { drain = true; }
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => return,

@@ -15,39 +15,26 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 
-/// Wake live subscribers with the event this write just recorded.
+/// Tell live subscribers the stream advanced, so they read it now rather than
+/// at the next poll.
 ///
-/// The stream is the durable record; the bus only saves a subscriber from
-/// waiting out the poll interval. Best-effort in consequence — a failure to
-/// read the stream or send to the bus is logged and the write still succeeds,
-/// because the poll path delivers the same event moments later.
-async fn publish_recent_stream_event(state: &HttpState, did: &str) {
-    let sequencer = state.reader.sequencer();
-    let latest = match sequencer.latest_seq().await {
-        Ok(Some(seq)) => seq,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(did, error = %error, "firehose: stream high-water read failed");
-            return;
-        }
-    };
-    // Read the single newest row so the broadcast carries the payload itself.
-    let rows = match sequencer.read_after(Some(latest - 1), Some(did), 1).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(did, error = %error, "firehose: stream tail read failed");
-            return;
-        }
-    };
-    for row in rows {
-        let _ = state.event_bus.publish(SubscribeEvent {
-            did: row.did,
-            seq: row.seq,
-            event_type: row.event_type,
-            payload: row.payload,
-            created_at: row.created_at,
-        });
-    }
+/// This used to try to publish the event itself, and could not: it re-read the
+/// newest row for `did` from the server-global `MAX(seq)`, from outside the
+/// per-DID write lock. Two writes overlapping anywhere on the server — not even
+/// to the same repo — and the second one's insert lands before the first one's
+/// read, so the first publishes the second's event and its own is never
+/// published at all. A subscriber advanced its cursor to what it received and
+/// read `seq >` that; the skipped event was gone permanently, and neither side
+/// could tell.
+///
+/// A signal cannot have that failure. It carries nothing to be wrong about, so
+/// what a subscriber sends is whatever the durable log says, in the log's
+/// order. Losing a signal costs the poll interval; sending a spurious one costs
+/// a query that returns nothing.
+fn signal_stream_advanced(state: &HttpState, did: &str) {
+    let _ = state.event_bus.publish(SubscribeEvent {
+        did: did.to_string(),
+    });
 }
 
 fn writer(state: &HttpState) -> Result<&RepoWriter, XrpcError> {
@@ -376,7 +363,7 @@ pub async fn create_record(
         )
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_stream_event(&state, &repo_did).await;
+    signal_stream_advanced(&state, &repo_did);
     let entry = &result.writes[0];
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
@@ -446,7 +433,7 @@ pub async fn put_record(
         )
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_stream_event(&state, &repo_did).await;
+    signal_stream_advanced(&state, &repo_did);
     let entry = &result.writes[0];
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
@@ -506,7 +493,7 @@ pub async fn delete_record(
         )
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_stream_event(&state, &repo_did).await;
+    signal_stream_advanced(&state, &repo_did);
     let entry = &result.writes[0];
     Ok(Json(WriteRecordResponse {
         uri: entry.uri.clone(),
@@ -720,7 +707,7 @@ pub async fn apply_writes(
         .apply_writes_with_swap(&repo_did, ops, swap_commit.as_deref())
         .await
         .map_err(XrpcError::from)?;
-    publish_recent_stream_event(&state, &repo_did).await;
+    signal_stream_advanced(&state, &repo_did);
     let commit = WriteCommitInfo {
         cid: result.commit_cid.clone(),
         rev: result.rev.clone(),
