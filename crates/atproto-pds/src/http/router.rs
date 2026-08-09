@@ -32,6 +32,18 @@ pub fn build_router(state: HttpState) -> Router {
     build_router_with_request_timeout(state, REQUEST_TIMEOUT)
 }
 
+/// [`build_router`] with both deadlines supplied.
+///
+/// `upload_timeout` covers `uploadBlob` and `importRepo`; `request_timeout`
+/// covers everything else. See [`large_body_routes`].
+pub fn build_router_with_timeouts(
+    state: HttpState,
+    request_timeout: std::time::Duration,
+    upload_timeout: std::time::Duration,
+) -> Router {
+    build_router_inner(state, request_timeout, upload_timeout)
+}
+
 /// [`build_router`] with the request deadline supplied.
 ///
 /// Exists so a test can assert what the deadline does *not* reach without
@@ -45,6 +57,14 @@ pub fn build_router(state: HttpState) -> Router {
 pub fn build_router_with_request_timeout(
     state: HttpState,
     request_timeout: std::time::Duration,
+) -> Router {
+    build_router_inner(state, request_timeout, UPLOAD_TIMEOUT)
+}
+
+fn build_router_inner(
+    state: HttpState,
+    request_timeout: std::time::Duration,
+    upload_timeout: std::time::Duration,
 ) -> Router {
     Router::new()
         .route("/", get(handlers::root))
@@ -84,14 +104,6 @@ pub fn build_router_with_request_timeout(
         .route(
             "/xrpc/com.atproto.repo.listMissingBlobs",
             get(write_handlers::list_missing_blobs),
-        )
-        .route(
-            "/xrpc/com.atproto.repo.uploadBlob",
-            post(write_handlers::upload_blob),
-        )
-        .route(
-            "/xrpc/com.atproto.repo.importRepo",
-            post(write_handlers::import_repo),
         )
         // com.atproto.sync.*
         .route(
@@ -595,6 +607,11 @@ pub fn build_router_with_request_timeout(
         .route("/admin/", get(admin::dashboard_handler))
         .fallback(unmatched)
         .layer(request_timeout_layer(request_timeout))
+        // Merged after the deadline above is applied and before the shared
+        // layers below, so these two routes carry their own deadline and
+        // everything else -- panic capture, body limit, shedding, CORS --
+        // still reaches them.
+        .merge(large_body_routes(upload_timeout))
         .layer(catch_panic_layer())
         .layer(axum::extract::DefaultBodyLimit::max(
             DEFAULT_BODY_LIMIT_BYTES,
@@ -619,6 +636,34 @@ pub fn build_router_with_request_timeout(
         )
         .layer(cors_layer())
         .with_state(state)
+}
+
+/// The two routes whose request body is the payload rather than a description
+/// of one, on a deadline sized for transferring it.
+///
+/// [`REQUEST_TIMEOUT`] bounds producing a response, and for a handler that
+/// reads its body to completion that includes receiving the upload. Thirty
+/// seconds is a sensible ceiling for a request whose body is a few hundred
+/// bytes of JSON and the wrong question entirely for one carrying up to a
+/// gibibyte: meeting it on `importRepo` at the default `PDS_IMPORT_LIMIT`
+/// would take a sustained 273 Mbit/s from the client, and `uploadBlob` at its
+/// 16 MiB default still asks for 4.3 Mbit/s -- above what plenty of domestic
+/// and mobile uplinks manage.
+///
+/// The size limits are the real bound on these two; the deadline only has to
+/// be long enough not to pre-empt them, while still reclaiming a connection
+/// that has genuinely stalled.
+fn large_body_routes(timeout: std::time::Duration) -> Router<HttpState> {
+    Router::new()
+        .route(
+            "/xrpc/com.atproto.repo.uploadBlob",
+            post(write_handlers::upload_blob),
+        )
+        .route(
+            "/xrpc/com.atproto.repo.importRepo",
+            post(write_handlers::import_repo),
+        )
+        .layer(request_timeout_layer(timeout))
 }
 
 /// How many requests may be in flight at once before the rest are refused.
@@ -650,6 +695,18 @@ const MAX_CONCURRENT_REQUESTS: usize = 1024;
 /// layer's. `a_subscription_is_not_subject_to_the_request_deadline` is what
 /// keeps that true.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long `uploadBlob` and `importRepo` have to produce a response.
+///
+/// Ten minutes carries a 1 GiB `importRepo` at about 14 Mbit/s and a 16 MiB
+/// `uploadBlob` at about 0.2 Mbit/s, which is slow enough to cover a bad
+/// mobile connection without leaving a stalled transfer holding a slot
+/// indefinitely.
+///
+/// It is deliberately not unbounded. These are the two endpoints where an
+/// attacker gets the most out of a slow-body attack, since the server has
+/// agreed in advance to wait for a large body.
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Ceiling on a request body buffered by an extractor.
 ///

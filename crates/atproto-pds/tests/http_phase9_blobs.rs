@@ -42,6 +42,59 @@ async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     (build_router(state), manager, tmp)
 }
 
+/// Same harness, with both deadlines supplied so a test can trip them without
+/// waiting out the real ones.
+async fn build_app_with_timeouts(
+    request_timeout: std::time::Duration,
+    upload_timeout: std::time::Duration,
+) -> (axum::Router, Arc<AccountManager>, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer);
+    (
+        atproto_pds::http::router::build_router_with_timeouts(
+            state,
+            request_timeout,
+            upload_timeout,
+        ),
+        manager,
+        tmp,
+    )
+}
+
+/// A body that arrives in two pieces with a gap between them, the way a large
+/// upload from a slow client does.
+fn trickling_body(gap: std::time::Duration) -> Body {
+    use futures::StreamExt;
+    let chunks = futures::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"first"))
+    })
+    .chain(futures::stream::once(async move {
+        tokio::time::sleep(gap).await;
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"second"))
+    }));
+    Body::from_stream(chunks)
+}
+
 async fn create_account(
     app: &axum::Router,
     manager: &AccountManager,
@@ -545,5 +598,80 @@ async fn deleting_a_record_drops_its_references() {
     assert!(
         missing_blobs(&app, did, &token).await.is_empty(),
         "a deleted record left its blob references behind"
+    );
+}
+
+/// `uploadBlob` carries a body sized in mebibytes; the general request
+/// deadline is sized for one carrying a few hundred bytes of JSON. Holding the
+/// upload to the general deadline made `uploadBlob` and `importRepo`
+/// unreachable for anything but a fast client -- a 1 GiB `importRepo` inside
+/// 30 seconds needs a sustained 273 Mbit/s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_upload_is_not_held_to_the_general_request_deadline() {
+    // The general deadline has to be loose enough for the account creation in
+    // the setup below and tight enough for the trickling body to clear it.
+    let (app, manager, _tmp) = build_app_with_timeouts(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    // Authenticated, so the handler actually reads the body. Unauthenticated it
+    // returns 401 without touching it, and the test would pass whatever the
+    // deadline did.
+    let token = create_account(&app, &manager, "did:plc:slowclient", "slow.example").await;
+
+    // Slower than the general deadline, well inside the upload one.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.repo.uploadBlob")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/octet-stream")
+                .body(trickling_body(std::time::Duration::from_secs(4)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        StatusCode::REQUEST_TIMEOUT,
+        "the upload was cut off by the general request deadline"
+    );
+    // And it genuinely completed rather than failing some other way.
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the upload should succeed"
+    );
+}
+
+/// The counterpart: every other route still has the shorter deadline, so the
+/// fix above is a carve-out for two routes rather than a hole in the layer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_body_on_an_ordinary_route_still_times_out() {
+    let (app, _manager, _tmp) = build_app_with_timeouts(
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.server.createSession")
+                .header("content-type", "application/json")
+                .body(trickling_body(std::time::Duration::from_millis(600)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::REQUEST_TIMEOUT,
+        "the general request deadline no longer reaches ordinary routes"
     );
 }
