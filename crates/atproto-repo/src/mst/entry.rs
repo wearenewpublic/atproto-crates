@@ -116,9 +116,23 @@ impl TreeEntry {
 
     /// Reconstruct the full key given the previous key.
     ///
+    /// `prefix_len` and `key_suffix` both come off the wire, so neither is
+    /// known to be anything until checked. The prefix is a byte count into
+    /// `prev_key`, and a count that lands inside a multi-byte character is a
+    /// number this function cannot use — `&prev_key[..prefix_len]` would panic
+    /// on it rather than return, which in a parser reached from an uploaded CAR
+    /// is a denial of service and, once a half-applied import has stored the
+    /// node, a repository that panics on every subsequent read of it.
+    ///
+    /// The two halves are joined as bytes and validated once, so a split that
+    /// lands mid-character and a suffix that is not UTF-8 arrive at the same
+    /// place: an error naming the key that could not be built.
+    ///
     /// # Errors
     ///
-    /// Returns error if the key cannot be reconstructed.
+    /// Returns [`MstError::InvalidPrefix`](crate::errors::MstError::InvalidPrefix)
+    /// when `prefix_len` exceeds the previous key, when it does not fall on a
+    /// character boundary, or when the two halves do not form valid UTF-8.
     pub fn reconstruct_key(&self, prev_key: &str) -> Result<String, crate::errors::MstError> {
         let prefix_len = self.prefix_len as usize;
 
@@ -132,14 +146,15 @@ impl TreeEntry {
             });
         }
 
-        let suffix = std::str::from_utf8(&self.key_suffix).map_err(|e| {
-            crate::errors::MstError::InvalidPrefix {
-                reason: format!("invalid UTF-8 in key suffix: {}", e),
-            }
-        })?;
+        let mut key = Vec::with_capacity(prefix_len + self.key_suffix.len());
+        key.extend_from_slice(&prev_key.as_bytes()[..prefix_len]);
+        key.extend_from_slice(&self.key_suffix);
 
-        let key = format!("{}{}", &prev_key[..prefix_len], suffix);
-        Ok(key)
+        String::from_utf8(key).map_err(|e| crate::errors::MstError::InvalidPrefix {
+            reason: format!(
+                "prefix_len {prefix_len} and key suffix do not form a valid UTF-8 key: {e}"
+            ),
+        })
     }
 
     /// Check if this entry has a subtree.
@@ -263,6 +278,64 @@ mod tests {
 
         assert!(entry.has_tree());
         assert_eq!(entry.tree, Some(tree_cid));
+    }
+
+    /// A prefix that lands inside a multi-byte character is refused, not
+    /// panicked on.
+    ///
+    /// `prefix_len` is a byte count off the wire and `&prev_key[..n]` panics
+    /// when `n` is not a character boundary. The length check that stood here
+    /// does not catch it: 1 is a perfectly good index into a two-byte key and
+    /// still splits it in half. Two entries are enough — one establishing a
+    /// key whose first character is multi-byte, the next claiming one byte of
+    /// it — and the whole thing is valid canonical DAG-CBOR that
+    /// content-addresses correctly, so nothing upstream refuses it first.
+    ///
+    /// Reached from an uploaded CAR, so the panic is a denial of service; and
+    /// because the import that carried it has already written blocks by the
+    /// time keys are reconstructed, the node stays and every later read of
+    /// that repository panics on it again.
+    #[test]
+    fn a_prefix_splitting_a_character_is_refused() {
+        // "é" is two bytes, so a prefix of 1 falls inside it.
+        let previous = "é";
+        let entry = TreeEntry::new(1, b"x".to_vec(), test_cid());
+
+        let result = entry.reconstruct_key(previous);
+
+        assert!(
+            result.is_err(),
+            "a prefix landing mid-character produced {result:?}"
+        );
+    }
+
+    /// The same prefix on a key where it *is* a boundary still reconstructs,
+    /// so the check refuses the split and not the character.
+    #[test]
+    fn a_multibyte_key_still_reconstructs_on_a_boundary() {
+        let previous = "éb";
+        // 2 is the boundary after "é".
+        let entry = TreeEntry::new(2, "c".as_bytes().to_vec(), test_cid());
+
+        let key = entry
+            .reconstruct_key(previous)
+            .expect("a prefix on a character boundary is valid");
+        assert_eq!(key, "éc");
+    }
+
+    /// Halves that are each invalid UTF-8 but concatenate to a valid key are
+    /// accepted, because the key is the concatenation. Validating the suffix
+    /// alone would refuse this.
+    #[test]
+    fn halves_are_validated_as_the_key_they_form() {
+        // "é" split across the prefix and the suffix.
+        let previous = "é";
+        let entry = TreeEntry::new(1, vec![0xA9], test_cid());
+
+        let key = entry
+            .reconstruct_key(previous)
+            .expect("the halves form a valid key");
+        assert_eq!(key, "é");
     }
 
     #[test]

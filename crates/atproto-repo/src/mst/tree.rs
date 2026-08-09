@@ -673,16 +673,39 @@ impl<S: BlockStorage> Mst<S> {
         let mut results = Vec::new();
 
         if let Some(ref root_cid) = self.root {
-            self.collect_entries(root_cid, &mut results, 0).await?;
+            let mut visited = std::collections::HashSet::new();
+            self.collect_entries(root_cid, &mut results, &mut visited, 0)
+                .await?;
         }
 
         Ok(results)
     }
 
+    /// Walk every node below `cid`, appending its entries in key order.
+    ///
+    /// `visited` is what bounds the work, and depth alone is not a substitute
+    /// for it. This is the one traversal here that fans out — a left child plus
+    /// a subtree per entry — and an MST is a *content-addressed graph*, so
+    /// nothing in the encoding stops two parents naming one child. Cost is then
+    /// `branching ^ depth` rather than the number of nodes, and with the depth
+    /// cap at 64 a CAR of about sixty small blocks, each pointing twice at the
+    /// next, is enough to ask for 2^65 loads from ten kilobytes of upload.
+    ///
+    /// A repeat is refused rather than skipped. Two identical subtrees cannot
+    /// occur in a well-formed MST: nodes cover disjoint key ranges, so distinct
+    /// positions hold distinct content and hash differently. Seeing one CID
+    /// twice therefore means a cycle or a duplicated subtree, and both are
+    /// structure violations. Skipping the second visit would return a tree
+    /// missing entries instead, which is the worse failure — wrong quietly
+    /// rather than refused loudly.
+    ///
+    /// With repeats refused, each node is loaded at most once, so the walk is
+    /// bounded by the number of distinct nodes the CAR carries.
     async fn collect_entries(
         &self,
         cid: &cid::Cid,
         results: &mut Vec<(String, Cid)>,
+        visited: &mut std::collections::HashSet<cid::Cid>,
         depth: usize,
     ) -> Result<(), MstError> {
         if depth > self.config.limits.max_depth {
@@ -691,11 +714,17 @@ impl<S: BlockStorage> Mst<S> {
             });
         }
 
+        if !visited.insert(*cid) {
+            return Err(MstError::StructureViolation {
+                reason: format!("node {cid} appears more than once in the tree"),
+            });
+        }
+
         let node = self.load_node(cid).await?;
 
         // First, traverse left subtree
         if let Some(ref left_cid) = node.left {
-            Box::pin(self.collect_entries(left_cid, results, depth + 1)).await?;
+            Box::pin(self.collect_entries(left_cid, results, visited, depth + 1)).await?;
         }
 
         // Then collect entries from this node, traversing subtrees in order
@@ -705,7 +734,7 @@ impl<S: BlockStorage> Mst<S> {
             results.push((key.clone(), entry.value.clone()));
 
             if let Some(ref tree_cid) = entry.tree {
-                Box::pin(self.collect_entries(tree_cid, results, depth + 1)).await?;
+                Box::pin(self.collect_entries(tree_cid, results, visited, depth + 1)).await?;
             }
 
             prev_key = key;
@@ -745,6 +774,7 @@ impl MemoryMst {
 mod tests {
     use super::*;
     use crate::compute_cid;
+    use crate::mst::TreeEntry;
 
     fn test_cid(data: &[u8]) -> Cid {
         compute_cid(data).into()
@@ -865,6 +895,166 @@ mod tests {
                 "app.bsky.feed.post/b",
                 "app.bsky.feed.post/c"
             ]
+        );
+    }
+
+    /// Write a node straight into storage, bypassing the builders.
+    ///
+    /// The trees below are ones `insert` cannot produce and would not accept;
+    /// they arrive over the wire, which is the only way this shape occurs.
+    async fn put_node(mst: &mut MemoryMst, node: &MstNode) -> cid::Cid {
+        let bytes = node.to_bytes().unwrap();
+        let cid = crate::compute_cid(&bytes);
+        mst.storage_mut().put(&cid, bytes).await.unwrap();
+        cid
+    }
+
+    /// One node reached by two paths is refused.
+    ///
+    /// An MST is content-addressed, so nothing in the encoding stops two
+    /// parents naming one child, and the depth cap does not notice: this tree
+    /// is two levels deep. Well-formed nodes cover disjoint key ranges and so
+    /// hash differently, which is why a repeat can be treated as the structure
+    /// violation it is rather than quietly skipped.
+    #[tokio::test]
+    async fn a_node_reached_twice_is_refused() {
+        let mut mst = MemoryMst::new_in_memory();
+
+        let leaf = MstNode {
+            left: None,
+            entries: vec![TreeEntry::new(0, b"k".to_vec(), test_cid(b"v"))],
+        };
+        let leaf_cid = put_node(&mut mst, &leaf).await;
+
+        // `left` and the first entry's subtree are the same node.
+        let parent = MstNode {
+            left: Some(leaf_cid.into()),
+            entries: vec![TreeEntry::with_tree(
+                0,
+                b"m".to_vec(),
+                test_cid(b"w"),
+                leaf_cid.into(),
+            )],
+        };
+        let parent_cid = put_node(&mut mst, &parent).await;
+
+        let mst = Mst::from_root(parent_cid, mst.into_storage(), RepoConfig::default());
+        let result = mst.entries().await;
+
+        assert!(
+            matches!(result, Err(MstError::StructureViolation { .. })),
+            "a repeated node produced {result:?}"
+        );
+    }
+
+    /// Storage that refuses to serve more than `budget` reads.
+    ///
+    /// The bound has to be enforced rather than timed. A timeout cannot help:
+    /// `MemoryStorage` completes every read without yielding, so the traversal
+    /// future never returns `Pending` and `tokio::time::timeout` never gets to
+    /// check its deadline — the first version of this test ran for over a
+    /// minute with a ten-second timeout wrapped around it. Counting turns "this
+    /// walk must be bounded by the nodes" into something that fails in
+    /// milliseconds instead of hanging the suite.
+    struct BudgetedStorage {
+        inner: MemoryStorage,
+        reads: std::sync::atomic::AtomicUsize,
+        budget: usize,
+    }
+
+    impl BlockStorage for BudgetedStorage {
+        async fn get(&self, cid: &cid::Cid) -> Result<Option<Vec<u8>>, atproto_dasl::StorageError> {
+            let n = self
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if n > self.budget {
+                return Err(atproto_dasl::StorageError::CapacityExceeded { limit: self.budget });
+            }
+            self.inner.get(cid).await
+        }
+
+        async fn put(
+            &mut self,
+            cid: &cid::Cid,
+            data: Vec<u8>,
+        ) -> Result<(), atproto_dasl::StorageError> {
+            self.inner.put(cid, data).await
+        }
+        async fn contains(&self, cid: &cid::Cid) -> Result<bool, atproto_dasl::StorageError> {
+            self.inner.contains(cid).await
+        }
+        async fn remove(
+            &mut self,
+            cid: &cid::Cid,
+        ) -> Result<Option<Vec<u8>>, atproto_dasl::StorageError> {
+            self.inner.remove(cid).await
+        }
+        fn memory_usage(&self) -> usize {
+            self.inner.memory_usage()
+        }
+        fn block_count(&self) -> usize {
+            self.inner.block_count()
+        }
+        fn cids(&self) -> Box<dyn Iterator<Item = cid::Cid> + '_> {
+            self.inner.cids()
+        }
+        async fn clear(&mut self) -> Result<(), atproto_dasl::StorageError> {
+            self.inner.clear().await
+        }
+    }
+
+    /// A chain of nodes each naming the next twice.
+    ///
+    /// This is the shape that costs. Work is `2 ^ depth` when a repeat is
+    /// followed, so thirty of these blocks — well under a kilobyte, and inside
+    /// the depth cap of 64 — ask for a billion node loads from a CAR small
+    /// enough to paste into a terminal.
+    ///
+    /// The storage refuses past `LINKS + 2` reads, which is more than a walk
+    /// that loads each node once can need and far less than a doubling one
+    /// reaches. So the assertion is on the reason it stopped: refused for
+    /// structure, or refused for reading too much.
+    #[tokio::test]
+    async fn a_doubling_chain_cannot_multiply_the_work() {
+        const LINKS: usize = 30;
+
+        let mut builder = MemoryMst::new_in_memory();
+
+        // Build from the bottom up so each node can name the one below it.
+        let mut child = put_node(
+            &mut builder,
+            &MstNode {
+                left: None,
+                entries: vec![TreeEntry::new(0, b"leaf".to_vec(), test_cid(b"leaf"))],
+            },
+        )
+        .await;
+        for _ in 0..LINKS {
+            let node = MstNode {
+                left: Some(child.into()),
+                entries: vec![TreeEntry::with_tree(
+                    0,
+                    b"k".to_vec(),
+                    test_cid(b"v"),
+                    child.into(),
+                )],
+            };
+            child = put_node(&mut builder, &node).await;
+        }
+
+        let storage = BudgetedStorage {
+            inner: builder.into_storage(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            budget: LINKS + 2,
+        };
+        let mst = Mst::from_root(child, storage, RepoConfig::default());
+
+        let result = mst.entries().await;
+
+        assert!(
+            matches!(result, Err(MstError::StructureViolation { .. })),
+            "the walk should refuse the repeated node; got {result:?}"
         );
     }
 

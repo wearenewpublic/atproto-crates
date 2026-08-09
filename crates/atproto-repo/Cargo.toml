@@ -48,7 +48,7 @@ reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex = "0.4"
-tokio = { workspace = true, features = ["macros", "rt", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt", "fs", "time"] }
 
 [features]
 default = []
