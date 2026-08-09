@@ -127,6 +127,7 @@ mod tests {
     fn synth_claims(jti: &str, ttl_secs: u64) -> OAuthClaims {
         let now = now_secs();
         OAuthClaims {
+            fam: None,
             sub: "did:plc:alice".to_string(),
             iss: "did:web:test.example".to_string(),
             aud: "did:web:test.example".to_string(),
@@ -187,6 +188,7 @@ mod tests {
             .register_refresh(
                 claims.jti.clone(),
                 RefreshHandle {
+                    family_id: "test-family".to_string(),
                     did: claims.sub.clone(),
                     client_id: claims.client_id.clone(),
                     dpop_jkt: String::new(),

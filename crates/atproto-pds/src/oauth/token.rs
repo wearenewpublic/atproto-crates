@@ -92,6 +92,16 @@ pub struct OAuthClaims {
     pub exp: u64,
     /// JWT ID (for refresh-rotation tracking).
     pub jti: String,
+    /// The authorization grant this token descends from.
+    ///
+    /// Present on refresh tokens; `None` on access tokens, and on refresh
+    /// tokens minted before families existed. Carried in the JWT rather than
+    /// looked up because the case that needs it is a token whose row is
+    /// *gone* -- a replayed, already-rotated token has nothing left in storage
+    /// to join against, and the claim is signed, so it cannot be chosen by
+    /// whoever presents it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fam: Option<String>,
     /// The account's session epoch when this grant was minted.
     ///
     /// An OAuth access token is a stateless JWT, so without this there is
@@ -288,6 +298,8 @@ async fn handle_code(
         &auth.request.client_id,
         &granted,
         &proof_jkt,
+        // A code exchange begins a new grant, so it begins a new chain.
+        &random_jti(),
     )
     .await
     .map(Json)
@@ -315,21 +327,52 @@ async fn handle_refresh(
         ));
     }
 
-    // Rotate.
     let old_jti = claims.jti.clone();
-    let new_jti = random_jti();
-    let handle = state
+
+    // Read the handle before rotating, because rotation is destructive and
+    // everything below decides whether it should happen.
+    //
+    // It used to rotate first. Rotation succeeds for anyone holding the token
+    // bytes, so a stolen refresh token consumed the legitimate client's one
+    // and *then* failed the DPoP check -- the thief got an error and the
+    // rightful holder got logged out, repeatably, without ever possessing the
+    // key. Authentication that runs after the side effect it guards is not
+    // guarding it.
+    let Some(handle) = state
         .oauth
-        .rotate_refresh(&old_jti, new_jti)
+        .peek_refresh(&old_jti)
         .await
         .map_err(XrpcError::from)?
-        .ok_or_else(|| {
-            XrpcError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "refresh token already consumed or revoked",
-            )
-        })?;
+    else {
+        // The token verified as one this server minted, but no row survives.
+        // Either it has already been rotated away or its grant was revoked.
+        //
+        // The first is reuse, and OAuth 2.1 §4.14.2 says end the grant: the
+        // explanations are a leaked token being used or a client racing
+        // itself, and ending it is the right answer to both. Doing nothing
+        // left whoever held the successor -- possibly the attacker --
+        // refreshing indefinitely, with the replay recorded nowhere.
+        if let Some(family_id) = claims.fam.as_deref() {
+            let revoked = state
+                .oauth
+                .revoke_refresh_family(family_id)
+                .await
+                .map_err(XrpcError::from)?;
+            if revoked > 0 {
+                tracing::warn!(
+                    did = %claims.sub,
+                    client_id = %claims.client_id,
+                    revoked,
+                    "a consumed refresh token was presented again; revoking the grant"
+                );
+            }
+        }
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "refresh token already consumed or revoked",
+        ));
+    };
 
     // A refresh token carries the thumbprint it was bound to. Presenting it
     // requires proving possession of that same key — otherwise a leaked
@@ -364,12 +407,32 @@ async fn handle_refresh(
         ));
     }
 
+    // Authenticated: now consume it. `rotate_refresh` is atomic and returns
+    // `None` if something else got there first, so two concurrent refreshes
+    // still yield exactly one rotation.
+    let new_jti = random_jti();
+    let handle = state
+        .oauth
+        .rotate_refresh(&old_jti, new_jti)
+        .await
+        .map_err(XrpcError::from)?
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token already consumed or revoked",
+            )
+        })?;
+
     issue_pair(
         &state,
         &handle.did,
         &handle.client_id,
         &handle.scope,
         &handle.dpop_jkt,
+        // Rotation stays in the chain it came from, so a token replayed from
+        // anywhere in the chain can still end all of it.
+        &handle.family_id,
     )
     .await
     .map(Json)
@@ -383,12 +446,18 @@ async fn handle_refresh(
 /// was stored as an empty string, came back as `cnf.jkt = ""`, and matched no
 /// proof for the life of the session (F-OAUTH-04). Taking `&str` means that
 /// failure cannot be expressed rather than merely not happening.
+///
+/// `family_id` names the authorization grant the refresh token belongs to: a
+/// fresh one at the code exchange, the existing one when rotating. Every token
+/// in a chain shares it, which is what lets a replayed token end the grant
+/// rather than merely fail.
 async fn issue_pair(
     state: &HttpState,
     did: &str,
     client_id: &str,
     scope: &str,
     dpop_jkt: &str,
+    family_id: &str,
 ) -> Result<TokenResponse, XrpcError> {
     let now = chrono::Utc::now().timestamp() as u64;
     let access_jti = random_jti();
@@ -417,6 +486,8 @@ async fn issue_pair(
         })?;
 
     let access_claims = OAuthClaims {
+        // Access tokens are not rotated, so they belong to no chain.
+        fam: None,
         sub: did.to_string(),
         iss: format!("did:web:{}", host_from_service_did(&state.service_did)),
         aud: state.service_did.clone(),
@@ -429,6 +500,7 @@ async fn issue_pair(
         ses: epoch,
     };
     let refresh_claims = OAuthClaims {
+        fam: Some(family_id.to_string()),
         sub: did.to_string(),
         iss: access_claims.iss.clone(),
         aud: state.service_did.clone(),
@@ -451,6 +523,7 @@ async fn issue_pair(
         .register_refresh(
             refresh_jti.clone(),
             RefreshHandle {
+                family_id: family_id.to_string(),
                 did: did.to_string(),
                 client_id: client_id.to_string(),
                 dpop_jkt: dpop_jkt.to_string(),
@@ -575,6 +648,7 @@ mod tests {
     fn oauth_jwt_round_trip() {
         let secret = b"secret-bytes-32!";
         let claims = OAuthClaims {
+            fam: None,
             sub: "did:plc:alice".to_string(),
             iss: "did:web:test".to_string(),
             aud: "did:web:test".to_string(),
@@ -598,6 +672,7 @@ mod tests {
     fn typ_mismatch_rejected() {
         let secret = b"secret-bytes-32!";
         let claims = OAuthClaims {
+            fam: None,
             sub: "did:plc:alice".to_string(),
             iss: "did:web:t".to_string(),
             aud: "did:web:t".to_string(),

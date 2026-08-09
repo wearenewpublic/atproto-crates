@@ -84,6 +84,11 @@ pub struct RefreshHandle {
     pub scope: String,
     /// Issuance timestamp.
     pub issued_at: DateTime<Utc>,
+    /// The authorization grant this token descends from.
+    ///
+    /// Every token produced by rotating this one shares it, so presenting a
+    /// consumed token can end the whole chain rather than just failing.
+    pub family_id: String,
 }
 
 /// Backend dispatch for OAuth in-flight state.
@@ -193,6 +198,32 @@ impl OAuthState {
         match self {
             OAuthState::Memory(m) => Ok(m.rotate_refresh(old_jti, new_jti)),
             OAuthState::Sql(s) => s.rotate_refresh(old_jti, new_jti).await,
+        }
+    }
+
+    /// Read a refresh handle without consuming it.
+    ///
+    /// Rotation is destructive, so everything that decides *whether* to rotate
+    /// has to be able to see the handle first. It could not, which is why the
+    /// DPoP-binding and account-state checks used to run after the rotation
+    /// they were supposed to gate.
+    pub async fn peek_refresh(&self, jti: &str) -> PdsResult<Option<RefreshHandle>> {
+        match self {
+            OAuthState::Memory(m) => Ok(m.peek_refresh(jti)),
+            OAuthState::Sql(s) => s.peek_refresh(jti).await,
+        }
+    }
+
+    /// Revoke every refresh token descended from one authorization grant.
+    ///
+    /// Returns how many were removed. OAuth 2.1 requires this when an
+    /// already-rotated token is presented: the explanations are a leaked token
+    /// in use or a client racing itself, and ending the grant is the right
+    /// answer to both.
+    pub async fn revoke_refresh_family(&self, family_id: &str) -> PdsResult<u64> {
+        match self {
+            OAuthState::Memory(m) => Ok(m.revoke_refresh_family(family_id)),
+            OAuthState::Sql(s) => s.revoke_refresh_family(family_id).await,
         }
     }
 
@@ -312,11 +343,31 @@ impl MemoryBackend {
         inner.refresh_tokens.insert(
             new_jti,
             RefreshHandle {
+                family_id: "test-family".to_string(),
                 issued_at: Utc::now(),
                 ..handle.clone()
             },
         );
         Some(handle)
+    }
+
+    fn peek_refresh(&self, jti: &str) -> Option<RefreshHandle> {
+        let inner = self.inner.lock().unwrap();
+        inner.refresh_tokens.get(jti).cloned()
+    }
+
+    fn revoke_refresh_family(&self, family_id: &str) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        let doomed: Vec<String> = inner
+            .refresh_tokens
+            .iter()
+            .filter(|(_, handle)| handle.family_id == family_id)
+            .map(|(jti, _)| jti.clone())
+            .collect();
+        for jti in &doomed {
+            inner.refresh_tokens.remove(jti);
+        }
+        doomed.len() as u64
     }
 
     fn revoke_refresh(&self, jti: &str) -> bool {
@@ -531,8 +582,8 @@ impl SqlBackend {
     async fn register_refresh(&self, jti: String, handle: RefreshHandle) -> PdsResult<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO oauth_refresh
-                (jti, did, client_id, dpop_jkt, scope, issued_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&jti)
         .bind(&handle.did)
@@ -540,6 +591,7 @@ impl SqlBackend {
         .bind(&handle.dpop_jkt)
         .bind(&handle.scope)
         .bind(handle.issued_at.to_rfc3339())
+        .bind(&handle.family_id)
         .execute(&self.pool)
         .await
         .map_err(|e| PdsError::Storage {
@@ -556,8 +608,8 @@ impl SqlBackend {
         let mut tx = self.pool.begin().await.map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh begin: {e}"),
         })?;
-        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
-            "SELECT did, client_id, dpop_jkt, scope, issued_at
+        let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(old_jti)
@@ -566,7 +618,7 @@ impl SqlBackend {
         .map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh select: {e}"),
         })?;
-        let Some((did, client_id, dpop_jkt, scope, issued_at)) = row else {
+        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id)) = row else {
             return Ok(None);
         };
         sqlx::query("DELETE FROM oauth_refresh WHERE jti = ?")
@@ -578,8 +630,9 @@ impl SqlBackend {
             })?;
         let now = Utc::now();
         sqlx::query(
-            "INSERT INTO oauth_refresh (jti, did, client_id, dpop_jkt, scope, issued_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO oauth_refresh
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_jti)
         .bind(&did)
@@ -587,6 +640,7 @@ impl SqlBackend {
         .bind(&dpop_jkt)
         .bind(&scope)
         .bind(now.to_rfc3339())
+        .bind(&family_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| PdsError::Storage {
@@ -606,7 +660,47 @@ impl SqlBackend {
             dpop_jkt,
             scope,
             issued_at: original_issued,
+            family_id,
         }))
+    }
+
+    async fn peek_refresh(&self, jti: &str) -> PdsResult<Option<RefreshHandle>> {
+        let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id
+             FROM oauth_refresh WHERE jti = ?",
+        )
+        .bind(jti)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("oauth_refresh peek: {e}"),
+        })?;
+        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(RefreshHandle {
+            did,
+            client_id,
+            dpop_jkt,
+            scope,
+            issued_at: chrono::DateTime::parse_from_rfc3339(&issued_at)
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("parse issued_at: {e}"),
+                })?
+                .with_timezone(&Utc),
+            family_id,
+        }))
+    }
+
+    async fn revoke_refresh_family(&self, family_id: &str) -> PdsResult<u64> {
+        let result = sqlx::query("DELETE FROM oauth_refresh WHERE family_id = ?")
+            .bind(family_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("oauth_refresh family delete: {e}"),
+            })?;
+        Ok(result.rows_affected())
     }
 
     async fn revoke_refresh(&self, jti: &str) -> PdsResult<bool> {
@@ -762,6 +856,7 @@ mod tests {
 
     fn handle() -> RefreshHandle {
         RefreshHandle {
+            family_id: "test-family".to_string(),
             did: "did:plc:alice".to_string(),
             client_id: "client".to_string(),
             dpop_jkt: "thumb".to_string(),

@@ -1828,3 +1828,144 @@ async fn a_revocation_survives_a_restart() {
         "the revocation did not survive a restart"
     );
 }
+
+/// Obtain a refresh token for `alice`, bound to `key`.
+async fn refresh_token_for(app: &axum::Router, key: &KeyData) -> String {
+    let (verifier, challenge) = pkce_pair();
+    let (_, par_body) = post_json(
+        app.clone(),
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "atproto", "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par_body["request_uri"].as_str().unwrap().to_string();
+    let (_, authz) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.example",
+            "password": "pw", "approve": true,
+        }),
+    )
+    .await;
+    let code = authz["code"].as_str().unwrap().to_string();
+    let (status, tokens) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {tokens}");
+    tokens["refresh_token"].as_str().unwrap().to_string()
+}
+
+/// A refresh token presented without its DPoP key must not consume it.
+///
+/// Rotation ran before the binding check, and rotation succeeds for anyone
+/// holding the token bytes. So a thief with no key could burn the legitimate
+/// client's token -- the thief got an error, the rightful holder got logged
+/// out, and it could be repeated on every new token the client obtained.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_presented_without_its_key_does_not_consume_it() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let refresh = refresh_token_for(&app, &key).await;
+
+    // The thief has the token bytes but a different key.
+    let thief_key = generate_key(KeyType::P256Private).unwrap();
+    let (status, body) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+            "refresh_token": refresh,
+        }),
+        &thief_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the thief must be refused");
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+
+    // The rightful holder is unaffected.
+    let (status, body) = post_token(
+        app,
+        json!({
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+            "refresh_token": refresh,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failed theft consumed the legitimate refresh token: {body}"
+    );
+}
+
+/// Presenting an already-rotated refresh token ends the whole grant.
+///
+/// OAuth 2.1 §4.14.2: the explanations for a second presentation are a leaked
+/// token being used or a client racing itself, and ending the grant is the
+/// right answer to both. Previously the replay got a generic `invalid_grant`
+/// while whoever held the successor -- possibly the attacker -- went on
+/// refreshing indefinitely.
+#[tokio::test(flavor = "multi_thread")]
+async fn replaying_a_consumed_refresh_token_revokes_the_whole_grant() {
+    let (app, manager, _tmp) = build_app().await;
+    let key = dpop_key();
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let first = refresh_token_for(&app, &key).await;
+
+    let (status, refreshed) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+            "refresh_token": first,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    let second = refreshed["refresh_token"].as_str().unwrap().to_string();
+
+    // Replay the consumed one.
+    let (status, body) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+            "refresh_token": first,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The successor must now be dead too. Without family revocation it would
+    // still work, which is the whole point: detecting the replay is worthless
+    // if the token the attacker holds keeps refreshing.
+    let (status, body) = post_token(
+        app,
+        json!({
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+            "refresh_token": second,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the successor survived a detected replay: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+}

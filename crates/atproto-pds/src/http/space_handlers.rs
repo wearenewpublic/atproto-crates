@@ -3255,6 +3255,7 @@ mod scope_gate_tests {
 
     fn oauth_subject(scope: &str) -> AuthSubject {
         AuthSubject::OAuth(OAuthClaims {
+            fam: None,
             sub: "did:plc:member".to_string(),
             iss: "did:web:pds".to_string(),
             aud: "did:web:pds".to_string(),
