@@ -96,6 +96,22 @@ async fn post_json(
     (status, value)
 }
 
+async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder().uri(path).method("GET");
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
 /// An app-password session token — no OAuth scopes, full account authority.
 async fn app_password_session(
     app: &axum::Router,
@@ -111,6 +127,11 @@ async fn app_password_session(
         .set_primary_password(did, "pw")
         .await
         .expect("fixture password");
+    sign_in(app, handle).await
+}
+
+/// A second session for an account that already exists.
+async fn sign_in(app: &axum::Router, handle: &str) -> String {
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.server.createSession",
@@ -263,6 +284,165 @@ async fn a_member_can_still_write() {
         StatusCode::OK,
         "the space owner was refused a write to their own space: {body}"
     );
+}
+
+// --- read endpoints --------------------------------------------------------
+
+/// `listRepoOps` inlines record values, so a non-member reading it is not
+/// learning that a space exists — it is reading the space.
+///
+/// Both sync endpoints authenticated the caller and then never checked them
+/// against the space. The only gate they ran was `assert_space_scope`, which
+/// opens with `if !subject.is_oauth() { return Ok(()) }`, so an app-password
+/// session — the credential account holders hand to third-party clients —
+/// passed through a check that had nothing to check.
+///
+/// `SpaceNotFound` rather than a distinct refusal is deliberate: whether a
+/// given space holds a given account's records is itself the confidential
+/// fact.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_repo_ops_refuses_a_non_member() {
+    let (app, manager, _tmp) = build_app().await;
+    let (space, outsider) = owner_space_and_an_outsider(&app, &manager).await;
+
+    // Put something in the space, so what is at stake is the record and not
+    // merely an empty page proving the space exists.
+    let owner = sign_in(&app, OWNER_HANDLE).await;
+    let (status, body) = post_json(
+        &app,
+        "/xrpc/com.atproto.space.putRecord",
+        json!({
+            "repo": OWNER_DID,
+            "space": space,
+            "collection": COLLECTION,
+            "rkey": "3kaaaaaaaaaa6",
+            "record": {"$type": COLLECTION, "text": "members only"},
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fixture write failed: {body}");
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.listRepoOps?space={}&repo={OWNER_DID}",
+            urlencoding(&space)
+        ),
+        Some(&outsider),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-member read another member's oplog: {body}"
+    );
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+    assert!(
+        !body.to_string().contains("members only"),
+        "the refusal carried the record it refused: {body}"
+    );
+}
+
+/// The same for `getRepoState`, which additionally loads the target account's
+/// private signing key and signs a fresh commit for whoever asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_repo_state_refuses_a_non_member() {
+    let (app, manager, _tmp) = build_app().await;
+    let (space, outsider) = owner_space_and_an_outsider(&app, &manager).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.getRepoState?space={}&repo={OWNER_DID}",
+            urlencoding(&space)
+        ),
+        Some(&outsider),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-member obtained a signed commit over another account's repo: {body}"
+    );
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+}
+
+/// `getLatestCommit` is routed to the same handler under the name the draft
+/// settled on, so it has to refuse for the same reason. Routing an alias at a
+/// handler is exactly how one of two names keeps an old behaviour.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_latest_commit_refuses_a_non_member() {
+    let (app, manager, _tmp) = build_app().await;
+    let (space, outsider) = owner_space_and_an_outsider(&app, &manager).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.getLatestCommit?space={}&repo={OWNER_DID}",
+            urlencoding(&space)
+        ),
+        Some(&outsider),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+}
+
+/// The owner reading their own repo is what the check must not cost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_can_still_read_the_sync_endpoints() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token = app_password_session(&app, &manager, OWNER_DID, OWNER_HANDLE).await;
+    let (status, body) = post_json(
+        &app,
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": "app.bsky.group", "skey": "default"}),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createSpace failed: {body}");
+    let space = body["uri"].as_str().unwrap().to_string();
+
+    let (status, body) = post_json(
+        &app,
+        "/xrpc/com.atproto.space.putRecord",
+        json!({
+            "repo": OWNER_DID,
+            "space": space,
+            "collection": COLLECTION,
+            "rkey": "3kaaaaaaaaaa5",
+            "record": {"$type": COLLECTION, "text": "mine"},
+        }),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fixture write failed: {body}");
+
+    for endpoint in ["listRepoOps", "getRepoState", "getLatestCommit"] {
+        let (status, body) = get_json(
+            &app,
+            &format!(
+                "/xrpc/com.atproto.space.{endpoint}?space={}&repo={OWNER_DID}",
+                urlencoding(&space)
+            ),
+            Some(&owner_token),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the space owner was refused {endpoint} on their own repo: {body}"
+        );
+    }
+}
+
+/// Percent-encode the characters an `at://` URI carries into a query string.
+fn urlencoding(s: &str) -> String {
+    s.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// A space whose authority is not on this server is not refused.

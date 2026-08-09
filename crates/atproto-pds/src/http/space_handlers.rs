@@ -1513,14 +1513,45 @@ fn signed_commit_block(
 /// Returns the repo account's current signed commit (`records` scope, signed
 /// by the repo account's atproto signing key). `commit` is absent when the
 /// repo is empty.
+///
+/// Auth goes through [`resolve_record_auth`], the same as every other record
+/// read. It authenticated before, which is not the same thing: the caller was
+/// established and then never checked against the space, so any account on
+/// this server could name any space and any member and be answered. That it
+/// signs a fresh commit with the repo account's own key made it the worse of
+/// the two endpoints to leave open.
 pub async fn get_repo_state(
     State(state): State<HttpState>,
     parts: Parts,
     Query(q): Query<RepoStateQuery>,
 ) -> Result<Json<StateResponse>, XrpcError> {
     let uri = parse_space_uri(&q.space)?;
-    let subject = require_any_authn(&parts, &state, &uri).await?;
-    assert_space_read_opt(&state, &subject, &uri).await?;
+    let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
+    if let Some(subject) = &resolved.subject {
+        assert_space_scope(
+            &state,
+            subject,
+            &uri,
+            atproto_oauth::scopes::SpaceAction::Read,
+            None,
+        )
+        .await?;
+    }
+    // 401 rather than the `AuthDenied` default of 403: a credential that does
+    // not verify is a failure to authenticate, not a permission shortfall, and
+    // this is the status these two endpoints have always answered a forged one
+    // with. Routing them through `resolve_record_auth` should change who is
+    // refused, not what a refusal looks like.
+    space_reader(&state)?
+        .verify_read_auth(&uri, &resolved.auth)
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                format!("invalid space credential: {e}"),
+            )
+        })?;
     let st = space_sync(&state)?
         .get_repo_state(&uri, &q.repo)
         .await
@@ -1712,14 +1743,39 @@ pub struct RepoOpsResponse {
 /// Incremental sync for a per-account repo within a space. On a caught-up
 /// page (fewer ops than `limit`), attaches the repo's current signed commit
 /// (`records` scope, signed by the repo account's key).
+///
+/// Auth goes through [`resolve_record_auth`], the same as every other record
+/// read. This endpoint inlines record values, so the page it returns is the
+/// space's contents rather than a summary of them — it was reachable by any
+/// authenticated account naming any space and any member.
 pub async fn list_repo_ops(
     State(state): State<HttpState>,
     parts: Parts,
     Query(q): Query<RepoOplogQuery>,
 ) -> Result<Json<RepoOpsResponse>, XrpcError> {
     let uri = parse_space_uri(&q.space)?;
-    let subject = require_any_authn(&parts, &state, &uri).await?;
-    assert_space_read_opt(&state, &subject, &uri).await?;
+    let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
+    if let Some(subject) = &resolved.subject {
+        assert_space_scope(
+            &state,
+            subject,
+            &uri,
+            atproto_oauth::scopes::SpaceAction::Read,
+            None,
+        )
+        .await?;
+    }
+    // See `get_repo_state`: an unverifiable credential stays a 401.
+    space_reader(&state)?
+        .verify_read_auth(&uri, &resolved.auth)
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                format!("invalid space credential: {e}"),
+            )
+        })?;
     let limit = page_limit(q.limit, 100, 1000);
     let since = match q.since.as_deref() {
         Some(token) => Some(OplogCursor::from_token(token).map_err(|_| {
