@@ -2195,3 +2195,75 @@ async fn an_authorization_nonce_is_not_accepted_at_the_resource_server() {
         "the two nonce spaces must not overlap"
     );
 }
+
+/// `getServiceAuth` mints a credential signed with the account's own key,
+/// naming an audience and method of the caller's choosing -- the same thing
+/// the proxy mints, handed over to be spent directly. The proxy checks the
+/// token's `rpc:` scopes; this did not, so the minimum `atproto` scope bought
+/// account-signed authority for any service and method the denylists did not
+/// happen to name.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_refuses_a_token_without_the_matching_rpc_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto").await;
+
+    let (status, body) = get_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:elsewhere.example&lxm=app.bsky.feed.getPosts",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "InsufficientScope", "{body}");
+}
+
+/// And a token that does grant it still works, so the gate is a scope check
+/// rather than a refusal to mint.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_allows_a_token_that_grants_the_rpc_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(
+        &app,
+        &key,
+        "atproto rpc:app.bsky.feed.getPosts?aud=did:web:appview.example",
+    )
+    .await;
+
+    let (status, body) = get_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:appview.example&lxm=app.bsky.feed.getPosts",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["token"].as_str().is_some(), "{body}");
+}
+
+/// A token naming no `lxm` is bounded by nothing, and no `rpc:` scope
+/// authorises everything. An OAuth caller has to say what it wants.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_auth_refuses_an_oauth_token_that_names_no_lxm() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto").await;
+
+    let (status, body) = get_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:elsewhere.example",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "InsufficientScope", "{body}");
+}

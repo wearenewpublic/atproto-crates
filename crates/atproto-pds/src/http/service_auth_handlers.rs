@@ -217,6 +217,39 @@ pub async fn get_service_auth(
         ));
     }
 
+    // The same `rpc:` gate the proxy path applies.
+    //
+    // This mints a credential signed with the *account's own key*, naming an
+    // audience and a method of the caller's choosing -- the same thing
+    // `proxy_handlers` mints, except handed to the caller to spend directly.
+    // That path checks the token's `rpc:` scopes and this one did not, so a
+    // token holding only the minimum `atproto` scope could mint account-signed
+    // authority for any service and any method the two denylists above happen
+    // not to name. The denylists are a floor, not a scope check: they say what
+    // nobody may request, not what this token may.
+    //
+    // App-password sessions carry no scopes and are full-authority, matching
+    // how the proxy, repo, blob and space assertions all treat them.
+    if claims.is_oauth() {
+        // A token with no `lxm` is bounded by nothing, and no `rpc:` scope can
+        // authorise everything. Refusing is the only honest answer; the
+        // caller names the method it actually wants.
+        let Some(lxm) = lxm else {
+            return Err(XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "InsufficientScope",
+                "an OAuth token must name the lxm it is requesting authority for",
+            ));
+        };
+        claims.scopes().assert_rpc(lxm, &q.aud).map_err(|missing| {
+            XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "InsufficientScope",
+                format!("this token does not grant {}", missing.scope),
+            )
+        })?;
+    }
+
     let manager = state.account_manager.as_ref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -226,13 +259,17 @@ pub async fn get_service_auth(
     })?;
     let claims_sub = claims.sub().to_string();
 
-    // A taken-down account keeps exactly one capability: migrating away. Any
-    // other token would let a moderated account keep acting through a peer.
-    if manager
+    // Only `Takendown` was checked, so a suspended or deactivated account
+    // could still mint authority for a peer to act on -- which is the thing
+    // those states exist to stop. Migrating away survives all of them,
+    // deliberately: an account being moderated or wound down is exactly one
+    // that may need to leave.
+    let account_state = manager
         .account_state(&claims_sub)
         .await
-        .map_err(XrpcError::from)?
-        == Some(crate::account::AccountState::Takendown)
+        .map_err(XrpcError::from)?;
+    if let Some(account_state) = account_state
+        && !account_state.allows_writes()
         && lxm != Some(TAKENDOWN_ALLOWED_LXM)
     {
         return Err(XrpcError::new(
