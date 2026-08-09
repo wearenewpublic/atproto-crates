@@ -16,6 +16,10 @@
 //!
 //! - `max_attempts` — give-up threshold (default 8 → ~1.5h with backoff).
 //! - `initial_backoff_ms` — first retry delay (default 1000ms).
+//! - `timeout` — per-delivery HTTP timeout (default 10s), applied by
+//!   [`build_client`]. Deliveries run serially in a background task that no
+//!   request timeout covers, so this is what stops one unresponsive recipient
+//!   from stalling every other space's notifications.
 
 use crate::errors::{PdsError, PdsResult};
 use chrono::{DateTime, Utc};
@@ -27,6 +31,41 @@ use sqlx::SqlitePool;
 pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 1000;
 /// Default max retry attempts (8 → cumulative ~1.5h with exponential backoff).
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
+/// Default per-delivery HTTP timeout (10s).
+///
+/// The value matters more here than the number does. `reqwest` applies no
+/// timeout unless asked, and [`Notifier::tick`] delivers its batch serially in
+/// a background task -- the one outbound path on the server that no request
+/// timeout covers. A recipient that accepts the connection and then never
+/// answers therefore stops the notifier permanently, and every other space's
+/// notifications queue behind it. Ten seconds is generous for a `notifyWrite`
+/// POST that carries no content; a recipient slower than that is failing, and
+/// the backoff is the right place to absorb it.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// Build the notifier's HTTP client.
+///
+/// One constructor so the timeout cannot be configured in one call site and
+/// forgotten in the other -- which is exactly how the untimed client survived:
+/// [`Notifier::default`] and the binary's worker each built their own.
+#[must_use]
+pub fn build_client(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(crate::user_agent())
+        .timeout(timeout)
+        // A separate, shorter bound on connection setup. The total timeout
+        // above already covers it, but a recipient whose DNS or TCP hangs is
+        // unreachable rather than slow, and there is nothing to wait for.
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        // `build()` fails only on TLS backend initialisation. A client with no
+        // timeout is the very thing this exists to prevent, so fall back to
+        // one that at least keeps the bound.
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "notifier HTTP client build failed; using defaults");
+            reqwest::Client::new()
+        })
+}
 
 /// State enum for `notify_attempt.state`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,7 +299,7 @@ pub struct Notifier {
 impl Default for Notifier {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_client(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
             initial_backoff_ms: DEFAULT_INITIAL_BACKOFF_MS,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             batch_size: 50,
@@ -336,6 +375,61 @@ mod tests {
     async fn fresh_pool() -> SqlitePool {
         let dir = AccountDirectory::open_memory().await.unwrap();
         dir.pool().clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unresponsive_recipient_does_not_stall_the_notifier() {
+        // A recipient that completes the TCP handshake and then says nothing.
+        // This is the case `reqwest` waits on forever when no timeout is set,
+        // and the reason it matters here is that `tick` delivers serially in a
+        // background task: one of these used to stop the notifier for good.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let black_hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                // Hold the connection open and never write a response.
+                held.push(socket);
+            }
+        });
+
+        let pool = fresh_pool().await;
+        enqueue_notification(
+            &pool,
+            "did:web:black-hole.example",
+            &format!("http://{addr}"),
+            b"payload-bytes".to_vec(),
+            "com.atproto.space.notifyWrite",
+            "application/json",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let notifier = Notifier {
+            client: build_client(std::time::Duration::from_millis(300)),
+            ..Notifier::default()
+        };
+
+        // An outer timeout so a regression fails the test instead of hanging
+        // the suite -- "waits forever" is the failure mode under test.
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), notifier.tick(&pool))
+                .await
+                .expect("tick must return; without a timeout it waits on this recipient forever")
+                .unwrap();
+
+        assert_eq!(delivered, 0, "nothing was delivered");
+
+        // The row is a failure to retry, not one silently dropped, and the
+        // backoff has taken it out of the due set for now.
+        let due = due_now(&pool, 100).await.unwrap();
+        assert!(
+            due.is_empty(),
+            "the failed delivery should be backed off, not immediately due again"
+        );
+
+        black_hole.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -368,6 +368,20 @@ struct Args {
     )]
     space_notify_retry_max_attempts: u32,
 
+    /// Notifier per-delivery HTTP timeout in seconds. Default 10.
+    ///
+    /// Deliveries run serially in a background task, which is the one
+    /// outbound path on the server that no request timeout covers. Without
+    /// this bound a recipient that accepts the connection and never answers
+    /// stalls every other space's notifications behind it.
+    #[arg(
+        long,
+        env = "PDS_SPACE_NOTIFY_TIMEOUT_SECS",
+        default_value_t = atproto_pds::notifier::DEFAULT_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=300),
+    )]
+    space_notify_timeout_secs: u64,
+
     /// SpaceCredential TTL in seconds. Default
     /// 7200 (2h, matching `atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS`).
     #[arg(
@@ -1187,6 +1201,7 @@ async fn main() -> anyhow::Result<()> {
         notifier_interval,
         args.space_notify_retry_initial_backoff_ms,
         args.space_notify_retry_max_attempts,
+        Duration::from_secs(args.space_notify_timeout_secs),
         token.clone(),
     ));
 
@@ -1332,12 +1347,13 @@ async fn notifier_loop(
     interval: Duration,
     initial_backoff_ms: u64,
     max_attempts: u32,
+    timeout: Duration,
     token: tokio_util::sync::CancellationToken,
 ) {
     // §11g — retry knobs come from CLI/env; defaults match the constants
     // exposed on `Notifier::default()`.
     let notifier = Notifier {
-        client: reqwest::Client::new(),
+        client: atproto_pds::notifier::build_client(timeout),
         initial_backoff_ms,
         max_attempts,
         batch_size: 50,
