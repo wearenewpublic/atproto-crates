@@ -39,9 +39,10 @@ pub enum StorageProfile {
 impl StorageProfile {
     /// The profile compiled into this binary, derived from the active Cargo features.
     pub const fn compiled() -> Self {
-        // When `sqlite` and `fjall` are both off (e.g., during bare
-        // `cargo check`), default to SQLite. The runtime profile-mismatch
-        // check is done at startup via `PDS_STORAGE_PROFILE`.
+        // `fjall` decides this on its own because it is additive: `sqlite` is
+        // required in every profile for the accounts database, so its presence
+        // says nothing about which per-actor store was chosen. The runtime
+        // profile-mismatch check is done at startup via `PDS_STORAGE_PROFILE`.
         #[cfg(feature = "fjall")]
         {
             StorageProfile::Fjall

@@ -1633,15 +1633,19 @@ mod tests {
         // The event is on the firehose stream, not in the fjall keyspace: the
         // stream is server-global and lives in the accounts DB under every
         // storage profile.
+        // Creating the account announces it first (`#identity`, `#account`), so
+        // the commit is the last of three rather than the only one. This
+        // asserted it was the only one, and had done since before account
+        // creation announced anything -- untouched because CI does not build
+        // this feature and so has never run this test.
         let events = stream_of(tmp_data.path())
             .await
             .read_after(None, None, 10)
             .await
             .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].seq, 1);
-        assert_eq!(events[0].did, "did:plc:alice");
-        assert_eq!(events[0].event_type, "commit");
+        let commits: Vec<_> = events.iter().filter(|e| e.event_type == "commit").collect();
+        assert_eq!(commits.len(), 1, "one write, one commit event: {events:?}");
+        assert_eq!(commits[0].did, "did:plc:alice");
     }
 
     #[cfg(feature = "fjall")]
@@ -1725,11 +1729,28 @@ mod tests {
             .unwrap();
         assert_eq!(page.len(), 2);
 
-        // Two stream events, one per commit — and numbered by the stream even
-        // though the repository lives in fjall.
+        // Two commit events, one per write -- and numbered by the stream even
+        // though the repository lives in fjall. The head is not 2: the account
+        // announcement precedes them, which is what this assertion missed.
+        let events = stream_of(tmp_data.path())
+            .await
+            .read_after(None, None, 20)
+            .await
+            .unwrap();
+        let commit_seqs: Vec<i64> = events
+            .iter()
+            .filter(|e| e.event_type == "commit")
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(commit_seqs.len(), 2, "two writes, two commits: {events:?}");
+        assert!(
+            commit_seqs[1] > commit_seqs[0],
+            "commits are numbered by the stream: {commit_seqs:?}"
+        );
         assert_eq!(
             stream_of(tmp_data.path()).await.latest_seq().await.unwrap(),
-            Some(2)
+            Some(*commit_seqs.last().unwrap()),
+            "the second commit is the stream head"
         );
     }
 

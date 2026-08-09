@@ -31,6 +31,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The accounts database is SQLite in every storage profile, so the `sqlite`
+/// feature is not one of two alternatives -- it is required.
+///
+/// `fjall` selects the *per-actor* store and is additive: a fjall build is
+/// `--features fjall` on top of the defaults, not `--no-default-features
+/// --features fjall`. Building without `sqlite` produced 120 type errors about
+/// an unlinked `sqlx` across 25 modules, which is a long way from saying "you
+/// dropped a feature you needed", and it is what the README's own fjall build
+/// command did.
+#[cfg(not(feature = "sqlite"))]
+compile_error!(
+    "atproto-pds requires the `sqlite` feature: the accounts database is SQLite in every \
+     storage profile. `fjall` selects the per-actor store and is additive -- build with \
+     `--features fjall`, not `--no-default-features --features fjall`."
+);
+
 pub mod account;
 pub mod actor_store;
 #[cfg(feature = "http")]

@@ -95,16 +95,22 @@ metrics at `GET /metrics` when the `metrics` feature is on.
 
 ## Storage profiles
 
-Two compile-time-mutually-exclusive backends for the per-actor store:
+Two backends for the per-actor store, selected at compile time:
 
 - **SQLite (default)** — per-actor SQLite files. Matches the upstream
   0016 Permissioned Data draft exactly. `cargo build` (or `cargo install`)
   produces this profile.
 - **fjall** — single fjall `Database` per data-dir with one `Keyspace`
   per logical table. Lower-overhead single-host alternative; build with
-  `--no-default-features --features fjall,smtp,metrics,hickory-dns`. The
-  trait dispatch (`PublicRealmBackend` + `AtomicCommitWriter`) lifts
-  every public-realm read + write path through the same surface.
+  `--features fjall` **on top of the defaults**. The trait dispatch
+  (`PublicRealmBackend` + `AtomicCommitWriter`) lifts every public-realm read
+  + write path through the same surface.
+
+The profiles are alternatives for the per-actor store and nothing else, so
+`fjall` is additive rather than a replacement: the `sqlite` feature stays on
+because the accounts database below is SQLite either way. Turning defaults off
+does not produce a fjall build, it produces one that does not compile — the
+crate refuses at build time with a message saying so.
 
 For the cross-account accounts DB:
 
@@ -173,8 +179,8 @@ PDS_JWT_SECRET=$(openssl rand -hex 32) \
 PDS_ADMIN_PASSWORD=$(openssl rand -hex 16) \
   cargo run --features clap,smtp,metrics,hickory-dns --bin pds
 
-# fjall-profile build:
-cargo build --no-default-features --features clap,fjall,smtp,metrics,hickory-dns \
+# fjall-profile build (additive — the defaults stay on):
+cargo build --features clap,fjall,smtp,metrics \
   --bin pds --bin atproto-pds-admin
 ```
 
