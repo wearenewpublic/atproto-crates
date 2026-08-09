@@ -232,6 +232,26 @@ async fn enqueue_for_space(
 
     let mut count = 0u32;
     for r in recipients {
+        // Re-check what was stored, before anything is signed for it.
+        //
+        // Validating only at registration would leave every row written
+        // before that guard existed live, and those are exactly the rows an
+        // attacker would have planted. Checking here means a hostile endpoint
+        // has to survive both the write and every read, and it is refused
+        // ahead of `mint_service_auth` so no token is ever produced for it.
+        if let Err(err) =
+            atproto_identity::validation::validate_service_endpoint(&r.service_endpoint)
+        {
+            tracing::warn!(
+                space = %space,
+                service_did = %r.service_did,
+                endpoint = %r.service_endpoint,
+                error = %err,
+                "skipping a notify subscription whose endpoint is not a permitted service endpoint"
+            );
+            continue;
+        }
+
         // Mint a per-recipient service-auth token when a signing key is
         // supplied (notifyWrite). aud is the recipient service DID.
         let auth_token = match owner_signing_key {
@@ -395,6 +415,67 @@ mod tests {
             .unwrap();
         assert_eq!(due.len(), 2);
         assert!(due.iter().all(|d| d.nsid == NOTIFY_WRITE_NSID));
+    }
+
+    /// A subscription row whose endpoint would not be accepted today is
+    /// skipped rather than delivered to.
+    ///
+    /// Validating only at registration would leave every row written before
+    /// that guard existed live, and those are the rows that matter. Nothing
+    /// is signed for a skipped recipient: the check runs ahead of
+    /// `mint_service_auth`, so a hostile endpoint never causes the space
+    /// authority's key to produce a token at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recipient_with_an_impermissible_endpoint_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let owner_store = SqlActorStore::open(&dir, "did:plc:owner").await.unwrap();
+        let uri = test_space();
+        ensure_space_row(owner_store.pool(), &uri).await;
+
+        // Written straight to the table, as a row predating the guard would be.
+        for (did, endpoint) in [
+            ("did:web:good.example", "https://good.example"),
+            // The SSRF shapes: cleartext, an address literal reaching inside
+            // the network, cloud metadata, and a non-standard port.
+            ("did:web:plain.example", "http://plain.example"),
+            ("did:web:internal.example", "https://10.0.0.5"),
+            ("did:web:metadata.example", "https://169.254.169.254"),
+            ("did:web:port.example", "https://port.example:8080"),
+        ] {
+            upsert_recipient(owner_store.pool(), &uri, did, endpoint)
+                .await
+                .unwrap();
+        }
+
+        let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        let payload = NotifyWritePayload {
+            hash: None,
+            space: uri.to_string(),
+            repo: "did:plc:alice".to_string(),
+            rev: "3kmev".to_string(),
+        };
+        let owner_key =
+            atproto_identity::key::generate_key(atproto_identity::key::KeyType::P256Private)
+                .unwrap();
+        let count = enqueue_writes(accounts.pool(), &dir, &uri, &payload, &owner_key)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count, 1,
+            "only the permitted endpoint should be delivered to"
+        );
+        let due = crate::notifier::due_now(accounts.pool(), 100)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].target_endpoint, "https://good.example",
+            "a notification was queued for an endpoint that is not permitted"
+        );
     }
 
     /// A per-repo subscription only matches notifyWrite fan-out for that repo.

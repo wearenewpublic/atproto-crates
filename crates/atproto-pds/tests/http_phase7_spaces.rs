@@ -1408,6 +1408,66 @@ async fn register_notify_requires_space_credential() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// The endpoint is a URL this server later POSTs to, carrying a JWT signed
+/// with the space authority's key. Stored unchecked, `registerNotify` was a
+/// request generator aimed wherever the caller liked -- reaching whatever the
+/// PDS can reach, and handing an authority-signed token to a host of the
+/// caller's choosing.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_notify_refuses_an_impermissible_endpoint() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+
+    for hostile in [
+        // Inside the network the PDS sits in.
+        "http://127.0.0.1:8080/hook",
+        "https://10.0.0.5/hook",
+        "https://192.168.1.1/hook",
+        // The cloud metadata service, the classic SSRF prize.
+        "https://169.254.169.254/latest/meta-data/",
+        // Cleartext, so the authority-signed token crosses the wire in clear.
+        "http://consumer.example",
+        // Credentials smuggled into the authority component.
+        "https://user:pass@consumer.example",
+    ] {
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.registerNotify",
+            json!({"space": uri, "endpoint": hostile}),
+            Some(&credential),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{hostile} should be refused: {body}"
+        );
+        assert_eq!(body["error"], "InvalidRequest", "{hostile}: {body}");
+    }
+}
+
+/// And an ordinary endpoint still registers, so the guard is not an outage.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_notify_accepts_an_ordinary_https_endpoint() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": uri, "endpoint": "https://consumer.example"}),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "registerNotify: {body}");
+}
+
 // ---------------------------------------------------------------------------
 //  Inbound notify endpoints (service auth required)
 // ---------------------------------------------------------------------------

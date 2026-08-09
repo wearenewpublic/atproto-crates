@@ -3068,6 +3068,22 @@ pub async fn register_notify(
         .client_id
         .clone()
         .unwrap_or_else(|| credential.iss.clone());
+    // The endpoint is a URL this server will later POST to, carrying a JWT
+    // signed with the space authority's key. Storing it unchecked made
+    // `registerNotify` a request generator pointed wherever the caller liked:
+    // an SSRF sink reaching whatever the PDS can reach, and a delivery
+    // mechanism for an authority-signed token to a host of the caller's
+    // choosing. The same guard already gates the two other places this server
+    // takes a URL from a caller and dereferences it -- `mint_authz` for
+    // `client_id` and `jwks_uri`, and `recipient` for a resolved host.
+    atproto_identity::validation::validate_service_endpoint(&input.endpoint).map_err(|err| {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!("endpoint is not a permitted service endpoint: {err}"),
+        )
+    })?;
+
     let expires_at =
         (chrono::Utc::now() + chrono::Duration::seconds(REGISTER_NOTIFY_TTL_SECS)).to_rfc3339();
     crate::space::notify::upsert_subscription(
