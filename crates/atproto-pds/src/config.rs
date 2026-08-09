@@ -133,6 +133,7 @@ pub fn validate_production_safety(config: &StartupConfig) -> Result<(), PdsError
 pub fn validate_supported_backends(
     postgres_url: Option<&str>,
     blob_store_url: Option<&str>,
+    valkey_url: Option<&str>,
 ) -> Result<(), PdsError> {
     let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
     let mut issues: Vec<String> = Vec::new();
@@ -141,6 +142,19 @@ pub fn validate_supported_backends(
             "PDS_POSTGRES_URL is set, but PostgreSQL is not a supported accounts backend on this \
              build — thirteen production call sites take a SQLite-only pool accessor that would \
              panic. Unset it; the accounts DB is SQLite at PDS_DATA_DIRECTORY/accounts.sqlite."
+                .to_string(),
+        );
+    }
+    // `PDS_VALKEY_URL` on a build without the feature was worse than ignored.
+    // It was read once, to decide what to tell the production-safety gate the
+    // durability profile would be, and the runtime selection that would honour
+    // it is `#[cfg(feature = "valkey")]` -- compiled out. So the gate was told
+    // "valkey", passed, and the server then fell through to the in-memory
+    // default: the exact configuration the gate exists to refuse, reached by
+    // setting the variable that is supposed to avoid it.
+    if set(valkey_url) && !cfg!(feature = "valkey") {
+        issues.push(
+            "PDS_VALKEY_URL is set, but this build has no `valkey` feature — the JTI replay guard              and rate limiters would silently fall back to in-process memory, which is the              configuration PDS_PRODUCTION refuses. Rebuild with `--features valkey`, or unset it              and set PDS_DURABILITY_PROFILE=sql."
                 .to_string(),
         );
     }
@@ -228,15 +242,16 @@ mod tests {
 
     #[test]
     fn an_unset_backend_url_is_fine() {
-        validate_supported_backends(None, None).unwrap();
+        validate_supported_backends(None, None, None).unwrap();
         // Empty and whitespace-only count as unset: an operator who exports
         // the variable with no value has not configured anything.
-        validate_supported_backends(Some(""), Some("   ")).unwrap();
+        validate_supported_backends(Some(""), Some("   "), Some(" ")).unwrap();
     }
 
     #[test]
     fn a_configured_postgres_url_refuses_and_says_why() {
-        let err = validate_supported_backends(Some("postgres://localhost/pds"), None).unwrap_err();
+        let err =
+            validate_supported_backends(Some("postgres://localhost/pds"), None, None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("PDS_POSTGRES_URL"), "{msg}");
         assert!(
@@ -247,19 +262,55 @@ mod tests {
 
     #[test]
     fn a_configured_blob_store_url_refuses_and_says_why() {
-        let err = validate_supported_backends(None, Some("s3://bucket")).unwrap_err();
+        let err = validate_supported_backends(None, Some("s3://bucket"), None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("PDS_BLOB_STORE_URL"), "{msg}");
         assert!(msg.contains("not wired into this binary"), "{msg}");
+    }
+
+    /// A valkey URL on a build that cannot use it is refused.
+    ///
+    /// This one is not merely ignored when unsupported, which is what makes it
+    /// worth its own test. The URL was read to decide what the production gate
+    /// was told the durability profile would be, while the code that would
+    /// honour it is compiled out — so setting it made the gate pass and the
+    /// server run on in-process memory, which is the state the gate exists to
+    /// refuse. Setting the variable meant to avoid that state was the way to
+    /// reach it.
+    #[cfg(not(feature = "valkey"))]
+    #[test]
+    fn a_valkey_url_without_the_feature_refuses_and_says_why() {
+        let err =
+            validate_supported_backends(None, None, Some("redis://localhost:6379")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("PDS_VALKEY_URL"), "{msg}");
+        assert!(
+            msg.contains("no `valkey` feature"),
+            "the refusal must name the reason: {msg}"
+        );
+        assert!(
+            msg.contains("--features valkey"),
+            "and what to do about it: {msg}"
+        );
+    }
+
+    /// With the feature compiled in, the same URL is ordinary configuration.
+    #[cfg(feature = "valkey")]
+    #[test]
+    fn a_valkey_url_with_the_feature_is_accepted() {
+        validate_supported_backends(None, None, Some("redis://localhost:6379")).unwrap();
     }
 
     #[test]
     fn both_are_reported_together() {
         // Same rule as the production gate: an operator fixing config should
         // see every problem in one boot, not one per attempt.
-        let err =
-            validate_supported_backends(Some("postgres://localhost/pds"), Some("s3://bucket"))
-                .unwrap_err();
+        let err = validate_supported_backends(
+            Some("postgres://localhost/pds"),
+            Some("s3://bucket"),
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("PDS_POSTGRES_URL"), "{msg}");
         assert!(msg.contains("PDS_BLOB_STORE_URL"), "{msg}");

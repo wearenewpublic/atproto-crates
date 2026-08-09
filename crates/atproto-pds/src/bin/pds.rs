@@ -529,6 +529,29 @@ async fn main() -> anyhow::Result<()> {
         "atproto-pds starting"
     );
 
+    // Backends that are configured but cannot be used. These flags used to
+    // parse and be ignored, so an operator who set one believed they had it and
+    // got neither.
+    //
+    // Refusing here rather than dropping the flags: an unrecognised environment
+    // variable is also silent, and silence is the failure being fixed.
+    //
+    // Ahead of the production gate on purpose. `PDS_VALKEY_URL` on a build
+    // without the feature leaves the durability profile at its default, so the
+    // gate would refuse first and say memory durability is not allowed in
+    // production -- true, and the symptom rather than the cause. The operator
+    // set a variable to avoid exactly that and needs to be told it did nothing,
+    // not told the consequence.
+    atproto_pds::config::validate_supported_backends(
+        args.postgres_url.as_deref(),
+        args.blob_store_url.as_deref(),
+        args.valkey_url.as_deref(),
+    )
+    .map_err(|e| {
+        error!(error = ?e, "unsupported backend configured");
+        anyhow::anyhow!("{e}")
+    })?;
+
     // Production-safety gate: refuse to boot with dev-sentinel secrets when
     // PDS_PRODUCTION=true. See.
     let startup = StartupConfig {
@@ -539,10 +562,18 @@ async fn main() -> anyhow::Result<()> {
         service_did: args.service_did.clone(),
         // Valkey overrides the flag when a URL is configured, so report what
         // will actually back the guard rather than what was typed.
-        durability_profile: if args
-            .valkey_url
-            .as_deref()
-            .is_some_and(|u| !u.trim().is_empty())
+        //
+        // `cfg!` and not just the URL: the runtime selection below is compiled
+        // out without the feature, so on such a build the URL changes nothing
+        // and saying "valkey" here would be reporting a backend that is not
+        // going to be used. `validate_supported_backends` refuses that
+        // combination outright a few lines down, and this is the second half of
+        // the same statement -- what is configured has to be what runs.
+        durability_profile: if cfg!(feature = "valkey")
+            && args
+                .valkey_url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty())
         {
             "valkey".to_string()
         } else {
@@ -551,23 +582,6 @@ async fn main() -> anyhow::Result<()> {
     };
     validate_production_safety(&startup).map_err(|e| {
         error!(error = ?e, "startup config rejected");
-        anyhow::anyhow!("{e}")
-    })?;
-
-    // Two backends are documented in the source tree, compile behind Cargo
-    // features, and are not wired into this binary. Both flags used to parse
-    // and be ignored, so an operator who configured either believed they had
-    // it and got neither.
-    //
-    // Refusing here rather than dropping the flags: an unrecognised
-    // environment variable is also silent, and silence is the failure being
-    // fixed.
-    atproto_pds::config::validate_supported_backends(
-        args.postgres_url.as_deref(),
-        args.blob_store_url.as_deref(),
-    )
-    .map_err(|e| {
-        error!(error = ?e, "unsupported backend configured");
         anyhow::anyhow!("{e}")
     })?;
 
@@ -1186,8 +1200,10 @@ async fn main() -> anyhow::Result<()> {
         unified_gc_jti,
         unified_gc_rate,
         args.data_dir.clone(),
-        args.space_oplog_retention_days,
-        args.blob_grace_hours,
+        GcRetention {
+            space_oplog_days: args.space_oplog_retention_days,
+            blob_grace_hours: args.blob_grace_hours,
+        },
         unified_gc_interval,
         token.clone(),
     ));
@@ -1338,6 +1354,16 @@ async fn notifier_loop(
     }
 }
 
+/// Retention knobs for the unified GC, grouped because they travel together
+/// and are read together.
+#[derive(Debug, Clone, Copy)]
+struct GcRetention {
+    /// Days of `space_*_oplog` history kept. `0` disables that sweep.
+    space_oplog_days: i64,
+    /// Hours an unreferenced blob is kept. `0` disables that sweep.
+    blob_grace_hours: i64,
+}
+
 /// Unified daily GC loop. Calls `gc::tick_with`
 /// on a fixed cadence until the shutdown token fires. Each tick prunes:
 ///
@@ -1357,8 +1383,7 @@ async fn unified_gc_loop(
     jti_guard: atproto_pds::security::JtiReplayGuard,
     rate_limiter: atproto_pds::security::SlidingWindowLimiter,
     data_dir: PathBuf,
-    space_oplog_retention_days: i64,
-    blob_grace_hours: i64,
+    retention: GcRetention,
     interval: Duration,
     token: tokio_util::sync::CancellationToken,
 ) {
@@ -1376,8 +1401,8 @@ async fn unified_gc_loop(
             _ = ticker.tick() => {
                 let opts = atproto_pds::gc::TickOptions {
                     data_dir: Some(&data_dir),
-                    space_oplog_retention_days,
-                    blob_grace_hours,
+                    space_oplog_retention_days: retention.space_oplog_days,
+                    blob_grace_hours: retention.blob_grace_hours,
                 };
                 let report = atproto_pds::gc::tick_with(&pool, &jti_guard, &rate_limiter, &opts).await;
                 tracing::info!(
