@@ -341,3 +341,42 @@ async fn a_request_with_no_peer_address_is_not_refused() {
         assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 }
+
+/// `/oauth/authorize` is the OAuth endpoint that takes a password, and it was
+/// the one not on the auth tier. `/oauth/token` and `/oauth/par` were listed,
+/// so the two steps that *consume* a credential were budgeted while the step
+/// that guesses at one ran at the ordinary tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_oauth_authorize_form_is_on_the_auth_tier() {
+    let (app, manager, _tmp) = build_app(100, 2, 0, &[]).await;
+    create_account(&manager, "did:plc:alice", "alice.example").await;
+
+    let guess = |app: axum::Router| async move {
+        let mut req = Request::builder()
+            .uri("/oauth/authorize")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "request_uri": "urn:ietf:params:oauth:request_uri:nonexistent",
+                    "identifier": "alice.example",
+                    "password": "wrong",
+                    "approve": true,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("7.7.7.7:1000".parse::<SocketAddr>().unwrap()));
+        app.oneshot(req).await.unwrap().status()
+    };
+
+    for _ in 0..2 {
+        guess(app.clone()).await;
+    }
+    assert_eq!(
+        guess(app.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the authorize form must be bounded like every other password entry point"
+    );
+}

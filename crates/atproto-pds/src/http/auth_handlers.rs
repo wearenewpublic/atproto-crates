@@ -575,25 +575,24 @@ pub async fn create_session(
     } else {
         directory.lookup_handle(&input.identifier).await
     }
-    .map_err(XrpcError::from)?
-    .ok_or_else(|| {
+    .map_err(XrpcError::from)?;
+
+    // One refusal for every way a login can fail, and the same work spent
+    // reaching it. See the matching note in `oauth::authorize`: distinct
+    // messages answer "does this handle exist here" to anyone who asks, and a
+    // state check ahead of the password check answers rather more than that.
+    let refused = || {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,
             "AuthenticationRequired",
-            "no such account",
+            "invalid identifier or password",
         )
-    })?;
+    };
 
-    if !matches!(
-        account.state,
-        AccountState::Active | AccountState::Deactivated
-    ) {
-        return Err(XrpcError::new(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
-            format!("account is {}", account.state),
-        ));
-    }
+    let Some(account) = account else {
+        crate::account::verify_password_against_decoy(&input.password);
+        return Err(refused());
+    };
 
     // Try app-password verification first.
     let app = app_password::verify(&manager.account_pool(), &account.did, &input.password)
@@ -609,13 +608,22 @@ pub async fn create_session(
             (row.id, authority)
         }
         None => {
-            return Err(XrpcError::new(
-                StatusCode::UNAUTHORIZED,
-                "AuthenticationRequired",
-                "invalid identifier or password",
-            ));
+            return Err(refused());
         }
     };
+
+    // Only now, with the credential proved, is the caller entitled to know
+    // anything about the account's state.
+    if !matches!(
+        account.state,
+        AccountState::Active | AccountState::Deactivated
+    ) {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!("account is {}", account.state),
+        ));
+    }
 
     // The policy gate. Placed here, after the credential has been proved and
     // before a token exists: refusing earlier would tell an unauthenticated

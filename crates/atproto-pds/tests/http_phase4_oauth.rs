@@ -1969,3 +1969,59 @@ async fn replaying_a_consumed_refresh_token_revokes_the_whole_grant() {
     );
     assert_eq!(body["error"], "invalid_grant", "{body}");
 }
+
+/// A login must not say which half was wrong.
+///
+/// "no such account" and "invalid identifier or password" were distinct
+/// replies, so anyone could ask this server whether a handle exists on it --
+/// the first step of a credential-stuffing run, answered for free and at the
+/// ordinary rate-limit tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_account_and_a_wrong_password_are_indistinguishable() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // A real PAR request each time, so both attempts fail on the credential
+    // rather than on the request_uri.
+    let attempt = |app: axum::Router, identifier: &'static str, password: &'static str| async move {
+        let (_, challenge) = pkce_pair();
+        let (_, par_body) = post_json(
+            app.clone(),
+            "/oauth/par",
+            json!({
+                "client_id": CLIENT_ID, "response_type": "code",
+                "redirect_uri": REDIRECT_URI,
+                "scope": "atproto", "state": "s",
+                "code_challenge": challenge, "code_challenge_method": "S256",
+            }),
+        )
+        .await;
+        let request_uri = par_body["request_uri"].as_str().unwrap().to_string();
+        post_json(
+            app,
+            "/oauth/authorize",
+            json!({
+                "request_uri": request_uri, "identifier": identifier,
+                "password": password, "approve": true,
+            }),
+        )
+        .await
+    };
+
+    let (absent_status, absent_body) = attempt(app.clone(), "nobody.example", "whatever").await;
+    let (wrong_status, wrong_body) = attempt(app.clone(), "alice.example", "wrong").await;
+
+    assert_eq!(
+        absent_status, wrong_status,
+        "status distinguishes a missing account from a bad password"
+    );
+    assert_eq!(
+        absent_body["error"], wrong_body["error"],
+        "error code distinguishes a missing account from a bad password"
+    );
+    assert_eq!(
+        absent_body["message"], wrong_body["message"],
+        "message distinguishes a missing account from a bad password: \
+         {absent_body} vs {wrong_body}"
+    );
+}

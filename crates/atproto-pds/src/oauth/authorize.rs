@@ -100,26 +100,29 @@ pub async fn authorize_handler(
         directory.lookup_did(&input.identifier).await
     } else {
         directory.lookup_handle(&input.identifier).await
-    }
-    .map_err(XrpcError::from)?
-    .ok_or_else(|| {
+    };
+
+    // One refusal for every way a login can fail, and the same work spent
+    // reaching it.
+    //
+    // "no such account" and "invalid identifier or password" were distinct
+    // messages, which answers "does this handle exist here" to anyone who asks
+    // -- and the account-state check sat ahead of the password check, so an
+    // unauthenticated caller could also learn that an account was suspended or
+    // taken down. Enumeration is the first step of a credential-stuffing run
+    // and there is no reason to assist it.
+    let refused = || {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,
             "AuthenticationRequired",
-            "no such account",
+            "invalid identifier or password",
         )
-    })?;
+    };
 
-    if !matches!(
-        account.state,
-        AccountState::Active | AccountState::Deactivated
-    ) {
-        return Err(XrpcError::new(
-            StatusCode::FORBIDDEN,
-            "access_denied",
-            format!("account is {}", account.state),
-        ));
-    }
+    let Some(account) = account.map_err(XrpcError::from)? else {
+        crate::account::verify_password_against_decoy(&input.password);
+        return Err(refused());
+    };
 
     let auth_ok = if app_password::verify(&manager.account_pool(), &account.did, &input.password)
         .await
@@ -134,10 +137,19 @@ pub async fn authorize_handler(
             .map_err(XrpcError::from)?
     };
     if !auth_ok {
+        return Err(refused());
+    }
+
+    // Only now, with the credential proved, is the holder entitled to know
+    // anything about the account's state.
+    if !matches!(
+        account.state,
+        AccountState::Active | AccountState::Deactivated
+    ) {
         return Err(XrpcError::new(
-            StatusCode::UNAUTHORIZED,
-            "AuthenticationRequired",
-            "invalid identifier or password",
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            format!("account is {}", account.state),
         ));
     }
 

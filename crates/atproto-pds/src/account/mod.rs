@@ -66,7 +66,10 @@ pub use directory::{AccountDirectory, AccountRow};
 pub use invite::InviteCodeRow;
 
 #[cfg(feature = "sqlite")]
-pub use manager::{AccountManager, CreateAccountParams, hash_password, verify_password};
+pub use manager::{
+    AccountManager, CreateAccountParams, hash_password, verify_password,
+    verify_password_against_decoy,
+};
 
 pub use session::{
     DEFAULT_ACCESS_TTL_SECS, DEFAULT_REFRESH_TTL_SECS, SessionClaims, SessionTokens, issue_pair,

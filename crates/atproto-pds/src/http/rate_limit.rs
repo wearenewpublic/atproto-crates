@@ -54,7 +54,7 @@ use crate::security::SlidingWindowLimiter;
 /// Everything here either mints a credential or consumes one, so a caller
 /// making many attempts in a minute is doing something other than using the
 /// service.
-const AUTH_PATHS: [&str; 7] = [
+const AUTH_PATHS: [&str; 8] = [
     "/xrpc/com.atproto.server.createSession",
     "/xrpc/com.atproto.server.createAccount",
     "/xrpc/com.atproto.server.refreshSession",
@@ -62,6 +62,12 @@ const AUTH_PATHS: [&str; 7] = [
     "/xrpc/com.atproto.server.resetPassword",
     "/oauth/token",
     "/oauth/par",
+    // The OAuth endpoint that actually takes a password. `/oauth/token` and
+    // `/oauth/par` were listed and this was not, so the two steps that consume
+    // a credential were budgeted while the one that guesses at it ran at the
+    // ordinary tier -- thousands of attempts per IP per window against a form
+    // taking an identifier and a password.
+    "/oauth/authorize",
 ];
 
 /// Operator-tunable rate-limit policy.

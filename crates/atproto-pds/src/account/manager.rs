@@ -1469,6 +1469,26 @@ pub fn hash_password(password: &str) -> PdsResult<String> {
     Ok(hash.to_string())
 }
 
+/// Spend the same work verifying a password as a real account would, and
+/// report failure.
+///
+/// Call this on the "no such account" branch of a login. Returning early there
+/// answers "does this account exist" in the response *time*, which survives
+/// every effort to make the response *body* say nothing: an absent account
+/// costs a database lookup, a present one costs a lookup plus an Argon2id
+/// verification, and the two are trivially distinguishable over the internet.
+///
+/// The hash is of a fixed passphrase nobody holds, computed once, so the
+/// comparison always fails while costing what a real one costs.
+pub fn verify_password_against_decoy(password: &str) {
+    static DECOY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let decoy = DECOY.get_or_init(|| {
+        hash_password("decoy password for equalising login timing")
+            .unwrap_or_else(|_| String::new())
+    });
+    let _ = verify_password(password, decoy);
+}
+
 /// Verify a password against an Argon2 hash. Returns `false` on mismatch or
 /// invalid hash format.
 #[must_use]
