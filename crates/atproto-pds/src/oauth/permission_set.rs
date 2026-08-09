@@ -66,6 +66,28 @@ pub async fn expand(resolver: Option<&Arc<dyn LexiconResolver>>, granted: &str) 
             continue;
         };
         let expanded = permissions_from(&doc, &nsid, include_aud.as_deref());
+        // Every string these scopes are built from is chosen by the client. The
+        // record lives in the client's own repository, so `lxm`, `collection`,
+        // `action` and `accept` are all its text, and the audience arrives on
+        // the `include:` scope the client wrote. A grant is space-delimited, so
+        // a value carrying a space is not a value -- it is a second scope, and
+        // one that never appeared on the consent screen because the screen
+        // splits on whitespace too and saw a single token.
+        //
+        // Checking here rather than in each builder is deliberate: this is the
+        // one place every expanded scope passes through, and a new resource
+        // arm added later inherits the check instead of having to remember it.
+        let (expanded, rejected): (Vec<String>, Vec<String>) = expanded
+            .into_iter()
+            .partition(|scope| atproto_oauth::scopes::is_scope_token(scope));
+        for scope in rejected {
+            tracing::warn!(
+                nsid = %nsid,
+                scope = %scope,
+                "dropping an expanded permission that is not a single scope token; a permission \
+                 set may not decide how many scopes it becomes"
+            );
+        }
         if expanded.is_empty() {
             tracing::warn!(nsid = %nsid, "permission set declared nothing this server understands");
         } else {
@@ -608,6 +630,124 @@ mod tests {
             granted
                 .assert_rpc("app.bsky.video.uploadVideo", "did:web:elsewhere.example")
                 .is_err()
+        );
+    }
+
+    // --- scope injection ----------------------------------------------------
+
+    /// A permission set is fetched from the client's own repository, so every
+    /// string in it is text the client chose -- and it needs no encoding trick,
+    /// just a space.
+    ///
+    /// Which field carries it depends on where the builder puts the value.
+    /// Only a value written *last* can append a whole token: `rpc:{lxm}?aud=`
+    /// puts `aud` last, so a space in `lxm` yields `transition:generic?aud=…`,
+    /// which parses as nothing and is ignored. `blob:{accept}` and the final
+    /// `action=` of `repo:{collection}?{actions}` are the two record fields
+    /// that do land at the end, so they are the two tested here.
+    ///
+    /// The assertion is on `assert_repo`, not on the string.
+    /// `transition:generic` short-circuits the repo axis, so a surviving token
+    /// turns a set that names one image type into write access to every
+    /// collection in the repository.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_sets_own_fields_cannot_append_a_second_scope() {
+        use atproto_oauth::scopes::{RepoAction, ScopesSet};
+
+        for permission in [
+            serde_json::json!({
+                "type": "permission", "resource": "blob",
+                "accept": ["image/png transition:generic"]
+            }),
+            serde_json::json!({
+                "type": "permission", "resource": "repo",
+                "collection": ["app.evil.thing"],
+                "action": ["create", "delete transition:generic"]
+            }),
+        ] {
+            let doc = serde_json::json!({
+              "lexicon": 1, "id": "app.evil.appAccess",
+              "defs": {"main": {
+                "type": "permission-set",
+                "title": "Upload an image",
+                "permissions": [permission]
+              }}
+            });
+            let r = resolver(doc);
+            let expanded = expand(Some(&r), "atproto include:app.evil.appAccess").await;
+
+            assert!(
+                !expanded
+                    .split_whitespace()
+                    .any(|token| token == "transition:generic"),
+                "a permission set appended a grant to itself: {expanded}"
+            );
+
+            let granted = ScopesSet::from_scope_string(&expanded);
+            assert!(
+                granted
+                    .assert_repo("app.bsky.feed.post", &RepoAction::Create)
+                    .is_err(),
+                "a permission set widened the grant to every collection: {expanded}"
+            );
+            // The rest of the grant is untouched.
+            assert!(expanded.contains("atproto"), "{expanded}");
+        }
+    }
+
+    /// The same defect reached through the audience instead of the record, so
+    /// it needs no published lexicon of the attacker's own -- a first-party set
+    /// carries it. `%20` is the whole payload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_encoded_space_in_the_audience_grants_nothing_extra() {
+        use atproto_oauth::scopes::{RepoAction, ScopesSet};
+
+        let r = resolver(auth_create_posts());
+        let expanded = expand(
+            Some(&r),
+            "atproto include:app.bsky.authCreatePosts\
+             ?aud=did%3Aweb%3Aapi.bsky.app%20transition%3Ageneric",
+        )
+        .await;
+
+        assert!(
+            !expanded
+                .split_whitespace()
+                .any(|token| token == "transition:generic"),
+            "the audience carried a second grant through expansion: {expanded}"
+        );
+
+        let granted = ScopesSet::from_scope_string(&expanded);
+        assert!(
+            granted
+                .assert_repo("app.bsky.feed.post", &RepoAction::Create)
+                .is_err(),
+            "a narrow consent became a write grant on every collection: {expanded}"
+        );
+    }
+
+    /// Refusing the injection must not cost a legitimate set its expansion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_well_formed_set_still_expands_in_full() {
+        use atproto_oauth::scopes::ScopesSet;
+
+        let r = resolver(auth_create_posts());
+        let expanded = expand(
+            Some(&r),
+            "include:app.bsky.authCreatePosts?aud=did:web:api.bsky.app%23bsky_appview",
+        )
+        .await;
+
+        let granted = ScopesSet::from_scope_string(&expanded);
+        granted
+            .assert_rpc(
+                "app.bsky.video.uploadVideo",
+                "did:web:api.bsky.app#bsky_appview",
+            )
+            .expect("the check must still pass for an audience naming a service");
+        assert!(
+            expanded.contains("repo:app.bsky.feed.post?action=create"),
+            "{expanded}"
         );
     }
 }

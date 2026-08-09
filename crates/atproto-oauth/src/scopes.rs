@@ -677,6 +677,29 @@ impl Scope {
             None
         };
 
+        // `aud` is the only field on any scope that arrives percent-encoded and
+        // leaves decoded, which makes it the only one that can introduce a
+        // character the grant format reserves. `%20` decodes to a space, and a
+        // space in an audience does not stay inside the audience: the expansion
+        // this scope drives writes `rpc:<lxm>?aud=<aud>` and joins the results
+        // with spaces, so `aud=did%3Aweb%3Ay%20transition%3Ageneric` arrives as
+        // one scope, is displayed as one scope on the consent screen, and is
+        // read back as two -- the second being a grant nobody approved.
+        //
+        // A DID contains no whitespace, so refusing costs nothing a real
+        // audience needs; `#` stays legal, which is what a service reference
+        // like `did:web:api.bsky.app#bsky_appview` requires. An empty `aud=` is
+        // left alone: it carries no value to inject and is already treated as
+        // an absent audience downstream.
+        if let Some(aud) = aud.as_deref()
+            && !aud.is_empty()
+            && !is_scope_token(aud)
+        {
+            return Err(ParseError::InvalidResource(format!(
+                "include: audience is not a single scope token: {aud}"
+            )));
+        }
+
         Ok(Scope::Include(IncludeScope {
             nsid: nsid.to_string(),
             aud,
@@ -1012,6 +1035,29 @@ impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_string_normalized())
     }
+}
+
+/// True when `s` is a single RFC 6749 §3.3 `scope-token`.
+///
+/// ```text
+/// scope       = scope-token *( SP scope-token )
+/// scope-token = 1*( %x21 / %x23-5B / %x5D-7E )
+/// ```
+///
+/// A grant is a space-delimited list, so this is the property that makes one
+/// scope one element of it. The excluded characters are exactly the three the
+/// list format cannot survive: SP ends a token and begins the next, and `"` and
+/// `\` are reserved so a grant can be carried inside a quoted string.
+///
+/// Anything that builds a scope by interpolating a value it did not choose --
+/// a permission set's fields, an audience taken from a client's request -- has
+/// to check this. Otherwise the value decides how many scopes it becomes, and
+/// a field that reads as a name is free to append a second grant to it.
+#[must_use]
+pub fn is_scope_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
 /// Parse a query string into a map of keys to lists of values
@@ -2752,6 +2798,68 @@ mod tests {
         let serialized = scope.to_string_normalized();
         let reparsed = Scope::parse(&serialized).unwrap();
         assert_eq!(scope, reparsed);
+    }
+
+    /// The grammar the space-delimited grant format depends on.
+    ///
+    /// The three excluded characters are the ones RFC 6749 §3.3 leaves out, and
+    /// each for a reason worth keeping straight: SP because it delimits, `"`
+    /// and `\` because a grant has to survive being quoted.
+    #[test]
+    fn a_scope_token_is_one_element_of_a_space_delimited_list() {
+        assert!(is_scope_token("atproto"));
+        assert!(is_scope_token("repo:app.bsky.feed.post?action=create"));
+        // A service reference: `#` is inside the grammar and every audience
+        // naming a service carries one.
+        assert!(is_scope_token("did:web:api.bsky.app#bsky_appview"));
+
+        assert!(!is_scope_token(""), "an empty token is not a token");
+        assert!(!is_scope_token("two tokens"), "SP delimits");
+        assert!(!is_scope_token("has\ttab"));
+        assert!(!is_scope_token("has\nnewline"));
+        assert!(!is_scope_token("has\"quote"));
+        assert!(!is_scope_token("has\\backslash"));
+    }
+
+    /// The carrier: `aud` is the one field that arrives encoded and leaves
+    /// decoded, so it is the one that can smuggle a delimiter past a check
+    /// that ran before the decode.
+    ///
+    /// `transition:generic` is the payload that makes this worth refusing --
+    /// it short-circuits the repo, blob and rpc axes to `true`, so a grant the
+    /// holder read as "create posts" becomes every collection and every
+    /// service.
+    #[test]
+    fn an_include_audience_may_not_decode_into_a_second_scope() {
+        let injected = "include:app.bsky.authCreatePosts\
+                        ?aud=did%3Aweb%3Aapi.bsky.app%20transition%3Ageneric";
+        assert!(
+            Scope::parse(injected).is_err(),
+            "a decoded space ends the audience and starts a grant nobody consented to"
+        );
+
+        // The same value with the space left encoded is inert and still parses:
+        // it stays one token all the way through.
+        let encoded = "include:app.bsky.authCreatePosts?aud=did%3Aweb%3Aapi.bsky.app%2Btransition";
+        assert!(Scope::parse(encoded).is_ok());
+    }
+
+    /// Refusing the injection must not refuse the audiences real clients send.
+    #[test]
+    fn an_include_audience_may_still_name_a_service() {
+        let scope = Scope::parse(
+            "include:app.bsky.authCreatePosts?aud=did%3Aweb%3Aapi.bsky.app%23bsky_appview",
+        )
+        .expect("a fragment-bearing audience is a legal one");
+
+        match scope {
+            Scope::Include(inc) => assert_eq!(
+                inc.aud.as_deref(),
+                Some("did:web:api.bsky.app#bsky_appview"),
+                "the fragment has to survive the decode"
+            ),
+            other => panic!("expected an include scope, got {other:?}"),
+        }
     }
 
     #[test]
