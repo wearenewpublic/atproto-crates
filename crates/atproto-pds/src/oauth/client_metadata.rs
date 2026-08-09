@@ -49,6 +49,52 @@ const LOOPBACK_CLIENT_ID_ORIGIN: &str = "http://localhost";
 /// How long to wait for a client metadata or JWKS fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How much of a client metadata or JWKS document to read before giving up.
+///
+/// Both are small JSON objects; a client metadata document is a handful of
+/// fields and a JWKS a handful of keys. Without a ceiling the reply is buffered
+/// to whatever length the far end chooses to send, which turns a URL an
+/// unauthenticated caller supplies into an allocation they control.
+const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+
+/// An HTTP client for fetching a URL a caller chose.
+///
+/// Redirects are refused rather than followed. Every URL policy in this module
+/// is applied to the URL the caller gave, and `reqwest` follows up to ten
+/// redirects by default without consulting anyone — so a host that passes
+/// `validate_service_endpoint` could answer `302 Location:
+/// http://169.254.169.254/` and reach the address the guard exists to refuse.
+/// A metadata document lives at its `client_id` by definition, so there is
+/// nothing legitimate to follow.
+fn fetch_client(user_agent: &str) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .timeout(FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Read at most [`MAX_DOCUMENT_BYTES`] of a response and parse it as JSON.
+async fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> Result<T, String> {
+    // Chunk by chunk rather than `.json()`, which buffers the whole reply
+    // first. A declared `Content-Length` is not checked instead of this: it is
+    // the sender's claim about a body they also control.
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| format!("read body: {err}"))?
+    {
+        if body.len() + chunk.len() > MAX_DOCUMENT_BYTES {
+            return Err(format!("document exceeds {MAX_DOCUMENT_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|err| format!("parse json: {err}"))
+}
+
 /// The parts of a client metadata document this server acts on.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ClientMetadata {
@@ -225,16 +271,12 @@ pub async fn resolve_client_metadata(
         details: err.to_string(),
     })?;
 
-    let http = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|err| ClientMetadataError::Unavailable {
-            client_id: client_id.to_string(),
-            details: format!("build http client: {err}"),
-        })?;
+    let http = fetch_client(user_agent).map_err(|err| ClientMetadataError::Unavailable {
+        client_id: client_id.to_string(),
+        details: format!("build http client: {err}"),
+    })?;
 
-    let metadata: ClientMetadata = http
+    let response = http
         .get(client_id)
         .send()
         .await
@@ -246,13 +288,14 @@ pub async fn resolve_client_metadata(
         .map_err(|err| ClientMetadataError::Unavailable {
             client_id: client_id.to_string(),
             details: format!("status: {err}"),
-        })?
-        .json()
-        .await
-        .map_err(|err| ClientMetadataError::Unavailable {
-            client_id: client_id.to_string(),
-            details: format!("parse json: {err}"),
         })?;
+    let metadata: ClientMetadata =
+        read_json_bounded(response)
+            .await
+            .map_err(|details| ClientMetadataError::Unavailable {
+                client_id: client_id.to_string(),
+                details,
+            })?;
 
     if let Some(declared) = metadata.client_id.as_deref()
         && declared != client_id
@@ -293,27 +336,29 @@ pub async fn resolve_client_jwks(
         details: err.to_string(),
     })?;
 
-    let http = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|err| ClientMetadataError::Unavailable {
-            client_id: uri.to_string(),
-            details: format!("build http client: {err}"),
-        })?;
+    let http = fetch_client(user_agent).map_err(|err| ClientMetadataError::Unavailable {
+        client_id: uri.to_string(),
+        details: format!("build http client: {err}"),
+    })?;
 
-    http.get(uri)
+    let response = http
+        .get(uri)
         .send()
         .await
         .map_err(|err| ClientMetadataError::Unavailable {
             client_id: uri.to_string(),
             details: format!("fetch jwks_uri: {err}"),
         })?
-        .json()
-        .await
+        .error_for_status()
         .map_err(|err| ClientMetadataError::Unavailable {
             client_id: uri.to_string(),
-            details: format!("parse jwks_uri json: {err}"),
+            details: format!("status: {err}"),
+        })?;
+    read_json_bounded(response)
+        .await
+        .map_err(|details| ClientMetadataError::Unavailable {
+            client_id: uri.to_string(),
+            details,
         })
 }
 

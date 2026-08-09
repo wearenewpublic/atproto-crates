@@ -12,7 +12,9 @@
 
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
-use crate::oauth::client_metadata::{assert_redirect_uri_registered, resolve_client_metadata};
+use crate::oauth::client_metadata::{
+    assert_redirect_uri_registered, resolve_client_jwks, resolve_client_metadata,
+};
 use crate::oauth::extract::JsonOrForm;
 use crate::oauth::state::{OAuthRequest, OAuthState, PAR_TTL_SECS};
 use atproto_identity::key::{KeyData, KeyType, validate as validate_signature};
@@ -24,7 +26,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chrono::Utc;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 /// Inputs for `POST /oauth/par`.
 ///
@@ -584,36 +585,27 @@ pub(crate) async fn resolve_client_signing_key(
     client_id: &str,
     kid: Option<&str>,
 ) -> Result<KeyData, KeyResolveError> {
-    let http = reqwest::Client::builder()
-        .user_agent(crate::user_agent())
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| KeyResolveError(format!("build http client: {e}")))?;
-    let metadata: serde_json::Value = http
-        .get(client_id)
-        .send()
+    // Both fetches go through the guarded resolvers rather than a client built
+    // here. This function used to do its own: `http.get(client_id)` on a URL
+    // taken from the *unverified* payload of the request object, before the
+    // signature that payload carries had been checked, on an endpoint requiring
+    // no authentication at all. It was the only client-metadata fetch in the
+    // crate that skipped `validate_service_endpoint`, so any scheme, host, port
+    // or address literal was reachable — `client_id` pointing at a cloud
+    // metadata service being the obvious one, with the error text distinguishing
+    // refused from timed-out from not-JSON well enough to scan a network with.
+    //
+    // The guard existing a few modules away and not being called here is the
+    // whole defect. Duplicating a fetch duplicates the decision about what is
+    // safe to fetch, and one of the two copies is going to be older.
+    let user_agent = crate::user_agent();
+    let metadata = resolve_client_metadata(client_id, &user_agent)
         .await
-        .map_err(|e| KeyResolveError(format!("fetch client metadata: {e}")))?
-        .json()
-        .await
-        .map_err(|e| KeyResolveError(format!("parse client metadata json: {e}")))?;
+        .map_err(|e| KeyResolveError(format!("resolve client metadata: {e}")))?;
 
-    // Inline keyset wins when present.
-    let keyset_value: serde_json::Value = if let Some(jwks) = metadata.get("jwks").cloned() {
-        jwks
-    } else if let Some(uri) = metadata.get("jwks_uri").and_then(|v| v.as_str()) {
-        http.get(uri)
-            .send()
-            .await
-            .map_err(|e| KeyResolveError(format!("fetch jwks_uri {uri}: {e}")))?
-            .json()
-            .await
-            .map_err(|e| KeyResolveError(format!("parse jwks_uri json: {e}")))?
-    } else {
-        return Err(KeyResolveError(
-            "client metadata has neither `jwks` nor `jwks_uri`".to_string(),
-        ));
-    };
+    let keyset_value = resolve_client_jwks(client_id, &metadata, &user_agent)
+        .await
+        .map_err(|e| KeyResolveError(format!("resolve client jwks: {e}")))?;
 
     let keys = keyset_value
         .get("keys")
@@ -721,6 +713,75 @@ impl HttpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answer one request with `body` and close, on an ephemeral loopback port.
+    ///
+    /// A real listener rather than a URL that cannot connect: a `client_id` the
+    /// server refuses to fetch and one it fails to reach both come back as
+    /// errors, and only a reachable one can tell those apart.
+    async fn serve_one_json(body: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    /// The `client_id` in a request object is read from an unverified payload,
+    /// on an endpoint that requires no authentication, and was fetched before
+    /// anything checked what it pointed at.
+    ///
+    /// The assertion is on *which* error comes back, not that one does. Pointed
+    /// at a listener that answers, the old code returned a JWKS complaint —
+    /// having made the request, which is the whole problem. Refusing before the
+    /// fetch is what leaves a policy refusal in its place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_object_client_id_is_refused_before_it_is_fetched() {
+        let addr = serve_one_json(r#"{"jwks":{"keys":[]}}"#).await;
+        let client_id = format!("http://{addr}/client-metadata.json");
+
+        let Err(err) = resolve_client_signing_key(&client_id, None).await else {
+            panic!("a loopback address must not be fetched");
+        };
+
+        assert!(
+            err.0.contains("Client ID rejected"),
+            "expected the URL policy to refuse this before any request; got: {}",
+            err.0
+        );
+    }
+
+    /// The addresses the policy exists for, through the PAR path specifically.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_object_client_id_cannot_name_an_internal_address() {
+        for hostile in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "https://169.254.169.254/client-metadata.json",
+            "https://2852039166/client-metadata.json",
+            "https://user:pw@app.example/client-metadata.json",
+            "https://metadata.google.internal/client-metadata.json",
+        ] {
+            let Err(err) = resolve_client_signing_key(hostile, None).await else {
+                panic!("{hostile} must be refused");
+            };
+            assert!(
+                err.0.contains("Client ID rejected"),
+                "{hostile} was not refused by the URL policy; got: {}",
+                err.0
+            );
+        }
+    }
 
     fn fresh_input() -> ParInput {
         ParInput {
