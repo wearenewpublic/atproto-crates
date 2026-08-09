@@ -69,6 +69,17 @@ async fn send_frame(socket: &mut WebSocket, bytes: Vec<u8>, is_text: bool) -> bo
     socket.send(message).await.is_ok()
 }
 
+/// Resolve when `token` is cancelled, or never if there is no token.
+///
+/// `select!` needs a future in every arm; this supplies one for the case where
+/// the state carries no shutdown token.
+async fn cancelled_or_pending(token: Option<&tokio_util::sync::CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_subscriber(
     mut socket: WebSocket,
     state: HttpState,
@@ -80,6 +91,7 @@ async fn run_subscriber(
     // stream's, so its cursor stays valid against the unfiltered stream.
     let did_filter = params.did.clone();
     let sequencer = state.reader.sequencer();
+    let shutdown = state.shutdown.clone();
 
     // A cursor past the head is a client error, not something to wait out. The
     // lexicon declares `FutureCursor` for it and the reference PDS raises it
@@ -224,6 +236,15 @@ async fn run_subscriber(
                 }
             }
             _ = sleep(poll_interval) => { drain = true; }
+            () = cancelled_or_pending(shutdown.as_ref()) => {
+                // Close deliberately rather than letting the process drop the
+                // socket. A consumer that sees a close frame reconnects; one
+                // whose connection is reset mid-frame has to decide whether it
+                // lost anything first.
+                tracing::debug!("subscribeRepos: shutting down; closing the subscription");
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => return,

@@ -162,7 +162,11 @@ startup is neither.
 - **`pds`** — the production server. Reads config from environment + flags
   (see `--help`); writes to `PDS_DATA_DIRECTORY`. Drains on SIGTERM/SIGINT
   via a coordinated shutdown controller (cancels long-lived workers, lets
-  in-flight requests complete, closes WebSocket subscribers cleanly).
+  in-flight requests complete, closes WebSocket subscribers cleanly). The
+  whole drain is bounded by `PDS_SHUTDOWN_DEADLINE_SECS` (default 25); set
+  it below whatever grace period your supervisor allows between SIGTERM and
+  SIGKILL, so the process gets to log an unfinished drain and flush its
+  telemetry rather than being killed mid-drain.
 - **`atproto-pds-admin`** — operational CLI. Subcommands for invite-code
   issuance, account inspection, takedown, etc.
 

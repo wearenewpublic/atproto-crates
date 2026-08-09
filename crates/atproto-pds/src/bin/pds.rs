@@ -331,6 +331,23 @@ struct Args {
     )]
     blob_grace_hours: i64,
 
+    /// How long to wait for in-flight requests and background workers after a
+    /// SIGTERM before exiting anyway. Default 25 seconds.
+    ///
+    /// This has to fit *inside* the supervisor's own grace period, not match
+    /// it. A platform that sends SIGTERM and then SIGKILL 30 seconds later
+    /// will kill the process at the exact moment a 30-second deadline
+    /// expires -- losing both the "deadline elapsed" warning that says the
+    /// drain failed and the telemetry flush that follows it. The five seconds
+    /// of headroom buy those.
+    #[arg(
+        long,
+        env = "PDS_SHUTDOWN_DEADLINE_SECS",
+        default_value_t = 25,
+        value_parser = clap::value_parser!(u64).range(1..=600),
+    )]
+    shutdown_deadline_secs: u64,
+
     /// Notifier retry initial backoff in milliseconds.
     /// Default 1000 (1s). Doubles per retry up to `max_attempts`.
     #[arg(
@@ -850,6 +867,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Wire shutdown before the state, which wants the token: `subscribeRepos`
+    // holds sockets open indefinitely and needs to know when to let go.
+    let ctrl = ShutdownController::with_deadline(Duration::from_secs(args.shutdown_deadline_secs));
+    let token = ctrl.token();
+
     // Captured before `args` is partially moved into `HttpState` below.
     let rate_policy_inputs = RateLimitInputs {
         global: args.rate_limit,
@@ -885,6 +907,7 @@ async fn main() -> anyhow::Result<()> {
     .with_oauth_access_ttl(args.oauth_access_token_ttl_seconds)
     .with_oauth_refresh_ttl(args.oauth_refresh_token_ttl_seconds)
     .with_email_service(email_service)
+    .with_shutdown(token.clone())
     .with_jti_guard(jti_guard.clone())
     .with_rate_limiter(rate_limiter.clone())
     .with_public_realm_backend(public_realm_backend.clone())
@@ -1120,9 +1143,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "HTTP listening");
 
-    // Wire shutdown.
-    let ctrl = ShutdownController::new();
-    let token = ctrl.token();
     let tracker = ctrl.tracker();
     tracker.spawn(heartbeat_loop(token.clone()));
 
@@ -1221,22 +1241,12 @@ async fn main() -> anyhow::Result<()> {
         shutdown_token.cancelled().await;
     });
 
-    tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                error!(error = ?e, "HTTP server exited with error");
-            }
-        }
-        signal_result = ctrl.wait_for_signal() => {
-            if let Err(e) = signal_result {
-                error!(error = ?e, "signal handler error");
-            }
-        }
+    // Hand the server to the controller rather than racing it against the
+    // signal. `with_graceful_shutdown` only drains while the future above is
+    // still being polled, so whoever owns the shutdown has to own the await.
+    if let Err(e) = ctrl.serve_and_drain(server).await {
+        error!(error = ?e, "HTTP server exited with error");
     }
-
-    info!("draining tasks");
-    drop(token);
-    drop(tracker);
     // §5.5 otel — flush pending OTLP spans before exit. No-op on
     // off-feature builds.
     atproto_pds::telemetry::shutdown();

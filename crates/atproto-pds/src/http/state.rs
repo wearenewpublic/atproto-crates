@@ -78,6 +78,17 @@ pub struct HttpState {
     pub lexicon_resolver: Option<Arc<dyn crate::repo::lexicon::LexiconResolver>>,
     /// PLC genesis service (None disables PLC-managed DID creation).
     pub plc_service: Option<Arc<PlcService>>,
+    /// Cancelled when the process is shutting down.
+    ///
+    /// Only `subscribeRepos` consults it. A firehose socket has no reason to
+    /// close on its own, and `axum::serve` waits for every open connection
+    /// before its graceful shutdown returns -- so without this, one attached
+    /// consumer makes every deploy sit out the full shutdown deadline before
+    /// being cut off mid-frame anyway.
+    ///
+    /// `None` in tests and for embedders that do not run a shutdown
+    /// controller; the subscription then lasts as long as the socket does.
+    pub shutdown: Option<tokio_util::sync::CancellationToken>,
     /// JWT-jti replay guard (always populated; in-memory by default).
     pub jti_guard: JtiReplayGuard,
     /// Brief memory of what each rotated refresh token was exchanged for, so a
@@ -206,6 +217,7 @@ impl HttpState {
             space_declaration_resolver: None,
             lexicon_resolver: None,
             plc_service: None,
+            shutdown: None,
             jti_guard: JtiReplayGuard::new(100_000),
             refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -256,6 +268,7 @@ impl HttpState {
             space_declaration_resolver: None,
             lexicon_resolver: None,
             plc_service: None,
+            shutdown: None,
             jti_guard: JtiReplayGuard::new(100_000),
             refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -298,6 +311,13 @@ impl HttpState {
     #[must_use]
     pub fn with_plc_service(mut self, plc: Arc<PlcService>) -> Self {
         self.plc_service = Some(plc);
+        self
+    }
+
+    /// Let `subscribeRepos` close its sockets when the process shuts down.
+    #[must_use]
+    pub fn with_shutdown(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown = Some(token);
         self
     }
 
