@@ -222,29 +222,75 @@ impl MemoryJtiInner {
         let now = Instant::now();
         let deadline = now + ttl;
 
-        // First check membership; if present and not expired, reject.
-        if let Some(existing) = self.inner.seen.get(jti)
-            && *existing >= now
-        {
+        // One `entry` rather than a `get` then an `insert`. Those were two
+        // operations with the shard lock released in between, so two requests
+        // carrying the same proof microseconds apart both looked it up, both
+        // found nothing, and both were admitted -- the guard failing at the one
+        // thing it exists to do. `entry` holds the shard's write lock across
+        // the decision.
+        //
+        // The guard it returns is not `Send`, so the scope ends before the
+        // `.await` below; holding it across one would deadlock against this
+        // same map.
+        let admitted = {
+            use dashmap::mapref::entry::Entry;
+            match self.inner.seen.entry(jti.to_string()) {
+                Entry::Occupied(mut existing) => {
+                    if *existing.get() >= now {
+                        false
+                    } else {
+                        // Expired: the JTI is free again, so refresh it.
+                        existing.insert(deadline);
+                        true
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(deadline);
+                    true
+                }
+            }
+        };
+        if !admitted {
             return Err(JtiReplay {
                 jti: jti.to_string(),
+                reason: JtiRejection::Replayed,
             });
         }
-        // Expired — fall through to refresh + insert below.
 
-        // Insert.
-        self.inner.seen.insert(jti.to_string(), deadline);
         let mut order = self.inner.insertion_order.lock().await;
         order.push_back((jti.to_string(), deadline));
 
-        // Opportunistic eviction: drop expired front entries until we hit a
-        // live one or shrink under the cap.
+        // Evict what has expired. An expired entry is genuinely free -- the
+        // token carrying it would be refused for age -- so forgetting it costs
+        // nothing.
         while let Some((front_jti, front_deadline)) = order.front() {
-            if *front_deadline >= now && order.len() <= self.inner.max_entries {
+            if *front_deadline >= now {
                 break;
             }
             self.inner.seen.remove(front_jti);
             order.pop_front();
+        }
+
+        // What is left is live, and the cap used to evict it anyway -- oldest
+        // first, silently, so a caller who sent enough traffic to fill the map
+        // could replay whatever it had pushed out. That turned a memory bound
+        // into the absence of the guarantee.
+        //
+        // Being over the cap with every entry live means this guard can no
+        // longer promise single-use. Refusing says so; forgetting said nothing.
+        if order.len() > self.inner.max_entries {
+            self.inner.seen.remove(jti);
+            order.pop_back();
+            tracing::error!(
+                max_entries = self.inner.max_entries,
+                "the in-memory replay guard is full of unexpired entries; refusing \
+                 rather than forgetting one. Raise the cap or move to the SQL \
+                 backend with PDS_DURABILITY_PROFILE=sql"
+            );
+            return Err(JtiReplay {
+                jti: jti.to_string(),
+                reason: JtiRejection::Unavailable,
+            });
         }
 
         Ok(())
@@ -274,23 +320,39 @@ impl SqlJtiInner {
             Ok(_) => Ok(()),
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
                 // Existing row — check if expired.
+                // `.ok().flatten()` here read a failed query as "no such
+                // row", which is the admit case. The JTI is known to exist --
+                // the INSERT just collided with it -- so a lookup that fails
+                // means unknown, not absent.
                 let row: Option<(String,)> =
-                    sqlx::query_as("SELECT expires_at FROM jti_replay WHERE jti = ?")
+                    match sqlx::query_as("SELECT expires_at FROM jti_replay WHERE jti = ?")
                         .bind(jti)
                         .fetch_optional(&self.pool)
                         .await
-                        .ok()
-                        .flatten();
+                    {
+                        Ok(row) => row,
+                        Err(e) => {
+                            tracing::error!(error = ?e, jti = %jti, "jti_replay lookup failed");
+                            return Err(JtiReplay {
+                                jti: jti.to_string(),
+                                reason: JtiRejection::Unavailable,
+                            });
+                        }
+                    };
                 let live = match row {
                     Some((exp,)) => match chrono::DateTime::parse_from_rfc3339(&exp) {
                         Ok(dt) => dt > now,
+                        // An unparseable timestamp is not an expiry to trust.
                         Err(_) => true,
                     },
+                    // The UNIQUE violation says it exists; a SELECT that finds
+                    // nothing means it was GC'd in between, so the JTI is free.
                     None => false,
                 };
                 if live {
                     Err(JtiReplay {
                         jti: jti.to_string(),
+                        reason: JtiRejection::Replayed,
                     })
                 } else {
                     // Refresh the expired row and accept the JTI.
@@ -304,9 +366,21 @@ impl SqlJtiInner {
             }
             Err(e) => {
                 tracing::error!(error = ?e, jti = %jti, "jti_replay insert failed");
-                // Fail-open on storage error so PDS keeps serving traffic;
-                // the operator alarm should fire on the structured error.
-                Ok(())
+                // This used to return `Ok(())` so the PDS kept serving. What
+                // it kept serving was every client assertion and every DPoP
+                // proof presented during the failure, each admitted without
+                // being checked -- and a storage failure is exactly the
+                // condition an attacker would induce to get that.
+                //
+                // Refusing costs no availability that was not already gone:
+                // `require_current_epoch` and the revocation check query this
+                // same database on the same request and propagate their
+                // errors, so a database this server cannot reach cannot
+                // authenticate anyone regardless.
+                Err(JtiReplay {
+                    jti: jti.to_string(),
+                    reason: JtiRejection::Unavailable,
+                })
             }
         }
     }
@@ -317,11 +391,39 @@ impl SqlJtiInner {
 pub struct JtiReplay {
     /// The replayed JTI.
     pub jti: String,
+    /// Why it was refused.
+    pub reason: JtiRejection,
+}
+
+/// Why [`JtiReplayGuard::check_and_insert`] refused a JTI.
+///
+/// The distinction exists because it used not to. A storage failure returned
+/// `Ok(())` -- indistinguishable, to every caller, from "this JTI is fresh" --
+/// so a database blip admitted every client assertion and every DPoP proof
+/// presented during it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JtiRejection {
+    /// The JTI has been seen before and has not expired.
+    Replayed,
+    /// The guard could not determine whether the JTI was fresh.
+    ///
+    /// Refused rather than admitted: single-use is the whole guarantee, and a
+    /// guard that cannot answer has not established it.
+    Unavailable,
 }
 
 impl std::fmt::Display for JtiReplay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JWT jti {} has already been used (replay)", self.jti)
+        match self.reason {
+            JtiRejection::Replayed => {
+                write!(f, "JWT jti {} has already been used (replay)", self.jti)
+            }
+            JtiRejection::Unavailable => write!(
+                f,
+                "JWT jti {} could not be checked for replay; refusing",
+                self.jti
+            ),
+        }
     }
 }
 
@@ -671,28 +773,120 @@ mod tests {
         assert_eq!(guard.len(), 3);
     }
 
+    /// A full guard refuses rather than forgets.
+    ///
+    /// This test used to assert the opposite, in as many words: *"Re-inserting
+    /// 'a' should succeed (we've forgotten it)."* That is the guard silently
+    /// ceasing to be one. The cap is there to bound memory, and evicting live
+    /// entries to honour it means a caller who sends enough traffic to fill the
+    /// map can then replay whatever it pushed out -- which is the only defence
+    /// standing behind client-assertion single-use and, absent DPoP nonces,
+    /// behind proof replay.
+    ///
+    /// Refusing is not a happy outcome either. It is an honest one: the guard
+    /// says it cannot answer, the operator sees the error, and the fix is a
+    /// larger cap or the SQL backend.
     #[tokio::test(flavor = "multi_thread")]
-    async fn jti_eviction_cap_holds() {
+    async fn a_full_guard_refuses_rather_than_forgetting_a_live_jti() {
         let guard = JtiReplayGuard::new(2);
-        guard
+        for jti in ["a", "b"] {
+            guard
+                .check_and_insert(jti, Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+
+        let over_cap = guard
+            .check_and_insert("c", Duration::from_secs(60))
+            .await
+            .expect_err("a guard at capacity must not admit silently");
+        assert_eq!(over_cap.reason, JtiRejection::Unavailable);
+
+        // The point of all of it: "a" is still remembered, so replaying it
+        // still fails.
+        let replayed = guard
             .check_and_insert("a", Duration::from_secs(60))
             .await
-            .unwrap();
-        guard
-            .check_and_insert("b", Duration::from_secs(60))
-            .await
-            .unwrap();
+            .expect_err("the oldest entry must not have been forgotten");
+        assert_eq!(replayed.reason, JtiRejection::Replayed);
+    }
+
+    /// The cap still bounds memory -- a refused insertion leaves nothing
+    /// behind, so a flood cannot grow the map past it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_insertion_does_not_grow_the_map() {
+        let guard = JtiReplayGuard::new(2);
+        for jti in ["a", "b"] {
+            guard
+                .check_and_insert(jti, Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        for jti in ["c", "d", "e", "f"] {
+            let _ = guard.check_and_insert(jti, Duration::from_secs(60)).await;
+        }
+        assert_eq!(guard.len(), 2, "the cap must still bound memory");
+    }
+
+    /// Expired entries are still reclaimed, so an ordinary server does not
+    /// wedge itself at the cap: the entries that fill it age out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expiry_frees_room_at_the_cap() {
+        let guard = JtiReplayGuard::new(2);
+        for jti in ["a", "b"] {
+            guard
+                .check_and_insert(jti, Duration::from_millis(50))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
         guard
             .check_and_insert("c", Duration::from_secs(60))
             .await
-            .unwrap();
-        // Cap is 2; oldest ("a") was evicted to make room.
-        assert!(guard.len() <= 2);
-        // Re-inserting "a" should succeed (we've forgotten it).
-        guard
-            .check_and_insert("a", Duration::from_secs(60))
-            .await
-            .unwrap();
+            .expect("expired entries should have made room");
+    }
+
+    /// The same proof arriving twice at once must not be admitted twice.
+    ///
+    /// The check and the insert were separate map operations with the shard
+    /// lock released between them, so two requests microseconds apart both
+    /// looked the JTI up, both found nothing, and both passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_presentations_of_one_jti_admit_exactly_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for _ in 0..64 {
+            let guard = Arc::new(JtiReplayGuard::new(1024));
+            let admitted = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(tokio::sync::Barrier::new(8));
+
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let guard = guard.clone();
+                let admitted = admitted.clone();
+                let barrier = barrier.clone();
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    if guard
+                        .check_and_insert("contended", Duration::from_secs(60))
+                        .await
+                        .is_ok()
+                    {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+
+            assert_eq!(
+                admitted.load(Ordering::SeqCst),
+                1,
+                "exactly one presentation of a jti may be admitted"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -721,6 +915,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(guard.sql_count().await.unwrap(), 1);
+    }
+
+    /// A guard that cannot reach storage refuses rather than admits.
+    ///
+    /// It used to return `Ok(())` on any storage error, logging and carrying
+    /// on. What it carried on doing was admitting every client assertion and
+    /// every DPoP proof presented during the failure without checking any of
+    /// them -- and inducing a storage failure is a reasonable way to arrange
+    /// one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sql_guard_that_cannot_reach_storage_refuses() {
+        let pool = fresh_pool().await;
+        let guard = JtiReplayGuard::new_sql(pool.clone());
+        // It works while the database is reachable.
+        guard
+            .check_and_insert("before", Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        pool.close().await;
+
+        let err = guard
+            .check_and_insert("after", Duration::from_secs(60))
+            .await
+            .expect_err("a guard that cannot check a jti must not admit it");
+        assert_eq!(
+            err.reason,
+            JtiRejection::Unavailable,
+            "the refusal should say the guard could not answer, not that the \
+             jti was replayed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

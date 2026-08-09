@@ -33,7 +33,7 @@
 //! `redis::pipe().atomic()` to keep contention low under bursty load.
 
 use crate::errors::{PdsError, PdsResult};
-use crate::security::{JtiReplay, RateLimited};
+use crate::security::{JtiRejection, JtiReplay, RateLimited};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use std::sync::Arc;
@@ -112,6 +112,7 @@ impl ValkeyJtiInner {
         match result {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(JtiReplay {
+                reason: JtiRejection::Replayed,
                 jti: jti.to_string(),
             }),
             Err(e) => {
