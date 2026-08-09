@@ -278,12 +278,33 @@ async fn proxy_call(
             format!("read upstream body: {e}"),
         )
     })?;
-    tracing::info!(
-        nsid = %nsid,
-        upstream = %endpoint,
-        upstream_status = status.as_u16(),
-        "AppView proxy: forwarded"
-    );
+    // Every proxied read passes through here, and AppView reads are the bulk
+    // of what a client does -- so one line per call at INFO is one line per
+    // timeline fetch, per profile view, per thread open. At the default
+    // `RUST_LOG=info` that buries the account-lifecycle events around it,
+    // which are the ones worth keeping.
+    //
+    // The outcome is what carries information, so the level follows it. A
+    // forward that worked says nothing that a request log does not already
+    // say. A 5xx from upstream does: it reaches the caller as this server's
+    // response, and it is the difference between "the PDS is broken" and "the
+    // AppView is". Client errors stay quiet -- a 404 for a record that does
+    // not exist is ordinary traffic, not a fault.
+    if status.is_server_error() {
+        tracing::warn!(
+            nsid = %nsid,
+            upstream = %endpoint,
+            upstream_status = status.as_u16(),
+            "AppView proxy: upstream error"
+        );
+    } else {
+        tracing::debug!(
+            nsid = %nsid,
+            upstream = %endpoint,
+            upstream_status = status.as_u16(),
+            "AppView proxy: forwarded"
+        );
+    }
     let mut response = (
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
         Body::from(body_bytes),

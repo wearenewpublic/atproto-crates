@@ -54,6 +54,71 @@ async fn start_upstream() -> Upstream {
     }
 }
 
+/// An upstream that answers every request with `status`, for asserting what
+/// this server says about someone else's failure.
+async fn start_upstream_returning(status: StatusCode) -> Upstream {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let recorder = recorder.clone();
+        async move {
+            recorder.lock().unwrap().push(uri.path().to_string());
+            (status, axum::Json(json!({})))
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Upstream {
+        base: format!("http://{addr}"),
+        seen,
+    }
+}
+
+/// Captures the level and message of every event emitted while it is
+/// installed, so a test can assert what a log line says *and* how loudly.
+#[derive(Clone, Default)]
+struct Levels(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Msg(Option<String>);
+        impl tracing::field::Visit for Msg {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut msg = Msg(None);
+        event.record(&mut msg);
+        if let Some(message) = msg.0 {
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message));
+        }
+    }
+}
+
+impl Levels {
+    /// The level a message containing `needle` was logged at.
+    fn level_of(&self, needle: &str) -> Option<tracing::Level> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, m)| m.contains(needle))
+            .map(|(level, _)| *level)
+    }
+}
+
 async fn build_app(app_view: Option<&Upstream>) -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
@@ -249,4 +314,81 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .as_str()
         .expect("createSession should return an access token")
         .to_string()
+}
+
+/// A successful proxy call is the single most frequent thing this server does
+/// -- every timeline fetch, profile view and thread open. At INFO it was a
+/// line per call, which at the default `RUST_LOG=info` buries the
+/// account-lifecycle events that are worth keeping.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_proxy_call_is_not_logged_at_info() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let upstream = start_upstream().await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    let token = create_account(&app, &manager, "did:plc:quiet", "quiet.test").await;
+
+    let levels = Levels::default();
+    let subscriber = tracing_subscriber::registry().with(levels.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    let status = get(app, "/xrpc/app.bsky.feed.getTimeline", &token).await;
+    drop(guard);
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        levels.level_of("AppView proxy: forwarded"),
+        Some(tracing::Level::DEBUG),
+        "a forward that worked should not be at INFO"
+    );
+}
+
+/// The counterpart: quieting the success path must not also quiet the
+/// failure. A 5xx from the AppView reaches the caller as this server's
+/// response, and the log is the difference between "the PDS is broken" and
+/// "the AppView is".
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_server_error_is_logged_at_warn() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let upstream = start_upstream_returning(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    let token = create_account(&app, &manager, "did:plc:loud", "loud.test").await;
+
+    let levels = Levels::default();
+    let subscriber = tracing_subscriber::registry().with(levels.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    let status = get(app, "/xrpc/app.bsky.feed.getTimeline", &token).await;
+    drop(guard);
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        levels.level_of("AppView proxy: upstream error"),
+        Some(tracing::Level::WARN),
+        "an upstream 5xx must stay visible at the default level"
+    );
+}
+
+/// A 4xx is ordinary traffic -- a record that does not exist, a malformed
+/// parameter -- and must not be promoted to a warning, or the quieting above
+/// buys nothing on a busy server.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_client_error_stays_quiet() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let upstream = start_upstream_returning(StatusCode::NOT_FOUND).await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    let token = create_account(&app, &manager, "did:plc:missing", "missing.test").await;
+
+    let levels = Levels::default();
+    let subscriber = tracing_subscriber::registry().with(levels.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    let status = get(app, "/xrpc/app.bsky.feed.getTimeline", &token).await;
+    drop(guard);
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        levels.level_of("AppView proxy: forwarded"),
+        Some(tracing::Level::DEBUG),
+        "a 404 from upstream is not a fault of this server"
+    );
 }
