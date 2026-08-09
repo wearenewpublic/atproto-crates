@@ -387,6 +387,146 @@ pub async fn update_primary_hash(pool: &AccountPool, did: &str, hash: &str) -> P
     Ok(())
 }
 
+/// Point the account's `__primary__` row at `hash`, creating it if absent.
+///
+/// Returns the row id, which is what a session is minted against.
+///
+/// This replaces the account password rather than adding one. The distinction
+/// is the whole point: `verify` accepts the first row whose hash matches, so a
+/// second `__primary__` row holding a superseded hash is a credential that
+/// still opens the account, and the holder who just changed their password has
+/// been told the old one no longer works.
+///
+/// The `UPDATE` deliberately matches every `__primary__` row for the account
+/// rather than one. A database written before the unique index landed may
+/// carry duplicates, and rewriting all of them is what stops one of those
+/// keeping a superseded hash alive.
+///
+/// # Errors
+///
+/// Forwards SQL errors as [`PdsError::Storage`].
+pub async fn upsert_primary(pool: &AccountPool, did: &str, hash: &str) -> PdsResult<String> {
+    let updated = match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => sqlx::query(
+            "UPDATE app_password SET password_hash = ?
+             WHERE did = ? AND name = '__primary__'",
+        )
+        .bind(hash)
+        .bind(did)
+        .execute(pool.as_sqlite())
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("upsert __primary__ app_password: {e}"),
+        })?
+        .rows_affected(),
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => sqlx::query(
+            "UPDATE app_password SET password_hash = $1
+             WHERE did = $2 AND name = '__primary__'",
+        )
+        .bind(hash)
+        .bind(did)
+        .execute(pool.as_postgres())
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("upsert __primary__ app_password: {e}"),
+        })?
+        .rows_affected(),
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    };
+
+    if updated > 0 {
+        // The oldest row is the one live sessions were minted against, so it is
+        // the id to keep answering with.
+        let row: Option<(String,)> = match pool.kind() {
+            #[cfg(feature = "sqlite")]
+            AccountPoolKind::Sqlite => sqlx::query_as(
+                "SELECT id FROM app_password WHERE did = ? AND name = '__primary__'
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(did)
+            .fetch_optional(pool.as_sqlite())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("read __primary__ app_password: {e}"),
+            })?,
+            #[cfg(feature = "postgres")]
+            AccountPoolKind::Postgres => sqlx::query_as(
+                "SELECT id FROM app_password WHERE did = $1 AND name = '__primary__'
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(did)
+            .fetch_optional(pool.as_postgres())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("read __primary__ app_password: {e}"),
+            })?,
+            #[cfg(not(feature = "sqlite"))]
+            AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+            #[cfg(not(feature = "postgres"))]
+            AccountPoolKind::Postgres => {
+                unreachable!("AccountPool::Postgres without `postgres` feature")
+            }
+        };
+        if let Some((id,)) = row {
+            return Ok(id);
+        }
+    }
+
+    // No primary row yet: this is account creation. Insert with the real hash
+    // rather than going through `create`, which would mint and hash a random
+    // plaintext nobody will ever present just to overwrite it a moment later.
+    let id = format!("ap-{}", new_id());
+    let now = Utc::now().to_rfc3339();
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query(
+                "INSERT INTO app_password (id, did, name, password_hash, privileged, created_at)
+                 VALUES (?, ?, '__primary__', ?, 1, ?)",
+            )
+            .bind(&id)
+            .bind(did)
+            .bind(hash)
+            .bind(&now)
+            .execute(pool.as_sqlite())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("create __primary__ app_password: {e}"),
+            })?;
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query(
+                "INSERT INTO app_password (id, did, name, password_hash, privileged, created_at)
+                 VALUES ($1, $2, '__primary__', $3, true, $4)",
+            )
+            .bind(&id)
+            .bind(did)
+            .bind(hash)
+            .bind(&now)
+            .execute(pool.as_postgres())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("create __primary__ app_password: {e}"),
+            })?;
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+    Ok(id)
+}
+
 /// Verify a presented plaintext password against an account's stored app
 /// passwords. Returns `Some(row)` if any matches, `None` otherwise.
 ///

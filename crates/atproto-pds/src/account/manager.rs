@@ -409,7 +409,8 @@ impl AccountManager {
         })
     }
 
-    /// Seed the implicit "primary" app password used to mint sessions.
+    /// Set the account password, creating the implicit "primary" app-password
+    /// row on first use and replacing it thereafter.
     ///
     /// `createSession` verifies against an app-password row, never against
     /// `account.password_hash` directly, so an account without this row exists
@@ -417,23 +418,29 @@ impl AccountManager {
     /// them inline in the handler meant every other caller — tests included —
     /// had to know that and repeat it.
     ///
+    /// # One password, two stores
+    ///
+    /// The same secret is held twice: `account.password_hash`, which
+    /// `verify_password` reads and the OAuth consent form falls back to, and
+    /// the `__primary__` row, which `createSession` and the portal read. Both
+    /// have to move together or the account has two passwords — and since
+    /// neither reader consults the other, the one left behind is a live
+    /// credential that no screen mentions and no revocation touches.
+    ///
+    /// Writing them together here is what makes that true for every caller,
+    /// rather than being something each of `createAccount`, `resetPassword` and
+    /// the portal has to remember separately. The password is hashed once and
+    /// the hash used for both.
+    ///
     /// Returns the app-password row id, which a session is issued against.
     ///
     /// # Errors
     ///
     /// Returns [`PdsError::Storage`] if either write fails.
     pub async fn set_primary_password(&self, did: &str, password: &str) -> PdsResult<String> {
-        let primary =
-            crate::account::app_password::create(&self.account_pool(), did, "__primary__", true)
-                .await?;
         let hash = crate::account::hash_password(password)?;
-        crate::account::app_password::update_hash_by_id(
-            &self.account_pool(),
-            &primary.row.id,
-            &hash,
-        )
-        .await?;
-        Ok(primary.row.id)
+        self.set_password_hash(did, &hash).await?;
+        crate::account::app_password::upsert_primary(&self.account_pool(), did, &hash).await
     }
 
     /// Verify a password against the stored Argon2id hash.
@@ -1933,6 +1940,116 @@ mod tests {
                 .verify_password("did:plc:absent", "anything")
                 .await
                 .unwrap()
+        );
+    }
+
+    /// Changing the password has to retire the old one.
+    ///
+    /// It did not. `set_primary_password` inserted a `__primary__` row instead
+    /// of replacing one, and `verify` returns the first row whose hash matches,
+    /// so the superseded hash kept opening the account. The portal reported
+    /// success and revoked every session, which is the part that made this hard
+    /// to notice: the holder is shown a change that worked.
+    ///
+    /// Both readers are asserted because the secret is stored twice.
+    /// `verify_password` reads `account.password_hash`, which the OAuth consent
+    /// form falls back to; `app_password::verify` reads the row, which
+    /// `createSession` and the portal use. Only the second was ever written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changing_the_password_retires_the_old_one() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: None,
+                password: "correct horse",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        manager
+            .set_primary_password("did:plc:alice", "correct horse")
+            .await
+            .unwrap();
+
+        manager
+            .set_primary_password("did:plc:alice", "battery staple")
+            .await
+            .unwrap();
+
+        let pool = manager.account_pool();
+        assert!(
+            crate::account::app_password::verify(&pool, "did:plc:alice", "correct horse")
+                .await
+                .unwrap()
+                .is_none(),
+            "the old password still opens the account"
+        );
+        assert!(
+            !manager
+                .verify_password("did:plc:alice", "correct horse")
+                .await
+                .unwrap(),
+            "the old password still verifies against account.password_hash"
+        );
+
+        // And the new one works through both readers.
+        let matched =
+            crate::account::app_password::verify(&pool, "did:plc:alice", "battery staple")
+                .await
+                .unwrap()
+                .expect("the new password must open the account");
+        assert_eq!(matched.name, "__primary__");
+        assert!(
+            manager
+                .verify_password("did:plc:alice", "battery staple")
+                .await
+                .unwrap()
+        );
+
+        // Replaced, not appended.
+        let primaries = crate::account::app_password::list(&pool, "did:plc:alice")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.name == "__primary__")
+            .count();
+        assert_eq!(primaries, 1, "a password change added a second primary row");
+    }
+
+    /// The row id is what a session is minted against, so replacing the
+    /// password in place keeps it answerable. Revoking the sessions is the
+    /// password change's own job -- it bumps the epoch -- and not something to
+    /// get as a side effect of orphaning a row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_primary_row_id_survives_a_password_change() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: None,
+                password: "correct horse",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let first = manager
+            .set_primary_password("did:plc:alice", "correct horse")
+            .await
+            .unwrap();
+        let second = manager
+            .set_primary_password("did:plc:alice", "battery staple")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "the primary row was replaced rather than updated"
         );
     }
 
