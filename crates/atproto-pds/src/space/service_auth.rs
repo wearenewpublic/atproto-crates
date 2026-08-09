@@ -130,6 +130,67 @@ pub async fn verify_service_auth(
     expected_lxm: &str,
     revocations: Option<&crate::account::AccountPool>,
 ) -> PdsResult<ServiceAuthClaims> {
+    verify_inner(
+        http,
+        token,
+        plc_directory_hostname,
+        Some(expected_aud),
+        expected_lxm,
+        revocations,
+    )
+    .await
+}
+
+/// Verify a service-auth token without deciding its audience.
+///
+/// Everything [`verify_service_auth`] checks except `aud`: signature against the
+/// issuer's published key, `lxm`, expiry, revocation. The caller is then holding
+/// *verified* claims and can decide whether the audience is one it will act on.
+///
+/// This exists for the case where the set of audiences a server accepts is not a
+/// single known string. The alternative -- reading `aud` out of the unverified
+/// payload and passing it back in as the expected value -- compares the claim to
+/// itself, so it always passes and reads in the code as a binding that is not
+/// there. If a caller has one audience in mind, it should use
+/// [`verify_service_auth`] and let the comparison happen where a mismatch is an
+/// error.
+///
+/// # Errors
+///
+/// As [`verify_service_auth`], minus the audience mismatch.
+pub async fn verify_service_auth_unaudienced(
+    http: &reqwest::Client,
+    token: &str,
+    plc_directory_hostname: Option<&str>,
+    expected_lxm: &str,
+    revocations: Option<&crate::account::AccountPool>,
+) -> PdsResult<ServiceAuthClaims> {
+    verify_inner(
+        http,
+        token,
+        plc_directory_hostname,
+        None,
+        expected_lxm,
+        revocations,
+    )
+    .await
+}
+
+/// The verification both entry points share.
+///
+/// `expected_aud` is `None` when the caller decides the audience itself. It is
+/// checked here rather than after the fact so a token addressed elsewhere is
+/// still refused before the issuer's DID document is fetched -- the claim checks
+/// are ordered ahead of that resolution on purpose, and an audience the server
+/// already knows it will not accept should not buy a network round trip.
+async fn verify_inner(
+    http: &reqwest::Client,
+    token: &str,
+    plc_directory_hostname: Option<&str>,
+    expected_aud: Option<&str>,
+    expected_lxm: &str,
+    revocations: Option<&crate::account::AccountPool>,
+) -> PdsResult<ServiceAuthClaims> {
     let mut parts = token.split('.');
     let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -143,7 +204,9 @@ pub async fn verify_service_auth(
         .map_err(|_| deny("service-auth payload not JSON"))?;
 
     // Claim checks before the (more expensive) DID-document resolution.
-    if claims.aud != expected_aud {
+    if let Some(expected_aud) = expected_aud
+        && claims.aud != expected_aud
+    {
         return Err(deny(&format!(
             "service-auth aud mismatch: token={}, expected={}",
             claims.aud, expected_aud
@@ -311,6 +374,77 @@ mod tests {
         assert!(
             err.to_string().contains("no lxm"),
             "expected an lxm-specific denial, got: {err}"
+        );
+    }
+
+    /// A mismatched audience is still refused, and still before the issuer's
+    /// DID document is fetched.
+    ///
+    /// The ordering is the part worth pinning. Splitting the audience check out
+    /// so one caller could skip it is an easy way to end up doing it after the
+    /// signature, which turns a token addressed elsewhere into a network round
+    /// trip against a DID the sender chose.
+    #[tokio::test]
+    async fn verify_rejects_a_token_addressed_elsewhere() {
+        let token = unsigned_token(&claims_with_lxm(Some("com.atproto.space.notifyWrite")));
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:someoneelse",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("a token for another audience must be refused");
+        assert!(
+            err.to_string().contains("aud mismatch"),
+            "expected an aud-specific denial before key resolution, got: {err}"
+        );
+    }
+
+    /// The unaudienced entry point does not gate on `aud` -- that is its whole
+    /// purpose -- but still applies every other check.
+    ///
+    /// It exists because reading `aud` out of the unverified payload and passing
+    /// it back as the expected value compares a claim to itself: it cannot fail,
+    /// and it reads in the code as a binding that is not there. A caller that
+    /// cannot name its audience up front should say so and decide afterwards on
+    /// claims that have been verified.
+    #[tokio::test]
+    async fn the_unaudienced_entry_point_still_enforces_lxm() {
+        let token = unsigned_token(&claims_with_lxm(Some("com.atproto.repo.createRecord")));
+        let err = verify_service_auth_unaudienced(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "com.atproto.space.notifySpaceDeleted",
+            None,
+        )
+        .await
+        .expect_err("a mismatched lxm must be refused whoever the audience is");
+        assert!(
+            err.to_string().contains("lxm mismatch"),
+            "expected an lxm mismatch denial, got: {err}"
+        );
+
+        // And an audience it was never given is not a reason to refuse: this
+        // token gets past every claim check and dies at the signature.
+        let token = unsigned_token(&claims_with_lxm(Some(
+            "com.atproto.space.notifySpaceDeleted",
+        )));
+        let err = verify_service_auth_unaudienced(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "com.atproto.space.notifySpaceDeleted",
+            None,
+        )
+        .await
+        .expect_err("the placeholder signature cannot verify");
+        assert!(
+            !err.to_string().contains("aud"),
+            "the unaudienced path must not refuse on audience, got: {err}"
         );
     }
 

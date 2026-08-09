@@ -52,7 +52,6 @@ use atproto_space::types::SpaceUri;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -3125,22 +3124,25 @@ pub async fn notify_space_deleted(
         .build()
         .unwrap_or_default();
 
-    // Service-auth verification. `iss` must be the space authority; `aud` is
-    // the recipient hosted here. We don't know the recipient ahead of time, so
-    // we peek the unverified `aud`, then verify with that expected audience.
+    // Verify the token, then decide whether its audience is one this server
+    // will act on. The order is the point.
+    //
+    // This used to read `aud` out of the unverified payload and pass that same
+    // string back as the expected audience, so the comparison inside the
+    // verifier was between a claim and itself: it could not fail, and the line
+    // that looked like audience binding was not doing any. What remained was
+    // `iss` and "the named DID has an account here", which is thinner than it
+    // reads and, in the window where a DID is served by two hosts at once --
+    // the middle of a migration -- lets a token minted for one of them be
+    // replayed at the other.
+    //
+    // Now the claims are verified first and the audience is checked against
+    // something this server knows independently: an account it hosts.
     let token = bearer_token(&parts)?;
-    let recipient_did = peek_jwt_aud(token).ok_or_else(|| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidToken",
-            "notifySpaceDeleted: missing aud claim",
-        )
-    })?;
-    let claims = crate::space::service_auth::verify_service_auth(
+    let claims = crate::space::service_auth::verify_service_auth_unaudienced(
         &http,
         token,
         plc_dir,
-        &recipient_did,
         "com.atproto.space.notifySpaceDeleted",
         state
             .account_manager
@@ -3157,6 +3159,7 @@ pub async fn notify_space_deleted(
         ));
     }
 
+    let recipient_did = claims.aud.clone();
     // aud must be a DID/handle; best-effort no-op otherwise.
     if !recipient_did.starts_with("did:") {
         return Ok(StatusCode::OK);
@@ -3189,18 +3192,6 @@ pub async fn notify_space_deleted(
             )
         })?;
     Ok(StatusCode::OK)
-}
-
-/// Best-effort extraction of the `aud` claim from a JWT *without* signature
-/// verification — used only to learn the expected audience before the full
-/// service-auth verification.
-fn peek_jwt_aud(token: &str) -> Option<String> {
-    let payload_b64 = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64.as_bytes())
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    Some(value.get("aud")?.as_str()?.to_string())
 }
 
 #[cfg(test)]
