@@ -27,6 +27,7 @@ pub mod metadata;
 pub mod par;
 pub mod permission_set;
 pub mod revoke;
+pub mod revoked;
 pub mod state;
 pub mod token;
 

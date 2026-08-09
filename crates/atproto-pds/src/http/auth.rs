@@ -269,6 +269,32 @@ pub fn bearer_token(parts: &Parts) -> Result<&str, XrpcError> {
 /// A token *ahead* of the stored epoch is not refused. The only way to hold
 /// one is to have been issued it, and refusing would turn a replica that had
 /// not yet caught up into a logout.
+/// Refuse an access token whose `jti` has been revoked.
+///
+/// Sits beside [`require_current_epoch`] deliberately: that is bulk revocation
+/// ("sign out everywhere") and this is the single-token case, and both have to
+/// be on the authentication path for a revocation endpoint to mean anything.
+///
+/// Errors propagate rather than being swallowed. A revocation check that fails
+/// open re-admits exactly the credential someone asked to destroy, and the
+/// query above already fails closed against the same database on the same
+/// request, so nothing new is risked.
+pub(crate) async fn require_not_revoked(state: &HttpState, jti: &str) -> Result<(), XrpcError> {
+    let pool = state.reader.accounts().account_pool();
+    if crate::oauth::revoked::is_revoked(&pool, jti)
+        .await
+        .map_err(XrpcError::from)?
+    {
+        tracing::debug!(jti, "refusing a revoked access token");
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "this token was revoked; sign in again",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn require_current_epoch(
     state: &HttpState,
     did: &str,
@@ -355,6 +381,7 @@ pub async fn require_authn(
     }
 
     require_current_epoch(state, &claims.sub, claims.ses).await?;
+    require_not_revoked(state, &claims.jti).await?;
     Ok(AuthSubject::OAuth(claims))
 }
 

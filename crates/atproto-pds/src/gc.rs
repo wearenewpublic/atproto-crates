@@ -8,6 +8,7 @@
 //! - `notify_attempt WHERE state='failed' AND last_attempt_at < now-30d`
 //! - `email_token WHERE expires_at < now`
 //! - `service_auth_blacklist WHERE expires_at < now`
+//! - `oauth_revoked_token WHERE expires_at < now`
 //! - `oauth_par WHERE expires_at < now` and `oauth_code WHERE expires_at < now`
 //!   (the SQL-backed `OAuthState` does opportunistic GC on every write; this
 //!   sweep catches leftovers from low-traffic periods)
@@ -61,6 +62,8 @@ pub struct GcReport {
     pub email_tokens: u64,
     /// Expired service-auth-blacklist rows.
     pub service_auth_blacklist: u64,
+    /// Revoked OAuth access tokens dropped once past their own `exp`.
+    pub oauth_revoked_token: u64,
     /// Expired OAuth PAR + auth-code rows (combined).
     pub oauth_state: u64,
     /// Expired JTI replay rows (`jti_replay` table; §6.1 SQL backend).
@@ -155,6 +158,11 @@ pub async fn tick_with(
     )
     .await;
     let account_pool = crate::account::AccountPool::Sqlite(pool.clone());
+    report.oauth_revoked_token = run_or_log(
+        "oauth_revoked_token",
+        crate::oauth::revoked::gc(&account_pool),
+    )
+    .await;
     report.service_auth_blacklist = run_or_log(
         "service_auth_blacklist",
         crate::service_auth_blacklist::gc(&account_pool),

@@ -19,7 +19,6 @@ use axum::Form;
 use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Form-encoded inputs for `/oauth/revoke`.
 #[derive(Debug, Deserialize)]
@@ -73,23 +72,32 @@ async fn try_revoke_one(typ: &str, token: &str, state: &HttpState) -> bool {
             tracing::debug!(jti = %claims.jti, removed, "revoke: refresh token");
         }
         TYP_ACCESS => {
-            // Mark the access JTI as replayed for the remainder of its
-            // lifetime so its bearer can no longer present it.
-            let now = now_secs();
-            let ttl = Duration::from_secs(claims.exp.saturating_sub(now));
-            let _ = state.jti_guard.check_and_insert(&claims.jti, ttl).await;
-            tracing::debug!(jti = %claims.jti, "revoke: access token marked replayed");
+            // Record the jti until the token's own `exp`, which is when it
+            // would start being refused for age anyway.
+            //
+            // This used to go into the JTI replay guard, where nothing read
+            // it: that guard is consulted for the DPoP *proof's* jti, and a
+            // `Bearer` presentation never reaches it at all. See
+            // `crate::oauth::revoked`.
+            let expires_at = match chrono::DateTime::from_timestamp(claims.exp as i64, 0) {
+                Some(t) => t.to_rfc3339(),
+                None => {
+                    tracing::warn!(jti = %claims.jti, exp = claims.exp, "revoke: unrepresentable exp");
+                    return false;
+                }
+            };
+            let pool = state.reader.accounts().account_pool();
+            if let Err(e) = crate::oauth::revoked::revoke(&pool, &claims.jti, &expires_at).await {
+                // Reporting success on a revocation that did not happen is the
+                // failure this whole change exists to remove, so say so.
+                tracing::error!(jti = %claims.jti, error = ?e, "revoke: could not record the revocation");
+                return false;
+            }
+            tracing::debug!(jti = %claims.jti, "revoke: access token revoked");
         }
         _ => return false,
     }
     true
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -103,6 +111,14 @@ mod tests {
     use crate::oauth::state::{OAuthState, RefreshHandle};
     use crate::oauth::token::{OAuthClaims, mint_oauth_jwt_for_test};
     use crate::security::JtiReplayGuard;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 
     fn jwt_secret() -> Vec<u8> {
         b"a-32-byte-test-only-jwt-secret!!".to_vec()
@@ -188,20 +204,28 @@ mod tests {
         assert_eq!(oauth.refresh_count().await.unwrap(), 0);
     }
 
+    /// Access-token revocation is covered end to end by
+    /// `a_revoked_access_token_stops_authenticating` in
+    /// `tests/http_phase4_oauth.rs`, which revokes through the endpoint and
+    /// then tries to use the token.
+    ///
+    /// It is not covered here, and the test that used to be here is why. It
+    /// called a local `revoke_into` helper that reimplemented the handler's
+    /// logic, then asserted that a second `check_and_insert` on the replay
+    /// guard collided. Both halves were true and neither was the feature: the
+    /// handler was never called, and nothing asked whether authentication
+    /// consults the guard -- which it does not, for this claim. The test
+    /// passed for the whole time revocation did nothing at all.
+    ///
+    /// A test that stands up its own copy of the thing it is testing can only
+    /// report on the copy.
     #[tokio::test(flavor = "multi_thread")]
-    async fn access_token_revoke_blocks_replay() {
+    async fn revoking_an_unparseable_token_reports_no_revocation() {
         let oauth = OAuthState::new();
         let guard = JtiReplayGuard::new(64);
-        let secret = jwt_secret();
-        let claims = synth_claims("access-jti-abc", 600);
-        let token = mint_oauth_jwt_for_test(TYP_ACCESS, &claims, &secret);
-        let removed = revoke_into(TYP_ACCESS, &token, &oauth, &guard, &secret).await;
-        assert!(removed);
-
-        // Second insert collides => replay rejected.
-        let second = guard
-            .check_and_insert(&claims.jti, Duration::from_secs(60))
-            .await;
-        assert!(second.is_err());
+        assert!(
+            !revoke_into(TYP_REFRESH, "not-a-real-jwt", &oauth, &guard, &jwt_secret()).await,
+            "nothing should be reported revoked for a token that does not parse"
+        );
     }
 }

@@ -44,6 +44,33 @@ async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
     (app, manager, tmp)
 }
 
+/// Reopen the same data directory as a fresh app, for asserting what survives
+/// a restart.
+async fn rebuild_app_over(dir: &std::path::Path) -> axum::Router {
+    let dir = dir.to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer);
+    build_router(state)
+}
+
 /// The same app, but with a policy set the account has not accepted.
 async fn build_app_with_policy() -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
@@ -1722,5 +1749,82 @@ async fn the_metadata_satisfies_the_atproto_oauth_client() {
             && meta.require_pushed_authorization_requests
             && meta.client_id_metadata_document_supported,
         "the client refuses a server missing any of these: {body}"
+    );
+}
+
+/// Revoking an access token must stop it authenticating.
+///
+/// The endpoint reported success and did nothing: it put the token's `jti`
+/// into the JTI replay guard, which is only ever consulted for the *DPoP
+/// proof's* jti -- a different claim from a different JWT -- so the revoked
+/// token kept working for its whole remaining lifetime.
+///
+/// The unit test that was supposed to cover this asserted against a local
+/// reimplementation of the revoke logic and then queried the guard directly.
+/// It never called the handler and never asked whether authentication
+/// consulted anything, so it passed throughout. This one goes through the
+/// HTTP endpoint and then tries to use the token.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_access_token_stops_authenticating() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = generate_key(KeyType::P256Private).unwrap();
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    // It works before revocation, or the test proves nothing afterwards.
+    assert_eq!(
+        write_with_token(&app, &key, &token, "app.bsky.feed.post").await,
+        StatusCode::OK,
+        "the token should authenticate before it is revoked"
+    );
+
+    let (status, _) = post_form(
+        app.clone(),
+        "/oauth/revoke",
+        &[
+            ("token", token.as_str()),
+            ("token_type_hint", "access_token"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "RFC 7009 always answers 200");
+
+    assert_eq!(
+        write_with_token(&app, &key, &token, "app.bsky.feed.post").await,
+        StatusCode::UNAUTHORIZED,
+        "the revoked token still authenticated"
+    );
+}
+
+/// Revocation must outlive the process. It is durable state, not a cache: the
+/// replay guard it used to be written to is memory-backed by default, so a
+/// restart would have restored every revoked token even once the guard was
+/// being read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revocation_survives_a_restart() {
+    let (app, manager, tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = generate_key(KeyType::P256Private).unwrap();
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    let (status, _) = post_form(
+        app.clone(),
+        "/oauth/revoke",
+        &[
+            ("token", token.as_str()),
+            ("token_type_hint", "access_token"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Same data directory, fresh process state.
+    let restarted = rebuild_app_over(tmp.path()).await;
+    assert_eq!(
+        write_with_token(&restarted, &key, &token, "app.bsky.feed.post").await,
+        StatusCode::UNAUTHORIZED,
+        "the revocation did not survive a restart"
     );
 }
