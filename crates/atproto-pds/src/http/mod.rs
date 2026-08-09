@@ -32,5 +32,5 @@ pub mod subscribe_handlers;
 pub mod write_handlers;
 
 pub use rate_limit::RateLimitPolicy;
-pub use router::{build_router, with_rate_limit};
+pub use router::{build_router, build_router_with_request_timeout, with_rate_limit};
 pub use state::HttpState;

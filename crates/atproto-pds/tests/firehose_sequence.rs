@@ -421,6 +421,71 @@ async fn a_new_repository_continues_the_stream_rather_than_restarting_it() {
     );
 }
 
+/// A subscription outlives the request deadline.
+///
+/// The deadline applies to this route like any other, and the subscription
+/// survives it anyway: what a timeout bounds is producing a response, and a
+/// subscription's response is the 101 it answers with immediately. Everything
+/// after that is a socket hyper hands off, outside the future the layer wraps.
+///
+/// This was worth finding out rather than assuming. The first version of this
+/// change routed `subscribeRepos` outside the timeout layer on the assumption
+/// that a live tail would be cut at thirty seconds; the test passed with the
+/// route moved back inside, which is what showed the exclusion was doing
+/// nothing. The ordering came out and this stayed.
+///
+/// What it guards is quiet: a body-level timeout, a connection-level one, or a
+/// different server underneath, any of which would start cutting every firehose
+/// consumer on a fixed interval — each reconnecting, and each appearing to work.
+///
+/// Built with a one-second deadline so the test costs seconds, not thirty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_is_not_subject_to_the_request_deadline() {
+    let (_, manager, _tmp) = build_app().await;
+    let did = "did:plc:seqdeadline";
+    let dir = manager.data_dir().to_path_buf();
+
+    // Rebuild the router with a deadline short enough to trip inside the test.
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer);
+    let app = atproto_pds::http::build_router_with_request_timeout(
+        state,
+        std::time::Duration::from_secs(1),
+    );
+
+    let token = create_account(&app, &manager, did, "deadline.seq.example").await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor")
+        .parse()
+        .unwrap();
+    let (mut socket, response) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    // Well past the deadline, with the subscription idle throughout.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Still connected, and still delivering.
+    write_record(&app, did, &token, "after the deadline").await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+        .await
+        .expect("a frame should arrive")
+        .expect("the subscription must outlive the request deadline")
+        .expect("the frame should not be a protocol error");
+    assert!(message.is_binary(), "expected a firehose frame");
+}
+
 /// Resuming at a cursor returns the tail exactly — no skips, no repeats.
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_from_a_cursor_returns_the_exact_tail() {

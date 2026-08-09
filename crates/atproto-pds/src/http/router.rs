@@ -29,6 +29,23 @@ use axum::routing::{any, get, post};
 ///   `refreshSession`, `deleteSession`, `createAppPassword`,
 ///   `listAppPasswords`, `revokeAppPassword`, `createInviteCode`.
 pub fn build_router(state: HttpState) -> Router {
+    build_router_with_request_timeout(state, REQUEST_TIMEOUT)
+}
+
+/// [`build_router`] with the request deadline supplied.
+///
+/// Exists so a test can assert what the deadline does *not* reach without
+/// waiting out the real one — specifically that a `subscribeRepos` subscription
+/// outlives it. That holds because the deadline bounds *producing a response*
+/// and an upgraded connection is not a response being produced: the handler
+/// answers 101 immediately and hyper hands the socket off, outside the future
+/// this layer wraps. It is not obvious, it is not written down anywhere else,
+/// and a later change — a body-level timeout, a connection-level one, a
+/// different server — could take it away without touching this line.
+pub fn build_router_with_request_timeout(
+    state: HttpState,
+    request_timeout: std::time::Duration,
+) -> Router {
     Router::new()
         .route("/", get(handlers::root))
         .route("/_alive", get(handlers::alive))
@@ -577,8 +594,112 @@ pub fn build_router(state: HttpState) -> Router {
         .route("/admin", get(admin::dashboard_handler))
         .route("/admin/", get(admin::dashboard_handler))
         .fallback(unmatched)
+        .layer(request_timeout_layer(request_timeout))
+        .layer(catch_panic_layer())
+        .layer(axum::extract::DefaultBodyLimit::max(
+            DEFAULT_BODY_LIMIT_BYTES,
+        ))
+        // Refuse past the cap rather than queue behind it. A concurrency limit
+        // on its own is a queue, and an unbounded queue is the same unbounded
+        // growth wearing a different shape: arrivals past the limit wait rather
+        // than being turned away, holding a connection and a partially-read
+        // body while they do. Shedding turns the excess into an immediate 503,
+        // which a client can retry and a load balancer can read.
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(|_| async {
+                    crate::http::errors::XrpcError::new(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Overloaded",
+                        "the server is at capacity; retry shortly",
+                    )
+                }))
+                .load_shed()
+                .concurrency_limit(MAX_CONCURRENT_REQUESTS),
+        )
         .layer(cors_layer())
         .with_state(state)
+}
+
+/// How many requests may be in flight at once before the rest are refused.
+///
+/// A deadline bounds how long one request holds its resources; it does not
+/// bound how many hold them at the same time. With no cap, arrival rate alone
+/// decides peak memory -- and the expensive endpoints here are unauthenticated
+/// ones, since `getRepo` builds the whole CAR in memory before sending a byte.
+///
+/// The number is deliberately high. This is a backstop against a pile-up, not a
+/// throughput control: per-IP rate limiting is what shapes ordinary traffic, and
+/// a cap low enough to be felt in normal use would be an outage of its own the
+/// first time an upstream got slow.
+const MAX_CONCURRENT_REQUESTS: usize = 1024;
+
+/// How long a request has to produce a response.
+///
+/// Hyper applies no deadline of its own, so before this a request had none at
+/// any layer: a client could open a connection, send a `Content-Length` and
+/// then a byte a minute, and the task, the socket and the partially-buffered
+/// body were held for as long as it cared to keep going. At roughly 0.3 bytes
+/// per second per connection, the cost of holding a server down is a laptop.
+///
+/// Thirty seconds is longer than any handler here should need and short enough
+/// that a stalled one is reclaimed. It applies to every route including
+/// `subscribeRepos`, which sounds wrong for a live tail and is not: what is
+/// bounded is producing the response, and a subscription's response is the 101
+/// it answers with immediately. The socket that follows is hyper's, not this
+/// layer's. `a_subscription_is_not_subject_to_the_request_deadline` is what
+/// keeps that true.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ceiling on a request body buffered by an extractor.
+///
+/// Equal to the axum default this replaces, so nothing changes size — what
+/// changes is that the number is stated here instead of inherited from a
+/// dependency's constant. The two endpoints that take large bodies read them as
+/// a stream and enforce their own ceilings (`PDS_BLOB_UPLOAD_LIMIT`,
+/// `PDS_IMPORT_LIMIT`), which is why this can stay small.
+const DEFAULT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+fn request_timeout_layer(timeout: std::time::Duration) -> tower_http::timeout::TimeoutLayer {
+    // 408 rather than the 500 an unhandled stall would eventually look like:
+    // the request ran out of time, which is a thing the caller can act on.
+    tower_http::timeout::TimeoutLayer::with_status_code(
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        timeout,
+    )
+}
+
+/// Turn a panic in a handler into a 503 instead of a dropped connection.
+///
+/// Without this a panic unwinds out of the task hyper is running the
+/// connection on and the client gets a reset — indistinguishable from a network
+/// fault in its telemetry, absent from the access log, and invisible in any
+/// metric counting responses by status. The first sign of a reachable panic is
+/// then silence, which is the worst way to learn about one.
+fn catch_panic_layer() -> tower_http::catch_panic::CatchPanicLayer<
+    fn(Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response,
+> {
+    fn on_panic(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+        // The payload is whatever `panic!` was given; a `&str` or `String` for
+        // an ordinary panic. It is logged and not returned: a panic message
+        // names internals and the caller has no use for it.
+        let detail = err
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| err.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        tracing::error!(panic = %detail, "a request handler panicked");
+
+        use axum::response::IntoResponse as _;
+        crate::http::errors::XrpcError::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "internal error",
+        )
+        .into_response()
+    }
+
+    tower_http::catch_panic::CatchPanicLayer::custom(on_panic as fn(_) -> _)
 }
 
 /// Answer a request that matched no route.
