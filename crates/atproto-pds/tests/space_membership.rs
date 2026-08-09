@@ -1,4 +1,4 @@
-//! Membership enforcement on the space write endpoints.
+//! Membership enforcement on the space endpoints.
 //!
 //! Space writes over XRPC are authorised by OAuth scopes, and
 //! `assert_space_scope` opens with `if !subject.is_oauth() { return Ok(()) }`.
@@ -188,6 +188,88 @@ async fn put_record_refuses_a_non_member() {
         StatusCode::FORBIDDEN,
         "a non-member wrote into a space with an app-password session: {body}"
     );
+}
+
+/// The same for `createRecord`, which is where the check was missing.
+///
+/// The other three write methods had it and this one did not, fifty lines
+/// apart in the same file. There was no test for `createRecord` either, which
+/// is the reason: a check is only as present as the thing that notices it is
+/// gone. This test exists so the set is complete rather than nearly so.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_record_refuses_a_non_member() {
+    let (app, manager, _tmp) = build_app().await;
+    let (space, outsider) = owner_space_and_an_outsider(&app, &manager).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/xrpc/com.atproto.space.createRecord",
+        json!({
+            "repo": OUTSIDER_DID,
+            "space": space,
+            "collection": COLLECTION,
+            "record": {"$type": COLLECTION, "text": "intruder"},
+        }),
+        Some(&outsider),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-member created a record in a space with an app-password session: {body}"
+    );
+}
+
+/// Every space write refuses a non-member, named together so a method added
+/// later is measured against the set rather than against whichever neighbour
+/// it was copied from.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_space_write_refuses_a_non_member() {
+    let (app, manager, _tmp) = build_app().await;
+    let (space, outsider) = owner_space_and_an_outsider(&app, &manager).await;
+
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "createRecord",
+            json!({"repo": OUTSIDER_DID, "space": space, "collection": COLLECTION,
+                   "record": {"$type": COLLECTION, "text": "x"}}),
+        ),
+        (
+            "putRecord",
+            json!({"repo": OUTSIDER_DID, "space": space, "collection": COLLECTION,
+                   "rkey": "3kaaaaaaaaaa7", "record": {"$type": COLLECTION, "text": "x"}}),
+        ),
+        (
+            "deleteRecord",
+            json!({"repo": OUTSIDER_DID, "space": space, "collection": COLLECTION,
+                   "rkey": "3kaaaaaaaaaa7"}),
+        ),
+        (
+            "applyWrites",
+            json!({"repo": OUTSIDER_DID, "space": space, "writes": [{
+                "action": "create",
+                "collection": COLLECTION,
+                "rkey": "3kaaaaaaaaaa8",
+                "value": {"$type": COLLECTION, "text": "x"}
+            }]}),
+        ),
+    ];
+
+    for (method, body) in cases {
+        let (status, resp) = post_json(
+            &app,
+            &format!("/xrpc/com.atproto.space.{method}"),
+            body,
+            Some(&outsider),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} admitted a non-member: {resp}"
+        );
+    }
 }
 
 /// The same for `applyWrites`, which takes a batch.

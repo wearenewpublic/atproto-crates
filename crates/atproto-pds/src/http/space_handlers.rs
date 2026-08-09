@@ -851,6 +851,7 @@ pub async fn create_record_write(
     let subject = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &subject)?;
     let uri = parse_space_uri(&input.space)?;
+    require_space_member(&state, &uri, &subject).await?;
     assert_space_scope(
         &state,
         &auth,
