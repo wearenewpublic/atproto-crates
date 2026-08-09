@@ -83,22 +83,7 @@ impl KeyStore for FileKeyStore {
                     reason: format!("create_dir_all({}): {e}", parent.display()),
                 })?;
         }
-        tokio::fs::write(&path, private_did_key.as_bytes())
-            .await
-            .map_err(|e| PdsError::Storage {
-                reason: format!("write({}): {e}", path.display()),
-            })?;
-        // Apply 0600 mode on Unix; Windows keeps default ACLs.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(&path, perms)
-                .await
-                .map_err(|e| PdsError::Storage {
-                    reason: format!("chmod 0600({}): {e}", path.display()),
-                })?;
-        }
+        write_key_durably(&path, private_did_key.as_bytes()).await?;
         Ok(key_ref)
     }
 
@@ -127,6 +112,100 @@ impl KeyStore for FileKeyStore {
             }),
         }
     }
+}
+
+/// Write a private key so that returning `Ok` means the bytes are on the
+/// device, and so that a crash leaves either the whole old file or the whole
+/// new one.
+///
+/// A bare `fs::write` gave neither. It truncates the target in place and
+/// returns once the bytes reach the page cache, so a power loss seconds later
+/// leaves a file that is empty or half-written while the account row naming it
+/// is already durable -- the accounts DB is WAL with `synchronous=FULL`, so it
+/// is the *more* durable of the two by a wide margin, and it is the one holding
+/// the reference rather than the secret.
+///
+/// What that costs is not a retry. Every write for the account fails at the
+/// signing-key lookup from then on, and if the DID was published to PLC before
+/// the loss, the `verificationMethods.atproto` key is one nobody holds -- and
+/// the rotation key needed to replace it went the same way, in the same
+/// directory, in the same instant. There is no recovery from that; the identity
+/// is gone. Of everything this server stores, these bytes are the only ones
+/// that cannot be rebuilt from somewhere else.
+///
+/// So: a temp file in the same directory, `sync_all` before the rename, the
+/// rename itself (atomic on POSIX), then `sync_all` on the directory so the
+/// rename is durable and not merely the contents. The mode is set by
+/// `OpenOptions` rather than a `chmod` afterwards, which also closes the window
+/// where a private key sat on disk under the process umask.
+async fn write_key_durably(path: &std::path::Path, bytes: &[u8]) -> PdsResult<()> {
+    use rand::RngExt as _;
+    use tokio::io::AsyncWriteExt;
+
+    let parent = path.parent().ok_or_else(|| PdsError::Storage {
+        reason: format!("key path has no parent directory: {}", path.display()),
+    })?;
+
+    // A unique temp name per call: `put` is idempotent by key, so two callers
+    // persisting the same key derive the same final path, and a shared temp
+    // name would let them interleave into one torn file.
+    let mut suffix = [0u8; 8];
+    rand::rng().fill(&mut suffix);
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("key"),
+        hex::encode(suffix)
+    ));
+
+    let result = async {
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        // `tokio::fs::OpenOptions` exposes `mode` directly on unix.
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(&tmp).await.map_err(|e| PdsError::Storage {
+            reason: format!("create({}): {e}", tmp.display()),
+        })?;
+        file.write_all(bytes).await.map_err(|e| PdsError::Storage {
+            reason: format!("write({}): {e}", tmp.display()),
+        })?;
+        // Before the rename, not after: a rename that lands ahead of the
+        // contents publishes an empty file under the name that matters.
+        file.sync_all().await.map_err(|e| PdsError::Storage {
+            reason: format!("fsync({}): {e}", tmp.display()),
+        })?;
+        drop(file);
+
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("rename({} -> {}): {e}", tmp.display(), path.display()),
+            })
+    }
+    .await;
+
+    if result.is_err() {
+        // Leaving the temp behind would accumulate unreadable key material in
+        // the keys directory on every failure.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return result;
+    }
+
+    // The directory entry the rename created is itself buffered. Without this
+    // the file's contents are durable and the name pointing at them is not.
+    #[cfg(unix)]
+    {
+        let dir = tokio::fs::File::open(parent)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("open dir({}): {e}", parent.display()),
+            })?;
+        dir.sync_all().await.map_err(|e| PdsError::Storage {
+            reason: format!("fsync dir({}): {e}", parent.display()),
+        })?;
+    }
+
+    Ok(())
 }
 
 /// In-memory `KeyStore` for testing.
@@ -233,6 +312,100 @@ mod tests {
         let r1 = store.put(&key).await.unwrap();
         let r2 = store.put(&key).await.unwrap();
         assert_eq!(r1, r2, "same key → same key_ref");
+    }
+
+    /// A key file is private from the moment it exists.
+    ///
+    /// The mode used to be applied by a `chmod` after the write, so the private
+    /// key was on disk under the process umask first. `OpenOptions::mode` is
+    /// what makes the permission a property of the file rather than of a later
+    /// call that might not run.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("keys");
+        let store = FileKeyStore::new(root.clone());
+        let key = generate_account_signing_key(KeyType::K256Private).unwrap();
+        let key_ref = store.put(&key).await.unwrap();
+
+        let path = root.join(format!("{}.key", key_ref.strip_prefix("file:").unwrap()));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key file mode is {mode:o}");
+    }
+
+    /// The rename is the publish step, so nothing else may be left in the
+    /// directory that the key store would later read as a key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_durable_write_leaves_no_temporary_behind() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("keys");
+        let store = FileKeyStore::new(root.clone());
+        for _ in 0..3 {
+            let key = generate_account_signing_key(KeyType::K256Private).unwrap();
+            store.put(&key).await.unwrap();
+        }
+
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp") || name.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporaries left behind: {leftovers:?}"
+        );
+    }
+
+    /// Rewriting an existing key replaces it, since the rename lands on a path
+    /// that is already there. Re-persisting the same key is the ordinary case:
+    /// `put` is idempotent by design and callers rely on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_persisting_a_key_overwrites_it_intact() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileKeyStore::new(tmp.path().join("keys"));
+        let key = generate_account_signing_key(KeyType::P256Private).unwrap();
+
+        let first = store.put(&key).await.unwrap();
+        let second = store.put(&key).await.unwrap();
+        assert_eq!(first, second);
+
+        let loaded = store.get(&second).await.unwrap();
+        assert_eq!(
+            loaded.to_string(),
+            key.to_string(),
+            "the second write left the key unreadable"
+        );
+    }
+
+    /// Two writers persisting the same key concurrently both succeed and the
+    /// file is whole. With one shared temp name they would interleave into it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_puts_of_one_key_do_not_tear_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(FileKeyStore::new(tmp.path().join("keys")));
+        let key = generate_account_signing_key(KeyType::K256Private).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move { store.put(&key).await }));
+        }
+        let mut key_ref = None;
+        for handle in handles {
+            key_ref = Some(
+                handle
+                    .await
+                    .unwrap()
+                    .expect("a concurrent put should succeed"),
+            );
+        }
+
+        let loaded = store.get(&key_ref.unwrap()).await.unwrap();
+        assert_eq!(loaded.to_string(), key.to_string());
     }
 
     #[tokio::test(flavor = "multi_thread")]
