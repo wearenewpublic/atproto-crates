@@ -72,7 +72,7 @@ pub async fn authenticate(
     assertion: Option<&str>,
     jti_guard: &crate::security::JtiReplayGuard,
     expected_audience: &[String],
-) -> Result<(), XrpcError> {
+) -> Result<Option<String>, XrpcError> {
     let refused = |detail: &str| {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,
@@ -90,7 +90,7 @@ pub async fn authenticate(
                 "this client is registered as public and cannot present a client assertion",
             ));
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // From here the client declared `private_key_jwt`, so every path that is
@@ -151,7 +151,7 @@ async fn verify_assertion(
     client_id: &str,
     jti_guard: &crate::security::JtiReplayGuard,
     expected_audience: &[String],
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let parts: Vec<&str> = assertion.split('.').collect();
     if parts.len() != 3 {
         return Err("client assertion is not a compact JWS".to_string());
@@ -226,7 +226,7 @@ async fn verify_assertion(
         .await
         .map_err(|e| format!("client assertion replay: {e}"))?;
 
-    Ok(())
+    Ok(header["kid"].as_str().map(str::to_string))
 }
 
 /// Decode one base64url JWS segment as JSON.
@@ -314,6 +314,69 @@ mod tests {
             .expect("loopback metadata");
         m.token_endpoint_auth_method = method.map(str::to_string);
         m
+    }
+
+    /// A public client authenticates with no key, and says so.
+    ///
+    /// `None` here is what a refresh compares against later, so it has to mean
+    /// "no key" rather than "did not look".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_public_client_reports_no_key() {
+        let kid = authenticate(
+            &metadata(None),
+            "http://localhost",
+            None,
+            None,
+            &guard(),
+            &audiences(),
+        )
+        .await
+        .expect("a public client authenticates by presenting nothing");
+        assert_eq!(kid, None);
+    }
+
+    /// A confidential client presenting nothing is refused, rather than
+    /// falling through as public.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_confidential_client_must_present_an_assertion() {
+        let err = authenticate(
+            &metadata(Some("private_key_jwt")),
+            "http://localhost",
+            None,
+            None,
+            &guard(),
+            &audiences(),
+        )
+        .await
+        .expect_err("a confidential client must authenticate");
+        assert_eq!(err.name, "invalid_client");
+    }
+
+    /// The `kid` reported is the one from the assertion header.
+    ///
+    /// Read from the header before the signature is checked, but only
+    /// *returned* from the path where the signature verified -- so what a
+    /// refresh pins against is a key that actually signed something.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reported_kid_comes_from_the_verified_assertion() {
+        // An assertion naming a kid the client does not publish cannot verify,
+        // so nothing is reported and the refresh has nothing to match.
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"alg":"ES256","kid":"not-a-published-key"}"#,
+        );
+        let err = verify_assertion(
+            &format!("{header}.e30.c2ln"),
+            "https://app.example/client-metadata.json",
+            &guard(),
+            &audiences(),
+        )
+        .await
+        .expect_err("an unresolvable kid cannot verify");
+        assert!(
+            err.contains("resolve client key") || err.contains("client_id"),
+            "expected a key-resolution refusal, got {err}"
+        );
     }
 
     /// A malformed assertion is refused before anything is read from it.

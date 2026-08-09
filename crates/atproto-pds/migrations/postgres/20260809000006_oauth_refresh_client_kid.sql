@@ -1,0 +1,21 @@
+-- The client authentication key a confidential client's grant was issued to.
+--
+-- `handle_refresh` never authenticated the client at all -- only the code
+-- exchange did -- so a confidential client's refresh requests were accepted on
+-- the strength of the refresh token and its DPoP binding alone.
+--
+-- The gap that matters is key rotation. The specification requires the
+-- authorization server to end a session when the key it was authenticated with
+-- becomes absent from the client's metadata, which is what a client does after
+-- a key compromise. Merely requiring *an* assertion on refresh would not
+-- deliver that: the client's new key is in its metadata and would verify
+-- happily, so the sessions minted under the compromised key would survive
+-- exactly the rotation performed to kill them.
+--
+-- Pinning the `kid` is what implements it. A refresh must present an assertion
+-- signed by the same key the grant was issued to, and once that key is
+-- withdrawn no assertion can be produced for it.
+--
+-- NULL for public clients, which authenticate with no key at all, and for rows
+-- predating this column.
+ALTER TABLE oauth_refresh ADD COLUMN client_kid TEXT;

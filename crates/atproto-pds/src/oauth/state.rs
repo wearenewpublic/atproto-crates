@@ -89,6 +89,13 @@ pub struct RefreshHandle {
     /// Every token produced by rotating this one shares it, so presenting a
     /// consumed token can end the whole chain rather than just failing.
     pub family_id: String,
+    /// The client authentication key this grant was issued to.
+    ///
+    /// A confidential client must present an assertion signed by this same key
+    /// on every refresh, so withdrawing the key ends the session -- which is
+    /// what the specification requires of a key that has been compromised.
+    /// `None` for public clients, which authenticate with no key.
+    pub client_kid: Option<String>,
 }
 
 /// Backend dispatch for OAuth in-flight state.
@@ -344,6 +351,7 @@ impl MemoryBackend {
             new_jti,
             RefreshHandle {
                 family_id: "test-family".to_string(),
+                client_kid: None,
                 issued_at: Utc::now(),
                 ..handle.clone()
             },
@@ -407,6 +415,18 @@ impl MemoryBackend {
 pub struct SqlBackend {
     pool: SqlitePool,
 }
+
+/// One `oauth_refresh` row as selected: did, client_id, dpop_jkt, scope,
+/// issued_at, family_id, client_kid.
+type RefreshRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 
 impl SqlBackend {
     async fn store_par(&self, request_uri: String, request: OAuthRequest) -> PdsResult<()> {
@@ -582,8 +602,8 @@ impl SqlBackend {
     async fn register_refresh(&self, jti: String, handle: RefreshHandle) -> PdsResult<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO oauth_refresh
-                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&jti)
         .bind(&handle.did)
@@ -592,6 +612,7 @@ impl SqlBackend {
         .bind(&handle.scope)
         .bind(handle.issued_at.to_rfc3339())
         .bind(&handle.family_id)
+        .bind(&handle.client_kid)
         .execute(&self.pool)
         .await
         .map_err(|e| PdsError::Storage {
@@ -608,8 +629,8 @@ impl SqlBackend {
         let mut tx = self.pool.begin().await.map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh begin: {e}"),
         })?;
-        let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
-            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id
+        let row: Option<RefreshRow> = sqlx::query_as(
+            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(old_jti)
@@ -618,7 +639,7 @@ impl SqlBackend {
         .map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh select: {e}"),
         })?;
-        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id)) = row else {
+        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)) = row else {
             return Ok(None);
         };
         sqlx::query("DELETE FROM oauth_refresh WHERE jti = ?")
@@ -631,8 +652,8 @@ impl SqlBackend {
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO oauth_refresh
-                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_jti)
         .bind(&did)
@@ -641,6 +662,7 @@ impl SqlBackend {
         .bind(&scope)
         .bind(now.to_rfc3339())
         .bind(&family_id)
+        .bind(&client_kid)
         .execute(&mut *tx)
         .await
         .map_err(|e| PdsError::Storage {
@@ -661,12 +683,13 @@ impl SqlBackend {
             scope,
             issued_at: original_issued,
             family_id,
+            client_kid,
         }))
     }
 
     async fn peek_refresh(&self, jti: &str) -> PdsResult<Option<RefreshHandle>> {
-        let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
-            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id
+        let row: Option<RefreshRow> = sqlx::query_as(
+            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(jti)
@@ -675,7 +698,7 @@ impl SqlBackend {
         .map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh peek: {e}"),
         })?;
-        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id)) = row else {
+        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)) = row else {
             return Ok(None);
         };
         Ok(Some(RefreshHandle {
@@ -689,6 +712,7 @@ impl SqlBackend {
                 })?
                 .with_timezone(&Utc),
             family_id,
+            client_kid,
         }))
     }
 
@@ -857,6 +881,7 @@ mod tests {
     fn handle() -> RefreshHandle {
         RefreshHandle {
             family_id: "test-family".to_string(),
+            client_kid: None,
             did: "did:plc:alice".to_string(),
             client_id: "client".to_string(),
             dpop_jkt: "thumb".to_string(),

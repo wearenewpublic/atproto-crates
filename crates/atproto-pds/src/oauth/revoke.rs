@@ -189,6 +189,7 @@ mod tests {
                 claims.jti.clone(),
                 RefreshHandle {
                     family_id: "test-family".to_string(),
+                    client_kid: None,
                     did: claims.sub.clone(),
                     client_id: claims.client_id.clone(),
                     dpop_jkt: String::new(),

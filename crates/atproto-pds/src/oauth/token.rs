@@ -273,7 +273,9 @@ async fn handle_code(
         format!("https://{}", state.service_did.replace("did:web:", "")),
         token_endpoint_url(&state),
     ];
-    crate::oauth::client_auth::authenticate(
+    // The key that authenticated the client here is the key its refreshes
+    // must keep presenting; see `RefreshHandle::client_kid`.
+    let client_kid = crate::oauth::client_auth::authenticate(
         &metadata,
         &auth.request.client_id,
         input.client_assertion_type.as_deref(),
@@ -300,6 +302,7 @@ async fn handle_code(
         &proof_jkt,
         // A code exchange begins a new grant, so it begins a new chain.
         &random_jti(),
+        client_kid.as_deref(),
     )
     .await
     .map(Json)
@@ -407,6 +410,57 @@ async fn handle_refresh(
         ));
     }
 
+    // A confidential client must authenticate here as well, and with the same
+    // key.
+    //
+    // Only the code exchange used to do this, so a confidential client's
+    // refreshes were accepted on the refresh token and its DPoP binding alone.
+    // The requirement that bites is key rotation: the specification says a
+    // session must end when the key it was authenticated with leaves the
+    // client's metadata, which is exactly what a client does after a key
+    // compromise. Requiring merely *an* assertion would not deliver that --
+    // the client's replacement key is in its metadata and verifies happily, so
+    // the sessions minted under the compromised key would outlive the rotation
+    // performed to kill them. Pinning the `kid` is what ends them.
+    let metadata = crate::oauth::client_metadata::resolve_client_metadata(
+        &handle.client_id,
+        &crate::user_agent(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            client_id = %handle.client_id,
+            error = ?e,
+            "could not resolve client metadata on refresh"
+        );
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "this client's metadata could not be retrieved",
+        )
+    })?;
+    let expected_audience = vec![
+        format!("https://{}", state.service_did.replace("did:web:", "")),
+        token_endpoint_url(&state),
+    ];
+    let presented_kid = crate::oauth::client_auth::authenticate(
+        &metadata,
+        &handle.client_id,
+        input.client_assertion_type.as_deref(),
+        input.client_assertion.as_deref(),
+        &state.jti_guard,
+        &expected_audience,
+    )
+    .await?;
+    assert_same_client_key(handle.client_kid.as_deref(), presented_kid.as_deref()).inspect_err(
+        |_| {
+            tracing::warn!(
+                client_id = %handle.client_id,
+                "refresh refused: assertion signed by a different key than the grant was issued to"
+            );
+        },
+    )?;
+
     // Authenticated: now consume it. `rotate_refresh` is atomic and returns
     // `None` if something else got there first, so two concurrent refreshes
     // still yield exactly one rotation.
@@ -433,9 +487,37 @@ async fn handle_refresh(
         // Rotation stays in the chain it came from, so a token replayed from
         // anywhere in the chain can still end all of it.
         &handle.family_id,
+        handle.client_kid.as_deref(),
     )
     .await
     .map(Json)
+}
+
+/// Refuse a refresh whose client assertion was signed by a different key than
+/// the grant was issued to.
+///
+/// The comparison is the point of pinning the `kid`. Accepting any key the
+/// client currently publishes would let a grant survive the withdrawal of the
+/// key it was authenticated with, and withdrawing a key is what a client does
+/// once that key is compromised.
+///
+/// `None` on both sides is a public client, which authenticates with no key.
+///
+/// # Errors
+///
+/// Returns `invalid_client` when the keys differ.
+fn assert_same_client_key(
+    issued_to: Option<&str>,
+    presented: Option<&str>,
+) -> Result<(), XrpcError> {
+    if issued_to == presented {
+        return Ok(());
+    }
+    Err(XrpcError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid_client",
+        "this refresh token requires the client key the grant was issued to",
+    ))
 }
 
 /// Mint an access/refresh pair bound to `dpop_jkt`.
@@ -458,6 +540,7 @@ async fn issue_pair(
     scope: &str,
     dpop_jkt: &str,
     family_id: &str,
+    client_kid: Option<&str>,
 ) -> Result<TokenResponse, XrpcError> {
     let now = chrono::Utc::now().timestamp() as u64;
     let access_jti = random_jti();
@@ -524,6 +607,7 @@ async fn issue_pair(
             refresh_jti.clone(),
             RefreshHandle {
                 family_id: family_id.to_string(),
+                client_kid: client_kid.map(str::to_string),
                 did: did.to_string(),
                 client_id: client_id.to_string(),
                 dpop_jkt: dpop_jkt.to_string(),
@@ -694,5 +778,47 @@ mod tests {
             host_from_service_did("did:web:pds.example.com"),
             "pds.example.com"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_key_pinning_tests {
+    use super::*;
+
+    /// A public client authenticates with no key, on both sides.
+    #[test]
+    fn a_public_client_matches_on_no_key() {
+        assert!(assert_same_client_key(None, None).is_ok());
+    }
+
+    /// The same key is the ordinary confidential-client refresh.
+    #[test]
+    fn the_same_key_is_accepted() {
+        assert!(assert_same_client_key(Some("key-1"), Some("key-1")).is_ok());
+    }
+
+    /// A different key is refused even though it is a key the client
+    /// legitimately publishes -- that is the whole mechanism. After a
+    /// compromise the client withdraws the old key and keeps the new one, and
+    /// accepting the new one here would let every session minted under the
+    /// compromised key outlive the rotation meant to end them.
+    #[test]
+    fn a_different_key_is_refused_even_though_the_client_owns_it() {
+        let err = assert_same_client_key(Some("compromised"), Some("rotated-in"))
+            .expect_err("a grant must not migrate to another key");
+        assert_eq!(err.name, "invalid_client");
+    }
+
+    /// A confidential grant refreshed with no assertion at all is refused
+    /// rather than falling through as a public client.
+    #[test]
+    fn a_confidential_grant_refuses_an_absent_key() {
+        assert!(assert_same_client_key(Some("key-1"), None).is_err());
+    }
+
+    /// And the reverse: a public grant cannot acquire a key mid-session.
+    #[test]
+    fn a_public_grant_refuses_a_presented_key() {
+        assert!(assert_same_client_key(None, Some("key-1")).is_err());
     }
 }
