@@ -396,6 +396,14 @@ impl RepoWriter {
 
         if let Some(backend) = self.backend.as_ref() {
             if replacing {
+                // The CIDs this reports as newly unreferenced are deliberately
+                // not deleted here. An update drops the old references and adds
+                // the new ones as two steps, so a blob the new version still
+                // uses is unreferenced in between -- deleting on this signal
+                // would delete it. The unified GC sweep collects blobs nothing
+                // refers to once they have been that way for a while, which is
+                // the same question asked at a point where the answer is
+                // settled.
                 backend.blob.drop_refs_for_record(did, uri).await?;
             }
             for blob in &refs {

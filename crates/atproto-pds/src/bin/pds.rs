@@ -315,6 +315,22 @@ struct Args {
     )]
     space_oplog_retention_days: i64,
 
+    /// How long an unreferenced blob is kept before the unified GC deletes
+    /// its bytes, in hours. Default 24. `0` disables the sweep, which
+    /// means blob storage grows without bound.
+    ///
+    /// A blob is legitimately unreferenced for a while: `uploadBlob` stores
+    /// bytes before any record names them, and an update that keeps the same
+    /// image drops the old references and adds the new ones as two steps. The
+    /// window has to outlast both, and a day does so comfortably.
+    #[arg(
+        long,
+        env = "PDS_BLOB_GRACE_HOURS",
+        default_value_t = 24,
+        value_parser = clap::value_parser!(i64).range(0..=8760),
+    )]
+    blob_grace_hours: i64,
+
     /// Notifier retry initial backoff in milliseconds.
     /// Default 1000 (1s). Doubles per retry up to `max_attempts`.
     #[arg(
@@ -1171,6 +1187,7 @@ async fn main() -> anyhow::Result<()> {
         unified_gc_rate,
         args.data_dir.clone(),
         args.space_oplog_retention_days,
+        args.blob_grace_hours,
         unified_gc_interval,
         token.clone(),
     ));
@@ -1341,6 +1358,7 @@ async fn unified_gc_loop(
     rate_limiter: atproto_pds::security::SlidingWindowLimiter,
     data_dir: PathBuf,
     space_oplog_retention_days: i64,
+    blob_grace_hours: i64,
     interval: Duration,
     token: tokio_util::sync::CancellationToken,
 ) {
@@ -1359,6 +1377,7 @@ async fn unified_gc_loop(
                 let opts = atproto_pds::gc::TickOptions {
                     data_dir: Some(&data_dir),
                     space_oplog_retention_days,
+                    blob_grace_hours,
                 };
                 let report = atproto_pds::gc::tick_with(&pool, &jti_guard, &rate_limiter, &opts).await;
                 tracing::info!(
@@ -1370,6 +1389,7 @@ async fn unified_gc_loop(
                     jti_replay = report.jti_replay,
                     rate_limit_window = report.rate_limit_window,
                     space_oplog = report.space_oplog,
+                    orphan_blobs = report.orphan_blobs,
                     "unified GC tick complete"
                 );
             }

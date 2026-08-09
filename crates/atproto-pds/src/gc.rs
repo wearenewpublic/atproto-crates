@@ -36,6 +36,19 @@ pub const DEFAULT_NOTIFY_FAILED_RETENTION_DAYS: i64 = 30;
 /// `PDS_SPACE_OPLOG_RETENTION_DAYS`.
 pub const DEFAULT_SPACE_OPLOG_RETENTION_DAYS: i64 = 30;
 
+/// How long a blob nothing refers to is kept before it is collected.
+///
+/// A blob is unreferenced for a while in the ordinary course of things, and
+/// deleting on sight would delete live data. `uploadBlob` stores bytes before
+/// any record mentions them -- that is the whole upload-then-write flow -- and
+/// an update to a record that keeps the same image drops the old refs and adds
+/// the new ones as two steps, so the blob is momentarily unreferenced while
+/// still very much in use.
+///
+/// A day is far longer than either window needs and short enough that a deleted
+/// video is not billed for a month.
+pub const DEFAULT_BLOB_GRACE_HOURS: i64 = 24;
+
 /// Per-table prune counts. `Ok(rows_pruned)` per table; `None` indicates the
 /// helper failed and the caller logged.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -58,6 +71,9 @@ pub struct GcReport {
     /// all accounts (`§11h`). Includes rows from per-actor stores that
     /// exceed the configured `space_oplog_retention_days`.
     pub space_oplog: u64,
+    /// Blob rows deleted because nothing referenced them any more, summed
+    /// across all accounts.
+    pub orphan_blobs: u64,
 }
 
 /// Optional knobs the unified GC tick honors.
@@ -70,6 +86,10 @@ pub struct TickOptions<'a> {
     /// [`DEFAULT_SPACE_OPLOG_RETENTION_DAYS`] (30). When `0`, the oplog
     /// step is skipped (operator-disabled).
     pub space_oplog_retention_days: i64,
+    /// How long an unreferenced blob is kept before it is collected, in
+    /// hours. Defaults to [`DEFAULT_BLOB_GRACE_HOURS`] (24). When `0`, the
+    /// blob sweep is skipped (operator-disabled).
+    pub blob_grace_hours: i64,
 }
 
 impl Default for TickOptions<'_> {
@@ -77,6 +97,7 @@ impl Default for TickOptions<'_> {
         Self {
             data_dir: None,
             space_oplog_retention_days: DEFAULT_SPACE_OPLOG_RETENTION_DAYS,
+            blob_grace_hours: DEFAULT_BLOB_GRACE_HOURS,
         }
     }
 }
@@ -143,17 +164,30 @@ pub async fn tick_with(
     report.jti_replay = run_or_log("jti_replay", jti_guard.gc()).await;
     report.rate_limit_window = run_or_log("rate_limit_window", rate_limiter.gc()).await;
 
-    // §11h: per-actor oplog sweep — only when `data_dir` + retention > 0.
-    if let Some(dir) = opts.data_dir
-        && opts.space_oplog_retention_days > 0
-    {
-        let cutoff_tid = atproto_record::tid::Tid::new_with_time(
-            (now - chrono::Duration::days(opts.space_oplog_retention_days)).timestamp_micros()
-                as u64,
-        )
-        .encode();
-        report.space_oplog =
-            run_or_log("space_*_oplog", prune_space_oplogs(pool, dir, &cutoff_tid)).await;
+    // Per-actor sweeps. Both walk every account, so they share one pass and one
+    // store handle each rather than opening every actor database twice.
+    if let Some(dir) = opts.data_dir {
+        let cutoff_tid = (opts.space_oplog_retention_days > 0).then(|| {
+            atproto_record::tid::Tid::new_with_time(
+                (now - chrono::Duration::days(opts.space_oplog_retention_days)).timestamp_micros()
+                    as u64,
+            )
+            .encode()
+        });
+        let blob_cutoff = (opts.blob_grace_hours > 0)
+            .then(|| (now - chrono::Duration::hours(opts.blob_grace_hours)).to_rfc3339());
+
+        if cutoff_tid.is_some() || blob_cutoff.is_some() {
+            match prune_per_actor(pool, dir, cutoff_tid.as_deref(), blob_cutoff.as_deref()).await {
+                Ok((oplog, blobs)) => {
+                    report.space_oplog = oplog;
+                    report.orphan_blobs = blobs;
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "unified GC: per-actor sweep failed");
+                }
+            }
+        }
     }
 
     report
@@ -200,14 +234,23 @@ async fn prune_simple(pool: &SqlitePool, sql: &str, bind: &str) -> PdsResult<u64
 /// Walk every account in the directory, open its per-actor store, and
 /// prune `space_record_oplog` + `space_member_oplog` rows whose `rev`
 /// (TID) sorts below the cutoff. Sums the row counts across actors.
-async fn prune_space_oplogs(
+/// One pass over every account, running whichever per-actor sweeps are enabled.
+///
+/// Returns `(oplog rows, blob rows)`.
+///
+/// Both sweeps walk the same account list and need the same store handle, so
+/// they share a pass: opening a per-actor database runs its migrations, and
+/// doing that twice per account per tick is the sort of cost that only shows up
+/// once there are enough accounts for it to matter.
+async fn prune_per_actor(
     accounts_pool: &SqlitePool,
     data_dir: &std::path::Path,
-    cutoff_tid: &str,
-) -> PdsResult<u64> {
+    cutoff_tid: Option<&str>,
+    blob_cutoff: Option<&str>,
+) -> PdsResult<(u64, u64)> {
     use crate::actor_store::sql::SqlActorStore;
-    // Stream the DID list in pages.
-    let mut total = 0u64;
+    let mut oplog_total = 0u64;
+    let mut blob_total = 0u64;
     let mut cursor: Option<String> = None;
     loop {
         let rows: Vec<(String,)> = match cursor.as_deref() {
@@ -224,7 +267,7 @@ async fn prune_space_oplogs(
             }
         }
         .map_err(|e| crate::errors::PdsError::Storage {
-            reason: format!("space oplog: list accounts: {e}"),
+            reason: format!("per-actor sweep: list accounts: {e}"),
         })?;
         if rows.is_empty() {
             break;
@@ -236,27 +279,73 @@ async fn prune_space_oplogs(
             let store = match SqlActorStore::open(data_dir, &did).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::debug!(did = %did, error = ?e, "space oplog: open store skipped");
+                    tracing::debug!(did = %did, error = ?e, "per-actor sweep: open store skipped");
                     continue;
                 }
             };
-            for table in ["space_record_oplog", "space_member_oplog"] {
-                let sql = format!("DELETE FROM {table} WHERE rev < ?");
-                let result = sqlx::query(&sql)
-                    .bind(cutoff_tid)
-                    .execute(store.pool())
-                    .await;
-                match result {
-                    Ok(r) => total = total.saturating_add(r.rows_affected()),
+
+            if let Some(cutoff_tid) = cutoff_tid {
+                for table in ["space_record_oplog", "space_member_oplog"] {
+                    let sql = format!("DELETE FROM {table} WHERE rev < ?");
+                    match sqlx::query(&sql)
+                        .bind(cutoff_tid)
+                        .execute(store.pool())
+                        .await
+                    {
+                        Ok(r) => oplog_total = oplog_total.saturating_add(r.rows_affected()),
+                        Err(e) => {
+                            tracing::warn!(did = %did, table, error = ?e, "space oplog: prune failed");
+                        }
+                    }
+                }
+            }
+
+            if let Some(blob_cutoff) = blob_cutoff {
+                match prune_orphan_blobs(&store, blob_cutoff).await {
+                    Ok(n) => blob_total = blob_total.saturating_add(n),
                     Err(e) => {
-                        tracing::warn!(did = %did, table, error = ?e, "space oplog: prune failed");
+                        tracing::warn!(did = %did, error = ?e, "orphan blobs: prune failed");
                     }
                 }
             }
         }
         cursor = last;
     }
-    Ok(total)
+    Ok((oplog_total, blob_total))
+}
+
+/// Delete blob bytes nothing refers to any more.
+///
+/// Nothing did this. `drop_refs_for_record` has always returned the CIDs whose
+/// last reference it removed, documented as "caller GCs the blob bytes", and no
+/// caller ever did; `delete_blob` had no production call site at all. So the
+/// bytes of every replaced avatar and every deleted video stayed, and an account
+/// could grow its store without bound by writing records and deleting them.
+///
+/// Both reference tables are consulted, not just the public one. A blob uploaded
+/// through `com.atproto.repo.uploadBlob` and referenced only from a permissioned
+/// record has no `repo_blob_ref` row and is very much in use; collecting on the
+/// public table alone would delete live data out of spaces.
+///
+/// The age condition is what makes this safe to run against a live server rather
+/// than a courtesy: see [`DEFAULT_BLOB_GRACE_HOURS`].
+async fn prune_orphan_blobs(
+    store: &crate::actor_store::sql::SqlActorStore,
+    cutoff: &str,
+) -> PdsResult<u64> {
+    let result = sqlx::query(
+        "DELETE FROM repo_blob
+         WHERE created_at < ?
+           AND cid NOT IN (SELECT blob_cid FROM repo_blob_ref)
+           AND cid NOT IN (SELECT blob_cid FROM space_blob_ref)",
+    )
+    .bind(cutoff)
+    .execute(store.pool())
+    .await
+    .map_err(|e| crate::errors::PdsError::Storage {
+        reason: format!("prune orphan blobs: {e}"),
+    })?;
+    Ok(result.rows_affected())
 }
 
 async fn prune_oauth(pool: &SqlitePool, now_iso: &str) -> PdsResult<u64> {
@@ -300,6 +389,141 @@ mod tests {
             SlidingWindowLimiter::new_sql(pool.clone(), 100, Duration::from_secs(60));
         let report = tick(&pool, &jti_guard, &rate_limiter).await;
         assert_eq!(report, GcReport::default());
+    }
+
+    /// A blob nothing refers to is collected; one that is still referenced,
+    /// from either realm, is not.
+    ///
+    /// The space case is the one worth stating. Permissioned blobs are uploaded
+    /// through the ordinary `com.atproto.repo.uploadBlob` and land in the same
+    /// `repo_blob` table, so a blob referenced only from a permissioned record
+    /// has no `repo_blob_ref` row at all. Sweeping on the public table alone
+    /// would read that as unreferenced and delete live data out of a space.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orphan_blobs_are_collected_and_referenced_ones_are_not() {
+        use crate::actor_store::sql::SqlActorStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        let pool = accounts.pool().clone();
+        sqlx::query(
+            "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref, pds_managed_rotation)
+             VALUES ('did:plc:alice', 'alice.example', '$argon2id$x', '2026-05-01T00:00:00Z',
+                     'active', 'file:x', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let store = SqlActorStore::open(&dir, "did:plc:alice").await.unwrap();
+        // Four blobs, all older than any grace window.
+        for cid in ["orphan", "public", "spaceonly", "recent"] {
+            let created = if cid == "recent" {
+                "2099-01-01T00:00:00Z"
+            } else {
+                "2020-01-01T00:00:00Z"
+            };
+            sqlx::query(
+                "INSERT INTO repo_blob (cid, mime_type, size, data, created_at)
+                 VALUES (?, 'image/png', 3, X'010203', ?)",
+            )
+            .bind(cid)
+            .bind(created)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO repo_blob_ref (record_uri, blob_cid, mime_type, size)
+             VALUES ('at://did:plc:alice/c/1', 'public', 'image/png', 3)",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO space_blob_ref (space, record_uri, blob_cid)
+             VALUES ('at://did:plc:alice/space/t/k', 'at://did:plc:alice/space/t/k/a/c/1', 'spaceonly')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let jti_guard = JtiReplayGuard::new_sql(pool.clone());
+        let rate_limiter =
+            SlidingWindowLimiter::new_sql(pool.clone(), 100, Duration::from_secs(60));
+        let opts = TickOptions {
+            data_dir: Some(&dir),
+            ..Default::default()
+        };
+        let report = tick_with(&pool, &jti_guard, &rate_limiter, &opts).await;
+
+        assert_eq!(
+            report.orphan_blobs, 1,
+            "only the unreferenced blob should go"
+        );
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT cid FROM repo_blob ORDER BY cid ASC")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        let remaining: Vec<&str> = remaining.iter().map(|(c,)| c.as_str()).collect();
+        assert_eq!(
+            remaining,
+            vec!["public", "recent", "spaceonly"],
+            "a referenced or too-new blob must survive"
+        );
+    }
+
+    /// The grace window is what makes the sweep safe to run against a live
+    /// server: `uploadBlob` stores bytes before any record names them, so a
+    /// blob is unreferenced for as long as the client takes to write the
+    /// record that uses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_freshly_uploaded_blob_is_not_collected() {
+        use crate::actor_store::sql::SqlActorStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        let pool = accounts.pool().clone();
+        sqlx::query(
+            "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref, pds_managed_rotation)
+             VALUES ('did:plc:alice', 'alice.example', '$argon2id$x', '2026-05-01T00:00:00Z',
+                     'active', 'file:x', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let store = SqlActorStore::open(&dir, "did:plc:alice").await.unwrap();
+        sqlx::query(
+            "INSERT INTO repo_blob (cid, mime_type, size, data, created_at)
+             VALUES ('justuploaded', 'image/png', 3, X'010203', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let jti_guard = JtiReplayGuard::new_sql(pool.clone());
+        let rate_limiter =
+            SlidingWindowLimiter::new_sql(pool.clone(), 100, Duration::from_secs(60));
+        let opts = TickOptions {
+            data_dir: Some(&dir),
+            ..Default::default()
+        };
+        let report = tick_with(&pool, &jti_guard, &rate_limiter, &opts).await;
+
+        assert_eq!(
+            report.orphan_blobs, 0,
+            "a blob uploaded moments ago is not yet an orphan"
+        );
     }
 
     /// Stale email_token rows past `expires_at` get pruned; live ones survive.
