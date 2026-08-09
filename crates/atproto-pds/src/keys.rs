@@ -287,11 +287,120 @@ pub fn parse_key_type(s: &str) -> PdsResult<KeyType> {
     }
 }
 
+/// Reuse the PDS-level signing key across restarts, or generate and persist a
+/// fresh P-256 key on first boot. Never panics; any error is returned. Used to
+/// populate the `pds_signing_key` slot on `HttpState` so `/oauth/jwks`
+/// publishes a stable federation key.
+///
+/// The reference is recorded in `pds_setting`, which is the whole of the fix
+/// this function once needed. It used to call `key_store().get("__pds_oauth__")`
+/// -- but `put` never accepted a label. It content-addresses the key and
+/// returns an opaque ref, so `__pds_oauth__` named nothing, the lookup missed
+/// on every boot, and each restart generated a replacement key, published it
+/// as the PDS's federation key, and left the previous one orphaned on disk.
+/// Every account key already persists its ref in `account.signing_key_ref`;
+/// this was the one key in the system with nowhere to write it down.
+pub async fn load_or_create_pds_signing_key(
+    manager: &crate::account::AccountManager,
+) -> PdsResult<atproto_identity::key::KeyData> {
+    use crate::account::setting::{PDS_SIGNING_KEY_REF, get_setting, put_setting};
+    use atproto_identity::key::{KeyType, generate_key};
+
+    let pool = manager.account_pool();
+    if let Some(key_ref) = get_setting(&pool, PDS_SIGNING_KEY_REF).await? {
+        match manager.key_store().get(&key_ref).await {
+            Ok(existing) => {
+                tracing::info!(key_ref, "PDS signing key loaded from KeyStore");
+                return Ok(existing);
+            }
+            // The ref is recorded but the key is gone -- a restored database
+            // without its keys directory, or a hand-pruned one. Minting a
+            // replacement is the only way to serve, but it silently changes
+            // the published federation key, so say so at a level that gets
+            // read.
+            Err(e) => {
+                tracing::warn!(
+                    key_ref,
+                    error = ?e,
+                    "PDS signing key reference is recorded but the key is missing; \
+                     generating a replacement and republishing /oauth/jwks"
+                );
+            }
+        }
+    }
+
+    let key = generate_key(KeyType::P256Private).map_err(|e| PdsError::Storage {
+        reason: format!("generate PDS signing key: {e}"),
+    })?;
+    let key_ref = manager.key_store().put(&key).await?;
+    put_setting(&pool, PDS_SIGNING_KEY_REF, &key_ref).await?;
+    tracing::info!(key_ref, "PDS signing key generated + persisted");
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atproto_identity::key::KeyType;
     use tempfile::TempDir;
+
+    /// Boot the key loader against a directory and database that persist
+    /// across calls -- a restart, with process state gone and only what was
+    /// written down surviving.
+    async fn boot(dir: &std::path::Path) -> atproto_identity::key::KeyData {
+        use crate::account::{AccountDirectory, AccountManager};
+        let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        let store: std::sync::Arc<dyn KeyStore> =
+            std::sync::Arc::new(FileKeyStore::new(dir.join("keys")));
+        let manager = AccountManager::new(
+            accounts.pool().clone(),
+            dir.to_path_buf(),
+            store,
+            KeyType::K256Private,
+        );
+        load_or_create_pds_signing_key(&manager).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pds_signing_key_survives_a_restart() {
+        let tmp = TempDir::new().unwrap();
+
+        let first = boot(tmp.path()).await;
+        let second = boot(tmp.path()).await;
+
+        assert_eq!(
+            first.to_string(),
+            second.to_string(),
+            "a restart minted a new PDS signing key, so /oauth/jwks published a \
+             different federation key than the one before it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_key_that_has_gone_missing_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let first = boot(tmp.path()).await;
+
+        // A database restored without its keys directory. The ref is on record
+        // and resolves to nothing.
+        tokio::fs::remove_dir_all(tmp.path().join("keys"))
+            .await
+            .unwrap();
+
+        let second = boot(tmp.path()).await;
+        assert_ne!(
+            first.to_string(),
+            second.to_string(),
+            "the key was gone, so a replacement was the only way to serve"
+        );
+
+        // And the replacement is itself durable, rather than the server
+        // falling back into minting one per boot.
+        let third = boot(tmp.path()).await;
+        assert_eq!(second.to_string(), third.to_string());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn file_keystore_round_trip() {

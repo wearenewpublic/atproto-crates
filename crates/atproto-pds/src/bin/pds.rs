@@ -756,7 +756,8 @@ async fn main() -> anyhow::Result<()> {
     // PDS-level signing key for federation (JWKS publication). Either reuse
     // a pre-existing key in the KeyStore (label `__pds_oauth__`) or generate
     // a P-256 key on first boot and persist it.
-    let pds_signing_key = load_or_create_pds_signing_key(&account_manager).await?;
+    let pds_signing_key =
+        atproto_pds::keys::load_or_create_pds_signing_key(&account_manager).await?;
 
     // §10.3 — when an operator supplies a JWK set via env, the first
     // entry is the *current* signer (overrides the load_or_create
@@ -1446,26 +1447,6 @@ async fn unified_gc_loop(
             }
         }
     }
-}
-
-/// Reuse the PDS-level signing key from the KeyStore (label `__pds_oauth__`)
-/// or generate + persist a fresh P-256 key on first boot. Never panics; any
-/// error is returned. Used to populate the `pds_signing_key` slot on
-/// `HttpState` so `/oauth/jwks` publishes a real federation key.
-async fn load_or_create_pds_signing_key(
-    manager: &AccountManager,
-) -> anyhow::Result<atproto_identity::key::KeyData> {
-    use atproto_identity::key::{KeyType, generate_key};
-    let label = "__pds_oauth__";
-    if let Ok(existing) = manager.key_store().get(label).await {
-        info!(label, "PDS signing key loaded from KeyStore");
-        return Ok(existing);
-    }
-    let key = generate_key(KeyType::P256Private)
-        .map_err(|e| anyhow::anyhow!("generate PDS signing key: {e}"))?;
-    let key_ref = manager.key_store().put(&key).await?;
-    info!(label, key_ref, "PDS signing key generated + persisted");
-    Ok(key)
 }
 
 /// Derive a public service endpoint URL from `hostname` (when set) or by

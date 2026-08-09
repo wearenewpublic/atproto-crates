@@ -53,6 +53,9 @@ pub mod refresh_grace;
 
 pub mod session;
 
+/// Durable process-level settings (see [`setting`]).
+pub mod setting;
+
 #[cfg(feature = "sqlite")]
 pub use app_password::{AppPasswordRow, CreatedAppPassword};
 
