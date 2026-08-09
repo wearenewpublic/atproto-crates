@@ -1943,6 +1943,164 @@ mod tests {
         );
     }
 
+    /// The repair migration points `account.password_hash` at the password in
+    /// force, so a password replaced through the portal stops working.
+    ///
+    /// `20260809000001` removed the duplicate `__primary__` rows the portal's
+    /// insert-instead-of-replace produced, which closed the session path. It
+    /// left this column holding the hash written at signup, and that column is
+    /// what `verify_password` reads — so on any database written before the fix,
+    /// the *original* password still authenticates at the OAuth consent form.
+    /// This is the other half.
+    ///
+    /// The drift is reconstructed rather than described: an account is created,
+    /// then its `__primary__` row is repointed at a new password while the
+    /// account row is left alone, which is exactly the state the old portal
+    /// change produced once the duplicates were swept. The assertion before the
+    /// repair is the defect — two different passwords both opening the account.
+    ///
+    /// The migration file is executed rather than restated, so the SQL under
+    /// test is the SQL that ships.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_repair_migration_retires_a_password_replaced_before_the_fix() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("accounts.sqlite");
+        let accounts = AccountDirectory::open(&db_path).await.unwrap();
+        let manager = AccountManager::new(
+            accounts.pool().clone(),
+            data_dir.clone(),
+            Arc::new(MemoryKeyStore::new()) as Arc<dyn KeyStore>,
+            KeyType::K256Private,
+        );
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:alice",
+                handle: "alice.example",
+                email: None,
+                password: "correct horse",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        manager
+            .set_primary_password("did:plc:alice", "correct horse")
+            .await
+            .unwrap();
+
+        // Reproduce the pre-fix drift: the row moves to the new password, the
+        // account column keeps the old one. The unique index means there is one
+        // row to move, which is the post-`20260809000001` shape.
+        let pool = manager.account_pool();
+        let new_hash = hash_password("battery staple").unwrap();
+        sqlx::query("UPDATE app_password SET password_hash = ? WHERE name = '__primary__'")
+            .bind(&new_hash)
+            .execute(pool.as_sqlite())
+            .await
+            .unwrap();
+
+        // The defect, stated as an assertion: both passwords open the account,
+        // by different doors.
+        assert!(
+            manager
+                .verify_password("did:plc:alice", "correct horse")
+                .await
+                .unwrap(),
+            "precondition: the stale column is what this repairs"
+        );
+        assert!(
+            crate::account::app_password::verify(&pool, "did:plc:alice", "battery staple")
+                .await
+                .unwrap()
+                .is_some(),
+            "precondition: the row holds the current password"
+        );
+
+        // Drive it the way production will: mark the migration unapplied, drop
+        // the pool, and let the runner re-apply it on the next open. Executing
+        // the file by hand would test the statement; this tests that the
+        // statement reaches a database that already carries the drift, which is
+        // the only situation it exists for.
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20260809000002")
+            .execute(pool.as_sqlite())
+            .await
+            .unwrap();
+        drop(pool);
+        let reopened = AccountDirectory::open(&db_path)
+            .await
+            .expect("re-opening applies the pending repair");
+        let manager = AccountManager::new(
+            reopened.pool().clone(),
+            data_dir.clone(),
+            Arc::new(MemoryKeyStore::new()) as Arc<dyn KeyStore>,
+            KeyType::K256Private,
+        );
+
+        assert!(
+            !manager
+                .verify_password("did:plc:alice", "correct horse")
+                .await
+                .unwrap(),
+            "the replaced password still authenticates against account.password_hash"
+        );
+        assert!(
+            manager
+                .verify_password("did:plc:alice", "battery staple")
+                .await
+                .unwrap(),
+            "the password in force must still work"
+        );
+    }
+
+    /// An account whose two stores already agree is left as it was.
+    ///
+    /// `resetPassword` and the admin path always wrote both from one hash, and
+    /// an account that never changed its password holds a valid hash in each.
+    /// A repair that only helps the affected rows is worth less than one that is
+    /// safe to run over the whole table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_repair_migration_leaves_an_undrifted_account_working() {
+        let (manager, _dir, _tmp) = fresh_manager().await;
+        manager
+            .create_account(CreateAccountParams {
+                did: "did:plc:bob",
+                handle: "bob.example",
+                email: None,
+                password: "correct horse",
+                pds_managed_rotation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        manager
+            .set_primary_password("did:plc:bob", "correct horse")
+            .await
+            .unwrap();
+
+        let pool = manager.account_pool();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/accounts/20260809000002_repair_primary_password_hash.sql"
+        ))
+        .execute(pool.as_sqlite())
+        .await
+        .unwrap();
+
+        assert!(
+            manager
+                .verify_password("did:plc:bob", "correct horse")
+                .await
+                .unwrap()
+        );
+        assert!(
+            crate::account::app_password::verify(&pool, "did:plc:bob", "correct horse")
+                .await
+                .unwrap()
+                .is_some(),
+            "both doors still open with the one password"
+        );
+    }
+
     /// Changing the password has to retire the old one.
     ///
     /// It did not. `set_primary_password` inserted a `__primary__` row instead
