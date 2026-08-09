@@ -910,6 +910,48 @@ pub fn with_metrics(router: Router, _metrics: ()) -> Router {
     router
 }
 
+/// Stamp the current `DPoP-Nonce` on every response.
+///
+/// A client learns the nonce from a response header, so a server that only
+/// sent one when refusing would make the first request of every session a
+/// wasted round trip. Sending it always means a client that keeps the latest
+/// value it saw is never challenged after its first exchange.
+///
+/// Which nonce depends on the endpoint: RFC 9449 §8.1 keeps the authorization
+/// server's nonces separate from the resource server's, and this process is
+/// both.
+pub fn with_dpop_nonce(router: Router, issuer: crate::oauth::nonce::NonceIssuer) -> Router {
+    use crate::oauth::nonce::NonceSpace;
+    use axum::middleware::from_fn_with_state;
+
+    async fn stamp(
+        axum::extract::State(issuer): axum::extract::State<crate::oauth::nonce::NonceIssuer>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let space = if request.uri().path().starts_with("/oauth/") {
+            NonceSpace::Authorization
+        } else {
+            NonceSpace::Resource
+        };
+        let mut response = next.run(request).await;
+        // A refusal that already carries a challenge chose its own value;
+        // overwriting it with the same-space current nonce is harmless, but
+        // leaving it alone keeps the challenge and the header it names in
+        // agreement whatever order the layers run in.
+        if !response.headers().contains_key("dpop-nonce")
+            && let Ok(value) = axum::http::HeaderValue::from_str(&issuer.current(space))
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::HeaderName::from_static("dpop-nonce"), value);
+        }
+        response
+    }
+
+    router.layer(from_fn_with_state(issuer, stamp))
+}
+
 /// Apply the per-IP rate-limit policy to every route.
 ///
 /// Layered outside the router so it runs before routing: a scan of a hundred

@@ -89,6 +89,14 @@ pub struct HttpState {
     /// `None` in tests and for embedders that do not run a shutdown
     /// controller; the subscription then lasts as long as the socket does.
     pub shutdown: Option<tokio_util::sync::CancellationToken>,
+    /// Issues and checks server-provided DPoP nonces.
+    ///
+    /// `None` disables the requirement, which is what tests and embedders that
+    /// have not configured one get. The specification calls nonces mandatory,
+    /// so the binary sets this; the option exists because an operator upgrading
+    /// a live server needs a way to turn it off if a client of theirs has not
+    /// implemented the retry.
+    pub dpop_nonce: Option<crate::oauth::nonce::NonceIssuer>,
     /// JWT-jti replay guard (always populated; in-memory by default).
     pub jti_guard: JtiReplayGuard,
     /// Brief memory of what each rotated refresh token was exchanged for, so a
@@ -218,6 +226,7 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             shutdown: None,
+            dpop_nonce: None,
             jti_guard: JtiReplayGuard::new(100_000),
             refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -269,6 +278,7 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             shutdown: None,
+            dpop_nonce: None,
             jti_guard: JtiReplayGuard::new(100_000),
             refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
             rate_limiter: SlidingWindowLimiter::new(300, Duration::from_secs(60), 100_000),
@@ -311,6 +321,13 @@ impl HttpState {
     #[must_use]
     pub fn with_plc_service(mut self, plc: Arc<PlcService>) -> Self {
         self.plc_service = Some(plc);
+        self
+    }
+
+    /// Require and issue DPoP nonces.
+    #[must_use]
+    pub fn with_dpop_nonce(mut self, issuer: crate::oauth::nonce::NonceIssuer) -> Self {
+        self.dpop_nonce = Some(issuer);
         self
     }
 

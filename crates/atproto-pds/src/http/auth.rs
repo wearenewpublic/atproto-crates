@@ -371,7 +371,16 @@ pub async fn require_authn(
             AuthScheme::Dpop,
             "this access token is bound to a DPoP key",
         )?;
-        verify_dpop_proof(&parts.headers, &claims, htm, htu, raw, &state.jti_guard).await?;
+        verify_dpop_proof(
+            &parts.headers,
+            &claims,
+            htm,
+            htu,
+            raw,
+            &state.jti_guard,
+            state.dpop_nonce.as_ref(),
+        )
+        .await?;
     } else {
         require_scheme(
             scheme,

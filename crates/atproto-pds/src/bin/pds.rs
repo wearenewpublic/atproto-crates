@@ -368,6 +368,27 @@ struct Args {
     )]
     space_notify_retry_max_attempts: u32,
 
+    /// Require server-provided DPoP nonces. Default true.
+    ///
+    /// The specification calls these mandatory, and without them a captured
+    /// proof is replayable for its whole freshness window with only the JTI
+    /// guard in the way.
+    ///
+    /// The escape hatch exists because turning this on changes what clients
+    /// must do: a client that does not handle a `use_dpop_nonce` challenge and
+    /// retry will start failing. Conformant clients do handle it -- the retry
+    /// is part of the flow and this workspace's own client implements it --
+    /// but an operator upgrading a live server should be able to turn it off
+    /// while a client of theirs catches up, rather than choosing between a
+    /// conformant server and a working one.
+    #[arg(
+        long,
+        env = "PDS_DPOP_NONCE_REQUIRED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    dpop_nonce_required: bool,
+
     /// Notifier per-delivery HTTP timeout in seconds. Default 10.
     ///
     /// Deliveries run serially in a background task, which is the one
@@ -882,6 +903,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Derived from the JWT secret rather than configured separately: that
+    // secret is already required, already at least 32 bytes, already stable
+    // across restarts and already shared by every instance, which is the whole
+    // list of properties a nonce key needs.
+    let dpop_nonce = args.dpop_nonce_required.then(|| {
+        atproto_pds::oauth::nonce::NonceIssuer::new(std::sync::Arc::new(
+            args.jwt_secret.clone().into_bytes(),
+        ))
+    });
+    if dpop_nonce.is_none() {
+        warn!(
+            "DPoP nonces are disabled; a captured proof is replayable for its \
+             freshness window. Set PDS_DPOP_NONCE_REQUIRED=true once clients support it"
+        );
+    }
+
     // Wire shutdown before the state, which wants the token: `subscribeRepos`
     // holds sockets open indefinitely and needs to know when to let go.
     let ctrl = ShutdownController::with_deadline(Duration::from_secs(args.shutdown_deadline_secs));
@@ -1131,6 +1168,10 @@ async fn main() -> anyhow::Result<()> {
         .pool()
         .clone();
 
+    if let Some(issuer) = dpop_nonce.clone() {
+        state = state.with_dpop_nonce(issuer);
+    }
+
     let app = build_router(state);
 
     // §5.1 metrics — when the feature is on AND `--metrics-bind` is
@@ -1150,6 +1191,10 @@ async fn main() -> anyhow::Result<()> {
     // attacked from many addresses, which a per-IP limit cannot see.
     let rate_policy = build_rate_limit_policy(&rate_policy_inputs, ip_limiter, auth_limiter)?;
     let app = atproto_pds::http::with_rate_limit(app, rate_policy);
+    let app = match dpop_nonce {
+        Some(issuer) => atproto_pds::http::with_dpop_nonce(app, issuer),
+        None => app,
+    };
 
     // Bind and serve.
     let bind_addr: SocketAddr = format!("{}:{}", args.bind, args.port)

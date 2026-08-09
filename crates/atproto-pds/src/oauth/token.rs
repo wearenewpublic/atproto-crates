@@ -151,8 +151,13 @@ pub async fn token_handler(
     // by whoever holds it, which is exactly what DPoP exists to prevent. The
     // server also advertises `require_dpop_bound_access_tokens: true`, so
     // accepting an unproven request contradicts its own metadata.
-    let proof_jkt =
-        verify_token_endpoint_dpop(&headers, &token_endpoint_url(&state), &state.jti_guard).await?;
+    let proof_jkt = verify_token_endpoint_dpop(
+        &headers,
+        &token_endpoint_url(&state),
+        &state.jti_guard,
+        state.dpop_nonce.as_ref(),
+    )
+    .await?;
 
     match input.grant_type.as_str() {
         "authorization_code" => handle_code(state, input, proof_jkt).await,

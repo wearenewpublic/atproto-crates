@@ -48,6 +48,7 @@ pub async fn verify_dpop_proof(
     htu: &str,
     access_token: &str,
     jti_guard: &JtiReplayGuard,
+    nonce_issuer: Option<&crate::oauth::nonce::NonceIssuer>,
 ) -> Result<(), XrpcError> {
     let bound_jkt = match claims.cnf.as_ref().map(|c| &c.jkt) {
         Some(jkt) => jkt.clone(),
@@ -70,12 +71,23 @@ pub async fn verify_dpop_proof(
 
     let mut config = DpopValidationConfig::for_resource_request(htm, htu, access_token);
     config.max_age_seconds = DPOP_MAX_AGE_SECS;
+    if let Some(issuer) = nonce_issuer {
+        config.expected_nonce_values = issuer.accepted(crate::oauth::nonce::NonceSpace::Resource);
+    }
     let proof_jkt = validate_dpop_jwt(proof, &config).map_err(|e| {
-        XrpcError::new(
-            StatusCode::UNAUTHORIZED,
-            "InvalidDpopProof",
-            format!("DPoP proof invalid: {e}"),
-        )
+        let detail = e.to_string();
+        match nonce_issuer {
+            Some(issuer) if is_nonce_failure(&detail) => nonce_challenge(
+                issuer,
+                crate::oauth::nonce::NonceSpace::Resource,
+                "a DPoP proof for this server must carry the nonce it issued",
+            ),
+            _ => XrpcError::new(
+                StatusCode::UNAUTHORIZED,
+                "InvalidDpopProof",
+                format!("DPoP proof invalid: {detail}"),
+            ),
+        }
     })?;
 
     if proof_jkt != bound_jkt {
@@ -133,6 +145,7 @@ pub async fn verify_token_endpoint_dpop(
     headers: &HeaderMap,
     htu: &str,
     jti_guard: &JtiReplayGuard,
+    nonce_issuer: Option<&crate::oauth::nonce::NonceIssuer>,
 ) -> Result<String, XrpcError> {
     let invalid =
         |message: String| XrpcError::new(StatusCode::BAD_REQUEST, "invalid_dpop_proof", message);
@@ -145,8 +158,21 @@ pub async fn verify_token_endpoint_dpop(
 
     let mut config = DpopValidationConfig::for_authorization("POST", htu);
     config.max_age_seconds = DPOP_MAX_AGE_SECS;
-    let jkt = validate_dpop_jwt(proof, &config)
-        .map_err(|e| invalid(format!("DPoP proof invalid: {e}")))?;
+    if let Some(issuer) = nonce_issuer {
+        config.expected_nonce_values =
+            issuer.accepted(crate::oauth::nonce::NonceSpace::Authorization);
+    }
+    let jkt = validate_dpop_jwt(proof, &config).map_err(|e| {
+        let detail = e.to_string();
+        match nonce_issuer {
+            Some(issuer) if is_nonce_failure(&detail) => nonce_challenge(
+                issuer,
+                crate::oauth::nonce::NonceSpace::Authorization,
+                "a DPoP proof for the token endpoint must carry the nonce it issued",
+            ),
+            _ => invalid(format!("DPoP proof invalid: {detail}")),
+        }
+    })?;
 
     let jti = extract_jti(proof).ok_or_else(|| invalid("DPoP proof missing jti".to_string()))?;
     jti_guard
@@ -172,7 +198,11 @@ pub async fn verify_token_endpoint_dpop(
 ///
 /// Returns a 400 `invalid_dpop_proof` when a proof is present but malformed or
 /// fails validation.
-pub fn par_dpop_thumbprint(headers: &HeaderMap, htu: &str) -> Result<Option<String>, XrpcError> {
+pub fn par_dpop_thumbprint(
+    headers: &HeaderMap,
+    htu: &str,
+    nonce_issuer: Option<&crate::oauth::nonce::NonceIssuer>,
+) -> Result<Option<String>, XrpcError> {
     let Some(proof) = headers.get(DPOP_HEADER) else {
         return Ok(None);
     };
@@ -185,10 +215,63 @@ pub fn par_dpop_thumbprint(headers: &HeaderMap, htu: &str) -> Result<Option<Stri
 
     let mut config = DpopValidationConfig::for_authorization("POST", htu);
     config.max_age_seconds = DPOP_MAX_AGE_SECS;
-    let jkt = validate_dpop_jwt(proof, &config)
-        .map_err(|e| invalid(format!("DPoP proof invalid: {e}")))?;
+    if let Some(issuer) = nonce_issuer {
+        config.expected_nonce_values =
+            issuer.accepted(crate::oauth::nonce::NonceSpace::Authorization);
+    }
+    let jkt = validate_dpop_jwt(proof, &config).map_err(|e| {
+        let detail = e.to_string();
+        match nonce_issuer {
+            Some(issuer) if is_nonce_failure(&detail) => nonce_challenge(
+                issuer,
+                crate::oauth::nonce::NonceSpace::Authorization,
+                "a DPoP proof on a pushed request must carry the nonce this server issued",
+            ),
+            _ => invalid(format!("DPoP proof invalid: {detail}")),
+        }
+    })?;
 
     Ok(Some(jkt))
+}
+
+/// The 401 that tells a client to retry with a nonce.
+///
+/// RFC 9449 §8.2: the challenge is the `DPoP-Nonce` header carrying the value
+/// to use and a `WWW-Authenticate` naming `use_dpop_nonce`, so a client can act
+/// on it without parsing prose. Both are already in the CORS expose list, so a
+/// browser client can read them.
+#[must_use]
+pub fn nonce_challenge(
+    issuer: &crate::oauth::nonce::NonceIssuer,
+    space: crate::oauth::nonce::NonceSpace,
+    detail: &str,
+) -> XrpcError {
+    XrpcError::new(
+        StatusCode::UNAUTHORIZED,
+        "use_dpop_nonce",
+        detail.to_string(),
+    )
+    .with_header(
+        axum::http::HeaderName::from_static("dpop-nonce"),
+        issuer.current(space),
+    )
+    .with_header(
+        axum::http::header::WWW_AUTHENTICATE,
+        format!(
+            "DPoP error=\"use_dpop_nonce\", \
+                 error_description=\"{detail}\""
+        ),
+    )
+}
+
+/// Whether a validation failure was the absence or staleness of a nonce.
+///
+/// A client that has never spoken to this server cannot know a nonce, so its
+/// first request failing is the protocol working rather than an error. It has
+/// to be answered with a challenge instead of a flat refusal, or the client
+/// has nothing to retry with.
+fn is_nonce_failure(error: &str) -> bool {
+    error.contains("nonce")
 }
 
 /// Decode the `jti` claim from a DPoP proof's payload (no signature check —

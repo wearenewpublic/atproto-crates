@@ -171,7 +171,8 @@ pub async fn par_handler(
         "{}/oauth/par",
         crate::oauth::metadata::issuer_url(&state.service_did)
     );
-    if let Some(proof_jkt) = crate::oauth::dpop::par_dpop_thumbprint(&headers, &par_url)?
+    if let Some(proof_jkt) =
+        crate::oauth::dpop::par_dpop_thumbprint(&headers, &par_url, state.dpop_nonce.as_ref())?
         && let Some(claimed) = resolved.dpop_jkt.as_deref()
         && claimed != proof_jkt
     {

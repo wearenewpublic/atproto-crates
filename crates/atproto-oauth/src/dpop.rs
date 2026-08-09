@@ -269,7 +269,36 @@ pub fn auth_dpop(
     http_method: &str,
     http_uri: &str,
 ) -> anyhow::Result<(String, Header, Claims)> {
-    build_dpop(key_data, http_method, http_uri, None)
+    build_dpop(key_data, http_method, http_uri, None, None)
+}
+
+/// Creates a DPoP proof carrying a server-provided nonce.
+///
+/// A server that requires nonces answers a proof without one with a
+/// `use_dpop_nonce` challenge naming the value to use. This is how a client
+/// mints the retry. The atproto OAuth specification calls server-provided
+/// nonces mandatory, so on a conformant server this is the ordinary path and
+/// [`auth_dpop`] is the opening move that gets challenged.
+///
+/// `oauth_access_token` is `None` at the authorization server, where no token
+/// exists yet, and `Some` on a resource request.
+///
+/// # Errors
+/// Returns an error if key conversion or token minting fails.
+pub fn dpop_with_nonce(
+    key_data: &KeyData,
+    http_method: &str,
+    http_uri: &str,
+    oauth_access_token: Option<&str>,
+    nonce: &str,
+) -> anyhow::Result<(String, Header, Claims)> {
+    build_dpop(
+        key_data,
+        http_method,
+        http_uri,
+        oauth_access_token,
+        Some(nonce),
+    )
 }
 
 /// Creates a DPoP proof token for OAuth resource requests.
@@ -298,7 +327,13 @@ pub fn request_dpop(
     http_uri: &str,
     oauth_access_token: &str,
 ) -> anyhow::Result<(String, Header, Claims)> {
-    build_dpop(key_data, http_method, http_uri, Some(oauth_access_token))
+    build_dpop(
+        key_data,
+        http_method,
+        http_uri,
+        Some(oauth_access_token),
+        None,
+    )
 }
 
 /// The `htu` claim: the target URI without query or fragment (RFC 9449 §4.2).
@@ -329,6 +364,7 @@ fn build_dpop(
     http_method: &str,
     http_uri: &str,
     access_token: Option<&str>,
+    nonce: Option<&str>,
 ) -> anyhow::Result<(String, Header, Claims)> {
     let now = chrono::Utc::now();
 
@@ -357,6 +393,7 @@ fn build_dpop(
         http_uri: Some(htu_of(http_uri).to_string()),
         issued_at,
         json_web_token_id: Some(Ulid::new().to_string()),
+        nonce: nonce.map(str::to_string),
         ..Default::default()
     });
 

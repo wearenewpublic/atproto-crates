@@ -33,6 +33,7 @@ pub mod write_handlers;
 
 pub use rate_limit::RateLimitPolicy;
 pub use router::{
-    build_router, build_router_with_request_timeout, build_router_with_timeouts, with_rate_limit,
+    build_router, build_router_with_request_timeout, build_router_with_timeouts, with_dpop_nonce,
+    with_rate_limit,
 };
 pub use state::HttpState;

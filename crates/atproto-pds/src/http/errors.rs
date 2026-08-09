@@ -18,6 +18,12 @@ pub struct XrpcError {
     pub name: String,
     /// Human-readable message.
     pub message: String,
+    /// Extra response headers this refusal has to carry.
+    ///
+    /// A DPoP nonce challenge is not a message, it is a `DPoP-Nonce` header
+    /// and a `WWW-Authenticate` the client reads and retries with. Without
+    /// somewhere to put them the challenge cannot be expressed.
+    pub headers: Vec<(axum::http::HeaderName, String)>,
 }
 
 impl XrpcError {
@@ -27,20 +33,39 @@ impl XrpcError {
             status,
             name: name.to_string(),
             message: message.into(),
+            headers: Vec::new(),
         }
+    }
+
+    /// Attach a response header to this refusal.
+    #[must_use]
+    pub fn with_header(mut self, name: axum::http::HeaderName, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
     }
 }
 
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(json!({
                 "error": self.name,
                 "message": self.message,
             })),
         )
-            .into_response()
+            .into_response();
+        for (name, value) in self.headers {
+            match axum::http::HeaderValue::from_str(&value) {
+                Ok(value) => {
+                    response.headers_mut().insert(name, value);
+                }
+                // A header this server generated should always be valid; if it
+                // is not, the refusal still has to reach the caller.
+                Err(e) => tracing::error!(error = ?e, %name, "dropping an unencodable header"),
+            }
+        }
+        response
     }
 }
 

@@ -24,6 +24,7 @@ pub mod dpop;
 pub mod extract;
 pub mod jwks;
 pub mod metadata;
+pub mod nonce;
 pub mod par;
 pub mod permission_set;
 pub mod revoke;

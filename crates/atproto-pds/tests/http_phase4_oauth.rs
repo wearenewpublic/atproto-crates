@@ -2025,3 +2025,173 @@ async fn an_unknown_account_and_a_wrong_password_are_indistinguishable() {
          {absent_body} vs {wrong_body}"
     );
 }
+
+/// The same app, but requiring DPoP nonces the way a conformant server does.
+async fn build_app_requiring_nonces() -> (axum::Router, Arc<AccountManager>, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+    let issuer = atproto_pds::oauth::nonce::NonceIssuer::new(Arc::new(
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+    ));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_dpop_nonce(issuer.clone());
+    let app = atproto_pds::http::with_dpop_nonce(build_router(state), issuer);
+    (app, manager, tmp)
+}
+
+/// A proof without a nonce must be answered with the nonce to use, not merely
+/// refused. A client that has never spoken to this server cannot know one, so
+/// its first request failing is the protocol working -- but only if the reply
+/// carries what the retry needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proof_without_a_nonce_is_challenged_with_one() {
+    let (app, manager, _tmp) = build_app_requiring_nonces().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+
+    let (dpop, _, _) = auth_dpop(&key, "POST", PAR_ENDPOINT).unwrap();
+    let (_, challenge) = pkce_pair();
+    let request = Request::builder()
+        .uri("/oauth/par")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "client_id": CLIENT_ID, "response_type": "code",
+                "redirect_uri": REDIRECT_URI,
+                "scope": "atproto", "state": "s",
+                "code_challenge": challenge, "code_challenge_method": "S256",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let nonce = response
+        .headers()
+        .get("dpop-nonce")
+        .expect("the challenge must carry the nonce to retry with")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!nonce.is_empty());
+    let www = response
+        .headers()
+        .get(axum::http::header::WWW_AUTHENTICATE)
+        .expect("a client should not have to parse prose to know what happened")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(www.contains("use_dpop_nonce"), "{www}");
+}
+
+/// And retrying with the challenged nonce works, which is the half that makes
+/// the challenge a protocol rather than an outage.
+///
+/// This is the client's actual sequence: send, be challenged, read the nonce
+/// off the refusal, resend. The nonce comes from the challenge deliberately --
+/// an authorization-server nonce is what `/oauth/par` wants, and a client that
+/// picked one up from some earlier XRPC response would hold a resource-server
+/// one, which is a different value by design.
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_with_the_challenged_nonce_succeeds() {
+    let (app, manager, _tmp) = build_app_requiring_nonces().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+
+    let par_request = |dpop: String| {
+        let (_, challenge) = pkce_pair();
+        Request::builder()
+            .uri("/oauth/par")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("host", "test.example")
+            .header("DPoP", dpop)
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "client_id": CLIENT_ID, "response_type": "code",
+                    "redirect_uri": REDIRECT_URI,
+                    "scope": "atproto", "state": "s",
+                    "code_challenge": challenge, "code_challenge_method": "S256",
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    let (first, _, _) = auth_dpop(&key, "POST", PAR_ENDPOINT).unwrap();
+    let challenged = app.clone().oneshot(par_request(first)).await.unwrap();
+    assert_eq!(challenged.status(), StatusCode::UNAUTHORIZED);
+    let nonce = challenged
+        .headers()
+        .get("dpop-nonce")
+        .expect("the challenge must name the nonce to retry with")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (retry, _, _) =
+        atproto_oauth::dpop::dpop_with_nonce(&key, "POST", PAR_ENDPOINT, None, &nonce).unwrap();
+    let response = app.oneshot(par_request(retry)).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a proof carrying the challenged nonce must be accepted"
+    );
+}
+
+/// Every response carries the current nonce, so a client that keeps the latest
+/// value it saw is challenged once per session rather than once per request.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_response_carries_the_current_nonce() {
+    let (app, _manager, _tmp) = build_app_requiring_nonces().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/_health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.headers().contains_key("dpop-nonce"),
+        "an ordinary response should hand the client a current nonce"
+    );
+}
+
+/// A nonce minted for the authorization server is not valid at the resource
+/// server. RFC 9449 §8.1 keeps the two separate and this process is both.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authorization_nonce_is_not_accepted_at_the_resource_server() {
+    use atproto_pds::oauth::nonce::{NonceIssuer, NonceSpace};
+    let issuer = NonceIssuer::new(Arc::new(b"test-secret-do-not-use-in-prod-32!".to_vec()));
+    assert!(
+        !issuer
+            .accepted(NonceSpace::Resource)
+            .contains(&issuer.current(NonceSpace::Authorization)),
+        "the two nonce spaces must not overlap"
+    );
+}
