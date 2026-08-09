@@ -978,6 +978,42 @@ pub async fn import_repo(
     if let Some(backend) = state.public_realm_backend.as_ref() {
         importer = importer.with_backend(backend);
     }
+
+    // Check the commits are the account's own before serving them as such.
+    //
+    // The importer has been able to do this since it was written and was never
+    // asked to: `with_plc_verifier` had no caller anywhere, including in tests.
+    // Without it the only check is the inductive proof, which says the CAR is
+    // internally consistent and nothing about who produced it — so a CAR of
+    // self-consistent commits signed by a key that was never in the account's
+    // PLC log was accepted and re-served as that account's repository.
+    //
+    // Gated on the PLC service because that is what supplies the audit log to
+    // check against; it is configured on any deployment that can register a
+    // `did:plc` at all. A DID of another method has no PLC history to resolve,
+    // so there is nothing to verify against and the skip is logged rather than
+    // implied.
+    match state.plc_service.as_ref() {
+        Some(plc) if claims.sub().starts_with("did:plc:") => {
+            importer = importer.with_plc_verifier(crate::repo::import::PlcVerifier::new(
+                plc.http_client().clone(),
+                plc.directory_hostname(),
+            ));
+        }
+        Some(_) => {
+            tracing::warn!(
+                did = %claims.sub(),
+                "importRepo: commit signatures unverified — signature checking resolves the \
+                 signing key from a PLC audit log and this DID has none"
+            );
+        }
+        None => {
+            tracing::warn!(
+                did = %claims.sub(),
+                "importRepo: commit signatures unverified — no PLC directory is configured"
+            );
+        }
+    }
     let outcome = importer
         .import_from_stream(claims.sub(), std::io::Cursor::new(body.to_vec()))
         .await

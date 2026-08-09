@@ -602,36 +602,76 @@ async fn verify_chain_signatures(
     Ok(())
 }
 
-/// Pick the atproto signing key recorded in the most-recent active PLC
-/// op whose `created_at` string is ≤ a heuristic timestamp derived from
-/// the commit's TID-shaped rev.
+/// Pick the atproto signing key that was current when a commit was written:
+/// the most recent active PLC operation created at or before the commit's own
+/// timestamp.
 ///
-/// TIDs are lex-sortable + ordered; PLC `created_at` strings are
-/// ISO-8601 + ordered. Both are monotonic per-DID, so we walk active
-/// ops oldest-first and pick the LAST whose `created_at` lex-precedes
-/// the commit's rev (interpreted as an ISO-8601 prefix would for very
-/// recent commits). This is a coarse heuristic — a precise mapping
-/// would require correlating commit-rev TIDs to wall-clock time, which
-/// the current data model doesn't expose. For the common case where
-/// rotation is rare and PLC ops are sparse, the coarse mapping picks
-/// the right key.
+/// A rev is a TID, which encodes microseconds since the epoch, so the commit's
+/// wall-clock time is available exactly rather than by analogy. This used to
+/// compare the two as strings — `entry.created_at.as_str() <= rev` — against a
+/// comment describing it as a coarse ordering. It was not coarse, it was
+/// constant: an ISO-8601 timestamp begins `"2…"` and a current TID begins
+/// `"3…"`, so every operation compared as earlier than every commit and the
+/// answer was always the newest key.
+///
+/// That is right for a repository that never rotated and wrong for every one
+/// that did, in the direction that refuses the account's own history: commits
+/// signed before a rotation would be checked against the key that replaced
+/// theirs. Since this runs on import, the account being locked out would be one
+/// migrating in.
+///
+/// When the rev is not a TID, or an operation's `created_at` does not parse,
+/// there is no ordering to apply and the newest key is the only defensible
+/// guess — which is what the old comparison did in every case, and is kept here
+/// only for the case where it is genuinely the best available.
+/// Microseconds since the epoch for an RFC 3339 timestamp, so a PLC
+/// operation and a commit rev can be compared as the instants they are.
+fn rfc3339_micros(created_at: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .ok()?
+        .timestamp_micros()
+        .into()
+}
+
 fn historical_signing_key_at_rev(
     active: &[&AuditLogEntry],
     rev: &str,
 ) -> Result<KeyData, anyhow::Error> {
-    let mut chosen: Option<&AuditLogEntry> = None;
-    for entry in active {
-        if entry.created_at.as_str() <= rev {
-            chosen = Some(entry);
-        } else {
-            break;
+    // A TID's timestamp is 53 bits, so it always fits; `try_from` rather than
+    // `as` so a future widening is a compile error and not a wrapped instant.
+    let commit_time = atproto_record::tid::Tid::decode(rev)
+        .ok()
+        .and_then(|tid| i64::try_from(tid.timestamp_micros()).ok());
+
+    let entry = match commit_time {
+        Some(commit_micros) => {
+            let mut chosen: Option<&AuditLogEntry> = None;
+            for entry in active {
+                let Some(entry_micros) = rfc3339_micros(&entry.created_at) else {
+                    // An unparseable timestamp cannot be ordered against the
+                    // commit. Stop rather than skip: the operations are in
+                    // order, so everything after this one is equally unusable,
+                    // and treating it as "earlier" would silently prefer a
+                    // later key.
+                    break;
+                };
+                if entry_micros <= commit_micros {
+                    chosen = Some(entry);
+                } else {
+                    break;
+                }
+            }
+            // No operation precedes the commit: the commit predates the DID's
+            // own genesis, which should not happen. The genesis key is the only
+            // one that could have signed it.
+            chosen.or_else(|| active.first().copied())
         }
+        // The rev carries no time, so there is no ordering to apply and the
+        // current key is the best available guess — as it was in every case
+        // before the comparison was fixed.
+        None => active.last().copied(),
     }
-    // If no op precedes the commit (shouldn't happen — genesis precedes all
-    // commits), fall back to the earliest active op.
-    let entry = chosen
-        .or_else(|| active.first().copied())
-        .ok_or_else(|| anyhow::anyhow!("no active PLC operation found for commit rev={rev}"))?;
+    .ok_or_else(|| anyhow::anyhow!("no active PLC operation found for commit rev={rev}"))?;
     let multibase = match &entry.operation {
         Operation::PlcOperation {
             verification_methods,
@@ -730,6 +770,125 @@ mod tests {
     use atproto_dasl::car::CarWriter;
     use atproto_repo::repo::UnsignedCommit;
     use std::io::Cursor;
+
+    // --- historical signing-key selection ---------------------------------
+
+    /// A PLC operation registering `key` as the account's atproto signing key
+    /// at `created_at`.
+    fn op_at(created_at: &str, key: &str) -> AuditLogEntry {
+        AuditLogEntry {
+            did: "did:plc:alice".to_string(),
+            operation: Operation::PlcOperation {
+                rotation_keys: Vec::new(),
+                verification_methods: std::collections::HashMap::from([(
+                    "atproto".to_string(),
+                    key.to_string(),
+                )]),
+                also_known_as: Vec::new(),
+                services: std::collections::HashMap::new(),
+                prev: None,
+                sig: String::new(),
+            },
+            cid: format!("bafy{created_at}"),
+            created_at: created_at.to_string(),
+            nullified: false,
+        }
+    }
+
+    /// A TID rev for an instant.
+    ///
+    /// `from_parts` rather than `new_with_time`: the latter consults a
+    /// process-global monotonicity cell and rewrites a timestamp that moves
+    /// backwards, so a fixed instant is only fixed until another test asks for
+    /// a later one first.
+    fn tid_at(rfc3339: &str) -> String {
+        let micros = chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .timestamp_micros();
+        atproto_record::tid::Tid::from_parts(u64::try_from(micros).unwrap(), 0).encode()
+    }
+
+    /// Two real K-256 signing keys, as `did:key` multibase strings.
+    fn two_keys() -> (String, String) {
+        let genesis =
+            atproto_identity::key::generate_key(atproto_identity::key::KeyType::K256Private)
+                .unwrap();
+        let rotated =
+            atproto_identity::key::generate_key(atproto_identity::key::KeyType::K256Private)
+                .unwrap();
+        (
+            atproto_identity::key::to_public(&genesis)
+                .unwrap()
+                .to_string(),
+            atproto_identity::key::to_public(&rotated)
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    /// A commit written before a key rotation is checked against the key that
+    /// was current when it was written, not the one that replaced it.
+    ///
+    /// The selection used to compare the operation's ISO-8601 `created_at`
+    /// against the commit's TID rev as strings. An ISO timestamp begins `"2…"`
+    /// and a current TID begins `"3…"`, so every operation sorted as earlier
+    /// than every commit and the answer was always the newest key. A comment
+    /// called it a coarse ordering; it was not an ordering at all.
+    ///
+    /// The direction of the error is what makes it worth a test: an account
+    /// that had ever rotated could not import its own history, and importing
+    /// history is what this code path is for.
+    #[test]
+    fn a_commit_predating_a_rotation_resolves_to_the_key_of_its_time() {
+        let (genesis_key, rotated_key) = two_keys();
+        // A TID for 2026-01-01T00:00:00Z, which falls between the two ops.
+        let rev = tid_at("2026-01-01T00:00:00Z");
+
+        let ops = vec![
+            op_at("2025-06-01T00:00:00Z", &genesis_key),
+            op_at("2026-06-01T00:00:00Z", &rotated_key),
+        ];
+        let active: Vec<&AuditLogEntry> = ops.iter().collect();
+
+        let chosen = historical_signing_key_at_rev(&active, &rev).expect("a key for the commit");
+        assert_eq!(
+            chosen.to_string(),
+            genesis_key,
+            "a commit from before the rotation was checked against the key that replaced it"
+        );
+    }
+
+    /// And a commit written after the rotation resolves to the new key.
+    #[test]
+    fn a_commit_after_a_rotation_resolves_to_the_new_key() {
+        let (genesis_key, rotated_key) = two_keys();
+        let rev = tid_at("2026-07-01T00:00:00Z");
+
+        let ops = vec![
+            op_at("2025-06-01T00:00:00Z", &genesis_key),
+            op_at("2026-06-01T00:00:00Z", &rotated_key),
+        ];
+        let active: Vec<&AuditLogEntry> = ops.iter().collect();
+
+        let chosen = historical_signing_key_at_rev(&active, &rev).expect("a key for the commit");
+        assert_eq!(chosen.to_string(), rotated_key);
+    }
+
+    /// A rev that is not a TID carries no instant to order against, so the
+    /// current key is the only defensible answer — which is what the old
+    /// comparison produced in every case, and is kept only for this one.
+    #[test]
+    fn a_rev_that_is_not_a_tid_falls_back_to_the_current_key() {
+        let (genesis_key, rotated_key) = two_keys();
+        let ops = vec![
+            op_at("2025-06-01T00:00:00Z", &genesis_key),
+            op_at("2026-06-01T00:00:00Z", &rotated_key),
+        ];
+        let active: Vec<&AuditLogEntry> = ops.iter().collect();
+
+        let chosen = historical_signing_key_at_rev(&active, "not-a-tid").expect("a key");
+        assert_eq!(chosen.to_string(), rotated_key);
+    }
 
     /// Construct a minimal valid CAR containing one commit + an empty MST root.
     /// Used to smoke-test the import pipeline without standing up a full repo writer.
@@ -977,13 +1136,15 @@ mod tests {
             },
         ];
         let active: Vec<&AuditLogEntry> = log.iter().collect();
-        // A commit with rev "2026-03-15Z" sees the OLD key (between op1 + op2).
-        let mid_rev = "2026-03-15T00:00:00Z";
-        let key = historical_signing_key_at_rev(&active, mid_rev).unwrap();
+        // A rev is a TID, not a timestamp string. This test used to pass ISO
+        // dates here, which is the one input shape that made the old
+        // string-vs-string comparison look like an ordering; against a real
+        // rev it always chose the newest key.
+        let mid_rev = tid_at("2026-03-15T00:00:00Z");
+        let key = historical_signing_key_at_rev(&active, &mid_rev).unwrap();
         assert_eq!(key.to_string(), k_old);
-        // A commit with rev "2027-..." sees the NEW key (after both ops).
-        let new_rev = "2027-01-01T00:00:00Z";
-        let key2 = historical_signing_key_at_rev(&active, new_rev).unwrap();
+        let new_rev = tid_at("2027-01-01T00:00:00Z");
+        let key2 = historical_signing_key_at_rev(&active, &new_rev).unwrap();
         assert_eq!(key2.to_string(), k_new);
     }
 

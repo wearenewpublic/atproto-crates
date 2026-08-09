@@ -107,6 +107,15 @@ impl PlcService {
         &self.config.directory_hostname
     }
 
+    /// The HTTP client this service submits with.
+    ///
+    /// Exposed so callers that talk to the same PLC directory reuse the pooled
+    /// client rather than building one per request.
+    #[must_use]
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
     /// PDS public-facing service endpoint URL configured at boot. Used by
     /// `getRecommendedDidCredentials` to advertise
     /// the right `services.atproto_pds.endpoint` shape to migration
