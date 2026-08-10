@@ -2866,6 +2866,21 @@ pub struct ListReposResponse {
     pub repos: Vec<RepoRef>,
 }
 
+/// The writer-set query, hoisted so the plan test cannot drift from it.
+///
+/// Answered entirely from `idx_space_received_op_issuer`; see the migration
+/// that adds it for the measurements.
+const LIST_REPOS_SQL: &str = "SELECT o.issuer_did, o.rev, o.set_hash
+         FROM space_received_op o
+         WHERE o.space = ? AND o.issuer_did > ?
+           AND o.rev = (
+             SELECT MAX(i.rev) FROM space_received_op i
+             WHERE i.space = o.space AND i.issuer_did = o.issuer_did
+           )
+         GROUP BY o.issuer_did
+         ORDER BY o.issuer_did ASC
+         LIMIT ?";
+
 /// `GET /xrpc/com.atproto.space.listRepos`.
 ///
 /// The writer set: distinct issuer DIDs observed in the owner's inbound
@@ -2920,30 +2935,28 @@ pub async fn list_repos(
     // a SQLite-specific guarantee — anywhere else it would silently pair a rev
     // with some other row's hash, which is a wrong answer rather than a missing
     // one. The correlated subquery says what is meant.
-    let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT o.issuer_did, o.rev, o.set_hash
-         FROM space_received_op o
-         WHERE o.space = ? AND o.issuer_did > ?
-           AND o.rev = (
-             SELECT MAX(i.rev) FROM space_received_op i
-             WHERE i.space = o.space AND i.issuer_did = o.issuer_did
-           )
-         GROUP BY o.issuer_did
-         ORDER BY o.issuer_did ASC
-         LIMIT ?",
-    )
-    .bind(space.to_string())
-    .bind(&cursor)
-    .bind(limit as i64)
-    .fetch_all(store.pool())
-    .await
-    .map_err(|e| {
-        XrpcError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            format!("listRepos query: {e}"),
-        )
-    })?;
+    //
+    // It is also the faster shape, which is worth writing down because the
+    // obvious rewrite is slower. `idx_space_received_op_issuer` turns both
+    // halves into covering seeks and lets `LIMIT` stop the scan after one
+    // page's worth of issuers. A `ROW_NUMBER() OVER (PARTITION BY issuer_did)`
+    // formulation returns identical rows but has to materialise every issuer
+    // in the space before it can order and cut, so its cost tracks the space
+    // rather than the page: measured over 200k receipts, 0.008s here against
+    // 0.104s for the window function.
+    let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(LIST_REPOS_SQL)
+        .bind(space.to_string())
+        .bind(&cursor)
+        .bind(limit as i64)
+        .fetch_all(store.pool())
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                format!("listRepos query: {e}"),
+            )
+        })?;
 
     let repos: Vec<RepoRef> = rows
         .into_iter()
@@ -3674,5 +3687,62 @@ mod wire_shape_tests {
         };
         let err = apply_writes_results(&actions, commit).unwrap_err();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+#[cfg(test)]
+mod list_repos_plan_tests {
+    use super::*;
+    use crate::actor_store::sql::SqlActorStore;
+
+    /// `listRepos` must answer a page from the index, not by scanning a space.
+    ///
+    /// The query filters `space = ? AND issuer_did > ?` and correlates
+    /// `MAX(rev)` per issuer. With only `PRIMARY KEY (space, rev, nsid)` and an
+    /// index on `(space, received_at)`, neither half can seek on `issuer_did`:
+    /// the outer read every row in the space, the subquery read them all again
+    /// for each of those, and `GROUP BY` filled a temp b-tree before `LIMIT`
+    /// could take its hundred. One page over 2,000 issuers took 3.63s.
+    ///
+    /// Asserted on the plan rather than a stopwatch, because a timing
+    /// threshold on a shared machine either flakes or is set so loose it stops
+    /// catching the regression. The plan is what changed, and the plan is what
+    /// a dropped or reordered index would change back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_writer_set_query_seeks_the_issuer_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqlActorStore::open(tmp.path(), "did:plc:planowner")
+            .await
+            .unwrap();
+
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {LIST_REPOS_SQL}"))
+                .bind("at://did:plc:planowner/space/main")
+                .bind("")
+                .bind(100i64)
+                .fetch_all(store.pool())
+                .await
+                .expect("explain");
+        let plan: Vec<String> = plan.into_iter().map(|(_, _, _, detail)| detail).collect();
+        let rendered = plan.join("\n");
+
+        assert!(
+            plan.iter()
+                .filter(|step| step.contains("idx_space_received_op_issuer"))
+                .count()
+                >= 2,
+            "both the scan and the correlated subquery should seek the issuer \
+             index; plan was:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("TEMP B-TREE"),
+            "a temp b-tree has to be filled before LIMIT can cut, so page cost \
+             would track the space rather than the page; plan was:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("SCAN space_received_op"),
+            "the writer set must not be answered by scanning the table; plan \
+             was:\n{rendered}"
+        );
     }
 }
