@@ -690,10 +690,16 @@ pub struct GetSessionResponse {
     /// Whether that email has been confirmed.
     ///
     /// This is the flag clients read to decide whether to prompt the account
-    /// holder to verify. Omitting it read as "not confirmed" no matter how
-    /// many times they completed `confirmEmail`, so the prompt never went
-    /// away.
-    pub email_confirmed: bool,
+    /// holder to verify. Reporting `false` where it is simply not disclosed
+    /// would say "unconfirmed" to a client that has no business asking, and
+    /// the earlier bug this doc used to describe -- omitting it made the
+    /// prompt never go away -- was about withholding it from clients that
+    /// *were* entitled to it. Those still receive it.
+    ///
+    /// Absent exactly when [`email`](Self::email) is absent: the specification
+    /// treats "email address (and confirmation status)" as one disclosure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_confirmed: Option<bool>,
     /// Whether the account is usable. `false` for anything but `active`.
     pub active: bool,
     /// Why the account is not usable. Absent while `active` is `true`.
@@ -711,7 +717,9 @@ pub async fn get_session(
     // decided in the handler, not here. This is the first call most
     // clients make after authorizing, and refusing it made every OAuth
     // token look broken at the first hop.
-    let did = require_session_or_oauth(&parts, &state, &OAuthScope::Any).await?;
+    let (htm, htu) = request_htm_htu(&parts);
+    let subject = require_authn(&parts, &state, &htm, &htu).await?;
+    let did = subject.sub().to_string();
     let directory = state.reader.accounts();
     let account = directory
         .lookup_did(&did)
@@ -725,11 +733,27 @@ pub async fn get_session(
             )
         })?;
     let active = account.state == AccountState::Active;
+
+    // The comment above says email access is decided in the handler. It was
+    // not decided anywhere: every OAuth token received the address, whatever
+    // it had been granted.
+    //
+    // `transition:email` exists for precisely this and its whole described
+    // effect is that "email address (and confirmation status) gets included in
+    // response to `com.atproto.server.getSession`" -- which is only a
+    // meaningful grant if withholding it is the default. `transition:generic`
+    // does not carry it.
+    //
+    // Session tokens are unchanged. This is an OAuth scope question, and an
+    // app-password holder's access to the address is a separate decision from
+    // the one the scope system is making here.
+    let disclose_email = !subject.is_oauth() || subject.scopes().allows_account_email_read();
+
     Ok(Json(GetSessionResponse {
         handle: account.handle,
         did: account.did,
-        email: account.email,
-        email_confirmed: account.email_confirmed_at.is_some(),
+        email: disclose_email.then_some(account.email).flatten(),
+        email_confirmed: disclose_email.then_some(account.email_confirmed_at.is_some()),
         active,
         // The lexicon defines `status` as the reason a session is not usable,
         // so "active" is expressed by its absence rather than by naming it.

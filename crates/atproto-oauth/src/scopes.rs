@@ -1421,6 +1421,29 @@ impl ScopesSet {
         }
     }
 
+    /// Returns `true` if the token may be told the account's email address.
+    ///
+    /// `transition:email` satisfies this and `transition:generic` does not,
+    /// which is the specification's own split: the legacy blanket covers repo,
+    /// blob and RPC, and the address is carved out into a scope of its own
+    /// whose entire described effect is that "email address (and confirmation
+    /// status) gets included in response to `com.atproto.server.getSession`".
+    ///
+    /// `manage` implies read -- a scope that may change the address may
+    /// certainly see it.
+    pub fn allows_account_email_read(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(
+                Scope::parse(scope),
+                Ok(Scope::Transition(TransitionScope::Email))
+                    | Ok(Scope::Account(AccountScope {
+                        resource: AccountResource::Email,
+                        action: AccountAction::Read | AccountAction::Manage,
+                    }))
+            )
+        })
+    }
+
     /// Returns `true` if some granted `account:` scope permits *managing* the
     /// email address, as opposed to reading it.
     ///

@@ -2422,3 +2422,79 @@ async fn put_preferences_admits_the_legacy_generic_scope() {
 
     assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
 }
+
+/// Create a fixture account that actually has an email, so a test asserting
+/// the address is withheld is not merely observing that there is none.
+async fn create_account_with_email(manager: &AccountManager, did: &str, handle: &str) {
+    manager
+        .create_account(
+            CreateAccountParams::new(did, handle, "pw").with_email(Some("alice@example.com")),
+        )
+        .await
+        .expect("fixture account should be created");
+    manager
+        .set_primary_password(did, "pw")
+        .await
+        .expect("fixture account needs a session password");
+}
+
+/// `getSession` returned the account's email address to every OAuth token,
+/// whatever it had been granted. `transition:email` exists for exactly this
+/// disclosure -- its whole described effect is that the address and its
+/// confirmation status appear in this response -- which is only a grant if
+/// withholding is the default.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_withholds_the_email_from_a_token_without_the_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account_with_email(&manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    let (status, body) =
+        get_with_token(&app, &key, &token, "/xrpc/com.atproto.server.getSession").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("email").is_none(),
+        "the address was disclosed to a token that was not granted it: {body}"
+    );
+    assert!(
+        body.get("emailConfirmed").is_none(),
+        "confirmation status is part of the same disclosure: {body}"
+    );
+    // The rest of the response is unaffected -- this is a redaction, not a
+    // refusal.
+    assert_eq!(body["did"], "did:plc:alice", "{body}");
+    assert_eq!(body["handle"], "alice.example", "{body}");
+}
+
+/// And `transition:email` still receives it, or the scope would grant nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_discloses_the_email_to_the_transition_email_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account_with_email(&manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto transition:generic transition:email").await;
+
+    let (status, body) =
+        get_with_token(&app, &key, &token, "/xrpc/com.atproto.server.getSession").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["email"], "alice@example.com", "{body}");
+    assert!(body.get("emailConfirmed").is_some(), "{body}");
+}
+
+/// The granular spelling works too.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_session_discloses_the_email_to_the_granular_read_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account_with_email(&manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto account:email?action=read").await;
+
+    let (status, body) =
+        get_with_token(&app, &key, &token, "/xrpc/com.atproto.server.getSession").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["email"], "alice@example.com", "{body}");
+}
