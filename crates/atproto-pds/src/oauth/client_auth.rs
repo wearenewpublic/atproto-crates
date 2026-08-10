@@ -221,6 +221,58 @@ const MAX_CLIENT_ASSERTION_LIFETIME_SECS: i64 = 300;
 /// assertion that has expired by any margin has expired.
 const CLOCK_SKEW_SECS: i64 = 60;
 
+/// Read a JWT NumericDate claim.
+///
+/// RFC 7519 §2 defines one as "a JSON numeric value representing the number of
+/// seconds from 1970-01-01T00:00:00Z UTC", and says in the same paragraph that
+/// "non-integer values can be represented". A client emitting `exp` from a
+/// floating-point clock -- `time.time()` in Python, `Date.now()/1000` in
+/// JavaScript -- is therefore conformant, and `as_i64()` returns `None` for
+/// every one of those.
+///
+/// It returned `None` for a missing claim too, so both produced "has no exp"
+/// and a claim that was present and legal was reported as absent. That is what
+/// made this cost a production debugging session rather than a log line, so
+/// the three cases are now distinguished.
+///
+/// Truncated rather than rounded: a fractional second on an expiry is not a
+/// precision anyone is relying on, and truncation cannot move an expiry later.
+///
+/// # Errors
+///
+/// Returns a description naming the claim and which way it was unusable.
+fn numeric_date(value: &serde_json::Value, claim: &'static str) -> Result<i64, String> {
+    numeric_date_opt(value, claim)?.ok_or_else(|| format!("client assertion has no {claim}"))
+}
+
+/// [`numeric_date`] for a claim whose absence is not itself an error.
+///
+/// `Ok(None)` means the claim is not there; `Err` means it is there and is not
+/// a NumericDate. Collapsing those two into one answer is what reported a
+/// present, legal `exp` as missing.
+///
+/// # Errors
+///
+/// Returns a description when the claim is present and unusable.
+fn numeric_date_opt(value: &serde_json::Value, claim: &'static str) -> Result<Option<i64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(n) = value.as_i64() {
+        return Ok(Some(n));
+    }
+    if let Some(f) = value.as_f64()
+        && f.is_finite()
+        && f >= i64::MIN as f64
+        && f <= i64::MAX as f64
+    {
+        return Ok(Some(f.trunc() as i64));
+    }
+    Err(format!(
+        "client assertion {claim} is not a NumericDate: {value}"
+    ))
+}
+
 /// The time and audience claims an assertion must satisfy, separated out so
 /// they can be exercised.
 ///
@@ -247,13 +299,6 @@ fn check_assertion_claims(
         return Err("client assertion aud does not name this server".to_string());
     }
 
-    let exp = claims["exp"]
-        .as_i64()
-        .ok_or_else(|| "client assertion has no exp".to_string())?;
-    if exp <= now {
-        return Err("client assertion has expired".to_string());
-    }
-
     // RFC 7523 §3 requires `iat`, and this had no opinion about it at all.
     //
     // Without it there is nothing to measure a lifetime against, so `exp` was
@@ -268,12 +313,40 @@ fn check_assertion_claims(
     // rather than evicting, so an attacker minting far-future assertions could
     // deny service to every client whose authentication needs the guard. The
     // ceiling is what keeps the entries transient.
-    let iat = claims["iat"]
-        .as_i64()
-        .ok_or_else(|| "client assertion has no iat".to_string())?;
+    let iat = numeric_date(&claims["iat"], "iat")?;
     if iat > now.saturating_add(CLOCK_SKEW_SECS) {
         return Err("client assertion was issued in the future".to_string());
     }
+
+    // RFC 7523 §3 requires `exp`: "The JWT MUST contain an \"exp\"
+    // (expiration time) claim that limits the time window during which the JWT
+    // can be used." An assertion without one is non-conformant.
+    //
+    // It is accommodated rather than refused. A client's omission becomes, for
+    // the account holder, a login that fails with nothing they can do about it
+    // -- and the omission is not a security problem here so long as this server
+    // supplies the bound the client left out. So an absent `exp` is read as the
+    // tightest one that would have been accepted anyway: `iat` plus the
+    // ceiling. The assertion is signed, single-use through the replay guard,
+    // and now expiring, which is every property a stated `exp` would have given
+    // it.
+    //
+    // Logged at debug rather than silently: an operator tracing an interop
+    // problem should be able to see which clients are relying on this.
+    let exp = match numeric_date_opt(&claims["exp"], "exp")? {
+        Some(exp) => exp,
+        None => {
+            tracing::debug!(
+                iss = %claims["iss"].as_str().unwrap_or_default(),
+                "client assertion has no exp; bounding it at the assertion ceiling"
+            );
+            iat.saturating_add(MAX_CLIENT_ASSERTION_LIFETIME_SECS)
+        }
+    };
+    if exp <= now {
+        return Err("client assertion has expired".to_string());
+    }
+
     let lifetime = exp.saturating_sub(iat);
     if lifetime > MAX_CLIENT_ASSERTION_LIFETIME_SECS {
         return Err(format!(
@@ -453,6 +526,106 @@ mod tests {
             "iat": iat,
             "exp": exp,
         })
+    }
+
+    /// The shape AIP actually sends: `iss`, `sub`, `aud`, `jti`, `iat`, and no
+    /// `exp` at all.
+    ///
+    /// `atproto-oauth` builds its client assertion with `..Default::default()`
+    /// and never sets `expiration`, and `JoseClaims` skips serializing a `None`
+    /// -- so `exp` is omitted from the JWT. RFC 7523 §3 requires it, so this is
+    /// the client's bug, but refusing it makes the account holder's login fail
+    /// with nothing they can act on.
+    #[test]
+    fn an_assertion_with_no_exp_is_bounded_rather_than_refused() {
+        let now = 1_800_000_000;
+        let claims = serde_json::json!({
+            "iss": "https://auth.m.graze.social/oauth-client-metadata.json",
+            "sub": "https://auth.m.graze.social/oauth-client-metadata.json",
+            "aud": "https://pds.example",
+            "jti": "assertion-jti",
+            "iat": now,
+        });
+        let exp = check_assertion_claims(&claims, &audiences(), now)
+            .expect("an assertion with no exp is bounded, not refused");
+        assert_eq!(
+            exp,
+            now + MAX_CLIENT_ASSERTION_LIFETIME_SECS,
+            "the bound supplied must be the ceiling, not something longer"
+        );
+    }
+
+    /// The bound is real: an assertion with no `exp` whose `iat` is older than
+    /// the ceiling is expired, exactly as a stated `exp` would have been.
+    #[test]
+    fn an_old_assertion_with_no_exp_is_still_expired() {
+        let now = 1_800_000_000;
+        let claims = serde_json::json!({
+            "iss": "https://app.example/client-metadata.json",
+            "aud": "https://pds.example",
+            "jti": "assertion-jti",
+            "iat": now - MAX_CLIENT_ASSERTION_LIFETIME_SECS - 1,
+        });
+        let err = check_assertion_claims(&claims, &audiences(), now)
+            .expect_err("the supplied bound must actually bound");
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    /// A `NumericDate` may be non-integer, and a client emitting one from a
+    /// floating-point clock is conformant.
+    ///
+    /// This cost a production debugging session: `as_i64()` returns `None` for
+    /// a float, and the same `None` meant "absent", so an assertion carrying a
+    /// perfectly legal `exp` was refused with "client assertion has no exp".
+    #[test]
+    fn a_fractional_numeric_date_is_read_not_refused() {
+        assert_eq!(
+            numeric_date(&serde_json::json!(1_786_368_290.0_f64), "exp"),
+            Ok(1_786_368_290)
+        );
+        // Truncated, so a fraction cannot push an expiry later than it was
+        // issued for.
+        assert_eq!(
+            numeric_date(&serde_json::json!(1_786_368_290.75_f64), "exp"),
+            Ok(1_786_368_290)
+        );
+        assert_eq!(
+            numeric_date(&serde_json::json!(1_786_368_290_i64), "exp"),
+            Ok(1_786_368_290)
+        );
+    }
+
+    /// Absent and unusable are different answers, and reporting them alike is
+    /// what made the original failure hard to read.
+    #[test]
+    fn an_absent_claim_and_an_unusable_one_are_distinguished() {
+        let absent = numeric_date(&serde_json::Value::Null, "exp").expect_err("null is absent");
+        assert!(absent.contains("has no exp"), "{absent}");
+
+        // A string is not a NumericDate -- RFC 7519 says numeric -- so it is
+        // still refused, but named for what it is.
+        let wrong = numeric_date(&serde_json::json!("1786368290"), "exp")
+            .expect_err("a string is not numeric");
+        assert!(
+            wrong.contains("is not a NumericDate"),
+            "the refusal should say what was wrong with it: {wrong}"
+        );
+        assert!(!wrong.contains("has no exp"), "{wrong}");
+    }
+
+    /// A whole assertion whose times are floats authenticates.
+    #[test]
+    fn an_assertion_with_fractional_times_passes_the_claim_checks() {
+        let now = 1_800_000_000;
+        let claims = serde_json::json!({
+            "iss": "https://app.example/client-metadata.json",
+            "aud": "https://pds.example",
+            "jti": "assertion-jti",
+            "iat": f64::from(now as u32),
+            "exp": f64::from(now as u32) + 60.5,
+        });
+        check_assertion_claims(&claims, &audiences(), now)
+            .expect("a client with a floating-point clock is conformant");
     }
 
     /// An ordinary short-lived assertion is accepted, so the bounds below are

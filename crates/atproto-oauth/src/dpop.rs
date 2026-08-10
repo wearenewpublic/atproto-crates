@@ -19,6 +19,31 @@ use crate::{
     pkce::challenge,
 };
 
+/// Read a JWT NumericDate claim as whole seconds.
+///
+/// RFC 7519 §2 defines one as "a JSON numeric value representing the number of
+/// seconds from 1970-01-01T00:00:00Z UTC" and says in the same paragraph that
+/// "non-integer values can be represented". A client deriving `iat` from a
+/// floating-point clock -- `time.time()` in Python, `Date.now() / 1000` in
+/// JavaScript -- is therefore conformant.
+///
+/// `as_u64()` returns `None` for every one of those, and this claim is
+/// required, so such a client was told its proof had no `iat` at all -- on
+/// every request it ever made, since a DPoP proof is minted per request.
+///
+/// Truncated rather than rounded, so a fractional second cannot move an `iat`
+/// forward into the future or an `exp` later than it was issued for.
+fn numeric_date(value: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    let f = value.as_f64()?;
+    if !f.is_finite() || f < 0.0 || f > u64::MAX as f64 {
+        return None;
+    }
+    Some(f.trunc() as u64)
+}
+
 /// Retry middleware for handling DPoP nonce challenges in HTTP requests.
 ///
 /// This struct implements the `Chainer` trait to automatically retry requests
@@ -733,7 +758,7 @@ pub fn validate_dpop_jwt(dpop_jwt: &str, config: &DpopValidationConfig) -> Resul
     // iat (issued at) - validate timestamp
     let iat = claims
         .get("iat")
-        .and_then(|v| v.as_u64())
+        .and_then(numeric_date)
         .ok_or_else(|| JWTError::MissingClaim {
             claim: "iat".to_string(),
         })?;
@@ -797,8 +822,7 @@ pub fn validate_dpop_jwt(dpop_jwt: &str, config: &DpopValidationConfig) -> Resul
     }
 
     // exp (expiration) - validate if present
-    if let Some(exp_value) = claims.get("exp")
-        && let Some(exp) = exp_value.as_u64()
+    if let Some(exp) = claims.get("exp").and_then(numeric_date)
         && config.now.cast_unsigned() >= exp
     {
         return Err(JWTError::TokenExpired.into());
@@ -826,6 +850,33 @@ pub fn validate_dpop_jwt(dpop_jwt: &str, config: &DpopValidationConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
+    /// A DPoP proof is minted per request, so a client whose `iat` comes from a
+    /// floating-point clock was told every proof it ever sent had no `iat`.
+    #[test]
+    fn a_fractional_numeric_date_is_read() {
+        assert_eq!(
+            numeric_date(&serde_json::json!(1_786_368_290.0_f64)),
+            Some(1_786_368_290)
+        );
+        assert_eq!(
+            numeric_date(&serde_json::json!(1_786_368_290.9_f64)),
+            Some(1_786_368_290)
+        );
+        assert_eq!(
+            numeric_date(&serde_json::json!(1_786_368_290_u64)),
+            Some(1_786_368_290)
+        );
+    }
+
+    /// What is genuinely not a NumericDate stays refused.
+    #[test]
+    fn a_non_numeric_date_is_still_refused() {
+        assert_eq!(numeric_date(&serde_json::json!("1786368290")), None);
+        assert_eq!(numeric_date(&serde_json::json!(-1.0_f64)), None);
+        assert_eq!(numeric_date(&serde_json::Value::Null), None);
+        assert_eq!(numeric_date(&serde_json::json!(f64::INFINITY)), None);
+    }
+
     use super::*;
 
     #[test]
