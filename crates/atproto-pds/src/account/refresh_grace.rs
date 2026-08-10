@@ -29,6 +29,7 @@
 
 use crate::account::session::SessionTokens;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -43,10 +44,28 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(10);
 /// without limit. Entries expire on their own; this is the backstop.
 const MAX_ENTRIES: usize = 10_000;
 
+/// A grace-window hit.
+pub struct GraceHit {
+    /// The successor pair the token was already exchanged for.
+    pub tokens: SessionTokens,
+    /// Whether this presentation came from a different address than the
+    /// exchange that created the entry.
+    ///
+    /// `false` when either address is unknown: that is "cannot tell", and it
+    /// should not read as "same".
+    pub from_elsewhere: bool,
+}
+
 /// Remembers, briefly, what each rotated refresh token was exchanged for.
 pub struct RefreshGrace {
     window: Duration,
-    entries: Mutex<HashMap<String, (Instant, SessionTokens)>>,
+    entries: Mutex<HashMap<String, Entry>>,
+}
+
+struct Entry {
+    at: Instant,
+    tokens: SessionTokens,
+    from: Option<IpAddr>,
 }
 
 impl RefreshGrace {
@@ -60,18 +79,40 @@ impl RefreshGrace {
     }
 
     /// What this token was already exchanged for, if it was, and recently.
+    ///
+    /// `from` is the address presenting it now. It is compared against the
+    /// address that performed the original exchange, and a difference is
+    /// reported rather than refused.
+    ///
+    /// Reported rather than refused deliberately. Whoever presents this token
+    /// already holds the credential -- they could have refreshed first and
+    /// received a session that way, so withholding the successor denies them
+    /// nothing. What the grace window does take away is the *signal*: without
+    /// it one of the two racing parties gets a 401, and a client that has been
+    /// robbed logs its user out, which the user notices. Restoring the signal
+    /// is therefore the fix, and refusing is not: a legitimate client that
+    /// changed address between two in-flight requests -- a phone moving
+    /// between networks -- would be refused and logged out, which is the exact
+    /// harm this window exists to prevent.
     #[must_use]
-    pub fn get(&self, jti: &str) -> Option<SessionTokens> {
+    pub fn get(&self, jti: &str, from: Option<IpAddr>) -> Option<GraceHit> {
         let entries = self.entries.lock().ok()?;
-        let (at, tokens) = entries.get(jti)?;
-        if at.elapsed() > self.window {
+        let entry = entries.get(jti)?;
+        if entry.at.elapsed() > self.window {
             return None;
         }
-        Some(tokens.clone())
+        let from_elsewhere = match (entry.from, from) {
+            (Some(first), Some(now)) => first != now,
+            _ => false,
+        };
+        Some(GraceHit {
+            tokens: entry.tokens.clone(),
+            from_elsewhere,
+        })
     }
 
-    /// Record what a token was exchanged for.
-    pub fn insert(&self, jti: &str, tokens: &SessionTokens) {
+    /// Record what a token was exchanged for, and from where.
+    pub fn insert(&self, jti: &str, tokens: &SessionTokens, from: Option<IpAddr>) {
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
@@ -79,10 +120,17 @@ impl RefreshGrace {
             // Drop everything already past the window before resorting to
             // refusing new records; in steady state this keeps the map small.
             let window = self.window;
-            entries.retain(|_, (at, _)| at.elapsed() <= window);
+            entries.retain(|_, entry| entry.at.elapsed() <= window);
         }
         if entries.len() < MAX_ENTRIES {
-            entries.insert(jti.to_string(), (Instant::now(), tokens.clone()));
+            entries.insert(
+                jti.to_string(),
+                Entry {
+                    at: Instant::now(),
+                    tokens: tokens.clone(),
+                    from,
+                },
+            );
         }
     }
 }
@@ -109,10 +157,12 @@ mod tests {
     #[test]
     fn a_replay_inside_the_window_returns_the_same_successor() {
         let grace = RefreshGrace::new(Duration::from_secs(10));
-        grace.insert("jti-1", &tokens("a"));
-        let again = grace.get("jti-1").expect("inside the window");
-        assert_eq!(again.access_jwt, "access-a");
-        assert_eq!(again.refresh_jwt, "refresh-a");
+        let from = Some("198.51.100.7".parse().unwrap());
+        grace.insert("jti-1", &tokens("a"), from);
+        let again = grace.get("jti-1", from).expect("inside the window");
+        assert_eq!(again.tokens.access_jwt, "access-a");
+        assert_eq!(again.tokens.refresh_jwt, "refresh-a");
+        assert!(!again.from_elsewhere, "the same address is not elsewhere");
     }
 
     /// Past the window the token is unknown again, so the caller falls through
@@ -121,15 +171,51 @@ mod tests {
     #[test]
     fn a_replay_outside_the_window_is_not_served() {
         let grace = RefreshGrace::new(Duration::from_millis(1));
-        grace.insert("jti-2", &tokens("b"));
+        grace.insert("jti-2", &tokens("b"), None);
         std::thread::sleep(Duration::from_millis(20));
-        assert!(grace.get("jti-2").is_none());
+        assert!(grace.get("jti-2", None).is_none());
     }
 
     #[test]
     fn an_unknown_token_is_not_served() {
         let grace = RefreshGrace::new(Duration::from_secs(10));
-        assert!(grace.get("never-seen").is_none());
+        assert!(grace.get("never-seen", None).is_none());
+    }
+
+    /// The same token exchanged from a second address inside ten seconds is
+    /// not a client racing itself. The successor is still returned -- whoever
+    /// holds the token could have refreshed first and got a session anyway --
+    /// but the caller is told, because the window would otherwise make the
+    /// second exchange invisible and that is what a stolen token needs.
+    #[test]
+    fn an_exchange_from_a_second_address_is_reported_and_still_served() {
+        let grace = RefreshGrace::new(Duration::from_secs(10));
+        let first = Some("198.51.100.7".parse().unwrap());
+        let second = Some("203.0.113.9".parse().unwrap());
+        grace.insert("jti-3", &tokens("c"), first);
+
+        let hit = grace.get("jti-3", second).expect("inside the window");
+        assert!(
+            hit.from_elsewhere,
+            "a different address must be reported as such"
+        );
+        assert_eq!(
+            hit.tokens.access_jwt, "access-c",
+            "the successor is still served: refusing it denies nothing to \
+             someone already holding the token, and would log out a client \
+             that changed network mid-flight"
+        );
+    }
+
+    /// An address this server could not attribute is "cannot tell", not
+    /// "same". Behind an undeclared proxy every caller looks alike, and
+    /// reporting that as agreement would be a claim the data does not support.
+    #[test]
+    fn an_unknown_address_is_not_reported_as_a_match() {
+        let grace = RefreshGrace::new(Duration::from_secs(10));
+        grace.insert("jti-4", &tokens("d"), Some("198.51.100.7".parse().unwrap()));
+        let hit = grace.get("jti-4", None).expect("inside the window");
+        assert!(!hit.from_elsewhere);
     }
 
     /// The map cannot grow without bound even if every refresh is remembered.
@@ -137,7 +223,7 @@ mod tests {
     fn the_record_is_bounded() {
         let grace = RefreshGrace::new(Duration::from_secs(3600));
         for i in 0..(MAX_ENTRIES + 500) {
-            grace.insert(&format!("jti-{i}"), &tokens("x"));
+            grace.insert(&format!("jti-{i}"), &tokens("x"), None);
         }
         let len = grace.entries.lock().unwrap().len();
         assert!(len <= MAX_ENTRIES, "grew to {len}");

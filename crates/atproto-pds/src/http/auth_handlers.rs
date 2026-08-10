@@ -786,11 +786,27 @@ pub async fn refresh_session(
     //
     // Outside that window the replay check still refuses it, which is what
     // keeps rotation meaningful.
-    if let Some(existing) = state.refresh_grace.get(&claims.jti) {
-        tracing::debug!(
-            did = %claims.sub,
-            "refresh replayed inside the grace window; returning the same successor"
-        );
+    let presented_from =
+        crate::http::rate_limit::client_ip_from_parts(&parts, state.trusted_proxy_hops);
+    if let Some(hit) = state.refresh_grace.get(&claims.jti, presented_from) {
+        if hit.from_elsewhere {
+            // The same refresh token exchanged from two addresses inside ten
+            // seconds is not a client racing itself. The successor is still
+            // returned -- whoever holds this token could have refreshed first
+            // and got a session anyway, so withholding it denies nothing --
+            // but the window would otherwise make the second exchange
+            // invisible, and that is what a stolen token needs.
+            tracing::warn!(
+                did = %claims.sub,
+                "a refresh token was exchanged from two addresses inside the grace window"
+            );
+        } else {
+            tracing::debug!(
+                did = %claims.sub,
+                "refresh replayed inside the grace window; returning the same successor"
+            );
+        }
+        let existing = hit.tokens;
         let account_row = state
             .reader
             .accounts()
@@ -882,7 +898,9 @@ pub async fn refresh_session(
 
     // Remember what this token bought, so a racing second request gets the
     // same answer instead of a 401.
-    state.refresh_grace.insert(&claims.jti, &tokens);
+    state
+        .refresh_grace
+        .insert(&claims.jti, &tokens, presented_from);
 
     let (email, email_confirmed, active, status) = session_account_fields(&account);
     Ok(Json(SessionResponse {

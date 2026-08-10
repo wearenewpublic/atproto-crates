@@ -126,11 +126,25 @@ impl RateLimitPolicy {
 /// call, and refusing those would break the caller rather than an attacker.
 #[must_use]
 pub fn client_ip(request: &Request, trusted_proxy_hops: usize) -> Option<IpAddr> {
+    client_ip_parts(request.headers(), request.extensions(), trusted_proxy_hops)
+}
+
+/// [`client_ip`] for a handler that has already destructured the request.
+#[must_use]
+pub fn client_ip_from_parts(
+    parts: &axum::http::request::Parts,
+    trusted_proxy_hops: usize,
+) -> Option<IpAddr> {
+    client_ip_parts(&parts.headers, &parts.extensions, trusted_proxy_hops)
+}
+
+fn client_ip_parts(
+    headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
+    trusted_proxy_hops: usize,
+) -> Option<IpAddr> {
     if trusted_proxy_hops > 0
-        && let Some(header) = request
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
+        && let Some(header) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
     {
         // Each trusted proxy appended the address it saw, so the rightmost
         // `hops` entries are ours. The one we want is the address the
@@ -146,8 +160,7 @@ pub fn client_ip(request: &Request, trusted_proxy_hops: usize) -> Option<IpAddr>
         // what the operator described. Fall through to the peer address —
         // the one thing that cannot be forged — rather than trusting it.
     }
-    request
-        .extensions()
+    extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip())
 }
