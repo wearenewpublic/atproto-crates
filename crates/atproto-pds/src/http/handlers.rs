@@ -114,8 +114,18 @@ pub struct GetRecordParams {
 /// Handler for `com.atproto.repo.getRecord`.
 pub async fn get_record(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<GetRecordParams>,
 ) -> Result<Json<RecordResponse>, XrpcError> {
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    // Gated at the boundary rather than inside the reader: the same reader
+    // methods serve authenticated flows -- the account portal, policy
+    // acceptance -- that must keep working while an account is deactivated,
+    // because reactivating is one of them.
+    state
+        .reader
+        .require_readable_if_present(&params.repo, caller.as_deref())
+        .await?;
     let response = state
         .reader
         .get_record(
@@ -167,8 +177,14 @@ fn default_limit() -> u32 {
 /// Handler for `com.atproto.repo.listRecords`.
 pub async fn list_records(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<ListRecordsParams>,
 ) -> Result<Json<ListRecordsResponse>, XrpcError> {
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    state
+        .reader
+        .require_readable_if_present(&params.repo, caller.as_deref())
+        .await?;
     let response = state
         .reader
         .list_records(
@@ -192,9 +208,14 @@ pub struct DescribeRepoParams {
 /// Handler for `com.atproto.repo.describeRepo`.
 pub async fn describe_repo(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<DescribeRepoParams>,
 ) -> Result<Json<DescribeRepoResponse>, XrpcError> {
-    let mut response = state.reader.describe_repo(&params.repo).await?;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    let mut response = state
+        .reader
+        .describe_repo_for(&params.repo, caller.as_deref())
+        .await?;
     // The stored handle, not the served one: a DID document says what this
     // DID claims to be known as, and a lapsed DNS record does not retract the
     // claim. Callers get `handle.invalid` in the `handle` field above, which
@@ -286,11 +307,16 @@ pub struct DidParam {
 /// Handler for `com.atproto.sync.getLatestCommit`.
 pub async fn get_latest_commit(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<DidParam>,
 ) -> Result<Json<Value>, XrpcError> {
     // Gated here rather than inside the reader: `listRepos` shares that method
     // and must list taken-down repositories rather than refuse them.
-    state.reader.require_available(&params.did).await?;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    state
+        .reader
+        .require_available_for(&params.did, caller.as_deref())
+        .await?;
     let result = state.reader.get_latest_commit(&params.did).await?;
     match result {
         Some(commit) => Ok(Json(json!({"cid": commit.cid, "rev": commit.rev}))),
@@ -327,6 +353,7 @@ pub struct GetRepoParams {
 /// Handler for `com.atproto.sync.getRepo` — returns the repo as a CAR v1 stream.
 pub async fn get_repo(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<GetRepoParams>,
 ) -> Result<axum::response::Response, XrpcError> {
     use crate::actor_store::sql::SqlActorStore;
@@ -339,7 +366,12 @@ pub async fn get_repo(
 
     // Availability first, and before any store is opened: a takedown that
     // still serves the whole repository CAR has not taken anything down.
-    let did = state.reader.require_available(&params.did).await?.did;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    let did = state
+        .reader
+        .require_available_for(&params.did, caller.as_deref())
+        .await?
+        .did;
     let car_bytes = if let Some(backend) = state.public_realm_backend.as_ref() {
         match params.since.as_deref() {
             Some(since) => export_repo_car_since_via_backend(backend, &did, since).await?,
@@ -373,6 +405,7 @@ pub struct GetBlocksParams {
 /// Handler for `com.atproto.sync.getBlocks`.
 pub async fn get_blocks(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<GetBlocksParams>,
 ) -> Result<axum::response::Response, XrpcError> {
     use crate::actor_store::sql::SqlActorStore;
@@ -395,7 +428,12 @@ pub async fn get_blocks(
     }
     // Same gate as `getRepo`, for the same reason: raw blocks are the
     // repository's contents by another name.
-    let did = state.reader.require_available(&params.did).await?.did;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    let did = state
+        .reader
+        .require_available_for(&params.did, caller.as_deref())
+        .await?
+        .did;
     let car_bytes = if let Some(backend) = state.public_realm_backend.as_ref() {
         export_blocks_car_via_backend(backend, &did, &cids).await?
     } else {
@@ -440,6 +478,7 @@ pub struct SyncGetRecordParams {
 /// that has never seen this one.
 pub async fn sync_get_record(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(params): Query<SyncGetRecordParams>,
 ) -> Result<axum::response::Response, XrpcError> {
     use crate::actor_store::sql::SqlActorStore;
@@ -449,7 +488,12 @@ pub async fn sync_get_record(
 
     // Same gate as `getRepo` and `getBlocks`, which is where the lexicon's
     // takendown / suspended / deactivated errors come from.
-    let did = state.reader.require_available(&params.did).await?.did;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    let did = state
+        .reader
+        .require_available_for(&params.did, caller.as_deref())
+        .await?
+        .did;
 
     let car_bytes = if let Some(backend) = state.public_realm_backend.as_ref() {
         export_record_proof_car_via_backend(backend, &did, &params.collection, &params.rkey).await?

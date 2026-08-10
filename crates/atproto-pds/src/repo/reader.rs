@@ -119,6 +119,24 @@ impl RepoReader {
     /// [`PdsError::RepoUnavailable`] when the repository is unknown or its
     /// state disallows public reads.
     pub async fn require_available(&self, repo: &str) -> PdsResult<crate::account::AccountRow> {
+        self.require_available_for(repo, None).await
+    }
+
+    /// [`Self::require_available`] on behalf of a known caller.
+    ///
+    /// `caller` is the authenticated DID when the request carried credentials.
+    /// It matters for one state: a deactivated repository is withdrawn from
+    /// the public and still available to its owner.
+    ///
+    /// # Errors
+    ///
+    /// [`PdsError::RepoUnavailable`] when the repository is unknown or its
+    /// state disallows this caller.
+    pub async fn require_available_for(
+        &self,
+        repo: &str,
+        caller: Option<&str>,
+    ) -> PdsResult<crate::account::AccountRow> {
         let row = if repo.starts_with("did:") {
             self.accounts.lookup_did(repo).await?
         } else {
@@ -128,13 +146,49 @@ impl RepoReader {
             did: repo.to_string(),
             state: "not found".to_string(),
         })?;
-        if !account.state.allows_public_read() {
+        if !content_readable_by(account.state, &account.did, caller) {
             return Err(PdsError::RepoUnavailable {
                 did: account.did.clone(),
                 state: account.state.as_str().to_string(),
             });
         }
         Ok(account)
+    }
+
+    /// Refuse a repository whose state disallows this caller, and say nothing
+    /// about one that is not here.
+    ///
+    /// For the `com.atproto.repo.*` reads, whose lexicons name no error for an
+    /// unhosted repository: the reference answers those with a generic
+    /// `InvalidRequest` from further down, and a gate that resolved the
+    /// identifier itself would replace that with `RepoNotFound` -- claiming
+    /// this server holds the repository it just failed to find.
+    ///
+    /// # Errors
+    ///
+    /// [`PdsError::RepoUnavailable`] when the repository is here and its state
+    /// disallows this caller.
+    pub async fn require_readable_if_present(
+        &self,
+        repo: &str,
+        caller: Option<&str>,
+    ) -> PdsResult<()> {
+        let row = if repo.starts_with("did:") {
+            self.accounts.lookup_did(repo).await?
+        } else {
+            self.accounts.lookup_handle(repo).await?
+        };
+        let Some(account) = row else {
+            return Ok(());
+        };
+        if content_readable_by(account.state, &account.did, caller) {
+            Ok(())
+        } else {
+            Err(PdsError::RepoUnavailable {
+                did: account.did,
+                state: account.state.as_str().to_string(),
+            })
+        }
     }
 
     /// Open the per-actor store for a DID.
@@ -446,7 +500,21 @@ impl RepoReader {
 
     /// Implementation of `com.atproto.repo.describeRepo`.
     pub async fn describe_repo(&self, repo: &str) -> PdsResult<DescribeRepoResponse> {
-        let account = self.require_available(repo).await?;
+        self.describe_repo_for(repo, None).await
+    }
+
+    /// [`Self::describe_repo`] on behalf of a known caller, which decides
+    /// whether a deactivated repository is described or refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::describe_repo`].
+    pub async fn describe_repo_for(
+        &self,
+        repo: &str,
+        caller: Option<&str>,
+    ) -> PdsResult<DescribeRepoResponse> {
+        let account = self.require_available_for(repo, caller).await?;
         // `handleIsCorrect` is the lexicon's word for the bidirectional check
         // -- the domain resolving back to this DID -- and it was answered
         // `true` unconditionally, on the strength of a proof taken when the
@@ -659,6 +727,35 @@ pub struct RepoStatusResponse {
     /// Current rev, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
+}
+
+/// Whether repository *contents* may be served to `caller`.
+///
+/// Deliberately not [`AccountState::allows_public_read`], which answers a
+/// different question -- whether the account's existence is public. Handle
+/// resolution keeps working for a deactivated account, because deactivation
+/// withdraws the repository and not the identity, and an account being
+/// migrated onto this server is deactivated for the whole window in which its
+/// handle has to keep resolving.
+///
+/// Deactivation is the one state with a caller-dependent answer. Every
+/// endpoint that reads repository contents declares `RepoDeactivated`, and
+/// none of them could raise it: `allows_public_read` is true for a deactivated
+/// account, so a repository its owner had withdrawn -- or one only half
+/// imported, since an account being migrated in is deactivated until it is
+/// activated -- was served in full to anyone who asked.
+///
+/// The owner still reads it. Locking an account holder out of their own
+/// repository the moment they deactivate would make the state a trap rather
+/// than a pause. An admin is not carved out: the admin API can reactivate the
+/// account, and routing admin credentials through the public read path would
+/// put the sync endpoints behind the admin rate limiter.
+fn content_readable_by(state: AccountState, did: &str, caller: Option<&str>) -> bool {
+    match state {
+        AccountState::Active => true,
+        AccountState::Deactivated => caller == Some(did),
+        AccountState::Takendown | AccountState::Suspended | AccountState::Deleted => false,
+    }
 }
 
 /// Refuse a public read against a repository whose state disallows it.

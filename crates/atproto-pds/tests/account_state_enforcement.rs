@@ -169,6 +169,16 @@ async fn get(app: &axum::Router, path: &str) -> StatusCode {
     app.clone().oneshot(request).await.unwrap().status()
 }
 
+/// The same, as an authenticated caller.
+async fn get_as(app: &axum::Router, path: &str, token: &str) -> StatusCode {
+    let request = Request::builder()
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
 /// Every public read path a repository exposes.
 fn public_read_paths(blob_cid: &str, block_cid: &str, rkey: &str) -> Vec<String> {
     vec![
@@ -233,6 +243,7 @@ async fn the_refusal_names_the_state() {
     for (state, expected) in [
         (AccountState::Takendown, "RepoTakendown"),
         (AccountState::Suspended, "RepoSuspended"),
+        (AccountState::Deactivated, "RepoDeactivated"),
     ] {
         let (app, manager, _tmp) = build_app().await;
         let token = create_account(&app, &manager).await;
@@ -501,4 +512,136 @@ async fn activation_refuses_when_the_did_document_cannot_be_checked() {
         Some(AccountState::Deactivated),
         "the account activated anyway",
     );
+}
+
+/// A deactivated repository is not served to the public.
+///
+/// Every endpoint that reads repository contents declares `RepoDeactivated`
+/// and none of them could raise it: the read gate treated deactivated as
+/// publicly readable, so a repository its owner had withdrawn was served in
+/// full to anyone who asked. The same gap covered an account being migrated
+/// *in*, which is deactivated for the whole window in which its repository is
+/// half imported.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deactivated_repository_is_not_served_to_the_public() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager).await;
+    let blob_cid = upload_a_blob(&app, &token).await;
+    let rkey = write_a_record_rkey_with_blob(&app, &token, Some(&blob_cid)).await;
+    let block_cid = head_commit_cid(&app).await;
+
+    // Answering first, so a refusal afterwards is the state and not a route
+    // that never worked.
+    for path in public_read_paths(&blob_cid, &block_cid, &rkey) {
+        assert!(
+            get(&app, &path).await.is_success(),
+            "{path} did not serve an active repository"
+        );
+    }
+
+    manager
+        .set_state(DID, AccountState::Deactivated)
+        .await
+        .unwrap();
+
+    for path in public_read_paths(&blob_cid, &block_cid, &rkey) {
+        assert_eq!(
+            get(&app, &path).await,
+            StatusCode::BAD_REQUEST,
+            "{path} still served a deactivated repository to an anonymous caller"
+        );
+    }
+}
+
+/// Its owner still reads it.
+///
+/// Deactivation is a pause, not a lock: an account holder who cannot reach
+/// their own repository cannot export it, and the migration path imports into
+/// an account that stays deactivated until it is activated -- so the owner
+/// carve-out is what makes the state usable rather than a trap. Takedown and
+/// suspension have no such carve-out, because those are not the account
+/// holder's decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deactivated_repository_is_still_served_to_its_owner() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager).await;
+    let blob_cid = upload_a_blob(&app, &token).await;
+    let rkey = write_a_record_rkey_with_blob(&app, &token, Some(&blob_cid)).await;
+    let block_cid = head_commit_cid(&app).await;
+
+    manager
+        .set_state(DID, AccountState::Deactivated)
+        .await
+        .unwrap();
+
+    for path in public_read_paths(&blob_cid, &block_cid, &rkey) {
+        assert!(
+            get_as(&app, &path, &token).await.is_success(),
+            "{path} refused the account its own repository while deactivated"
+        );
+    }
+}
+
+/// A takedown is not undone by holding the account's own token.
+///
+/// The owner carve-out is for deactivation alone. Reading it as "an
+/// authenticated caller sees more" would hand every taken-down account a way
+/// to keep serving the content that was taken down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takedown_is_not_lifted_by_the_owners_token() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager).await;
+    let blob_cid = upload_a_blob(&app, &token).await;
+    let rkey = write_a_record_rkey_with_blob(&app, &token, Some(&blob_cid)).await;
+    let block_cid = head_commit_cid(&app).await;
+
+    manager
+        .set_state(DID, AccountState::Takendown)
+        .await
+        .unwrap();
+
+    for path in public_read_paths(&blob_cid, &block_cid, &rkey) {
+        assert_eq!(
+            get_as(&app, &path, &token).await,
+            StatusCode::BAD_REQUEST,
+            "{path} served a taken-down repository to the account itself"
+        );
+    }
+}
+
+/// Another account's token buys nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deactivated_repository_is_not_served_to_a_different_account() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager).await;
+    let blob_cid = upload_a_blob(&app, &token).await;
+    let rkey = write_a_record_rkey_with_blob(&app, &token, Some(&blob_cid)).await;
+    let block_cid = head_commit_cid(&app).await;
+
+    manager
+        .create_account(CreateAccountParams::new(
+            "did:plc:onlooker",
+            "onlooker.test.example",
+            "pw",
+        ))
+        .await
+        .unwrap();
+    manager
+        .set_primary_password("did:plc:onlooker", "pw")
+        .await
+        .unwrap();
+    let other = session_token(&app, "onlooker.test.example").await;
+
+    manager
+        .set_state(DID, AccountState::Deactivated)
+        .await
+        .unwrap();
+
+    for path in public_read_paths(&blob_cid, &block_cid, &rkey) {
+        assert_eq!(
+            get_as(&app, &path, &other).await,
+            StatusCode::BAD_REQUEST,
+            "{path} served a deactivated repository to an unrelated account"
+        );
+    }
 }

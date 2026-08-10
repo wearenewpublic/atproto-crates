@@ -42,12 +42,18 @@ pub struct GetBlobQuery {
 /// runs.
 pub async fn get_blob(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(q): Query<GetBlobQuery>,
 ) -> Result<Response, XrpcError> {
     // Availability before storage. `SqlActorStore::open` creates the directory
     // and runs migrations, so gating after it would let an unauthenticated
     // caller materialise a SQLite file for every DID it cared to invent.
-    let did = state.reader.require_available(&q.did).await?.did;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    let did = state
+        .reader
+        .require_available_for(&q.did, caller.as_deref())
+        .await?
+        .did;
 
     // Blob-level takedown. Checked before the bytes are fetched and reported as
     // `BlobNotFound` rather than a distinct error: an operator removing an
@@ -202,10 +208,16 @@ pub struct ListBlobsResponse {
 /// `GET /xrpc/com.atproto.sync.listBlobs`.
 pub async fn list_blobs(
     State(state): State<HttpState>,
+    parts: axum::http::request::Parts,
     Query(q): Query<ListBlobsQuery>,
 ) -> Result<axum::Json<ListBlobsResponse>, XrpcError> {
     // Same gate and the same ordering as `getBlob`.
-    let did = state.reader.require_available(&q.did).await?.did;
+    let caller = crate::http::auth::optional_authn_sub(&parts, &state).await?;
+    let did = state
+        .reader
+        .require_available_for(&q.did, caller.as_deref())
+        .await?
+        .did;
     let manager = state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,

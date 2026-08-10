@@ -415,6 +415,38 @@ fn require_scheme(got: AuthScheme, want: AuthScheme, why: &str) -> Result<(), Xr
     ))
 }
 
+/// The caller's DID when the request carries credentials, and `None` when it
+/// carries none.
+///
+/// For endpoints that are open to the world but answer differently for the
+/// account itself. A deactivated repository is not served to the public and is
+/// still served to its owner, and the only way to tell those apart is to look
+/// at credentials that are not required to be there.
+///
+/// Absent credentials are not an error; *bad* credentials are. Treating an
+/// invalid token as anonymous would turn every expired session into a silent
+/// downgrade, and the caller would see the public answer with no indication
+/// that its token was the problem.
+///
+/// # Errors
+///
+/// Whatever [`require_authn`] returns, when credentials are present.
+pub async fn optional_authn_sub(
+    parts: &Parts,
+    state: &HttpState,
+) -> Result<Option<String>, XrpcError> {
+    if parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
+    let subject = require_authn(parts, state, &htm, &htu).await?;
+    Ok(Some(subject.sub().to_string()))
+}
+
 /// Convenience wrapper: same as [`require_authn`] but discards the full
 /// claims shape and returns just the subject DID. Suitable for the dozens
 /// of handlers that only care about *which account* is calling.
