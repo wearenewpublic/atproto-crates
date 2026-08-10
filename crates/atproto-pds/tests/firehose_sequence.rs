@@ -26,6 +26,13 @@ use tower::ServiceExt;
 
 /// Build a PDS router backed by a temporary directory.
 async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
+    build_app_with(|state| state).await
+}
+
+/// The same, with a chance to adjust the state before the router is built.
+async fn build_app_with(
+    tune: impl FnOnce(HttpState) -> HttpState,
+) -> (axum::Router, Arc<AccountManager>, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
@@ -48,7 +55,7 @@ async fn build_app() -> (axum::Router, Arc<AccountManager>, TempDir) {
         false,
     )
     .with_writer(writer);
-    (build_router(state), manager, tmp)
+    (build_router(tune(state)), manager, tmp)
 }
 
 /// Create an account and return its access token.
@@ -792,5 +799,76 @@ async fn apply_writes_still_refuses_an_empty_batch() {
     assert!(
         result.is_err(),
         "applyWrites with no ops must stay an error, got {result:?}"
+    );
+}
+
+/// A consumer that stops reading is dropped, not waited on forever.
+///
+/// `send` was awaited with no bound. Once a consumer stops reading, TCP
+/// backpressure reaches that await and it parks: the task, the socket and the
+/// connection slot are held for as long as the peer leaves the connection
+/// open, which can be indefinitely, and nothing tells that apart from a
+/// subscriber idling on a quiet stream. The lexicon declares `ConsumerTooSlow`
+/// for exactly this and nothing raised it.
+///
+/// The client here connects and then does not poll the socket at all, which is
+/// what a wedged consumer looks like from this side: the connection is open,
+/// the peer is reachable, and nothing is being taken off the wire. Records are
+/// large enough to fill the buffers between the two ends, because a consumer
+/// only counts as slow once there is something it is failing to take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_that_stops_reading_is_dropped() {
+    let (app, manager, _tmp) = build_app_with(|state| state.with_firehose_send_timeout(1)).await;
+    let alice = "did:plc:slowalice";
+    let token = create_account(&app, &manager, alice, "alice.slow.example").await;
+
+    // Under the per-record ceiling, and enough of them to overrun the socket
+    // buffers on either side of loopback.
+    let bulk = "x".repeat(900_000);
+    for _ in 0..16 {
+        write_record(&app, alice, &token, &bulk).await;
+    }
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri =
+        format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=json&cursor=0")
+            .parse()
+            .unwrap();
+    let (mut socket, _) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+
+    // Not reading is the point: the server fills what it can and then blocks
+    // on a send that will not complete.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Now drain. Whatever the server managed to write is buffered locally, so
+    // this reads it out and then finds the stream ended.
+    let mut frames = 0usize;
+    let mut saw_too_slow = false;
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(20), socket.next()).await;
+        let Ok(next) = next else {
+            panic!(
+                "the subscription is still open after {frames} frames; a stalled consumer was never dropped"
+            );
+        };
+        match next {
+            None => break,
+            Some(Err(_)) => break,
+            Some(Ok(message)) => {
+                frames += 1;
+                let text = String::from_utf8_lossy(message.as_payload()).to_string();
+                if text.contains("ConsumerTooSlow") {
+                    saw_too_slow = true;
+                }
+            }
+        }
+    }
+
+    // The discriminating fact is that the stream ended. Sixteen records were
+    // written and a server that waits out a stalled consumer delivers all of
+    // them once reading resumes.
+    assert!(
+        frames < 16 || saw_too_slow,
+        "the whole backlog arrived ({frames} frames) with no ConsumerTooSlow: the consumer was waited out"
     );
 }

@@ -21,6 +21,21 @@ use std::time::Duration;
 /// failed for any non-trivial repository.
 pub const DEFAULT_IMPORT_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
+/// How long a single firehose frame may take to reach a consumer before the
+/// subscription is dropped as too slow.
+///
+/// The lexicon declares `ConsumerTooSlow` for a consumer that cannot keep up,
+/// and nothing raised it: `send` was awaited without a bound, so a consumer
+/// that stopped reading while leaving its TCP connection open held its task
+/// and its socket forever, indistinguishable from one that is idle because
+/// the stream is quiet.
+///
+/// A minute is deliberately generous. This is a liveness bound, not a
+/// performance one -- the question it answers is whether anything is reading
+/// at all, and a consumer on a bad link that needs a few seconds for a frame
+/// is not the thing being caught.
+pub const DEFAULT_FIREHOSE_SEND_TIMEOUT_SECS: u64 = 60;
+
 /// A policy document set the portal asks new accounts to accept.
 #[derive(Debug, Clone)]
 pub struct PolicyDocuments {
@@ -202,6 +217,11 @@ pub struct HttpState {
     /// Separate from the blob ceiling because the two bound different things:
     /// one media file against a whole repository.
     pub import_limit_bytes: usize,
+    /// How long one `subscribeRepos` frame may take to reach a consumer before
+    /// the subscription is closed with `ConsumerTooSlow`. Default
+    /// [`DEFAULT_FIREHOSE_SEND_TIMEOUT_SECS`] (60s). Set via
+    /// `PDS_FIREHOSE_SEND_TIMEOUT`.
+    pub firehose_send_timeout_secs: u64,
     /// OAuth access-token TTL. Default
     /// [`crate::oauth::state::DEFAULT_ACCESS_TTL_SECS`] (15 min). Set via
     /// `PDS_OAUTH_ACCESS_TOKEN_TTL_SECONDS`.
@@ -276,6 +296,7 @@ impl HttpState {
             public_realm_backend: None,
             blob_upload_limit_bytes: crate::blob::DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
             import_limit_bytes: DEFAULT_IMPORT_LIMIT_BYTES,
+            firehose_send_timeout_secs: DEFAULT_FIREHOSE_SEND_TIMEOUT_SECS,
             oauth_access_ttl_secs: crate::oauth::state::DEFAULT_ACCESS_TTL_SECS,
             oauth_refresh_ttl_secs: crate::oauth::state::DEFAULT_REFRESH_TTL_SECS,
             pds_extra_signing_keys: Vec::new(),
@@ -333,6 +354,7 @@ impl HttpState {
             public_realm_backend: None,
             blob_upload_limit_bytes: crate::blob::DEFAULT_BLOB_UPLOAD_LIMIT_BYTES,
             import_limit_bytes: DEFAULT_IMPORT_LIMIT_BYTES,
+            firehose_send_timeout_secs: DEFAULT_FIREHOSE_SEND_TIMEOUT_SECS,
             oauth_access_ttl_secs: crate::oauth::state::DEFAULT_ACCESS_TTL_SECS,
             oauth_refresh_ttl_secs: crate::oauth::state::DEFAULT_REFRESH_TTL_SECS,
             pds_extra_signing_keys: Vec::new(),
@@ -523,6 +545,17 @@ impl HttpState {
     #[must_use]
     pub fn with_import_limit(mut self, bytes: usize) -> Self {
         self.import_limit_bytes = bytes;
+        self
+    }
+
+    /// Override how long a firehose frame may take to reach a consumer.
+    ///
+    /// Zero disables the bound, restoring the unbounded await. That is the
+    /// wrong default but a legitimate choice for an operator whose consumers
+    /// are all on the same host.
+    #[must_use]
+    pub fn with_firehose_send_timeout(mut self, secs: u64) -> Self {
+        self.firehose_send_timeout_secs = secs;
         self
     }
 

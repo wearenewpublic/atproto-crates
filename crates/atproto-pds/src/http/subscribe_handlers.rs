@@ -60,13 +60,44 @@ pub async fn subscribe_repos(
 
 /// Send a single frame to a subscriber, returning `false` if the socket
 /// closed (caller should exit the loop).
-async fn send_frame(socket: &mut WebSocket, bytes: Vec<u8>, is_text: bool) -> bool {
+async fn send_frame(
+    socket: &mut WebSocket,
+    bytes: Vec<u8>,
+    is_text: bool,
+    timeout_secs: u64,
+) -> SendOutcome {
     let message = if is_text {
         Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())
     } else {
         Message::Binary(bytes.into())
     };
-    socket.send(message).await.is_ok()
+    if timeout_secs == 0 {
+        return match socket.send(message).await {
+            Ok(()) => SendOutcome::Sent,
+            Err(_) => SendOutcome::Closed,
+        };
+    }
+    // A send that never completes is the whole failure. Once the consumer
+    // stops reading, TCP backpressure reaches this await and it parks -- the
+    // task, the socket and the connection slot are held for as long as the
+    // peer leaves the connection open, which can be forever, and nothing
+    // distinguishes it from a subscriber idling on a quiet stream.
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), socket.send(message)).await {
+        Ok(Ok(())) => SendOutcome::Sent,
+        Ok(Err(_)) => SendOutcome::Closed,
+        Err(_) => SendOutcome::TooSlow,
+    }
+}
+
+/// What became of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    /// The consumer took it.
+    Sent,
+    /// The socket is gone; nothing more can be delivered.
+    Closed,
+    /// The consumer did not take it within the bound.
+    TooSlow,
 }
 
 /// Resolve when `token` is cancelled, or never if there is no token.
@@ -92,6 +123,7 @@ async fn run_subscriber(
     let did_filter = params.did.clone();
     let sequencer = state.reader.sequencer();
     let shutdown = state.shutdown.clone();
+    let send_timeout = state.firehose_send_timeout_secs;
 
     // A cursor past the head is a client error, not something to wait out. The
     // lexicon declares `FutureCursor` for it and the reference PDS raises it
@@ -114,7 +146,7 @@ async fn run_subscriber(
             "FutureCursor",
             "cursor is ahead of the stream head",
         );
-        let _ = send_frame(&mut socket, bytes, is_text).await;
+        let _ = send_frame(&mut socket, bytes, is_text, send_timeout).await;
         return;
     }
 
@@ -190,12 +222,39 @@ async fn run_subscriber(
                         "InternalServerError",
                         "an event in the stream could not be encoded",
                     );
-                    let _ = send_frame(&mut socket, bytes, is_text).await;
+                    let _ = send_frame(&mut socket, bytes, is_text, send_timeout).await;
                     return;
                 };
-                if !send_frame(&mut socket, bytes, is_text).await {
-                    tracing::debug!("subscribeRepos: client closed");
-                    return;
+                match send_frame(&mut socket, bytes, is_text, send_timeout).await {
+                    SendOutcome::Sent => {}
+                    SendOutcome::Closed => {
+                        tracing::debug!("subscribeRepos: client closed");
+                        return;
+                    }
+                    SendOutcome::TooSlow => {
+                        // Say so before dropping the socket. A consumer that
+                        // reads `ConsumerTooSlow` knows to reconnect from its
+                        // cursor and that it is the one falling behind; one
+                        // whose connection simply ends has to guess.
+                        //
+                        // The error frame gets its own bound rather than the
+                        // full one: the socket is already congested, so
+                        // waiting the same minute again to announce the
+                        // problem would double the time the connection is
+                        // held for no further benefit.
+                        tracing::info!(
+                            seq = row.seq,
+                            timeout_secs = send_timeout,
+                            "subscribeRepos: consumer could not take a frame; closing as too slow"
+                        );
+                        let (bytes, is_text) = encode_error(
+                            encoding,
+                            "ConsumerTooSlow",
+                            "the stream moved faster than this connection could take it",
+                        );
+                        let _ = send_frame(&mut socket, bytes, is_text, 1).await;
+                        return;
+                    }
                 }
                 cursor = Some(row.seq);
             }

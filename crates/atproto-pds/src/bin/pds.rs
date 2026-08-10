@@ -280,6 +280,17 @@ struct Args {
     )]
     import_limit: usize,
 
+    /// How long one `subscribeRepos` frame may take to reach a consumer
+    /// before the subscription is closed with `ConsumerTooSlow`. Default 60
+    /// seconds; `0` restores the unbounded await.
+    #[arg(
+        long,
+        env = "PDS_FIREHOSE_SEND_TIMEOUT",
+        default_value_t = atproto_pds::http::state::DEFAULT_FIREHOSE_SEND_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64),
+    )]
+    firehose_send_timeout: u64,
+
     /// OAuth access-token TTL in seconds. Default
     /// 900 (15 minutes); operators tighten for higher-security deployments.
     #[arg(
@@ -956,6 +967,7 @@ async fn main() -> anyhow::Result<()> {
     .with_extra_signing_keys(extra_signing_keys)
     .with_blob_upload_limit(args.blob_upload_limit)
     .with_import_limit(args.import_limit)
+    .with_firehose_send_timeout(args.firehose_send_timeout)
     .with_oauth_access_ttl(args.oauth_access_token_ttl_seconds)
     .with_oauth_refresh_ttl(args.oauth_refresh_token_ttl_seconds)
     .with_email_service(email_service)
