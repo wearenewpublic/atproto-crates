@@ -55,7 +55,21 @@ pub async fn export_repo_car(store: &SqlActorStore) -> PdsResult<Vec<u8>> {
     // Collect all reachable CIDs starting from the commit.
     let mut visited: HashSet<cid::Cid> = HashSet::new();
     let mut stack = vec![commit_cid];
-    let mut blocks: Vec<CarBlock> = Vec::new();
+
+    // Written as the walk finds them rather than collected first.
+    //
+    // This used to accumulate every reachable block into a `Vec<CarBlock>`
+    // and then assemble the CAR into a second buffer, so a repository was
+    // resident twice over before a byte left the process. The walk order is
+    // unchanged -- blocks were appended in exactly this order and written in
+    // that order afterwards -- so the bytes produced are identical. There is
+    // one copy of them now instead of two.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(commit_cid)])
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("CarWriter::new: {e}"),
+        })?;
 
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid) {
@@ -85,24 +99,15 @@ pub async fn export_repo_car(store: &SqlActorStore) -> PdsResult<Vec<u8>> {
             // Commit block: enqueue MST root.
             stack.push(commit.data.0);
         }
-        blocks.push(CarBlock { cid, data });
-    }
-
-    // Write CAR.
-    let mut buffer: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.data.len() + 64).sum());
-    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(commit_cid)])
-        .await
-        .map_err(|e| PdsError::Storage {
-            reason: format!("CarWriter::new: {e}"),
-        })?;
-    for block in &blocks {
         writer
-            .write_block(block)
+            .write_block(&CarBlock { cid, data })
             .await
             .map_err(|e| PdsError::Storage {
                 reason: format!("CarWriter::write_block: {e}"),
             })?;
     }
+
+    // Write CAR.
     writer.finish().await.map_err(|e| PdsError::Storage {
         reason: format!("CarWriter::finish: {e}"),
     })?;
@@ -191,7 +196,21 @@ pub async fn export_repo_car_since(store: &SqlActorStore, since: &str) -> PdsRes
     // Step 2: walk from `head`, collecting blocks not in baseline.
     let mut visited: HashSet<cid::Cid> = HashSet::new();
     let mut stack = vec![head_cid];
-    let mut blocks: Vec<CarBlock> = Vec::new();
+
+    // Written as the walk finds them rather than collected first.
+    //
+    // This used to accumulate every reachable block into a `Vec<CarBlock>`
+    // and then assemble the CAR into a second buffer, so a repository was
+    // resident twice over before a byte left the process. The walk order is
+    // unchanged -- blocks were appended in exactly this order and written in
+    // that order afterwards -- so the bytes produced are identical. There is
+    // one copy of them now instead of two.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(head_cid)])
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("CarWriter::new: {e}"),
+        })?;
 
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid) {
@@ -220,25 +239,16 @@ pub async fn export_repo_car_since(store: &SqlActorStore, since: &str) -> PdsRes
             stack.push(commit.data.0);
         }
         if !baseline.contains(&cid) {
-            blocks.push(CarBlock { cid, data });
+            writer
+                .write_block(&CarBlock { cid, data })
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("CarWriter::write_block: {e}"),
+                })?;
         }
     }
 
     // Write CAR with head as root, only delta blocks as body.
-    let mut buffer: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.data.len() + 64).sum());
-    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(head_cid)])
-        .await
-        .map_err(|e| PdsError::Storage {
-            reason: format!("CarWriter::new: {e}"),
-        })?;
-    for block in &blocks {
-        writer
-            .write_block(block)
-            .await
-            .map_err(|e| PdsError::Storage {
-                reason: format!("CarWriter::write_block: {e}"),
-            })?;
-    }
     writer.finish().await.map_err(|e| PdsError::Storage {
         reason: format!("CarWriter::finish: {e}"),
     })?;
@@ -291,7 +301,21 @@ where
 {
     let mut visited: HashSet<cid::Cid> = HashSet::new();
     let mut stack = vec![head_cid];
-    let mut blocks: Vec<CarBlock> = Vec::new();
+
+    // Written as the walk finds them rather than collected first.
+    //
+    // This used to accumulate every reachable block into a `Vec<CarBlock>`
+    // and then assemble the CAR into a second buffer, so a repository was
+    // resident twice over before a byte left the process. The walk order is
+    // unchanged -- blocks were appended in exactly this order and written in
+    // that order afterwards -- so the bytes produced are identical. There is
+    // one copy of them now instead of two.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(head_cid)])
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("CarWriter::new: {e}"),
+        })?;
 
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid) {
@@ -314,17 +338,8 @@ where
         } else if let Ok(commit) = atproto_dasl::from_slice::<atproto_repo::Commit>(&data) {
             stack.push(commit.data.0);
         }
-        blocks.push(CarBlock { cid, data });
-    }
-    let mut buffer: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.data.len() + 64).sum());
-    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(head_cid)])
-        .await
-        .map_err(|e| PdsError::Storage {
-            reason: format!("CarWriter::new: {e}"),
-        })?;
-    for block in &blocks {
         writer
-            .write_block(block)
+            .write_block(&CarBlock { cid, data })
             .await
             .map_err(|e| PdsError::Storage {
                 reason: format!("CarWriter::write_block: {e}"),
@@ -403,7 +418,21 @@ pub async fn export_repo_car_since_via_backend(
     let baseline = walk_reachable_dyn(&storage, since_cid).await?;
     let mut visited: HashSet<cid::Cid> = HashSet::new();
     let mut stack = vec![head_cid];
-    let mut blocks: Vec<CarBlock> = Vec::new();
+
+    // Written as the walk finds them rather than collected first.
+    //
+    // This used to accumulate every reachable block into a `Vec<CarBlock>`
+    // and then assemble the CAR into a second buffer, so a repository was
+    // resident twice over before a byte left the process. The walk order is
+    // unchanged -- blocks were appended in exactly this order and written in
+    // that order afterwards -- so the bytes produced are identical. There is
+    // one copy of them now instead of two.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(head_cid)])
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("CarWriter::new: {e}"),
+        })?;
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid) {
             continue;
@@ -426,22 +455,13 @@ pub async fn export_repo_car_since_via_backend(
             stack.push(commit.data.0);
         }
         if !baseline.contains(&cid) {
-            blocks.push(CarBlock { cid, data });
+            writer
+                .write_block(&CarBlock { cid, data })
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("CarWriter::write_block: {e}"),
+                })?;
         }
-    }
-    let mut buffer: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.data.len() + 64).sum());
-    let mut writer = CarWriter::new(&mut buffer, vec![atproto_dasl::Cid::from(head_cid)])
-        .await
-        .map_err(|e| PdsError::Storage {
-            reason: format!("CarWriter::new: {e}"),
-        })?;
-    for block in &blocks {
-        writer
-            .write_block(block)
-            .await
-            .map_err(|e| PdsError::Storage {
-                reason: format!("CarWriter::write_block: {e}"),
-            })?;
     }
     writer.finish().await.map_err(|e| PdsError::Storage {
         reason: format!("CarWriter::finish: {e}"),
@@ -700,6 +720,46 @@ mod tests {
     use super::*;
     use atproto_dasl::car::CarReader;
     use std::io::Cursor;
+
+    /// The export writes blocks as the walk finds them rather than collecting
+    /// them first, so the property worth pinning is that the walk order is
+    /// what reaches the wire: the root commit first, then everything
+    /// reachable, each block exactly once.
+    ///
+    /// This is what makes the change safe to describe as byte-identical --
+    /// blocks were appended in walk order and written in that order
+    /// afterwards, so removing the intermediate collection cannot reorder
+    /// them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_export_writes_the_root_first_and_each_block_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqlActorStore::open(tmp.path(), "did:plc:carorder")
+            .await
+            .unwrap();
+        seed_store_with_commit(&store).await;
+
+        let car = export_repo_car(&store).await.expect("export");
+        let mut reader = CarReader::new(Cursor::new(car)).await.expect("parse CAR");
+        let roots = reader.roots().to_vec();
+        assert_eq!(roots.len(), 1, "a repo export has one root");
+
+        let mut seen: Vec<atproto_dasl::Cid> = Vec::new();
+        while let Some(block) = reader.next_block().await.expect("read block") {
+            seen.push(block.cid.into());
+        }
+
+        assert!(!seen.is_empty(), "the export should contain blocks");
+        assert_eq!(
+            seen[0], roots[0],
+            "the root commit is the first block written"
+        );
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "the visited set means each block is written exactly once"
+        );
+    }
 
     async fn seed_store_with_commit(store: &SqlActorStore) {
         let pool = store.pool();
