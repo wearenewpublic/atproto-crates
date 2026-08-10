@@ -41,6 +41,63 @@ pub struct SqlActorStore {
     pool: SqlitePool,
 }
 
+/// How many per-actor pools stay open.
+///
+/// A pool is a ceiling on connections, not a reservation -- sqlx opens them on
+/// demand and reaps them when idle -- so a cached pool for an actor nobody is
+/// touching costs a map entry. The cap exists because file descriptors are
+/// finite, not because pools are expensive to hold.
+const POOL_CACHE_CAPACITY: usize = 256;
+
+/// Per-actor pools, keyed on the database path.
+///
+/// Keyed on the path rather than the DID so two data directories -- which is
+/// what every test with its own `TempDir` is -- cannot collide, and so
+/// `open_memory` shares nothing with anything.
+///
+/// One caveat, recorded because it is the way this goes wrong: nothing in this
+/// server deletes a per-actor database today. If something ever does, it has
+/// to evict the entry here as well. SQLite keeps working against an unlinked
+/// inode, so a stale cached pool would not error -- it would quietly read and
+/// write a file that no longer has a name.
+static POOL_CACHE: std::sync::OnceLock<std::sync::Mutex<lru::LruCache<PathBuf, SqlitePool>>> =
+    std::sync::OnceLock::new();
+
+/// How many pools have been constructed per database, for tests to observe
+/// that the cache is doing something.
+///
+/// Per database rather than a single counter because the test binary runs
+/// these concurrently in one process: a global count would see every other
+/// test's pools and measure nothing. Nothing reads this in production.
+#[cfg(test)]
+static POOLS_BUILT: std::sync::OnceLock<dashmap::DashMap<PathBuf, usize>> =
+    std::sync::OnceLock::new();
+
+fn pool_cache() -> &'static std::sync::Mutex<lru::LruCache<PathBuf, SqlitePool>> {
+    POOL_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(POOL_CACHE_CAPACITY).expect("capacity is not zero"),
+        ))
+    })
+}
+
+/// How many pools have been constructed for `db_path`.
+#[cfg(test)]
+fn pools_built_for(db_path: &Path) -> usize {
+    POOLS_BUILT
+        .get_or_init(dashmap::DashMap::new)
+        .get(db_path)
+        .map_or(0, |n| *n)
+}
+
+#[cfg(test)]
+fn record_pool_built(db_path: &Path) {
+    *POOLS_BUILT
+        .get_or_init(dashmap::DashMap::new)
+        .entry(db_path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
 impl SqlActorStore {
     /// Open (and migrate) the per-actor DB for `did` under `data_dir`.
     ///
@@ -54,6 +111,24 @@ impl SqlActorStore {
     /// [`PdsError::Storage`] forwarded for migration failures.
     pub async fn open(data_dir: &Path, did: &str) -> PdsResult<Self> {
         let db_path = actor_db_path(data_dir, did);
+
+        // Every trait method on the storage backends called this, so a single
+        // `getRecord` opened three pools and `createRecord` with a blob ref
+        // about five -- each one a `create_dir_all`, a fresh SQLite handle,
+        // WAL and pragma setup, and a full run of the migration table. The
+        // work was per *operation* where the thing it produces is per *actor*
+        // and lives as long as the process.
+        if let Some(pool) = pool_cache()
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&db_path).cloned())
+        {
+            return Ok(Self {
+                did: did.to_string(),
+                pool,
+            });
+        }
+
         if let Some(parent) = db_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -93,6 +168,27 @@ impl SqlActorStore {
             .map_err(|e| PdsError::Storage {
                 reason: format!("actor migrations failed for {did}: {e}"),
             })?;
+        #[cfg(test)]
+        record_pool_built(&db_path);
+
+        // Two tasks reaching an actor for the first time can both build a
+        // pool. Both are valid -- they address the same file, and sqlx
+        // serialises the migration run -- so the loser simply drops its own
+        // and takes the cached one, leaving one pool per actor rather than
+        // whichever arrived last.
+        let pool = match pool_cache().lock() {
+            Ok(mut cache) => {
+                if let Some(existing) = cache.get(&db_path) {
+                    existing.clone()
+                } else {
+                    cache.put(db_path, pool.clone());
+                    pool
+                }
+            }
+            // A poisoned cache is not a reason to refuse the request; it costs
+            // this caller the pool it just built and nothing else.
+            Err(_) => pool,
+        };
 
         Ok(Self {
             did: did.to_string(),
@@ -171,6 +267,95 @@ mod tests {
         assert!(!f.contains('\\'));
         assert!(!f.contains(':'));
         assert!(f.ends_with(".sqlite"));
+    }
+
+    /// Opening the same actor repeatedly builds one pool.
+    ///
+    /// Every storage trait method called `open`, so a single `getRecord`
+    /// opened three and `createRecord` with a blob ref about five -- each a
+    /// `create_dir_all`, a fresh SQLite handle, WAL and pragma setup, and a
+    /// full migration-table run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_one_actor_repeatedly_builds_one_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let did = "did:plc:poolcache";
+
+        for _ in 0..20 {
+            SqlActorStore::open(tmp.path(), did)
+                .await
+                .expect("open should succeed");
+        }
+        assert_eq!(
+            pools_built_for(&actor_db_path(tmp.path(), did)),
+            1,
+            "twenty opens of one actor should build one pool"
+        );
+    }
+
+    /// Distinct actors still get distinct pools -- the cache is a cache, not a
+    /// single shared connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_actors_get_distinct_pools() {
+        let tmp = tempfile::tempdir().unwrap();
+        SqlActorStore::open(tmp.path(), "did:plc:one")
+            .await
+            .unwrap();
+        SqlActorStore::open(tmp.path(), "did:plc:two")
+            .await
+            .unwrap();
+        assert_eq!(
+            pools_built_for(&actor_db_path(tmp.path(), "did:plc:one")),
+            1
+        );
+        assert_eq!(
+            pools_built_for(&actor_db_path(tmp.path(), "did:plc:two")),
+            1
+        );
+    }
+
+    /// A cached pool is usable, not merely present: a row written through one
+    /// handle is readable through the next.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cached_pool_still_reads_what_was_written_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let did = "did:plc:roundtrip";
+
+        let first = SqlActorStore::open(tmp.path(), did).await.unwrap();
+        sqlx::query("INSERT INTO repo_block (cid, data, indexed_at) VALUES (?, ?, ?)")
+            .bind("bafytest")
+            .bind(vec![1u8, 2, 3])
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(first.pool())
+            .await
+            .expect("write through the first handle");
+
+        let second = SqlActorStore::open(tmp.path(), did).await.unwrap();
+        let found: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM repo_block WHERE cid = ?")
+            .bind("bafytest")
+            .fetch_one(second.pool())
+            .await
+            .expect("read through the second handle");
+        assert_eq!(found.0, 1);
+    }
+
+    /// Two data directories are two databases, however the DID reads. Every
+    /// test with its own `TempDir` depends on this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_did_under_two_data_dirs_is_two_pools() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        SqlActorStore::open(a.path(), "did:plc:same").await.unwrap();
+        SqlActorStore::open(b.path(), "did:plc:same").await.unwrap();
+        assert_eq!(
+            pools_built_for(&actor_db_path(a.path(), "did:plc:same")),
+            1,
+            "the cache must key on the database, not the DID"
+        );
+        assert_eq!(
+            pools_built_for(&actor_db_path(b.path(), "did:plc:same")),
+            1,
+            "the cache must key on the database, not the DID"
+        );
     }
 
     #[test]

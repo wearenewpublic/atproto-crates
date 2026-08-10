@@ -459,6 +459,7 @@ dependencies = [
  "http-body-util",
  "k256",
  "lettre",
+ "lru 0.16.4",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
