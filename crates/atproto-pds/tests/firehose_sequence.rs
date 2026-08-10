@@ -872,3 +872,130 @@ async fn a_consumer_that_stops_reading_is_dropped() {
         "the whole backlog arrived ({frames} frames) with no ConsumerTooSlow: the consumer was waited out"
     );
 }
+
+// ---------------------------------------------------------------------------
+//  Proposal 0015 — subprotocol negotiation.
+// ---------------------------------------------------------------------------
+
+/// Connect offering `protocols`, returning the socket and the echoed
+/// subprotocol.
+async fn connect_offering(
+    addr: std::net::SocketAddr,
+    protocols: Option<&str>,
+) -> (
+    tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<tokio::net::TcpStream>>,
+    Option<String>,
+) {
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0")
+        .parse()
+        .unwrap();
+    let mut builder = ClientBuilder::from_uri(uri);
+    if let Some(protocols) = protocols {
+        builder = builder
+            .add_header(
+                http::header::SEC_WEBSOCKET_PROTOCOL,
+                http::HeaderValue::from_str(protocols).unwrap(),
+            )
+            .unwrap();
+    }
+    let (socket, response) = builder.connect().await.unwrap();
+    let echoed = response
+        .headers()
+        .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    (socket, echoed)
+}
+
+/// A client that asks for JSON gets JSON, and is told so in the handshake.
+///
+/// The server had no subprotocol negotiation at all: the only way to a JSON
+/// stream was a private `?encoding=json` query parameter producing a private
+/// frame shape. A consumer written against proposal 0015 had no way to ask,
+/// and no way to discover what it was going to be sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_can_negotiate_the_json_subprotocol() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:protoalice";
+    let token = create_account(&app, &manager, alice, "alice.proto.example").await;
+    write_record(&app, alice, &token, "negotiated").await;
+    let addr = serve(app).await;
+
+    let (mut socket, echoed) = connect_offering(addr, Some("xrpc.v1.json")).await;
+    assert_eq!(
+        echoed.as_deref(),
+        Some("xrpc.v1.json"),
+        "the server must echo the subprotocol it selected"
+    );
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+        .await
+        .expect("a frame should arrive")
+        .expect("the socket should stay open")
+        .expect("no protocol error");
+    assert!(message.is_text(), "xrpc.v1.json travels in text frames");
+
+    let value: serde_json::Value =
+        serde_json::from_slice(message.as_payload()).expect("frames must be JSON");
+    assert_eq!(value["$type"], "message", "{value}");
+    let payload_type = value["payload"]["$type"].as_str().unwrap_or_default();
+    assert!(
+        payload_type.starts_with("com.atproto.sync.subscribeRepos#"),
+        "the payload must name its lexicon type in full: {value}"
+    );
+    assert!(
+        value.get("op").is_none(),
+        "v1 carries no header fields: {value}"
+    );
+}
+
+/// A client that offers nothing still gets the legacy stream.
+///
+/// This is the compatibility guarantee the proposal is built around, and the
+/// reason negotiation could be added at all: every consumer in the network
+/// today sends no `Sec-WebSocket-Protocol`, and must keep receiving
+/// `xrpc.v0.cbor` binary frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_offers_nothing_gets_the_legacy_stream() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:legacyalice";
+    let token = create_account(&app, &manager, alice, "alice.legacy.example").await;
+    write_record(&app, alice, &token, "unnegotiated").await;
+    let addr = serve(app).await;
+
+    let (mut socket, echoed) = connect_offering(addr, None).await;
+    assert_eq!(echoed, None, "nothing was negotiated, so nothing is echoed");
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+        .await
+        .expect("a frame should arrive")
+        .expect("the socket should stay open")
+        .expect("no protocol error");
+    assert!(
+        message.is_binary(),
+        "an unnegotiated connection must still be given CBOR"
+    );
+}
+
+/// An offer the server does not speak falls back rather than failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_offer_falls_back_to_the_legacy_stream() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:unknownalice";
+    let token = create_account(&app, &manager, alice, "alice.unknown.example").await;
+    write_record(&app, alice, &token, "unknown offer").await;
+    let addr = serve(app).await;
+
+    let (mut socket, echoed) = connect_offering(addr, Some("graphql-ws")).await;
+    assert_eq!(
+        echoed, None,
+        "the server must not claim a protocol it refused"
+    );
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(30), socket.next())
+        .await
+        .expect("a frame should arrive")
+        .expect("the socket should stay open")
+        .expect("no protocol error");
+    assert!(message.is_binary());
+}

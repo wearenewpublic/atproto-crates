@@ -18,17 +18,64 @@ use serde::{Deserialize, Serialize};
 /// Frame encoding selection for a subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
-    /// Spec-default: each WS message is a binary blob with two CBOR
-    /// objects concatenated (header || body).
+    /// `xrpc.v0.cbor` — each WS message is a binary blob with two CBOR
+    /// objects concatenated (header || body). The default, and what every
+    /// existing consumer speaks.
     Cbor,
     /// Browser-dev: each WS message is a JSON text frame combining the
-    /// header + body fields into one object. NOT spec-compliant.
+    /// header + body fields into one object. NOT spec-compliant, reachable
+    /// only through the private `?encoding=json` query parameter.
     Json,
+    /// `xrpc.v1.json` — one self-describing object per text frame.
+    V1Json,
+    /// `xrpc.v1.cbor` — the same object, serialized as DRISL-CBOR.
+    V1Cbor,
 }
 
+/// The legacy subprotocol, and the default when nothing is negotiated.
+pub const XRPC_V0_CBOR: &str = "xrpc.v0.cbor";
+/// Proposal 0015's JSON subprotocol.
+pub const XRPC_V1_JSON: &str = "xrpc.v1.json";
+/// Proposal 0015's CBOR subprotocol, the same framing as [`XRPC_V1_JSON`].
+pub const XRPC_V1_CBOR: &str = "xrpc.v1.cbor";
+
+/// The lexicon these frames belong to.
+///
+/// Proposal 0015 requires the payload's `$type` to be the full
+/// `<nsid>#<fragment>`, so that a frame can be handed to a lexicon decoder
+/// without unwrapping. This module serves one subscription; a second would
+/// have to carry its own NSID rather than borrow this one.
+pub const SUBSCRIBE_REPOS_NSID: &str = "com.atproto.sync.subscribeRepos";
+
 impl Encoding {
+    /// Pick the subprotocol from a `Sec-WebSocket-Protocol` request header.
+    ///
+    /// Returns the encoding and the exact token to echo back, or `None` when
+    /// the client offered nothing this server speaks -- including when it
+    /// offered no header at all, which is every consumer written before
+    /// proposal 0015 and must keep getting `xrpc.v0.cbor`.
+    ///
+    /// The client's order wins. It offers in preference order, and there is
+    /// no reason for a server that speaks both to overrule it.
+    #[must_use]
+    pub fn negotiate_subprotocol(header: Option<&str>) -> Option<(Self, &'static str)> {
+        let header = header?;
+        header.split(',').find_map(|offered| match offered.trim() {
+            XRPC_V1_JSON => Some((Self::V1Json, XRPC_V1_JSON)),
+            XRPC_V1_CBOR => Some((Self::V1Cbor, XRPC_V1_CBOR)),
+            XRPC_V0_CBOR => Some((Self::Cbor, XRPC_V0_CBOR)),
+            _ => None,
+        })
+    }
+
     /// Pick an encoding from the optional `?encoding=` query param + the
     /// `Accept` header. CBOR is the default.
+    ///
+    /// A private extension that predates proposal 0015 and stays for the
+    /// browser consoles that use it. [`Self::negotiate_subprotocol`] takes
+    /// precedence: a client that negotiates a subprotocol has said what it
+    /// speaks in the standard way, and a query parameter should not overrule
+    /// the handshake.
     pub fn negotiate(encoding_query: Option<&str>, accept_header: Option<&str>) -> Self {
         if let Some(enc) = encoding_query {
             return match enc.to_ascii_lowercase().as_str() {
@@ -103,6 +150,54 @@ pub fn encode_event(
             out.extend_from_slice(&body_bytes);
             Some((out, false))
         }
+        Encoding::V1Json | Encoding::V1Cbor => v1_bytes(encoding, &v1_message(&body_bytes, &t)?),
+    }
+}
+
+/// Wrap a lexicon message in proposal 0015's `v1` envelope.
+///
+/// The payload is the event itself with its full `$type`, so a consumer hands
+/// it straight to a lexicon decoder. `v0` carried that discriminator in a
+/// separate header object, which is the unwrapping step this removes.
+fn v1_message(body_bytes: &[u8], type_tag: &str) -> Option<atproto_dasl::Ipld> {
+    use atproto_dasl::Ipld;
+    let Ipld::Map(mut payload) = atproto_dasl::from_slice::<Ipld>(body_bytes).ok()? else {
+        return None;
+    };
+    let fragment = type_tag.strip_prefix('#').unwrap_or(type_tag);
+    payload.insert(
+        "$type".to_string(),
+        Ipld::String(format!("{SUBSCRIBE_REPOS_NSID}#{fragment}")),
+    );
+    let mut frame = std::collections::BTreeMap::new();
+    frame.insert("$type".to_string(), Ipld::String("message".to_string()));
+    frame.insert("payload".to_string(), Ipld::Map(payload));
+    Some(Ipld::Map(frame))
+}
+
+/// Proposal 0015's `v1` error frame.
+fn v1_error(error: &str, message: &str) -> atproto_dasl::Ipld {
+    use atproto_dasl::Ipld;
+    let mut frame = std::collections::BTreeMap::new();
+    frame.insert("$type".to_string(), Ipld::String("error".to_string()));
+    frame.insert("error".to_string(), Ipld::String(error.to_string()));
+    frame.insert("message".to_string(), Ipld::String(message.to_string()));
+    Ipld::Map(frame)
+}
+
+/// Serialize a `v1` frame in whichever encoding was negotiated.
+///
+/// Returns the bytes and whether they are a text frame.
+fn v1_bytes(encoding: Encoding, frame: &atproto_dasl::Ipld) -> Option<(Vec<u8>, bool)> {
+    match encoding {
+        Encoding::V1Json => Some((
+            atproto_dasl::atproto_json::json_from_ipld(frame)
+                .to_string()
+                .into_bytes(),
+            true,
+        )),
+        Encoding::V1Cbor => Some((atproto_dasl::to_vec(frame).ok()?, false)),
+        Encoding::Cbor | Encoding::Json => None,
     }
 }
 
@@ -142,6 +237,16 @@ pub fn encode_info(encoding: Encoding, name: &str, message: &str) -> (Vec<u8>, b
             }
             (out, false)
         }
+        Encoding::V1Json | Encoding::V1Cbor => {
+            // `#info` stays a message in v1 for the same reason it is one in
+            // v0: the stream continues after it.
+            let body = serde_json::json!({ "name": name, "message": message });
+            atproto_dasl::to_vec(&body)
+                .ok()
+                .and_then(|bytes| v1_message(&bytes, "#info"))
+                .and_then(|frame| v1_bytes(encoding, &frame))
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -167,6 +272,9 @@ pub fn encode_error(encoding: Encoding, error: &str, message: &str) -> (Vec<u8>,
                 out.extend_from_slice(&body_bytes);
             }
             (out, false)
+        }
+        Encoding::V1Json | Encoding::V1Cbor => {
+            v1_bytes(encoding, &v1_error(error, message)).unwrap_or_default()
         }
     }
 }
@@ -359,5 +467,114 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"], "FutureCursor");
         assert!(value.get("t").is_none());
+    }
+
+    /// A consumer that offers nothing gets the legacy protocol.
+    ///
+    /// Every consumer written before proposal 0015 sends no
+    /// `Sec-WebSocket-Protocol` at all, and the proposal is explicit that the
+    /// existing firehose is untouched: absent negotiation means
+    /// `xrpc.v0.cbor`.
+    #[test]
+    fn no_offer_negotiates_nothing() {
+        assert_eq!(Encoding::negotiate_subprotocol(None), None);
+        assert_eq!(Encoding::negotiate_subprotocol(Some("")), None);
+        assert_eq!(Encoding::negotiate_subprotocol(Some("graphql-ws")), None);
+    }
+
+    /// The client's preference order wins.
+    ///
+    /// It offers in preference order; a server that speaks both has no reason
+    /// to overrule it. axum's own selection walks the *server's* list, which
+    /// is why the handler passes only the token it picked here.
+    #[test]
+    fn the_clients_order_decides() {
+        assert_eq!(
+            Encoding::negotiate_subprotocol(Some("xrpc.v1.json, xrpc.v1.cbor")),
+            Some((Encoding::V1Json, XRPC_V1_JSON))
+        );
+        assert_eq!(
+            Encoding::negotiate_subprotocol(Some("xrpc.v1.cbor, xrpc.v1.json")),
+            Some((Encoding::V1Cbor, XRPC_V1_CBOR))
+        );
+        assert_eq!(
+            Encoding::negotiate_subprotocol(Some("graphql-ws, xrpc.v1.json")),
+            Some((Encoding::V1Json, XRPC_V1_JSON)),
+            "an unknown offer must not stop the search"
+        );
+    }
+
+    /// A `v1` message is one self-describing object carrying the whole
+    /// lexicon message.
+    ///
+    /// The point of the framing is that `payload` can go straight to a lexicon
+    /// decoder: no separate header object, and a `$type` that names the
+    /// fragment in full rather than the bare `#commit` tag `v0` puts in its
+    /// header.
+    #[test]
+    fn a_v1_message_carries_the_full_type_and_no_header() {
+        let body = atproto_dasl::to_vec(&serde_json::json!({ "seq": 42, "repo": "did:plc:a" }))
+            .expect("body");
+        let frame = v1_message(&body, "#commit").expect("frame");
+        let (bytes, is_text) = v1_bytes(Encoding::V1Json, &frame).expect("json");
+        assert!(is_text, "the JSON encoding travels in text frames");
+
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(value["$type"], "message");
+        assert_eq!(
+            value["payload"]["$type"],
+            "com.atproto.sync.subscribeRepos#commit"
+        );
+        assert_eq!(value["payload"]["seq"], 42);
+        assert!(
+            value.get("op").is_none() && value.get("t").is_none(),
+            "v1 has no header fields: {value}"
+        );
+    }
+
+    /// The two `v1` encodings are the same object, and only the serialization
+    /// differs.
+    #[test]
+    fn the_v1_encodings_agree() {
+        let body =
+            atproto_dasl::to_vec(&serde_json::json!({ "seq": 7, "repo": "did:plc:a" })).unwrap();
+        let frame = v1_message(&body, "#sync").expect("frame");
+
+        let (json_bytes, json_is_text) = v1_bytes(Encoding::V1Json, &frame).unwrap();
+        let (cbor_bytes, cbor_is_text) = v1_bytes(Encoding::V1Cbor, &frame).unwrap();
+        assert!(json_is_text && !cbor_is_text);
+
+        let from_json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        let from_cbor = atproto_dasl::atproto_json::json_from_ipld(
+            &atproto_dasl::from_slice::<atproto_dasl::Ipld>(&cbor_bytes).unwrap(),
+        );
+        assert_eq!(from_json, from_cbor);
+    }
+
+    /// A `v1` error frame names the error and nothing else.
+    #[test]
+    fn a_v1_error_is_a_single_object() {
+        let (bytes, is_text) = encode_error(Encoding::V1Json, "FutureCursor", "too far");
+        assert!(is_text);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["$type"], "error");
+        assert_eq!(value["error"], "FutureCursor");
+        assert_eq!(value["message"], "too far");
+    }
+
+    /// `#info` stays a message in `v1`, because the stream continues after it.
+    ///
+    /// Emitting it as an error frame would tell a consumer to disconnect over
+    /// a notice that its cursor was old.
+    #[test]
+    fn v1_info_is_a_message_not_an_error() {
+        let (bytes, _) = encode_info(Encoding::V1Json, "OutdatedCursor", "resuming from the head");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["$type"], "message");
+        assert_eq!(
+            value["payload"]["$type"],
+            "com.atproto.sync.subscribeRepos#info"
+        );
+        assert_eq!(value["payload"]["name"], "OutdatedCursor");
     }
 }

@@ -17,8 +17,16 @@
 //! the `com.atproto.sync.subscribeRepos` lexicon. The encoder lives in
 //! [`crate::sequencer::frame`].
 //!
-//! Browser-dev consumers can opt-in to JSON frames via `?encoding=json` or
-//! the `Accept: application/json` header. CBOR is the production default.
+//! Proposal 0015 adds a versioned wire subprotocol, negotiated through
+//! `Sec-WebSocket-Protocol`: `xrpc.v1.json` and `xrpc.v1.cbor` carry one
+//! self-describing object per frame, where `xrpc.v0.cbor` splits each message
+//! into a header and a body. `xrpc.v0.cbor` stays the default for anything
+//! that does not negotiate, which is every consumer in the network today.
+//!
+//! Browser-dev consumers can also opt-in to JSON frames via `?encoding=json`
+//! or the `Accept: application/json` header. That is a private shape from
+//! before the proposal and is not the same thing as `xrpc.v1.json`; it stays
+//! for the consoles already using it, and a negotiated subprotocol wins.
 
 use crate::http::state::HttpState;
 use crate::sequencer::frame::{Encoding, encode_error, encode_event};
@@ -39,17 +47,38 @@ pub struct SubscribeReposParams {
     /// global).
     pub did: Option<String>,
     /// Override the wire encoding. `cbor` (default, spec) or `json`
-    /// (browser-dev). Also negotiable via the `Accept` header.
+    /// (browser-dev). Also negotiable via the `Accept` header. A private
+    /// extension predating proposal 0015; a negotiated subprotocol wins.
     pub encoding: Option<String>,
 }
 
 /// WebSocket upgrade handler.
+///
+/// The wire subprotocol is negotiated the standard way, through
+/// `Sec-WebSocket-Protocol` (proposal 0015). A client that offers nothing this
+/// server speaks -- or no header at all, which is every consumer written
+/// before the proposal -- gets `xrpc.v0.cbor`, which is what the lexicon
+/// declares by omission and what the existing firehose has always been.
 pub async fn subscribe_repos(
     ws: WebSocketUpgrade,
     State(state): State<HttpState>,
     headers: HeaderMap,
     crate::http::extract::XrpcQuery(params): crate::http::extract::XrpcQuery<SubscribeReposParams>,
 ) -> axum::response::Response {
+    let offered = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok());
+
+    if let Some((encoding, selected)) = Encoding::negotiate_subprotocol(offered) {
+        // Handed back as a one-element list so the token the server echoes is
+        // the one this connection will actually speak. axum picks the first
+        // *server*-listed protocol the client also offered, so passing the
+        // full set would let its order overrule the client's.
+        return ws
+            .protocols([selected])
+            .on_upgrade(move |socket| run_subscriber(socket, state, params, encoding));
+    }
+
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
