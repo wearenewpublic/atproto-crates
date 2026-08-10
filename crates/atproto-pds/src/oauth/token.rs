@@ -324,14 +324,17 @@ async fn handle_code(
 
     issue_pair(
         &state,
-        &auth.did,
-        &auth.request.client_id,
-        &granted,
+        Grant {
+            did: &auth.did,
+            client_id: &auth.request.client_id,
+            scope: &granted,
+            // A code exchange begins a new grant, so it begins a new chain --
+            // named after the code, so a replay of that code can find it.
+            family_id: &family_for_code(code),
+            client_kid: client_kid.as_deref(),
+            started_at: chrono::Utc::now(),
+        },
         &proof_jkt,
-        // A code exchange begins a new grant, so it begins a new chain --
-        // named after the code, so a replay of that code can find it.
-        &family_for_code(code),
-        client_kid.as_deref(),
     )
     .await
     .map(Json)
@@ -490,6 +493,38 @@ async fn handle_refresh(
         },
     )?;
 
+    // A public client's session has an end, and rotation is not allowed to
+    // move it. `issued_at` is rewritten on every rotation, so it could never
+    // answer this -- which is why a session could be extended indefinitely one
+    // refresh at a time, each looking exactly like the first.
+    //
+    // Rows written before the grant start was recorded carry `None` and are
+    // exempt rather than cut off: an upgrade should not end sessions that were
+    // legitimate under the rules in force when they began.
+    let grant_started_at = handle.grant_started_at.unwrap_or_else(chrono::Utc::now);
+    if handle.client_kid.is_none()
+        && handle.grant_started_at.is_some()
+        && chrono::Utc::now() - grant_started_at
+            > chrono::Duration::seconds(crate::oauth::state::MAX_PUBLIC_SESSION_SECS as i64)
+    {
+        tracing::info!(
+            did = %handle.did,
+            client_id = %handle.client_id,
+            "refusing a public-client session that has reached its lifetime cap"
+        );
+        // End it rather than leave the rest of the chain refreshable.
+        state
+            .oauth
+            .revoke_refresh_family(&handle.family_id)
+            .await
+            .map_err(XrpcError::from)?;
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "this session has reached its maximum lifetime; sign in again",
+        ));
+    }
+
     // Authenticated: now consume it. `rotate_refresh` is atomic and returns
     // `None` if something else got there first, so two concurrent refreshes
     // still yield exactly one rotation.
@@ -509,14 +544,17 @@ async fn handle_refresh(
 
     issue_pair(
         &state,
-        &handle.did,
-        &handle.client_id,
-        &handle.scope,
+        Grant {
+            did: &handle.did,
+            client_id: &handle.client_id,
+            scope: &handle.scope,
+            // Rotation stays in the chain it came from, so a token replayed
+            // from anywhere in the chain can still end all of it.
+            family_id: &handle.family_id,
+            client_kid: handle.client_kid.as_deref(),
+            started_at: grant_started_at,
+        },
         &handle.dpop_jkt,
-        // Rotation stays in the chain it came from, so a token replayed from
-        // anywhere in the chain can still end all of it.
-        &handle.family_id,
-        handle.client_kid.as_deref(),
     )
     .await
     .map(Json)
@@ -572,6 +610,26 @@ fn assert_same_client_key(
     ))
 }
 
+/// What one authorization grant is, for the purpose of minting tokens from it.
+///
+/// Grouped rather than passed as six arguments because they travel together and
+/// are read together: the code exchange fills them in once and every rotation
+/// carries the same set forward.
+struct Grant<'a> {
+    /// Account the grant is for.
+    did: &'a str,
+    /// Client the holder approved.
+    client_id: &'a str,
+    /// Granted scope, already expanded.
+    scope: &'a str,
+    /// Chain every token from this authorization shares.
+    family_id: &'a str,
+    /// Client authentication key, or `None` for a public client.
+    client_kid: Option<&'a str>,
+    /// When the holder approved, which is what the session cap measures from.
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Mint an access/refresh pair bound to `dpop_jkt`.
 ///
 /// The thumbprint is not optional. Every grant proves possession at the token
@@ -587,13 +645,17 @@ fn assert_same_client_key(
 /// rather than merely fail.
 async fn issue_pair(
     state: &HttpState,
-    did: &str,
-    client_id: &str,
-    scope: &str,
+    grant: Grant<'_>,
     dpop_jkt: &str,
-    family_id: &str,
-    client_kid: Option<&str>,
 ) -> Result<TokenResponse, XrpcError> {
+    let Grant {
+        did,
+        client_id,
+        scope,
+        family_id,
+        client_kid,
+        started_at: grant_started_at,
+    } = grant;
     let now = chrono::Utc::now().timestamp() as u64;
     let access_jti = random_jti();
     let refresh_jti = random_jti();
@@ -604,7 +666,38 @@ async fn issue_pair(
     // §10.4 — TTLs come from runtime config; default to module constants
     // (15 min / 30d) when the operator hasn't overridden via env.
     let access_ttl = state.oauth_access_ttl_secs;
-    let refresh_ttl = state.oauth_refresh_ttl_secs;
+
+    // The specification sets a different bound for each kind of client. A
+    // public client gets two weeks for "overall session lifetime and the
+    // lifetime of individual refresh tokens ... both"; a confidential client's
+    // session "may be unlimited" -- it reproves its key on every refresh --
+    // with each token held to 180 days.
+    //
+    // The configured TTL is a ceiling the operator lowers, not one they raise:
+    // the default is thirty days, which already exceeded the public limit.
+    let is_public = client_kid.is_none();
+    let ceiling = if is_public {
+        crate::oauth::state::MAX_PUBLIC_SESSION_SECS
+    } else {
+        crate::oauth::state::MAX_CONFIDENTIAL_REFRESH_SECS
+    };
+    let refresh_ttl = state.oauth_refresh_ttl_secs.min(ceiling);
+
+    // A public grant's tokens may not outlive the session they belong to, so
+    // the last token before the cap expires at the cap rather than past it.
+    let session_ends_at = is_public.then(|| {
+        grant_started_at
+            + chrono::Duration::seconds(crate::oauth::state::MAX_PUBLIC_SESSION_SECS as i64)
+    });
+    let token_expires_at = {
+        let natural = chrono::Utc::now() + chrono::Duration::seconds(refresh_ttl as i64);
+        match session_ends_at {
+            Some(end) if end < natural => end,
+            _ => natural,
+        }
+    };
+    let refresh_ttl =
+        u64::try_from((token_expires_at - chrono::Utc::now()).num_seconds().max(0)).unwrap_or(0);
 
     // Stamped so "log out everywhere" can end this grant. Read here rather
     // than carried from the code or refresh token: a grant minted after the
@@ -660,6 +753,8 @@ async fn issue_pair(
             RefreshHandle {
                 family_id: family_id.to_string(),
                 client_kid: client_kid.map(str::to_string),
+                grant_started_at: Some(grant_started_at),
+                expires_at: Some(token_expires_at),
                 did: did.to_string(),
                 client_id: client_id.to_string(),
                 dpop_jkt: dpop_jkt.to_string(),

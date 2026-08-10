@@ -30,6 +30,22 @@ pub const DEFAULT_ACCESS_TTL_SECS: u64 = 900;
 /// Default refresh-token TTL: 30 days.
 pub const DEFAULT_REFRESH_TTL_SECS: u64 = 2_592_000;
 
+/// Ceiling on everything a public client's grant may become.
+///
+/// The specification: for an untrusted public client "overall session lifetime
+/// and the lifetime of individual refresh tokens should both be limited to 2
+/// weeks". Both, which is why this bounds the per-token TTL as well as the
+/// total -- a fortnight-long session made of one 30-day token satisfies
+/// neither reading.
+pub const MAX_PUBLIC_SESSION_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Ceiling on one refresh token issued to a confidential client.
+///
+/// The specification lets a confidential client's *session* run indefinitely
+/// -- it re-authenticates with its key on every refresh, so the grant is
+/// continuously reproven -- while holding each token to 180 days.
+pub const MAX_CONFIDENTIAL_REFRESH_SECS: u64 = 180 * 24 * 60 * 60;
+
 /// Default authorization-code TTL: 60 seconds.
 pub const AUTH_CODE_TTL_SECS: u64 = 60;
 
@@ -96,6 +112,22 @@ pub struct RefreshHandle {
     /// what the specification requires of a key that has been compromised.
     /// `None` for public clients, which authenticate with no key.
     pub client_kid: Option<String>,
+    /// When the grant this token descends from was first issued.
+    ///
+    /// Set once at the code exchange and carried through every rotation
+    /// unchanged -- `issued_at` is rewritten each time, so it answers "when
+    /// was this token minted" and never "when did this session begin".
+    /// Without the distinction a public client's session extends forever, one
+    /// rotation at a time.
+    ///
+    /// `None` on rows written before the column existed.
+    pub grant_started_at: Option<DateTime<Utc>>,
+    /// When this particular token stops being accepted.
+    ///
+    /// Also what lets the row be collected: rotation replaces a row, but an
+    /// abandoned session leaves its last one behind, and nothing swept this
+    /// table at all.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Backend dispatch for OAuth in-flight state.
@@ -352,6 +384,8 @@ impl MemoryBackend {
             RefreshHandle {
                 family_id: "test-family".to_string(),
                 client_kid: None,
+                grant_started_at: None,
+                expires_at: None,
                 issued_at: Utc::now(),
                 ..handle.clone()
             },
@@ -426,7 +460,17 @@ type RefreshRow = (
     String,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
+
+fn parse_opt_time(raw: Option<String>) -> Option<DateTime<Utc>> {
+    raw.and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    })
+}
 
 impl SqlBackend {
     async fn store_par(&self, request_uri: String, request: OAuthRequest) -> PdsResult<()> {
@@ -602,8 +646,9 @@ impl SqlBackend {
     async fn register_refresh(&self, jti: String, handle: RefreshHandle) -> PdsResult<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO oauth_refresh
-                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
+                 grant_started_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&jti)
         .bind(&handle.did)
@@ -613,6 +658,8 @@ impl SqlBackend {
         .bind(handle.issued_at.to_rfc3339())
         .bind(&handle.family_id)
         .bind(&handle.client_kid)
+        .bind(handle.grant_started_at.map(|t| t.to_rfc3339()))
+        .bind(handle.expires_at.map(|t| t.to_rfc3339()))
         .execute(&self.pool)
         .await
         .map_err(|e| PdsError::Storage {
@@ -630,7 +677,8 @@ impl SqlBackend {
             reason: format!("oauth_refresh begin: {e}"),
         })?;
         let row: Option<RefreshRow> = sqlx::query_as(
-            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid
+            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
+                    grant_started_at, expires_at
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(old_jti)
@@ -639,7 +687,18 @@ impl SqlBackend {
         .map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh select: {e}"),
         })?;
-        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)) = row else {
+        let Some((
+            did,
+            client_id,
+            dpop_jkt,
+            scope,
+            issued_at,
+            family_id,
+            client_kid,
+            grant_started_at,
+            expires_at,
+        )) = row
+        else {
             return Ok(None);
         };
         sqlx::query("DELETE FROM oauth_refresh WHERE jti = ?")
@@ -652,8 +711,9 @@ impl SqlBackend {
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO oauth_refresh
-                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
+                 grant_started_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_jti)
         .bind(&did)
@@ -663,6 +723,9 @@ impl SqlBackend {
         .bind(now.to_rfc3339())
         .bind(&family_id)
         .bind(&client_kid)
+        // Carried unchanged: the grant began when it began.
+        .bind(grant_started_at.clone())
+        .bind(expires_at.clone())
         .execute(&mut *tx)
         .await
         .map_err(|e| PdsError::Storage {
@@ -684,12 +747,15 @@ impl SqlBackend {
             issued_at: original_issued,
             family_id,
             client_kid,
+            grant_started_at: parse_opt_time(grant_started_at),
+            expires_at: parse_opt_time(expires_at),
         }))
     }
 
     async fn peek_refresh(&self, jti: &str) -> PdsResult<Option<RefreshHandle>> {
         let row: Option<RefreshRow> = sqlx::query_as(
-            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid
+            "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
+                    grant_started_at, expires_at
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(jti)
@@ -698,7 +764,18 @@ impl SqlBackend {
         .map_err(|e| PdsError::Storage {
             reason: format!("oauth_refresh peek: {e}"),
         })?;
-        let Some((did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid)) = row else {
+        let Some((
+            did,
+            client_id,
+            dpop_jkt,
+            scope,
+            issued_at,
+            family_id,
+            client_kid,
+            grant_started_at,
+            expires_at,
+        )) = row
+        else {
             return Ok(None);
         };
         Ok(Some(RefreshHandle {
@@ -713,6 +790,8 @@ impl SqlBackend {
                 .with_timezone(&Utc),
             family_id,
             client_kid,
+            grant_started_at: parse_opt_time(grant_started_at),
+            expires_at: parse_opt_time(expires_at),
         }))
     }
 
@@ -785,6 +864,16 @@ impl SqlBackend {
             .await
             .map_err(|e| PdsError::Storage {
                 reason: format!("oauth_code gc: {e}"),
+            })?;
+        // This table was never swept. Rotation replaces a row, so a live
+        // session stays one row -- but an abandoned session leaves its last
+        // one behind for good, and nothing collected it.
+        sqlx::query("DELETE FROM oauth_refresh WHERE expires_at IS NOT NULL AND expires_at <= ?")
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("oauth_refresh gc: {e}"),
             })?;
         Ok(())
     }
@@ -878,10 +967,104 @@ mod tests {
         assert!(state.take_code("code-1").await.unwrap().is_none());
     }
 
+    /// Nothing swept `oauth_refresh`. Rotation replaces a row, so a live
+    /// session stays one row -- but a session that is simply abandoned leaves
+    /// its last one behind for good, and the sweep did not mention the table.
+    ///
+    /// Driven through `store_par`, which is what triggers the sweep in
+    /// production: a test calling the private method directly would prove the
+    /// DELETE works and not that anything runs it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_refresh_row_is_collected() {
+        let state = sql_backend().await;
+        let mut expired = handle();
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        state
+            .register_refresh("jti-expired".to_string(), expired)
+            .await
+            .unwrap();
+
+        let mut live = handle();
+        live.expires_at = Some(Utc::now() + chrono::Duration::seconds(3600));
+        state
+            .register_refresh("jti-live".to_string(), live)
+            .await
+            .unwrap();
+        assert_eq!(state.refresh_count().await.unwrap(), 2);
+
+        // Any PAR write runs the sweep.
+        state
+            .store_par("urn:sweep".to_string(), req())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.refresh_count().await.unwrap(),
+            1,
+            "the expired row should be gone and the live one kept"
+        );
+        assert!(
+            state.peek_refresh("jti-live").await.unwrap().is_some(),
+            "the sweep must not take a token that has not expired"
+        );
+    }
+
+    /// A row written before the column existed carries no expiry, and is left
+    /// alone rather than collected on the strength of a NULL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_with_no_expiry_is_not_collected() {
+        let state = sql_backend().await;
+        state
+            .register_refresh("jti-legacy".to_string(), handle())
+            .await
+            .unwrap();
+        state
+            .store_par("urn:sweep-2".to_string(), req())
+            .await
+            .unwrap();
+        assert!(
+            state.peek_refresh("jti-legacy").await.unwrap().is_some(),
+            "a NULL expiry is unknown, not past"
+        );
+    }
+
+    /// The grant start survives rotation. `issued_at` is rewritten each time,
+    /// so without this a public session extends forever one refresh at a time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotation_carries_the_grant_start_unchanged() {
+        let state = sql_backend().await;
+        let started = Utc::now() - chrono::Duration::days(3);
+        let mut first = handle();
+        first.grant_started_at = Some(started);
+        state
+            .register_refresh("jti-a".to_string(), first)
+            .await
+            .unwrap();
+
+        state
+            .rotate_refresh("jti-a", "jti-b".to_string())
+            .await
+            .unwrap()
+            .expect("the token should rotate");
+
+        let rotated = state
+            .peek_refresh("jti-b")
+            .await
+            .unwrap()
+            .expect("the successor should exist");
+        let carried = rotated.grant_started_at.expect("grant start carried");
+        assert!(
+            (carried - started).num_seconds().abs() < 2,
+            "rotation must not restart the session clock: {carried} vs {started}"
+        );
+    }
+
     fn handle() -> RefreshHandle {
         RefreshHandle {
             family_id: "test-family".to_string(),
             client_kid: None,
+            grant_started_at: None,
+            expires_at: None,
             did: "did:plc:alice".to_string(),
             client_id: "client".to_string(),
             dpop_jkt: "thumb".to_string(),

@@ -2707,3 +2707,29 @@ async fn replaying_an_authorization_code_revokes_the_grant_it_issued() {
         "the grant issued by a replayed code must be revoked: {body}"
     );
 }
+
+/// A public client's refresh token may not outlive the two weeks the
+/// specification allows it, whatever the operator configured.
+///
+/// The default is thirty days, which already exceeded the limit -- so this
+/// was not a misconfiguration to guard against but the shipped behaviour.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_clients_refresh_token_is_capped_at_two_weeks() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let refresh = refresh_token_for(&app, &key).await;
+
+    let payload = refresh.split('.').nth(1).expect("compact JWS");
+    let claims: Value =
+        serde_json::from_slice(&B64URL.decode(payload).expect("payload")).expect("claims");
+    let iat = claims["iat"].as_i64().expect("iat");
+    let exp = claims["exp"].as_i64().expect("exp");
+    let lifetime = exp - iat;
+
+    let fortnight = 14 * 24 * 60 * 60;
+    assert!(
+        lifetime <= fortnight,
+        "a public client's refresh token lived {lifetime}s, past the {fortnight}s limit"
+    );
+}

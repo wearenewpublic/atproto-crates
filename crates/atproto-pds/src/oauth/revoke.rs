@@ -190,6 +190,8 @@ mod tests {
                 RefreshHandle {
                     family_id: "test-family".to_string(),
                     client_kid: None,
+                    grant_started_at: None,
+                    expires_at: None,
                     did: claims.sub.clone(),
                     client_id: claims.client_id.clone(),
                     dpop_jkt: String::new(),
