@@ -959,6 +959,7 @@ async fn main() -> anyhow::Result<()> {
     .with_oauth_access_ttl(args.oauth_access_token_ttl_seconds)
     .with_oauth_refresh_ttl(args.oauth_refresh_token_ttl_seconds)
     .with_email_service(email_service)
+    .with_trusted_proxy_hops(args.trusted_proxy_hops)
     .with_shutdown(token.clone())
     .with_jti_guard(jti_guard.clone())
     .with_rate_limiter(rate_limiter.clone())

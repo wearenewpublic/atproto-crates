@@ -48,7 +48,7 @@ pub async fn create_report(
 ) -> Result<axum::response::Response, XrpcError> {
     use axum::response::IntoResponse;
 
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
     let caller = subject.sub().to_string();
     let manager = state.account_manager.as_ref().ok_or_else(|| {

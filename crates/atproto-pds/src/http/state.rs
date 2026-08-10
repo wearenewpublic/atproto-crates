@@ -89,6 +89,13 @@ pub struct HttpState {
     /// `None` in tests and for embedders that do not run a shutdown
     /// controller; the subscription then lasts as long as the socket does.
     pub shutdown: Option<tokio_util::sync::CancellationToken>,
+    /// How many reverse proxies the operator says sit in front of this server.
+    ///
+    /// Zero means none, and therefore that `X-Forwarded-*` is caller-supplied
+    /// text rather than infrastructure. The rate limiter has always read it
+    /// that way; the DPoP `htu` and the portal cookie's `Secure` flag did not,
+    /// and trusted the headers unconditionally.
+    pub trusted_proxy_hops: usize,
     /// Issues and checks server-provided DPoP nonces.
     ///
     /// `None` disables the requirement, which is what tests and embedders that
@@ -226,6 +233,7 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             shutdown: None,
+            trusted_proxy_hops: 0,
             dpop_nonce: None,
             jti_guard: JtiReplayGuard::new(100_000),
             refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
@@ -278,6 +286,7 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             shutdown: None,
+            trusted_proxy_hops: 0,
             dpop_nonce: None,
             jti_guard: JtiReplayGuard::new(100_000),
             refresh_grace: Arc::new(crate::account::refresh_grace::RefreshGrace::default()),
@@ -321,6 +330,13 @@ impl HttpState {
     #[must_use]
     pub fn with_plc_service(mut self, plc: Arc<PlcService>) -> Self {
         self.plc_service = Some(plc);
+        self
+    }
+
+    /// Declare how many trusted reverse proxies sit in front of this server.
+    #[must_use]
+    pub fn with_trusted_proxy_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_hops = hops;
         self
     }
 

@@ -84,7 +84,7 @@ async fn require_writable_session(
 ) -> Result<AuthSubject, XrpcError> {
     use crate::account::AccountState;
 
-    let (htm, htu) = request_htm_htu(parts);
+    let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
     let subject = require_authn(parts, state, &htm, &htu).await?;
 
     let account = state

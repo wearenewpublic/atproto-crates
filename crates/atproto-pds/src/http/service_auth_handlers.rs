@@ -173,7 +173,7 @@ pub async fn get_service_auth(
     // Caller must hold a session access JWT or an OAuth token. OAuth
     // tokens with a `cnf.jkt` thumbprint require a fresh DPoP proof
     // (RFC 9449) — the unified helper enforces that automatically.
-    let (htm, htu) = crate::http::auth::request_htm_htu(&parts);
+    let (htm, htu) = crate::http::auth::request_htm_htu(&parts, state.trusted_proxy_hops);
     let claims = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
 
     if !q.aud.starts_with("did:") {

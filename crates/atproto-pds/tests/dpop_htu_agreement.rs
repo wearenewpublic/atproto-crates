@@ -35,12 +35,15 @@ fn derived_htu(path_and_query: &str, host: &str) -> String {
     let parts = Request::builder()
         .uri(path_and_query)
         .header("host", host)
+        // Models the deployed shape: a reverse proxy terminating TLS and
+        // forwarding plain HTTP, which is the only case where the forwarded
+        // scheme is believed.
         .header("x-forwarded-proto", "https")
         .body(())
         .expect("request")
         .into_parts()
         .0;
-    let (_, htu) = atproto_pds::http::auth::request_htm_htu(&parts);
+    let (_, htu) = atproto_pds::http::auth::request_htm_htu(&parts, 1);
     htu
 }
 

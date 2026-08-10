@@ -192,7 +192,7 @@ async fn proxy_call(
         )
     })?;
     let parts = build_parts_for_authn(&headers, &method)?;
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = crate::http::auth::require_authn(&parts, state, &htm, &htu).await?;
 
     // `rpc:` scopes bound which method may be called at which audience. Without

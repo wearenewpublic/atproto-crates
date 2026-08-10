@@ -133,7 +133,7 @@ pub async fn update_handle(
     parts: Parts,
     Json(input): Json<UpdateHandleInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
 
     // Rotating the handle is an identity change, not a repo write, and it is
@@ -452,7 +452,7 @@ pub async fn request_plc_operation_signature(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<StatusCode, XrpcError> {
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
     let did = subject.sub().to_string();
 
@@ -587,7 +587,7 @@ pub async fn get_recommended_did_credentials(
 ) -> Result<Json<RecommendedDidCredentials>, XrpcError> {
     use atproto_identity::key::to_public;
 
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let did = require_authn_sub(&parts, &state, &htm, &htu).await?;
 
     let manager = state.account_manager.as_ref().ok_or_else(|| {
@@ -750,7 +750,7 @@ pub async fn refresh_identity(
 ) -> Result<Json<RefreshIdentityResponse>, XrpcError> {
     use atproto_identity::plc;
 
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let caller = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
 
     // This rewrites the handle and emits an `#identity` event, which is the

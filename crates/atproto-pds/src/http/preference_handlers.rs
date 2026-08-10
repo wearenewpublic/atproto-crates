@@ -51,7 +51,7 @@ pub async fn get_preferences(
     State(state): State<HttpState>,
     parts: Parts,
 ) -> Result<Json<GetPreferencesResponse>, XrpcError> {
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let did = require_authn_sub(&parts, &state, &htm, &htu).await?;
     let store = open_store(&state, &did).await?;
 
@@ -89,7 +89,7 @@ pub async fn put_preferences(
     parts: Parts,
     Json(input): Json<PutPreferencesInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
     let did = subject.sub().to_string();
 

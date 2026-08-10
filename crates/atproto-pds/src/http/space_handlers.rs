@@ -123,7 +123,7 @@ fn account_manager(state: &HttpState) -> Result<&Arc<AccountManager>, XrpcError>
 /// just the subject DID since Spaces management endpoints don't care about
 /// the rest of the OAuth claims.
 async fn require_session_subject(parts: &Parts, state: &HttpState) -> Result<String, XrpcError> {
-    let (htm, htu) = request_htm_htu(parts);
+    let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
     require_authn_sub(parts, state, &htm, &htu).await
 }
 
@@ -135,7 +135,7 @@ async fn require_session_auth(
     parts: &Parts,
     state: &HttpState,
 ) -> Result<crate::http::auth::AuthSubject, XrpcError> {
-    let (htm, htu) = request_htm_htu(parts);
+    let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
     require_authn(parts, state, &htm, &htu).await
 }
 
@@ -1347,7 +1347,7 @@ async fn resolve_record_auth<'a>(
             // Treat as a session-style or OAuth access token. The unified
             // helper transparently accepts both shapes and enforces DPoP
             // when an OAuth token carries a `cnf.jkt` thumbprint.
-            let (htm, htu) = request_htm_htu(parts);
+            let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
             let subject = require_authn(parts, state, &htm, &htu).await?;
             let sub = subject.sub().to_string();
             let target_repo = repo.map(|r| r.to_string()).unwrap_or_else(|| sub.clone());
@@ -1877,7 +1877,7 @@ pub async fn get_delegation_token(
     parts: Parts,
     Query(q): Query<GetDelegationTokenQuery>,
 ) -> Result<Json<DelegationTokenResponse>, XrpcError> {
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = require_authn(&parts, &state, &htm, &htu).await?;
     let member_did = subject.sub().to_string();
     // The delegation token proves an app is acting on the user's behalf, so
@@ -2249,7 +2249,7 @@ async fn require_any_authn(
             })?;
         return Ok(None);
     }
-    let (htm, htu) = request_htm_htu(parts);
+    let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
     require_authn(parts, state, &htm, &htu).await.map(Some)
 }
 

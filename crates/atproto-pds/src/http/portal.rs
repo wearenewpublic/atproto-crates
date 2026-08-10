@@ -95,10 +95,14 @@ fn set_cookie(value: &str, secure: bool, max_age: i64) -> String {
 /// Whether the request reached us over a secure transport.
 fn is_secure(headers: &HeaderMap, state: &HttpState) -> bool {
     // Behind the tunnel or any ordinary reverse proxy the hop to us is plain
-    // HTTP, so the forwarded scheme is the only truthful signal.
-    if let Some(proto) = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
+    // HTTP, so the forwarded scheme is the only truthful signal -- when there
+    // is a proxy. Without one it is a header the caller wrote, and believing
+    // it let a caller ask for its own session cookie to be issued without
+    // `Secure` by claiming the request arrived over plain HTTP.
+    if state.trusted_proxy_hops > 0
+        && let Some(proto) = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
     {
         return proto.eq_ignore_ascii_case("https");
     }
@@ -1869,6 +1873,52 @@ fn urlencoding_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build read-only state with a chosen proxy-trust setting.
+    async fn state_with_hops(hops: usize) -> HttpState {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = crate::account::AccountDirectory::open_memory()
+            .await
+            .unwrap();
+        let reader = std::sync::Arc::new(crate::repo::RepoReader::new(
+            accounts,
+            tmp.path().to_path_buf(),
+        ));
+        let mut state = HttpState::new(reader).with_trusted_proxy_hops(hops);
+        // `HttpState::new` uses a localhost service DID, under which the
+        // fallback is "not secure"; a deployed host is the case worth testing.
+        state.service_did = "did:web:pds.example".to_string();
+        state
+    }
+
+    /// A caller could ask for its own session cookie to be issued without
+    /// `Secure` by claiming the request arrived over plain HTTP. With no proxy
+    /// declared, `x-forwarded-proto` is text the caller wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forwarded_scheme_cannot_downgrade_the_cookie_with_no_proxy() {
+        let state = state_with_hops(0).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(
+            is_secure(&headers, &state),
+            "a caller-supplied scheme must not strip Secure from the session cookie"
+        );
+    }
+
+    /// Behind a declared proxy the forwarded scheme is the only truthful
+    /// signal, and a genuinely plain-HTTP deployment must still be able to say
+    /// so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forwarded_scheme_is_believed_behind_a_declared_proxy() {
+        let state = state_with_hops(1).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!is_secure(&headers, &state));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(is_secure(&headers, &state));
+    }
 
     #[test]
     fn the_cookie_is_read_out_of_a_header_with_neighbours() {

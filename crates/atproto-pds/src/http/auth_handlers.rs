@@ -717,7 +717,7 @@ pub async fn get_session(
     // decided in the handler, not here. This is the first call most
     // clients make after authorizing, and refusing it made every OAuth
     // token look broken at the first hop.
-    let (htm, htu) = request_htm_htu(&parts);
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = require_authn(&parts, &state, &htm, &htu).await?;
     let did = subject.sub().to_string();
     let directory = state.reader.accounts();
@@ -3018,7 +3018,7 @@ async fn require_session_or_oauth(
     state: &HttpState,
     policy: &OAuthScope,
 ) -> Result<String, XrpcError> {
-    let (htm, htu) = request_htm_htu(parts);
+    let (htm, htu) = request_htm_htu(parts, state.trusted_proxy_hops);
     let subject = require_authn(parts, state, &htm, &htu).await?;
 
     if subject.is_oauth() {

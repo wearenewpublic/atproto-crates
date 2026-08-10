@@ -436,22 +436,42 @@ pub async fn require_authn_sub(
 /// scheme + authority are reconstructed from the `Host` (or
 /// `X-Forwarded-Host` / `X-Forwarded-Proto`) headers when proxied; falls
 /// back to the request's URI authority + scheme.
-pub fn request_htm_htu(parts: &Parts) -> (String, String) {
+pub fn request_htm_htu(parts: &Parts, trusted_proxy_hops: usize) -> (String, String) {
     let htm = parts.method.as_str().to_string();
 
+    // `X-Forwarded-*` is written by infrastructure the operator controls, or
+    // by the caller, and nothing in the header distinguishes the two. The rate
+    // limiter has always said so -- it refuses to key on `X-Forwarded-For`
+    // without `PDS_TRUSTED_PROXY_HOPS`, because "a header any client can set
+    // is not an identity". The same is true of the scheme and host, and this
+    // function believed them unconditionally.
+    //
+    // What that bought a caller is control over the `htu` a DPoP proof is
+    // checked against: the value the server recomputes and compares is partly
+    // chosen by whoever sent the request.
+    let trust_forwarded = trusted_proxy_hops > 0;
+
     let path = parts.uri.path();
-    let scheme = parts
-        .headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    let scheme = trust_forwarded
+        .then(|| {
+            parts
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .flatten()
         .or_else(|| parts.uri.scheme_str().map(str::to_string))
         .unwrap_or_else(|| "http".to_string());
-    let authority = parts
-        .headers
-        .get("x-forwarded-host")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    let authority = trust_forwarded
+        .then(|| {
+            parts
+                .headers
+                .get("x-forwarded-host")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .flatten()
         .or_else(|| {
             parts
                 .headers
@@ -487,14 +507,16 @@ mod tests {
             "/xrpc/com.atproto.foo?since=abc",
             &[("host", "pds.example")],
         );
-        let (htm, htu) = request_htm_htu(&parts);
+        let (htm, htu) = request_htm_htu(&parts, 0);
         assert_eq!(htm, "POST");
-        // Default scheme is http when no x-forwarded-proto is set.
+        // Default scheme is http when no x-forwarded-proto is trusted.
         assert_eq!(htu, "http://pds.example/xrpc/com.atproto.foo");
     }
 
+    /// With a proxy declared, the forwarded headers are what the request
+    /// actually arrived as, and the `htu` a client signed is built from them.
     #[test]
-    fn request_htm_htu_honors_forwarded_proto() {
+    fn request_htm_htu_honors_forwarded_headers_behind_a_declared_proxy() {
         let parts = parts_with(
             Method::GET,
             "/xrpc/com.atproto.bar",
@@ -504,9 +526,30 @@ mod tests {
                 ("x-forwarded-host", "public.example"),
             ],
         );
-        let (htm, htu) = request_htm_htu(&parts);
+        let (htm, htu) = request_htm_htu(&parts, 1);
         assert_eq!(htm, "GET");
         assert_eq!(htu, "https://public.example/xrpc/com.atproto.bar");
+    }
+
+    /// With no proxy declared they are text the caller wrote, and the `htu` a
+    /// DPoP proof is checked against must not be partly chosen by whoever sent
+    /// the request.
+    #[test]
+    fn request_htm_htu_ignores_forwarded_headers_with_no_declared_proxy() {
+        let parts = parts_with(
+            Method::GET,
+            "/xrpc/com.atproto.bar",
+            &[
+                ("host", "pds.example"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-host", "attacker.example"),
+            ],
+        );
+        let (_, htu) = request_htm_htu(&parts, 0);
+        assert_eq!(
+            htu, "http://pds.example/xrpc/com.atproto.bar",
+            "a caller-supplied host must not reach the htu"
+        );
     }
 
     #[test]
