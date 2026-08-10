@@ -954,8 +954,14 @@ pub async fn import_repo(
     body: axum::body::Body,
 ) -> Result<Json<ImportRepoResponse>, XrpcError> {
     let claims = require_migration_session(&parts, &state).await?;
-    let limit = state.import_limit_bytes;
-    let body = buffer_body(body, limit, || car_too_large(limit)).await?;
+
+    // Decided before the body is read, not after.
+    //
+    // This ran after `buffer_body`, so a caller who was going to be refused
+    // still got up to `PDS_IMPORT_LIMIT` -- a gibibyte by default -- read into
+    // memory first. Authorising before allocating costs nothing and means a
+    // refusal is a refusal rather than a gibibyte and then a refusal.
+    //
     // Importing replaces every record in every collection at once. That is
     // account migration, not a lot of writes, and the specification separates
     // the two: `transition:generic` grants writing any record type and
@@ -984,6 +990,10 @@ pub async fn import_repo(
             "importRepo requires a privileged session (account password)",
         ));
     }
+
+    let limit = state.import_limit_bytes;
+    let body = buffer_body(body, limit, || car_too_large(limit)).await?;
+
     let data_dir = match state.account_manager.as_deref() {
         Some(m) => m.data_dir().to_path_buf(),
         None => {
@@ -1036,7 +1046,11 @@ pub async fn import_repo(
         }
     }
     let outcome = importer
-        .import_from_stream(claims.sub(), std::io::Cursor::new(body.to_vec()))
+        // `Cursor` over the `Bytes` rather than a `Vec` copied out of it.
+        // `to_vec` here duplicated the whole body -- up to a second gibibyte
+        // -- for nothing: tokio implements `AsyncRead` for `Cursor<T>` where
+        // `T: AsRef<[u8]> + Unpin`, which `Bytes` satisfies.
+        .import_from_stream(claims.sub(), std::io::Cursor::new(body))
         .await
         .map_err(XrpcError::from)?;
     Ok(Json(ImportRepoResponse {

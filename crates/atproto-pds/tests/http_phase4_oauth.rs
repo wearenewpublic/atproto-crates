@@ -2794,3 +2794,65 @@ async fn an_app_password_cannot_complete_an_authorization() {
         "the refusal must not confirm the string is a live credential: {body}"
     );
 }
+
+/// A caller who is going to be refused should not get a gibibyte read into
+/// memory first.
+///
+/// The authorization check ran after `buffer_body`, so `PDS_IMPORT_LIMIT` bytes
+/// were buffered before anyone asked whether this token was allowed to import
+/// at all. Ordering is observable: with a body over the ceiling *and* a token
+/// lacking the scope, whichever check runs first is the one that answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_repo_refuses_the_scope_before_reading_the_body() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    // Small enough to exceed from a test, so the two checks can be raced.
+    .with_import_limit(64);
+    let app = build_router(state);
+
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    // `transition:generic` is what the specification excludes from account
+    // migration, so this token is refused on scope.
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    let (status, body) = post_raw_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.repo.importRepo",
+        "application/vnd.ipld.car",
+        vec![0u8; 4096],
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the scope refusal should answer, not the size: {body}"
+    );
+    assert_eq!(
+        body["error"], "InsufficientScope",
+        "a caller being refused must not have its body read first: {body}"
+    );
+}
