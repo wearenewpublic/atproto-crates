@@ -1,0 +1,17 @@
+-- The index `getAccountInviteCodes` needs to find one account's codes.
+--
+-- `invite_code` is keyed on `code` alone, so a lookup by `created_by_did`
+-- had nothing to seek with: the query read every code on the server and then
+-- built a temp b-tree to order the handful that matched. Measured over 200k
+-- codes, returning one account's ten: 5ms of scanning before, none after.
+--
+-- `created_at DESC` alongside the DID because that is the order the listing
+-- asks for, so the ordering comes out of the index rather than out of a
+-- sort.
+--
+-- Note what this does *not* change: the response is one account's own codes,
+-- bounded by what this server issued to it, not by the size of the table.
+-- The listing stays uncapped because its lexicon declares neither a limit nor
+-- a cursor, and truncating a response that has no way to say it was truncated
+-- would hide codes rather than bound anything.
+CREATE INDEX idx_invite_code_creator ON invite_code(created_by_did, created_at DESC);

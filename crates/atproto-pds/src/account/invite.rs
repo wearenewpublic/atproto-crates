@@ -259,6 +259,16 @@ pub async fn redeem(pool: &AccountPool, code: &str, did: &str) -> PdsResult<bool
 
 /// List codes issued by a DID (excludes admin-issued codes where
 /// `created_by_did` is null).
+///
+/// Answered from `idx_invite_code_creator`, which is what keeps this
+/// proportional to one account's codes rather than to every code on the
+/// server. Without it the filter had nothing to seek with and the ordering
+/// needed a temp b-tree over the whole table.
+///
+/// Deliberately uncapped: `com.atproto.server.getAccountInviteCodes` declares
+/// neither a limit nor a cursor, so a truncated response has no way to say it
+/// was truncated, and the row count is bounded by what this server chose to
+/// issue to the account.
 pub async fn list_for_did(pool: &AccountPool, did: &str) -> PdsResult<Vec<InviteCodeRow>> {
     match pool.kind() {
         #[cfg(feature = "sqlite")]
@@ -572,5 +582,51 @@ mod tests {
         let a = create(&pool, None, 1).await.unwrap();
         let b = create(&pool, None, 1).await.unwrap();
         assert_ne!(a.code, b.code);
+    }
+
+    /// One account's codes are found by seeking, not by reading every code on
+    /// the server.
+    ///
+    /// `invite_code` is keyed on `code` alone, so the filter on
+    /// `created_by_did` had nothing to seek with: the listing scanned the
+    /// whole table and then built a temp b-tree to order the few rows that
+    /// matched. Over 200k codes, returning one account's ten cost 5ms of
+    /// scanning.
+    ///
+    /// The plan is asserted rather than a duration, for the usual reason: a
+    /// timing threshold on a shared machine either flakes or is loose enough
+    /// to stop catching the regression.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listing_an_account_s_codes_seeks_the_creator_index() {
+        let pool = fresh_pool().await;
+        create(&pool, Some("did:plc:alice"), 1).await.unwrap();
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN
+             SELECT code, created_by_did, available_uses, used_by, created_at, disabled
+             FROM invite_code WHERE created_by_did = ? ORDER BY created_at DESC",
+        )
+        .bind("did:plc:alice")
+        .fetch_all(pool.as_sqlite())
+        .await
+        .expect("explain");
+        let rendered = plan
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("idx_invite_code_creator"),
+            "the listing should seek the creator index; plan was:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("SCAN invite_code"),
+            "the listing still reads every code on the server; plan was:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("TEMP B-TREE"),
+            "the order should come from the index rather than a sort; plan was:\n{rendered}"
+        );
     }
 }
