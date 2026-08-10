@@ -56,6 +56,12 @@ pub struct ServiceAuthClaims {
     pub jti: String,
 }
 
+/// Clock drift allowed between this server and a peer.
+///
+/// Only the `iat` sanity check consults it. `exp` is compared exactly, because
+/// a token that has expired by any margin has expired.
+const CLOCK_SKEW_SECS: u64 = 60;
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -229,10 +235,55 @@ async fn verify_inner(
             )));
         }
     }
-    if claims.exp <= now_secs() {
+    let now = now_secs();
+    if claims.exp <= now {
         return Err(deny("service-auth token expired"));
     }
 
+    // A token issued in the future is not a token whose lifetime can be
+    // reasoned about: the ceiling below is measured from `iat`, so an `iat`
+    // the issuer is free to place anywhere makes the ceiling free too. Some
+    // slack for honest clock drift between peers, and no more.
+    if claims.iat > now.saturating_add(CLOCK_SKEW_SECS) {
+        return Err(deny("service-auth token issued in the future"));
+    }
+
+    // Hold a peer to the same lifetime this server holds itself to.
+    //
+    // `exp > now` was the only bound, so a peer could mint a token good for a
+    // decade and this server would take it -- while its own `getServiceAuth`
+    // clamps to an hour. A leaked token then stayed valid until an operator
+    // found it and blacklisted that exact `jti`, which requires knowing it
+    // leaked. The ceiling is what makes the credential short-lived whether or
+    // not anyone notices.
+    if claims.exp.saturating_sub(claims.iat)
+        > crate::http::service_auth_handlers::MAX_SERVICE_AUTH_LIFETIME_SECS
+    {
+        return Err(deny(&format!(
+            "service-auth token lifetime {}s exceeds the {}s ceiling",
+            claims.exp.saturating_sub(claims.iat),
+            crate::http::service_auth_handlers::MAX_SERVICE_AUTH_LIFETIME_SECS
+        )));
+    }
+
+    // The `jti` is checked against revocations and deliberately *not* against
+    // a replay guard.
+    //
+    // Single-use would be the stronger posture and it is wrong here: this
+    // server's own notifier mints one token per queued delivery, stores it on
+    // the `notify_attempt` row, and presents that same token on every retry.
+    // Enforcing single-use inbound would therefore reject every retry after
+    // the first attempt that reached the peer -- the delivery would fail, back
+    // off, retry with a token the receiver had already burned, and fail again
+    // until it hit `max_attempts`. A replay defence that breaks the retry path
+    // it shares a codebase with is not a defence, it is an outage with a
+    // security rationale.
+    //
+    // What bounds replay instead is the lifetime ceiling above, which is now
+    // enforced rather than assumed. Making these single-use would mean minting
+    // per attempt rather than per delivery, which is a change to the notifier,
+    // not to this check.
+    //
     // `com.atproto.admin.revokeServiceAuth` writes the jti here. Until this
     // check existed the endpoint returned 200 OK and did nothing, so an
     // operator revoking a leaked token was told it had worked and it had not —
@@ -350,6 +401,105 @@ mod tests {
             exp: now_secs() + 60,
             jti: "test-jti".to_string(),
         }
+    }
+
+    /// A peer must be held to the lifetime this server holds itself to.
+    ///
+    /// `exp > now` was the only bound, so a peer could mint a token good for a
+    /// decade and this server would take it -- while its own `getServiceAuth`
+    /// clamps to an hour. The refusal happens before the issuer's DID document
+    /// is fetched, like the other claim checks.
+    #[tokio::test]
+    async fn verify_rejects_a_token_that_outlives_the_ceiling() {
+        let mut claims = claims_with_lxm(Some("com.atproto.space.notifyWrite"));
+        claims.exp =
+            claims.iat + crate::http::service_auth_handlers::MAX_SERVICE_AUTH_LIFETIME_SECS + 1;
+        let token = unsigned_token(&claims);
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("a token outliving the ceiling must be refused");
+        assert!(
+            err.to_string().contains("ceiling"),
+            "expected a lifetime-specific denial, got: {err}"
+        );
+    }
+
+    /// A token exactly at the ceiling is fine -- the bound is a ceiling, not a
+    /// margin, and refusing at it would make the documented maximum unusable.
+    #[tokio::test]
+    async fn verify_accepts_a_token_at_the_ceiling() {
+        let mut claims = claims_with_lxm(Some("com.atproto.space.notifyWrite"));
+        claims.exp =
+            claims.iat + crate::http::service_auth_handlers::MAX_SERVICE_AUTH_LIFETIME_SECS;
+        let token = unsigned_token(&claims);
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("the unsigned fixture cannot pass signature verification");
+        assert!(
+            !err.to_string().contains("ceiling"),
+            "a token at the ceiling must clear the lifetime check, got: {err}"
+        );
+    }
+
+    /// An `iat` in the future makes the ceiling meaningless, because the
+    /// ceiling is measured from it.
+    #[tokio::test]
+    async fn verify_rejects_a_token_issued_in_the_future() {
+        let mut claims = claims_with_lxm(Some("com.atproto.space.notifyWrite"));
+        claims.iat = now_secs() + CLOCK_SKEW_SECS + 120;
+        claims.exp = claims.iat + 60;
+        let token = unsigned_token(&claims);
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("a token issued in the future must be refused");
+        assert!(
+            err.to_string().contains("issued in the future"),
+            "expected an iat-specific denial, got: {err}"
+        );
+    }
+
+    /// Ordinary clock drift between peers is not an attack.
+    #[tokio::test]
+    async fn verify_tolerates_a_little_clock_drift() {
+        let mut claims = claims_with_lxm(Some("com.atproto.space.notifyWrite"));
+        claims.iat = now_secs() + CLOCK_SKEW_SECS / 2;
+        claims.exp = claims.iat + 60;
+        let token = unsigned_token(&claims);
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("the unsigned fixture cannot pass signature verification");
+        assert!(
+            !err.to_string().contains("issued in the future"),
+            "a peer a few seconds fast must still be served, got: {err}"
+        );
     }
 
     /// A token with no `lxm` must be refused, not treated as satisfying
