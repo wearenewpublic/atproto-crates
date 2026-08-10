@@ -279,6 +279,36 @@ async fn full_migration_sequence() {
     .await;
     assert_eq!(status, StatusCode::OK, "checkAccountStatus: {body}");
     assert_eq!(body["activated"], true);
+
+    // Step 7: what a relay has to work from.
+    //
+    // Only `importRepo` emitted anything carrying a `rev`, and it did so while
+    // the account was still deactivated -- when a relay may reasonably ignore
+    // it and `getRepo` refuses to serve. Activation's own event is `#account
+    // active=true`, which says the account is live and not where its head is,
+    // so a relay learned to start indexing and had nothing to index from.
+    let sequencer = manager.sequencer();
+    let rows = sequencer
+        .read_after(None, Some(did), 100)
+        .await
+        .expect("read the stream log");
+    let last_sync = rows
+        .iter()
+        .rev()
+        .find(|row| row.event_type == "sync")
+        .expect("the migration should leave a #sync on the log");
+    let last_account = rows
+        .iter()
+        .rev()
+        .find(|row| row.event_type == "account")
+        .expect("activation emits an #account event");
+    assert!(
+        last_sync.seq > last_account.seq,
+        "the #sync naming the repo head must not be older than the event saying \
+         the account is live: sync at {}, account at {}",
+        last_sync.seq,
+        last_account.seq
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -24,4 +24,4 @@ pub use event_bus::{EventBus, SubscribeEvent};
 pub use frame::{Encoding, FrameHeader, encode_error, encode_event, encode_info};
 pub use outbox::{EventFrame, EventType, OutboxReader, OutboxRow};
 pub use stream::{Sequencer, StreamRow};
-pub use sync_event::publish_sync;
+pub use sync_event::{publish_sync, publish_sync_for_head};

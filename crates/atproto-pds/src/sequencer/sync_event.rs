@@ -47,6 +47,88 @@ pub struct SyncEvent<'a> {
 ///
 /// Returns [`crate::errors::PdsError::Storage`] if the event cannot be
 /// encoded or recorded.
+/// Emit a `#sync` naming an account's current head, if it has one.
+///
+/// Returns the sequence number, or `None` when the repository has no commits
+/// -- an account that has never written is not in a state a `#sync` describes.
+///
+/// This exists because the inbound migration flow is create, deactivate,
+/// `importRepo`, `activateAccount`, and only the third step emitted anything
+/// carrying a `rev`. At that moment the account is still deactivated, so a
+/// relay may reasonably ignore the event and `getRepo` refuses to serve it.
+/// By the time the account activates, the only event is `#account
+/// active=true`, which says the account is live and not where its repository
+/// head is -- so a relay learns to start indexing and has nothing to index
+/// from.
+///
+/// # Errors
+///
+/// Returns [`PdsError`] when the head or its block cannot be read, or when the
+/// event cannot be sequenced.
+pub async fn publish_sync_for_head(
+    state: &crate::http::state::HttpState,
+    did: &str,
+) -> PdsResult<Option<i64>> {
+    use crate::errors::PdsError;
+    use std::str::FromStr as _;
+
+    let Some(head) = state.reader.get_latest_commit(did).await? else {
+        return Ok(None);
+    };
+    let commit_cid = cid::Cid::from_str(&head.cid).map_err(|e| PdsError::Storage {
+        reason: format!("parse head commit CID {}: {e}", head.cid),
+    })?;
+
+    // Read through the configured backend when there is one, so this sees the
+    // same repository every other read path does.
+    let commit_block = match state.public_realm_backend.as_ref() {
+        Some(backend) => {
+            let storage = backend.open_block_storage(did).await?;
+            atproto_dasl::storage::BlockStorage::get(&storage, &commit_cid)
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("read head commit block: {e}"),
+                })?
+        }
+        None => {
+            let store =
+                crate::actor_store::sql::SqlActorStore::open(state.reader.data_dir(), did).await?;
+            let row: Option<(Vec<u8>,)> =
+                sqlx::query_as("SELECT data FROM repo_block WHERE cid = ?")
+                    .bind(head.cid.as_str())
+                    .fetch_optional(store.pool())
+                    .await
+                    .map_err(|e| PdsError::Storage {
+                        reason: format!("read head commit block: {e}"),
+                    })?;
+            row.map(|(data,)| data)
+        }
+    };
+    let Some(commit_block) = commit_block else {
+        return Err(PdsError::Storage {
+            reason: format!("head commit block {} is missing from the repo", head.cid),
+        });
+    };
+
+    let event = SyncEvent {
+        did,
+        rev: &head.rev,
+        commit_cid: &commit_cid,
+        commit_block: &commit_block,
+    };
+    publish_sync(&state.reader.sequencer(), &event)
+        .await
+        .map(Some)
+}
+
+/// Append a `#sync` event to the firehose stream.
+///
+/// Returns the assigned stream `seq`.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::PdsError::Storage`] if the event cannot be
+/// encoded or recorded.
 pub async fn publish_sync(sequencer: &Sequencer, event: &SyncEvent<'_>) -> PdsResult<i64> {
     let blocks =
         crate::repo::commit_car::build_sync_car(event.commit_cid, event.commit_block).await?;

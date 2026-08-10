@@ -1456,6 +1456,37 @@ pub async fn activate_account(
         .set_state(&claims.sub, AccountState::Active)
         .await
         .map_err(XrpcError::from)?;
+
+    // Tell the firehose where the repository is, now that it can be served.
+    //
+    // `set_state` emits `#account active=true`, which says the account is live
+    // and not where its head is. On an inbound migration -- create,
+    // deactivate, `importRepo`, activate -- the only event carrying a `rev` was
+    // the `#sync` from the import, emitted while the account was still
+    // deactivated, when a relay may reasonably ignore it and `getRepo` refuses
+    // to serve. So a relay learned to start indexing and had nothing to index
+    // from.
+    //
+    // Best-effort: the account is active either way, and refusing to activate
+    // because the firehose is unhappy would leave an account that has already
+    // taken over its DID stuck deactivated. An account with no commits emits
+    // nothing, which is the ordinary case for an activation that is not a
+    // migration.
+    match crate::sequencer::publish_sync_for_head(&state, &claims.sub).await {
+        Ok(Some(seq)) => {
+            tracing::info!(did = %claims.sub, seq, "activateAccount: emitted #sync for the repo head");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                did = %claims.sub,
+                error = ?e,
+                "activateAccount: could not emit #sync; consumers will not learn the repo head \
+                 until the next commit"
+            );
+        }
+    }
+
     Ok(axum::http::StatusCode::OK)
 }
 
