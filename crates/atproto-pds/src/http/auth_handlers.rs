@@ -1194,6 +1194,31 @@ pub async fn create_invite_code(
     // particular account is attributed to nobody. The column is a nullable FK
     // for exactly this. When an admin names `forAccount`, that account is
     // checked like any other.
+    // Naming someone else is an administrator's power.
+    //
+    // `for_account` used to be honoured whoever sent it, and the only check
+    // that followed was the *named* account's issuance toggle. So any account
+    // could mint codes attributed to another: it escaped its own
+    // `InviteIssuanceDisabled` gate by pointing at somebody whose gate was
+    // open, and every code it issued was recorded against them. Invite
+    // attribution is what an operator follows back when codes are used to
+    // create abusive accounts, and it was writable by the abuser.
+    //
+    // Refused rather than quietly re-pointed at the caller: a client sending
+    // `forAccount` believes it is doing something, and silently doing
+    // something else is how a bug becomes a mystery. Naming yourself is
+    // allowed, because that is what the parameter would have meant anyway.
+    if let Some(for_account) = input.for_account.as_deref()
+        && !admin_is_caller
+        && for_account != caller
+    {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "only an administrator may attribute an invite code to another account",
+        ));
+    }
+
     let admin_without_account = admin_is_caller && input.for_account.is_none();
     let attribute_to = input.for_account.as_deref().unwrap_or(&caller);
 

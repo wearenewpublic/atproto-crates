@@ -708,3 +708,53 @@ async fn dead_schema_tables_dropped_after_migrations() {
         assert!(row.is_some(), "table {table} unexpectedly missing");
     }
 }
+
+/// `forAccount` names who an invite code is attributed to. It used to be
+/// honoured whoever sent it, and the only check that followed was the *named*
+/// account's issuance toggle -- so any account could mint codes attributed to
+/// another, escaping its own gate by pointing at someone whose gate was open.
+/// Invite attribution is what an operator follows back when codes are used to
+/// create abusive accounts, and it was writable by the abuser.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_invite_code_refuses_attributing_to_another_account() {
+    let (app, manager, _tmp) = build_app(false).await;
+    let (access, _refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+    // The victim exists and has issuance enabled, which is what made the
+    // original bypass work.
+    let _ = fixture_session(&app, &manager, "did:plc:bob", "bob.example", "pw").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.createInviteCode",
+        json!({"useCount": 1, "forAccount": "did:plc:bob"}),
+        Some(&access),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "one account must not mint codes attributed to another: {body}"
+    );
+}
+
+/// Naming yourself is what the parameter would have meant anyway, so it is
+/// allowed -- the refusal is about attributing to *someone else*.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_invite_code_allows_naming_yourself() {
+    let (app, manager, _tmp) = build_app(false).await;
+    let (access, _refresh) =
+        fixture_session(&app, &manager, "did:plc:alice", "alice.example", "pw").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.createInviteCode",
+        json!({"useCount": 1, "forAccount": "did:plc:alice"}),
+        Some(&access),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["code"].as_str().unwrap().starts_with("pds-"));
+}
