@@ -1020,8 +1020,10 @@ async fn a_batch_builds_one_catalog_per_collection() {
 
     let resolutions = calls.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
-        resolutions, 1,
-        "twenty records in one collection should resolve its schema once, not {resolutions} times"
+        resolutions, 2,
+        "a batch resolves a collection once per thing that needs the document -- the \
+         validation catalog and the record-key rule -- and not once per record. \
+         Got {resolutions} for twenty records; per-record would be twenty-one."
     );
 }
 
@@ -1131,4 +1133,209 @@ async fn create_record_allows_an_ordinary_record() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// Resolves one schema, for whatever collection is asked about.
+struct FixedResolver {
+    schema: Value,
+}
+
+#[async_trait::async_trait]
+impl atproto_pds::repo::lexicon::LexiconResolver for FixedResolver {
+    async fn resolve(&self, _nsid: &str) -> Option<Value> {
+        Some(self.schema.clone())
+    }
+}
+
+/// Build an app whose lexicon resolver declares `key: literal:self` for one
+/// collection, which is what `app.bsky.actor.profile` declares.
+async fn app_with_self_keyed_collection() -> (axum::Router, Arc<AccountManager>, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+
+    let schema = json!({
+        "lexicon": 1,
+        "id": "app.example.profile",
+        "defs": {"main": {
+            "type": "record",
+            "key": "literal:self",
+            "record": {"type": "object", "properties": {"name": {"type": "string"}}}
+        }}
+    });
+    let resolver: Arc<dyn atproto_pds::repo::lexicon::LexiconResolver> =
+        Arc::new(FixedResolver { schema });
+
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_lexicon_resolver(resolver);
+    (build_router(state), manager, tmp)
+}
+
+/// A record filed under a key its own lexicon forbids is refused.
+///
+/// `app.bsky.actor.profile` declares `key: literal:self`, and nothing checked
+/// it -- so a profile written at a TID was accepted, committed and broadcast,
+/// then silently ignored by every consumer that looks for it at `self`. The
+/// write reported success and the record did not exist as far as the network
+/// was concerned.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_record_refuses_a_key_the_lexicon_forbids() {
+    let (app, manager, _tmp) = app_with_self_keyed_collection().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.example.profile",
+            "rkey": "3kabcdefghij2",
+            "record": {"$type": "app.example.profile", "name": "alice"}
+        }),
+        Some(&token),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRecordKey", "{body}");
+}
+
+/// The key the lexicon does name is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_record_accepts_the_key_the_lexicon_names() {
+    let (app, manager, _tmp) = app_with_self_keyed_collection().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.example.profile",
+            "rkey": "self",
+            "record": {"$type": "app.example.profile", "name": "alice"}
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// A create that omits the key gets the one the lexicon names, rather than a
+/// generated TID -- which would file the record where nothing looks for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_record_uses_the_literal_key_when_none_is_given() {
+    let (app, manager, _tmp) = app_with_self_keyed_collection().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.example.profile",
+            "record": {"$type": "app.example.profile", "name": "alice"}
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let uri = body["uri"].as_str().expect("uri");
+    assert!(
+        uri.ends_with("/self"),
+        "the record should be filed at the key its lexicon names: {uri}"
+    );
+}
+
+/// `applyWrites` resolves each collection's key rule once for the batch, so
+/// the enforcement lives on a different path from the single-record handlers
+/// and is checked separately. A batch is all-or-nothing: one bad key rejects
+/// the whole thing rather than committing part of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_refuses_a_key_the_lexicon_forbids() {
+    let (app, manager, _tmp) = app_with_self_keyed_collection().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({
+            "repo": "did:plc:alice",
+            "writes": [
+                {"$type": "com.atproto.repo.applyWrites#create",
+                 "collection": "app.example.profile",
+                 "rkey": "self",
+                 "value": {"$type": "app.example.profile", "name": "alice"}},
+                {"$type": "com.atproto.repo.applyWrites#create",
+                 "collection": "app.example.profile",
+                 "rkey": "3kabcdefghij2",
+                 "value": {"$type": "app.example.profile", "name": "alice"}}
+            ]
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRecordKey", "{body}");
+
+    let (status, _) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&collection=app.example.profile&rkey=self",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the valid entry should not have been committed on its own"
+    );
+}
+
+/// A record already filed at a forbidden key can still be deleted.
+///
+/// Repos predate this check, and imports carry in whatever the exporting
+/// server allowed. If the key rule applied to deletes, such a record would be
+/// permanent -- the account holder could neither fix it nor remove it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_at_a_forbidden_key_can_still_be_deleted() {
+    let (app, manager, _tmp) = app_with_self_keyed_collection().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // Written without validation, standing in for a record that arrived before
+    // the rule was enforced.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({
+            "repo": "did:plc:alice",
+            "writes": [{"$type": "com.atproto.repo.applyWrites#delete",
+                        "collection": "app.example.profile",
+                        "rkey": "3kabcdefghij2"}]
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_ne!(
+        body["error"], "InvalidRecordKey",
+        "a delete should not be held to the key rule: {body}"
+    );
+    let _ = status;
 }

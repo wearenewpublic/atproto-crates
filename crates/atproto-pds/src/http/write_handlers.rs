@@ -229,6 +229,88 @@ async fn resolve_repo_did(state: &HttpState, repo: &str) -> Result<String, XrpcE
     Ok(account.did)
 }
 
+/// The record key a collection's lexicon requires, if it says.
+///
+/// `defs.main.key` is `tid`, `literal:<value>`, `any`, or absent. Read from the
+/// resolved document rather than the parsed catalog because the catalog is a
+/// validator for the record *body* and this is a constraint on where the body
+/// is filed.
+async fn record_key_rule(state: &HttpState, collection: &str) -> Option<String> {
+    let resolver = state.lexicon_resolver.as_ref()?;
+    let doc = resolver.resolve(collection).await?;
+    doc["defs"]["main"]["key"].as_str().map(str::to_string)
+}
+
+/// Refuse a record filed under a key its own lexicon does not allow.
+///
+/// `app.bsky.actor.profile` declares `key: literal:self`, and nothing checked
+/// it -- so a profile written at a TID was accepted, committed, and broadcast,
+/// and then silently ignored by every consumer that looks for it at `self`.
+/// The write reports success and the record does not exist as far as the
+/// network is concerned, which is the worst shape a failure can take.
+///
+/// A rule this server cannot read is not enforced: an unresolvable collection,
+/// a document without `key`, or `any` all pass. This is a check on what a
+/// lexicon states, not a requirement that one exist.
+///
+/// # Errors
+///
+/// Returns `InvalidRecordKey` when the lexicon states a rule the key breaks.
+async fn assert_record_key(
+    state: &HttpState,
+    collection: &str,
+    rkey: &str,
+) -> Result<(), XrpcError> {
+    let rule = record_key_rule(state, collection).await;
+    assert_record_key_rule(rule.as_deref(), collection, rkey)
+}
+
+/// [`assert_record_key`] against an already-resolved rule.
+///
+/// Split out so a batch can resolve once per collection rather than once per
+/// entry -- resolving per entry would put back the repeated work that caching
+/// the validation catalog removed.
+///
+/// # Errors
+///
+/// Returns `InvalidRecordKey` when the lexicon states a rule the key breaks.
+fn assert_record_key_rule(
+    rule: Option<&str>,
+    collection: &str,
+    rkey: &str,
+) -> Result<(), XrpcError> {
+    let Some(rule) = rule else {
+        return Ok(());
+    };
+    let refuse = |detail: String| {
+        Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRecordKey",
+            detail,
+        ))
+    };
+    match rule {
+        "tid" => {
+            if Tid::decode(rkey).is_err() {
+                return refuse(format!(
+                    "{collection} requires a TID record key; {rkey:?} is not one"
+                ));
+            }
+            Ok(())
+        }
+        "any" => Ok(()),
+        other => match other.strip_prefix("literal:") {
+            Some(literal) if literal == rkey => Ok(()),
+            Some(literal) => refuse(format!(
+                "{collection} requires the record key {literal:?}; got {rkey:?}"
+            )),
+            // A rule this server does not recognise is not one it can hold a
+            // caller to.
+            None => Ok(()),
+        },
+    }
+}
+
 /// The largest a single record may be.
 ///
 /// The sync specification: "individual record blocks within the `blocks` field
@@ -414,7 +496,21 @@ pub async fn create_record(
     assert_record_size(&input.record)?;
     let outcome = validate_record(&state, validate, &input.collection, &input.record).await?;
 
-    let rkey = input.rkey.unwrap_or_else(|| Tid::new().to_string());
+    // A collection whose lexicon names a literal key has exactly one valid
+    // key, so generating a TID for it produces a record nothing will look for.
+    let rkey = match input.rkey {
+        Some(rkey) => {
+            assert_record_key(&state, &input.collection, &rkey).await?;
+            rkey
+        }
+        None => match record_key_rule(&state, &input.collection).await {
+            Some(rule) => match rule.strip_prefix("literal:") {
+                Some(literal) => literal.to_string(),
+                None => Tid::new().to_string(),
+            },
+            None => Tid::new().to_string(),
+        },
+    };
     let result = writer
         .apply_writes_with_swap(
             &repo_did,
@@ -484,6 +580,7 @@ pub async fn put_record(
 
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
     assert_record_size(&input.record)?;
+    assert_record_key(&state, &input.collection, &input.rkey).await?;
     let outcome = validate_record(&state, validate, &input.collection, &input.record).await?;
 
     let result = writer
@@ -730,6 +827,22 @@ pub async fn apply_writes(
     // validated only its first entry would let the rest through unchecked
     // while reporting the whole call as validated.
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
+    // One resolution per distinct collection, not one per entry. Resolving per
+    // entry would put back the repeated work that caching the validation
+    // catalog removed.
+    let mut key_rules: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for entry in &input.writes {
+        let collection = match entry {
+            ApplyWritesEntry::Create { collection, .. }
+            | ApplyWritesEntry::Update { collection, .. }
+            | ApplyWritesEntry::Delete { collection, .. } => collection,
+        };
+        if !key_rules.contains_key(collection) {
+            let rule = record_key_rule(&state, collection).await;
+            key_rules.insert(collection.clone(), rule);
+        }
+    }
     for entry in &input.writes {
         match entry {
             ApplyWritesEntry::Create {
@@ -743,7 +856,35 @@ pub async fn apply_writes(
             }
             ApplyWritesEntry::Delete { .. } => {}
         }
+        // Checked separately from the body because a create may omit the key.
+        // Deletes are exempt: a repo may already hold a record at a key its
+        // lexicon forbids, written before this check existed or carried in by
+        // an import, and refusing the delete would make it permanent.
+        if let Some((collection, Some(rkey))) = match entry {
+            ApplyWritesEntry::Create {
+                collection, rkey, ..
+            } => Some((collection, rkey.clone())),
+            ApplyWritesEntry::Update {
+                collection, rkey, ..
+            } => Some((collection, Some(rkey.clone()))),
+            ApplyWritesEntry::Delete { .. } => None,
+        } {
+            let rule = key_rules.get(collection).and_then(Option::as_deref);
+            assert_record_key_rule(rule, collection, &rkey)?;
+        }
     }
+
+    // A create that omits the key needs the same treatment `createRecord`
+    // gives it: a collection naming a literal has one valid key, and
+    // generating a TID for it files the record where nothing looks.
+    let literal_keys: std::collections::HashMap<String, String> = key_rules
+        .iter()
+        .filter_map(|(collection, rule)| {
+            rule.as_deref()
+                .and_then(|rule| rule.strip_prefix("literal:"))
+                .map(|literal| (collection.clone(), literal.to_string()))
+        })
+        .collect();
 
     let ops: Vec<WriteOp> = input
         .writes
@@ -753,13 +894,21 @@ pub async fn apply_writes(
                 collection,
                 rkey,
                 value,
-            } => WriteOp {
-                action: WriteAction::Create,
-                collection,
-                rkey: rkey.unwrap_or_else(|| Tid::new().to_string()),
-                value: Some(value),
-                swap_record: None,
-            },
+            } => {
+                let rkey = rkey.unwrap_or_else(|| {
+                    literal_keys
+                        .get(&collection)
+                        .cloned()
+                        .unwrap_or_else(|| Tid::new().to_string())
+                });
+                WriteOp {
+                    action: WriteAction::Create,
+                    collection,
+                    rkey,
+                    value: Some(value),
+                    swap_record: None,
+                }
+            }
             ApplyWritesEntry::Update {
                 collection,
                 rkey,
