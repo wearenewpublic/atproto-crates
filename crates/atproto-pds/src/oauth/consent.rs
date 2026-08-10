@@ -556,7 +556,7 @@ fn render_consent(
       <label for="identifier">Handle, DID, or email</label>
       <input id="identifier" name="identifier" type="text" autocomplete="username" required{identifier_value}{identifier_autofocus}>
 
-      <label for="password">Password (account or app password)</label>
+      <label for="password">Account password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required{password_autofocus}>
 
       <input type="hidden" name="request_uri" value="{request_uri_safe}">

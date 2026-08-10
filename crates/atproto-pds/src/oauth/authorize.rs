@@ -7,7 +7,7 @@
 //! ships friendly per-scope descriptions; the Askama-rendered template form is documented in
 //! D-7.
 
-use crate::account::{AccountState, app_password};
+use crate::account::AccountState;
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
 use axum::Json;
@@ -124,19 +124,28 @@ pub async fn authorize_handler(
         return Err(refused());
     };
 
-    let auth_ok = if app_password::verify(&manager.account_pool(), &account.did, &input.password)
+    // The account password, and not an app password.
+    //
+    // An app password is a credential handed to a third-party tool, which is
+    // why `SessionClaims::full` exists and why `createAppPassword`,
+    // `signPlcOperation` and `requestAccountDelete` are all reserved to a
+    // session the holder authenticated for directly: "the operations that can
+    // take over or destroy an identity" are not delegable.
+    //
+    // Approving an OAuth client mints a third-party credential of whatever
+    // scope was asked for -- `transition:generic` among them. That is the same
+    // act as minting an app password, reached through a different door, and it
+    // accepted an app password to do it. A leaked app password could therefore
+    // be exchanged for an OAuth grant, which is the boundary going around
+    // itself rather than being broken.
+    let auth_ok = manager
+        .verify_password(&account.did, &input.password)
         .await
-        .map_err(XrpcError::from)?
-        .is_some()
-    {
-        true
-    } else {
-        manager
-            .verify_password(&account.did, &input.password)
-            .await
-            .map_err(XrpcError::from)?
-    };
+        .map_err(XrpcError::from)?;
     if !auth_ok {
+        // An app password presented here is refused as a credential, not
+        // named as one: saying "that was an app password" would confirm the
+        // account exists and that the string is a live credential for it.
         return Err(refused());
     }
 

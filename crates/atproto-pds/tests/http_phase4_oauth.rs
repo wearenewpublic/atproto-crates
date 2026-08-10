@@ -2733,3 +2733,64 @@ async fn a_public_clients_refresh_token_is_capped_at_two_weeks() {
         "a public client's refresh token lived {lifetime}s, past the {fortnight}s limit"
     );
 }
+
+/// An app password must not complete an OAuth authorization.
+///
+/// App passwords are handed to third-party tools, which is why
+/// `createAppPassword`, `signPlcOperation` and `requestAccountDelete` are all
+/// reserved to a session the holder authenticated for directly. Approving an
+/// OAuth client mints a third-party credential of whatever scope was asked
+/// for -- the same act, through a different door -- and it accepted an app
+/// password to do it, so a leaked one could be exchanged for a grant.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_password_cannot_complete_an_authorization() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    // A real app password for the account, which authenticates elsewhere.
+    let created = atproto_pds::account::app_password::create(
+        &manager.account_pool(),
+        "did:plc:alice",
+        "a-tool",
+        false,
+    )
+    .await
+    .expect("mint an app password");
+
+    let (_, challenge) = pkce_pair();
+    let (_, par_body) = post_json(
+        app.clone(),
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "atproto transition:generic", "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par_body["request_uri"].as_str().unwrap().to_string();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.example",
+            "password": created.plaintext, "approve": true,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an app password must not mint an OAuth grant: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid identifier or password"),
+        "the refusal must not confirm the string is a live credential: {body}"
+    );
+}
