@@ -193,6 +193,53 @@ async fn verify_assertion(
         }
     }
 
+    let now = chrono::Utc::now().timestamp();
+    let exp = check_assertion_claims(&claims, expected_audience, now)?;
+
+    let jti = claims["jti"]
+        .as_str()
+        .ok_or_else(|| "client assertion has no jti".to_string())?;
+    let remaining = u64::try_from(exp - now).unwrap_or(0).saturating_add(1);
+    jti_guard
+        .check_and_insert(jti, std::time::Duration::from_secs(remaining))
+        .await
+        .map_err(|e| format!("client assertion replay: {e}"))?;
+
+    Ok(header["kid"].as_str().map(str::to_string))
+}
+
+/// How long a client assertion may live.
+///
+/// It authenticates one call to the token endpoint, so it needs to survive a
+/// round trip and nothing more. Five minutes matches the ceiling the space
+/// attestation path already uses for the same shape of short-lived assertion.
+const MAX_CLIENT_ASSERTION_LIFETIME_SECS: i64 = 300;
+
+/// Clock drift allowed between this server and a client.
+///
+/// Only the `iat` check consults it. `exp` is compared exactly, because an
+/// assertion that has expired by any margin has expired.
+const CLOCK_SKEW_SECS: i64 = 60;
+
+/// The time and audience claims an assertion must satisfy, separated out so
+/// they can be exercised.
+///
+/// They sit behind signature verification in `verify_assertion` -- deliberately,
+/// since reading claims out of a JWT nobody has authenticated is how an
+/// unsigned token becomes evidence -- which also puts them behind a network
+/// key resolution. Nothing reached them in a test until they moved here.
+///
+/// Returns the validated `exp`, which the caller needs for the replay entry's
+/// lifetime.
+///
+/// # Errors
+///
+/// Returns a description of the first claim that fails.
+fn check_assertion_claims(
+    claims: &serde_json::Value,
+    expected_audience: &[String],
+    now: i64,
+) -> Result<i64, String> {
     // Audience must name this server, or an assertion minted for a different
     // authorization server would be accepted here -- the mix-up this claim
     // exists to prevent.
@@ -203,9 +250,36 @@ async fn verify_assertion(
     let exp = claims["exp"]
         .as_i64()
         .ok_or_else(|| "client assertion has no exp".to_string())?;
-    let now = chrono::Utc::now().timestamp();
     if exp <= now {
         return Err("client assertion has expired".to_string());
+    }
+
+    // RFC 7523 §3 requires `iat`, and this had no opinion about it at all.
+    //
+    // Without it there is nothing to measure a lifetime against, so `exp` was
+    // the only bound and it is chosen by the client: an assertion naming a
+    // year in the next century is a bearer credential good for a century. It
+    // also sets the replay-guard entry's TTL, so each one wrote a row that
+    // will not age out in any practical window -- which is unbounded growth in
+    // the store, driven by whoever is presenting the assertions.
+    //
+    // That second effect got sharper when the guard stopped forgetting live
+    // entries under pressure: a guard full of decade-long entries now refuses
+    // rather than evicting, so an attacker minting far-future assertions could
+    // deny service to every client whose authentication needs the guard. The
+    // ceiling is what keeps the entries transient.
+    let iat = claims["iat"]
+        .as_i64()
+        .ok_or_else(|| "client assertion has no iat".to_string())?;
+    if iat > now.saturating_add(CLOCK_SKEW_SECS) {
+        return Err("client assertion was issued in the future".to_string());
+    }
+    let lifetime = exp.saturating_sub(iat);
+    if lifetime > MAX_CLIENT_ASSERTION_LIFETIME_SECS {
+        return Err(format!(
+            "client assertion lifetime {lifetime}s exceeds the \
+             {MAX_CLIENT_ASSERTION_LIFETIME_SECS}s ceiling"
+        ));
     }
 
     // Single use, per RFC 7523 §3. An assertion is not bound to the code it
@@ -217,16 +291,7 @@ async fn verify_assertion(
     // Held until the assertion expires and no longer: past `exp` the check
     // above refuses it anyway, so a longer entry only spends memory to
     // re-refuse something already refused.
-    let jti = claims["jti"]
-        .as_str()
-        .ok_or_else(|| "client assertion has no jti".to_string())?;
-    let remaining = u64::try_from(exp - now).unwrap_or(0).saturating_add(1);
-    jti_guard
-        .check_and_insert(jti, std::time::Duration::from_secs(remaining))
-        .await
-        .map_err(|e| format!("client assertion replay: {e}"))?;
-
-    Ok(header["kid"].as_str().map(str::to_string))
+    Ok(exp)
 }
 
 /// Decode one base64url JWS segment as JSON.
@@ -377,6 +442,82 @@ mod tests {
             err.contains("resolve client key") || err.contains("client_id"),
             "expected a key-resolution refusal, got {err}"
         );
+    }
+
+    fn assertion_claims(iat: i64, exp: i64) -> serde_json::Value {
+        serde_json::json!({
+            "iss": "https://app.example/client-metadata.json",
+            "sub": "https://app.example/client-metadata.json",
+            "aud": "https://pds.example",
+            "jti": "assertion-jti",
+            "iat": iat,
+            "exp": exp,
+        })
+    }
+
+    /// An ordinary short-lived assertion is accepted, so the bounds below are
+    /// a ceiling rather than a refusal to authenticate anyone.
+    #[test]
+    fn an_ordinary_assertion_passes_the_claim_checks() {
+        let now = 1_800_000_000;
+        check_assertion_claims(&assertion_claims(now, now + 60), &audiences(), now)
+            .expect("a 60-second assertion is what a client should send");
+    }
+
+    /// RFC 7523 §3 requires `iat`, and without one there is nothing to measure
+    /// a lifetime against.
+    #[test]
+    fn an_assertion_with_no_iat_is_refused() {
+        let now = 1_800_000_000;
+        let mut claims = assertion_claims(now, now + 60);
+        claims["iat"] = serde_json::Value::Null;
+        let err = check_assertion_claims(&claims, &audiences(), now).expect_err("iat is required");
+        assert!(err.contains("no iat"), "{err}");
+    }
+
+    /// `exp` is chosen by the client, so without a ceiling an assertion naming
+    /// a year in the next century is a bearer credential good for a century --
+    /// and it sets the replay entry's lifetime, so each one writes a row that
+    /// will not age out in any practical window.
+    #[test]
+    fn an_assertion_valid_for_decades_is_refused() {
+        let now = 1_800_000_000;
+        // Roughly the year 2100.
+        let claims = assertion_claims(now, 4_102_444_800);
+        let err = check_assertion_claims(&claims, &audiences(), now)
+            .expect_err("a decades-long assertion must be refused");
+        assert!(err.contains("ceiling"), "{err}");
+    }
+
+    /// The ceiling is measured from `iat`, so an `iat` the client is free to
+    /// place anywhere would make the ceiling free too.
+    #[test]
+    fn an_assertion_issued_in_the_future_is_refused() {
+        let now = 1_800_000_000;
+        let iat = now + CLOCK_SKEW_SECS + 120;
+        let claims = assertion_claims(iat, iat + 60);
+        let err = check_assertion_claims(&claims, &audiences(), now)
+            .expect_err("an assertion issued in the future must be refused");
+        assert!(err.contains("issued in the future"), "{err}");
+    }
+
+    /// Ordinary drift between a client and this server is not an attack.
+    #[test]
+    fn a_little_clock_drift_is_tolerated() {
+        let now = 1_800_000_000;
+        let iat = now + CLOCK_SKEW_SECS / 2;
+        check_assertion_claims(&assertion_claims(iat, iat + 60), &audiences(), now)
+            .expect("a client a few seconds fast must still authenticate");
+    }
+
+    /// An assertion exactly at the ceiling clears it -- the bound is a
+    /// ceiling, not a margin.
+    #[test]
+    fn an_assertion_at_the_ceiling_is_accepted() {
+        let now = 1_800_000_000;
+        let claims = assertion_claims(now, now + MAX_CLIENT_ASSERTION_LIFETIME_SECS);
+        check_assertion_claims(&claims, &audiences(), now)
+            .expect("the documented maximum must be usable");
     }
 
     /// A malformed assertion is refused before anything is read from it.
