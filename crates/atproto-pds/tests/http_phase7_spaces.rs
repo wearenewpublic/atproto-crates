@@ -3367,3 +3367,118 @@ async fn a_malformed_since_is_still_refused() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{token}: {body}");
     }
 }
+
+/// A cross-collection listing pages, and says when there is more.
+///
+/// It used to concatenate the first `limit` records of every collection and
+/// answer `cursor: null` -- so the response could be `collections × limit`
+/// records however small a limit was asked for, and a caller had no way to
+/// request the rest or to tell that a rest existed. A short page is the only
+/// signal a client has that it has seen everything, and this mode never sent
+/// one.
+#[tokio::test(flavor = "multi_thread")]
+async fn listing_across_collections_pages_and_terminates() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // Three collections, three records each: nine in total, so a limit of two
+    // must page rather than return six.
+    for collection in ["a.one", "b.two", "c.three"] {
+        for rkey in ["k1", "k2", "k3"] {
+            post_json(
+                app.clone(),
+                "/xrpc/com.atproto.space.applyWrites",
+                json!({
+                    "repo": "did:plc:owner",
+                    "space": uri,
+                    "writes": [{"action": "create", "collection": collection, "rkey": rkey, "value": {}}]
+                }),
+                Some(&owner_token),
+            )
+            .await;
+        }
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for round in 0..20 {
+        let mut url = format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&limit=2",
+            urlencode(&uri)
+        );
+        if let Some(c) = &cursor {
+            url.push_str(&format!("&cursor={}", urlencode(c)));
+        }
+        let (status, body) = get_json(app.clone(), &url, Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let records = body["records"].as_array().cloned().unwrap_or_default();
+        assert!(
+            records.len() <= 2,
+            "a limit of 2 returned {} records on round {round}: {body}",
+            records.len()
+        );
+        for record in &records {
+            // The listing is keys-only, so identity is collection + rkey.
+            seen.push(format!(
+                "{}/{}",
+                record["collection"].as_str().unwrap_or_default(),
+                record["rkey"].as_str().unwrap_or_default()
+            ));
+        }
+        match body["cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+        assert!(round < 19, "the listing never reported itself finished");
+    }
+
+    assert_eq!(seen.len(), 9, "paging did not cover every record: {seen:?}");
+    let unique: std::collections::HashSet<&String> = seen.iter().collect();
+    assert_eq!(
+        unique.len(),
+        9,
+        "paging returned the same record twice: {seen:?}"
+    );
+}
+
+/// The last page is short and carries no cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cross_collection_listing_that_fits_reports_no_cursor() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    for collection in ["a.one", "b.two"] {
+        post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.applyWrites",
+            json!({
+                "repo": "did:plc:owner",
+                "space": uri,
+                "writes": [{"action": "create", "collection": collection, "rkey": "k1", "value": {}}]
+            }),
+            Some(&owner_token),
+        )
+        .await;
+    }
+
+    let (status, body) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&limit=50",
+            urlencode(&uri)
+        ),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["records"].as_array().unwrap().len(), 2);
+    assert!(
+        body["cursor"].is_null(),
+        "a page that fits must not offer a cursor: {body}"
+    );
+}

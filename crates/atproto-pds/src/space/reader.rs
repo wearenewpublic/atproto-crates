@@ -90,6 +90,25 @@ pub struct SpaceReader {
     http_client: reqwest::Client,
 }
 
+/// Split a cross-collection cursor into its collection and rkey halves.
+///
+/// `\u{1}` as the separator because an NSID cannot contain it and an rkey
+/// cannot either, so the split is unambiguous in a way that a `/` or a `.`
+/// would not be -- both appear in the values being joined.
+///
+/// A cursor without the separator is treated as naming a collection with no
+/// position inside it, which is what a caller hand-writing one would most
+/// likely mean and is harmless: the collection restarts.
+fn split_cross_cursor(cursor: Option<&str>) -> (Option<&str>, Option<&str>) {
+    match cursor {
+        None => (None, None),
+        Some(raw) => match raw.split_once('\u{1}') {
+            Some((coll, rkey)) => (Some(coll), Some(rkey)),
+            None => (Some(raw), None),
+        },
+    }
+}
+
 impl SpaceReader {
     /// Construct.
     #[must_use]
@@ -183,11 +202,20 @@ impl SpaceReader {
     /// `listRecords` — paginated listing within a collection, or across all
     /// collections when `collection` is `None`.
     ///
-    /// When `collection` is `Some`, the call is paginated via the supplied
-    /// `cursor`. When `collection` is `None`, the reader iterates every
-    /// collection in the space and concatenates the first `limit` records
-    /// from each; `cursor` is ignored in this mode (matching the TypeScript
-    /// PDS behavior).
+    /// Both modes page. The cross-collection mode used to concatenate the
+    /// first `limit` records of every collection and answer `cursor: None`,
+    /// which is two problems wearing one coat: the response could be
+    /// `collections × limit` records however small a limit the caller asked
+    /// for, and a caller had no way to ask for the rest or to tell that there
+    /// was a rest. A short page is the only signal a client has that it has
+    /// seen everything, and this mode never sent one.
+    ///
+    /// Across collections the cursor is `<collection>\u{1}<rkey>`: it names
+    /// the last record delivered, so the next call resumes inside the
+    /// collection it stopped in rather than at that collection's start.
+    /// Collections are always walked in ascending order, `reverse` ordering
+    /// records within each, because the cursor has to name a position in a
+    /// stable sequence.
     ///
     /// `target_repo` has the same meaning as in [`Self::get_record`].
     pub async fn list_records(
@@ -224,11 +252,32 @@ impl SpaceReader {
                 Ok(page)
             }
             None => {
+                let (resume_collection, resume_rkey) = split_cross_cursor(cursor);
                 let collections = repo.list_collections().await.map_err(PdsError::Space)?;
                 let mut all_records = Vec::new();
+                let mut last_key: Option<(String, String)> = None;
+
                 for coll in collections {
+                    // `list_collections` is ascending, so anything sorting
+                    // before the cursor's collection was delivered already.
+                    if let Some(from) = resume_collection
+                        && coll.as_str() < from
+                    {
+                        continue;
+                    }
+                    let remaining =
+                        limit.saturating_sub(u32::try_from(all_records.len()).unwrap_or(u32::MAX));
+                    if remaining == 0 {
+                        break;
+                    }
+                    // Only the collection the cursor stopped in resumes from an
+                    // rkey; the ones after it start at the beginning.
+                    let within = match resume_collection {
+                        Some(from) if coll.as_str() == from => resume_rkey,
+                        _ => None,
+                    };
                     let mut page = repo
-                        .list_records(&coll, None, limit, reverse)
+                        .list_records(&coll, within, remaining, reverse)
                         .await
                         .map_err(PdsError::Space)?;
                     let taken: std::collections::HashSet<String> =
@@ -236,11 +285,22 @@ impl SpaceReader {
                     if !taken.is_empty() {
                         page.records.retain(|r| !taken.contains(&r.rkey));
                     }
+                    if let Some(last) = page.records.last() {
+                        last_key = Some((coll.clone(), last.rkey.clone()));
+                    }
                     all_records.append(&mut page.records);
                 }
+
+                // A full page may have more behind it; a short one cannot, and
+                // saying so is what lets a client stop. Suppressing the cursor
+                // on a short page is the same rule the single-collection mode
+                // follows.
+                let cursor = (u32::try_from(all_records.len()).unwrap_or(u32::MAX) >= limit)
+                    .then(|| last_key.map(|(coll, rkey)| format!("{coll}\u{1}{rkey}")))
+                    .flatten();
                 Ok(RecordPage {
                     records: all_records,
-                    cursor: None,
+                    cursor,
                 })
             }
         }
