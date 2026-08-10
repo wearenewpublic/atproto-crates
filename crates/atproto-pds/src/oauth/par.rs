@@ -557,26 +557,66 @@ async fn verify_request_object(
         )
     })?;
 
-    // Audience: when claims.aud is set, it should include this PDS's
-    // issuer/host. We don't strictly enforce — the spec recommends but
-    // doesn't require — but log mismatches.
-    if let Some(aud) = claims.aud.as_ref() {
-        let expected = state.service_did.as_str();
-        let matches = match aud {
-            serde_json::Value::String(s) => s == expected,
-            serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(expected)),
-            _ => false,
-        };
-        if !matches {
-            tracing::debug!(
-                aud = ?aud,
-                expected,
-                "PAR request_object aud mismatch (advisory)"
-            );
-        }
+    // The audience must name this server, and this is where a request object
+    // minted for a different authorization server is refused.
+    //
+    // It was compared against `state.service_did` -- a DID -- while the
+    // identifier this server publishes as its `issuer`, and therefore the one
+    // a client puts in `aud`, is an HTTPS URL. The two never match, so the
+    // comparison could only ever fail, and it was advisory: a mismatch was
+    // logged at debug and the request accepted. Both halves had to be wrong
+    // for the check to look present and do nothing. The struct's own field
+    // documentation says `aud` "must equal the PDS issuer URL", which is what
+    // it now compares against.
+    let expected = crate::oauth::metadata::issuer_url(&state.service_did);
+    if let Err(detail) = assert_aud_names_this_server(claims.aud.as_ref(), &expected) {
+        tracing::warn!(
+            aud = ?claims.aud,
+            %expected,
+            client_id = %claims.client_id,
+            "refused a request object addressed to another authorization server"
+        );
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_object",
+            detail,
+        ));
     }
 
     Ok(claims)
+}
+
+/// Require a request object's `aud` to name this server.
+///
+/// Separated out because the caller sits behind a JWS signature check, which
+/// sits behind a network key resolution -- so nothing reached this in a test
+/// while it was inline, which is a fair part of why it went unnoticed that it
+/// compared the wrong two strings and then ignored the answer.
+///
+/// `expected` is the `issuer` this server publishes in its authorization
+/// server metadata, which is the identifier RFC 9101 says a request object
+/// addresses. An array is accepted because `aud` may be one.
+///
+/// # Errors
+///
+/// Returns a description when `aud` is absent or names somewhere else.
+fn assert_aud_names_this_server(
+    aud: Option<&serde_json::Value>,
+    expected: &str,
+) -> Result<(), &'static str> {
+    let Some(aud) = aud else {
+        return Err("request object has no aud");
+    };
+    let names_this_server = match aud {
+        serde_json::Value::String(s) => s == expected,
+        serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(expected)),
+        _ => false,
+    };
+    if names_this_server {
+        Ok(())
+    } else {
+        Err("request object aud does not name this server")
+    }
 }
 
 /// Fetch the client's metadata document at `client_id`, extract `jwks` or
@@ -747,6 +787,66 @@ mod tests {
     /// at a listener that answers, the old code returned a JWKS complaint —
     /// having made the request, which is the whole problem. Refusing before the
     /// fetch is what leaves a policy refusal in its place.
+    /// The identifier a client addresses is the `issuer` this server
+    /// publishes, which is an HTTPS URL. The check compared it against the
+    /// service DID, so it could only ever fail -- and it was advisory, so
+    /// failing meant a debug line and an accepted request. Both halves had to
+    /// be wrong for the check to look present and do nothing.
+    #[test]
+    fn the_issuer_url_is_what_a_request_object_must_name() {
+        let expected = crate::oauth::metadata::issuer_url("did:web:pds.example");
+        assert_eq!(expected, "https://pds.example");
+
+        assert_aud_names_this_server(Some(&serde_json::json!("https://pds.example")), &expected)
+            .expect("the published issuer is what a conformant client sends");
+
+        // The value the check used to compare against.
+        assert!(
+            assert_aud_names_this_server(
+                Some(&serde_json::json!("did:web:pds.example")),
+                &expected
+            )
+            .is_err(),
+            "the service DID is not the issuer identifier"
+        );
+    }
+
+    /// A request object minted for a different authorization server is
+    /// refused rather than logged.
+    #[test]
+    fn a_request_object_for_another_server_is_refused() {
+        let expected = crate::oauth::metadata::issuer_url("did:web:pds.example");
+        assert!(
+            assert_aud_names_this_server(
+                Some(&serde_json::json!("https://other-pds.example")),
+                &expected
+            )
+            .is_err()
+        );
+    }
+
+    /// `aud` may be an array, and this server naming any entry is enough.
+    #[test]
+    fn an_array_audience_naming_this_server_passes() {
+        let expected = crate::oauth::metadata::issuer_url("did:web:pds.example");
+        assert_aud_names_this_server(
+            Some(&serde_json::json!([
+                "https://other.example",
+                "https://pds.example"
+            ])),
+            &expected,
+        )
+        .expect("naming this server among others is naming it");
+    }
+
+    /// An absent audience is the un-addressed case the claim exists to
+    /// prevent, so it is refused rather than waved through.
+    #[test]
+    fn a_request_object_with_no_aud_is_refused() {
+        let expected = crate::oauth::metadata::issuer_url("did:web:pds.example");
+        assert!(assert_aud_names_this_server(None, &expected).is_err());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_request_object_client_id_is_refused_before_it_is_fetched() {
         let addr = serve_one_json(r#"{"jwks":{"keys":[]}}"#).await;
