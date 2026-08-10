@@ -2267,3 +2267,158 @@ async fn service_auth_refuses_an_oauth_token_that_names_no_lxm() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"], "InsufficientScope", "{body}");
 }
+
+/// POST `path` with a DPoP-bound OAuth token and a raw body.
+async fn post_raw_with_token(
+    app: &axum::Router,
+    key: &KeyData,
+    token: &str,
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
+    let url = format!("http://test.example{path}");
+    let (dpop, _, _) = request_dpop(key, "POST", &url, token).expect("mint DPoP proof");
+    let request = Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("content-type", content_type)
+        .header("authorization", format!("DPoP {token}"))
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// `importRepo` replaces every record in every collection at once. That is
+/// account migration, and the specification says `transition:generic` grants
+/// writing any record type while excluding "account management actions:
+/// ... migrate account". `privileged()` read the legacy scope as privileged,
+/// so this endpoint admitted exactly what the specification excludes.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_repo_refuses_the_legacy_generic_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    let (status, body) = post_raw_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.repo.importRepo",
+        "application/vnd.ipld.car",
+        b"not-a-car".to_vec(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "InsufficientScope", "{body}");
+}
+
+/// And the granular grant gets past the scope gate -- it fails later, on the
+/// body not being a CAR, which is the point: the refusal is about scope and
+/// stops being about scope once the scope is held.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_repo_admits_the_granular_account_repo_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(
+        &app,
+        &key,
+        "atproto transition:generic account:repo?action=manage",
+    )
+    .await;
+
+    let (status, body) = post_raw_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.repo.importRepo",
+        "application/vnd.ipld.car",
+        b"not-a-car".to_vec(),
+    )
+    .await;
+
+    assert_ne!(
+        body["error"], "InsufficientScope",
+        "the granular grant should pass the scope gate: {body}"
+    );
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// `refreshIdentity` rewrites the handle and emits `#identity`, which is what
+/// `identity:handle` gates. The handler took only the DID from
+/// authentication, so the scopes were never in reach to be checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_identity_refuses_a_token_without_the_identity_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    let (status, body) = post_raw_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/com.atproto.identity.refreshIdentity",
+        "application/json",
+        serde_json::to_vec(&json!({"did": "did:plc:alice"})).unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "InsufficientScope", "{body}");
+}
+
+/// Preferences are account data and any token at all could rewrite them.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_preferences_refuses_a_bare_atproto_token() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto").await;
+
+    let (status, body) = post_raw_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/app.bsky.actor.putPreferences",
+        "application/json",
+        serde_json::to_vec(&json!({"preferences": []})).unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "InsufficientScope", "{body}");
+}
+
+/// The specification names personal preferences among what
+/// `transition:generic` grants, so that token must keep working.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_preferences_admits_the_legacy_generic_scope() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let token = token_with_scope(&app, &key, "atproto transition:generic").await;
+
+    let (status, body) = post_raw_with_token(
+        &app,
+        &key,
+        &token,
+        "/xrpc/app.bsky.actor.putPreferences",
+        "application/json",
+        serde_json::to_vec(&json!({"preferences": []})).unwrap(),
+    )
+    .await;
+
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+}

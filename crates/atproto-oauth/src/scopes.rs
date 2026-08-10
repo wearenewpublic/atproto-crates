@@ -1456,6 +1456,56 @@ impl ScopesSet {
         }
     }
 
+    /// Returns `true` if some granted `account:` scope permits *managing* the
+    /// repository as a whole -- importing over it, or otherwise migrating the
+    /// account.
+    ///
+    /// `transition:generic` deliberately does **not** satisfy this, and the
+    /// specification is explicit about why: the legacy blanket grants writing
+    /// any record type, but excludes "account management actions: change
+    /// handle, change email, delete or deactivate account, migrate account".
+    /// Replacing every record in every collection at once is the migration
+    /// case, not the write case, however much it resembles a lot of writes.
+    pub fn allows_account_repo_manage(&self) -> bool {
+        self.scopes.iter().any(|scope| {
+            matches!(
+                Scope::parse(scope),
+                Ok(Scope::Account(AccountScope {
+                    resource: AccountResource::Repo,
+                    action: AccountAction::Manage,
+                }))
+            )
+        })
+    }
+
+    /// Asserts that some granted `account:` scope permits managing the
+    /// repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeMissingError`](crate::errors::ScopeMissingError) naming
+    /// `account:repo?action=manage`.
+    pub fn assert_account_repo_manage(&self) -> Result<(), crate::errors::ScopeMissingError> {
+        if self.allows_account_repo_manage() {
+            Ok(())
+        } else {
+            Err(crate::errors::ScopeMissingError::new(
+                "account:repo?action=manage",
+            ))
+        }
+    }
+
+    /// Returns `true` if the legacy blanket scope was granted.
+    ///
+    /// Exposed because the specification names personal preferences as one of
+    /// the things `transition:generic` grants, and no granular scope for them
+    /// is specified here yet. A caller gating preference writes has nothing
+    /// else to ask. When a granular preference scope exists this becomes the
+    /// legacy half of that check rather than the whole of it.
+    pub fn allows_legacy_generic(&self) -> bool {
+        self.has_legacy_generic()
+    }
+
     /// Returns `true` if some granted `identity:` scope permits changing the
     /// account handle.
     /// `transition:generic` deliberately does **not** satisfy this. The legacy

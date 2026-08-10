@@ -90,7 +90,20 @@ pub async fn put_preferences(
     Json(input): Json<PutPreferencesInput>,
 ) -> Result<StatusCode, XrpcError> {
     let (htm, htu) = request_htm_htu(&parts);
-    let did = require_authn_sub(&parts, &state, &htm, &htu).await?;
+    let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
+    let did = subject.sub().to_string();
+
+    // Preferences are account data, and any token at all could rewrite them.
+    // The specification names them among what `transition:generic` grants, and
+    // no granular preference scope is specified yet, so that is the grant to
+    // ask for -- a bare `atproto` token should not be able to reach in here.
+    if subject.is_oauth() && !subject.scopes().allows_legacy_generic() {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            "this token does not grant writing personal preferences",
+        ));
+    }
 
     if !input.preferences.is_array() {
         return Err(XrpcError::new(

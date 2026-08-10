@@ -751,7 +751,26 @@ pub async fn refresh_identity(
     use atproto_identity::plc;
 
     let (htm, htu) = request_htm_htu(&parts);
-    let _caller = require_authn_sub(&parts, &state, &htm, &htu).await?;
+    let caller = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
+
+    // This rewrites the handle and emits an `#identity` event, which is the
+    // change `identity:handle` exists to gate. `require_authn_sub` returns
+    // only the DID, so the scopes were never in reach to be checked -- and
+    // `transition:generic` deliberately does not cover identity, so without
+    // this every client holding the standard legacy scope could rotate the
+    // account's handle.
+    if caller.is_oauth() {
+        caller
+            .scopes()
+            .assert_identity_handle()
+            .map_err(|missing| {
+                XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "InsufficientScope",
+                    format!("this token does not grant {}", missing.scope),
+                )
+            })?;
+    }
 
     let manager = state.account_manager.as_ref().ok_or_else(|| {
         XrpcError::new(

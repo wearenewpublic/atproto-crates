@@ -22,7 +22,7 @@
 //! `PDS_REPORT_SERVICE_DID` / `PDS_REPORT_SERVICE_URL` are unset (the
 //! operator hasn't wired forwarding yet).
 
-use crate::http::auth::{request_htm_htu, require_authn_sub};
+use crate::http::auth::request_htm_htu;
 use crate::http::errors::XrpcError;
 use crate::http::space_auth::local_signing_key;
 use crate::http::state::HttpState;
@@ -49,7 +49,8 @@ pub async fn create_report(
     use axum::response::IntoResponse;
 
     let (htm, htu) = request_htm_htu(&parts);
-    let caller = require_authn_sub(&parts, &state, &htm, &htu).await?;
+    let subject = crate::http::auth::require_authn(&parts, &state, &htm, &htu).await?;
+    let caller = subject.sub().to_string();
     let manager = state.account_manager.as_ref().ok_or_else(|| {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -72,6 +73,26 @@ pub async fn create_report(
             "PDS_REPORT_SERVICE_URL is not configured",
         )
     })?;
+
+    // This is a proxied call: it mints a service-auth JWT under the caller's
+    // own key and forwards to the moderation service, exactly as
+    // `proxy_handlers` does -- and that path asserts the `rpc:` scope while
+    // this one did not. `transition:generic` satisfies it, matching the
+    // specification's "API endpoints and service proxying for most Lexicon
+    // endpoints", so this refuses only a token that was never granted the
+    // call.
+    if subject.is_oauth() {
+        subject
+            .scopes()
+            .assert_rpc("com.atproto.moderation.createReport", report_did)
+            .map_err(|missing| {
+                XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "InsufficientScope",
+                    format!("this token does not grant {}", missing.scope),
+                )
+            })?;
+    }
 
     // Mint a service-auth JWT signed by the caller's atproto signing key.
     let signing_key = local_signing_key(manager, &caller).await?;

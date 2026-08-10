@@ -956,7 +956,28 @@ pub async fn import_repo(
     let claims = require_migration_session(&parts, &state).await?;
     let limit = state.import_limit_bytes;
     let body = buffer_body(body, limit, || car_too_large(limit)).await?;
-    if !claims.privileged() {
+    // Importing replaces every record in every collection at once. That is
+    // account migration, not a lot of writes, and the specification separates
+    // the two: `transition:generic` grants writing any record type and
+    // excludes "account management actions: change handle, change email,
+    // delete or deactivate account, migrate account".
+    //
+    // `privileged()` reads `transition:generic` as privileged, so this check
+    // admitted exactly the scope the specification excludes. An OAuth token
+    // now needs the granular grant; an app-password session still needs the
+    // account password, as before.
+    if claims.is_oauth() {
+        claims
+            .scopes()
+            .assert_account_repo_manage()
+            .map_err(|missing| {
+                XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "InsufficientScope",
+                    format!("this token does not grant {}", missing.scope),
+                )
+            })?;
+    } else if !claims.privileged() {
         return Err(XrpcError::new(
             StatusCode::FORBIDDEN,
             "Forbidden",
