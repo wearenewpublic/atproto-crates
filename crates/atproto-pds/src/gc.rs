@@ -247,9 +247,14 @@ async fn prune_simple(pool: &SqlitePool, sql: &str, bind: &str) -> PdsResult<u64
 /// Returns `(oplog rows, blob rows)`.
 ///
 /// Both sweeps walk the same account list and need the same store handle, so
-/// they share a pass: opening a per-actor database runs its migrations, and
-/// doing that twice per account per tick is the sort of cost that only shows up
-/// once there are enough accounts for it to matter.
+/// they share a pass: opening a per-actor database is the dominant cost here,
+/// and doing it twice per account per tick is the sort of thing that only
+/// shows up once there are enough accounts for it to matter.
+///
+/// Opened through [`SqlActorStore::open_for_sweep`] rather than the ordinary
+/// path, because a job that visits every account must not evict the pool cache
+/// that live requests depend on, run migrations across the whole server, or
+/// create a database for an account that never wrote one.
 async fn prune_per_actor(
     accounts_pool: &SqlitePool,
     data_dir: &std::path::Path,
@@ -284,8 +289,11 @@ async fn prune_per_actor(
         for (did,) in rows {
             // Best-effort: if the per-actor store can't be opened (deleted
             // account, fjall-only deployments, etc.), log + continue.
-            let store = match SqlActorStore::open(data_dir, &did).await {
-                Ok(s) => s,
+            let store = match SqlActorStore::open_for_sweep(data_dir, &did).await {
+                Ok(Some(s)) => s,
+                // An account with no database yet has nothing to collect, and
+                // creating one to discover that is the opposite of the job.
+                Ok(None) => continue,
                 Err(e) => {
                     tracing::debug!(did = %did, error = ?e, "per-actor sweep: open store skipped");
                     continue;
@@ -635,5 +643,135 @@ mod tests {
                 .await
                 .unwrap();
         assert!(pending.is_some(), "pending row untouched");
+    }
+
+    /// The sweep does not create a database for an account that has none.
+    ///
+    /// It used to open every account through the ordinary path, which has
+    /// `create_if_missing(true)` and runs migrations -- so a nightly job whose
+    /// purpose is to remove data materialised a fresh SQLite file, with a full
+    /// schema, for every account row that had never written one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sweep_does_not_create_databases() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref)
+             VALUES ('did:plc:neverwrote', 'nw.example', 'x', '2026-01-01T00:00:00Z', 'active', 'k')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (oplog, blobs) = prune_per_actor(
+            &pool,
+            tmp.path(),
+            Some("3zzzzzzzzzzzz"),
+            Some("2099-01-01T00:00:00Z"),
+        )
+        .await
+        .expect("sweep");
+        assert_eq!((oplog, blobs), (0, 0));
+
+        let actors = tmp.path().join("actors");
+        let created = tokio::fs::try_exists(&actors).await.unwrap_or(false);
+        assert!(
+            !created,
+            "the sweep created {} for an account with no data",
+            actors.display()
+        );
+    }
+
+    /// The sweep does not evict the pool cache that live requests use.
+    ///
+    /// The cache holds a bounded number of pools. A sweep over more accounts
+    /// than that, opening each through the ordinary path, evicts every pool
+    /// serving live traffic -- so the cache that exists to keep request
+    /// latency down was emptied by the one job with nothing to gain from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sweep_leaves_the_pool_cache_alone() {
+        use crate::actor_store::sql::SqlActorStore;
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Enough sweep-visited accounts to overrun any bounded cache, each
+        // with a database on disk so the sweep actually opens it. Seeded
+        // first: creating them goes through the ordinary path, which is
+        // itself enough to evict anything already cached.
+        let live = "did:plc:livetraffic";
+        for i in 0..300 {
+            let did = format!("did:plc:swept{i:04}");
+            SqlActorStore::open(tmp.path(), &did).await.unwrap();
+            sqlx::query(
+                "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref)
+                 VALUES (?, ?, 'x', '2026-01-01T00:00:00Z', 'active', 'k')",
+            )
+            .bind(&did)
+            .bind(format!("s{i:04}.example"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Now the account under live traffic, so it is in the cache when the
+        // sweep starts -- which is the state the sweep must not disturb.
+        SqlActorStore::open(tmp.path(), live).await.unwrap();
+        let before = crate::actor_store::sql::pools_built_for_did(tmp.path(), live);
+        prune_per_actor(&pool, tmp.path(), Some("3zzzzzzzzzzzz"), None)
+            .await
+            .expect("sweep");
+        SqlActorStore::open(tmp.path(), live).await.unwrap();
+        let after = crate::actor_store::sql::pools_built_for_did(tmp.path(), live);
+
+        assert_eq!(
+            before, after,
+            "the live account's pool was rebuilt after the sweep, so the sweep \
+             evicted it from the cache"
+        );
+    }
+
+    /// The retention prune seeks the cutoff instead of reading the table.
+    ///
+    /// Both oplog tables are keyed `(space, rev, idx)`, so `rev` is the second
+    /// column and `WHERE rev < ?` could not seek on it. Every tick scanned
+    /// both tables in full in every account, including -- overwhelmingly the
+    /// common case -- ticks where nothing has aged past the cutoff at all.
+    ///
+    /// The plan is asserted rather than a duration, for the same reason as
+    /// everywhere else: a threshold either flakes on a shared machine or is
+    /// loose enough to stop catching the regression.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_oplog_prune_seeks_the_cutoff() {
+        use crate::actor_store::sql::SqlActorStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqlActorStore::open(tmp.path(), "did:plc:planned")
+            .await
+            .unwrap();
+
+        for table in ["space_record_oplog", "space_member_oplog"] {
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+                "EXPLAIN QUERY PLAN DELETE FROM {table} WHERE rev < ?"
+            ))
+            .bind("3zzzzzzzzzzzz")
+            .fetch_all(store.pool())
+            .await
+            .expect("explain");
+            let rendered = plan
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect::<Vec<_>>()
+                .join("\n");
+            // "USING INDEX" or "USING COVERING INDEX" -- which of the two
+            // SQLite picks is not the point, and pinning it would make this
+            // fail on a planner improvement rather than on a regression.
+            assert!(
+                rendered.contains(&format!("idx_{table}_rev")) && rendered.contains("SEARCH"),
+                "{table} prune should seek its rev index; plan was:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains(&format!("SCAN {table}")),
+                "{table} prune still reads the whole table; plan was:\n{rendered}"
+            );
+        }
     }
 }

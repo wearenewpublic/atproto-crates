@@ -22,4 +22,6 @@ pub use public_realm::{
 };
 pub use space_members_storage::SqlSpaceMembersStorage;
 pub use space_repo_storage::SqlSpaceRepoStorage;
+#[cfg(test)]
+pub(crate) use store::pools_built_for_did;
 pub use store::{SqlActorStore, actor_db_path, did_filename};

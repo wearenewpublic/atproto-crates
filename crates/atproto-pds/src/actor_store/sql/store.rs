@@ -90,6 +90,13 @@ fn pools_built_for(db_path: &Path) -> usize {
         .map_or(0, |n| *n)
 }
 
+/// How many pools have been built for `did`'s database, for tests that need to
+/// observe whether a code path went through the cache.
+#[cfg(test)]
+pub(crate) fn pools_built_for_did(data_dir: &Path, did: &str) -> usize {
+    pools_built_for(&actor_db_path(data_dir, did))
+}
+
 #[cfg(test)]
 fn record_pool_built(db_path: &Path) {
     *POOLS_BUILT
@@ -99,6 +106,74 @@ fn record_pool_built(db_path: &Path) {
 }
 
 impl SqlActorStore {
+    /// Open an existing per-actor DB for a maintenance sweep, or `None` when
+    /// there is nothing there.
+    ///
+    /// A background sweep visits every account on the server, which makes it
+    /// the one caller that must not behave like a request. [`Self::open`] is
+    /// wrong for it in three separate ways:
+    ///
+    /// * It inserts into the shared pool cache, which holds 256 entries. A
+    ///   sweep over ten thousand accounts evicts every pool serving live
+    ///   traffic, forty times over, so the cache that exists to keep request
+    ///   latency down is emptied nightly by the one job that gains nothing
+    ///   from it. This reads through the cache -- a hit is free and stays hot
+    ///   -- and a miss builds a pool it drops on the way out.
+    /// * It runs migrations. Doing that against every database on the server
+    ///   is a large amount of work to discover that nothing has changed, and
+    ///   a database the sweep cannot read is better skipped than repaired
+    ///   from a background task: the next real request opens it properly.
+    /// * It creates the database. A sweep that materialises an empty SQLite
+    ///   file for every account that has never written one is doing the
+    ///   opposite of collecting garbage.
+    ///
+    /// One connection, because a sweep is sequential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if the file exists but cannot be opened.
+    pub async fn open_for_sweep(data_dir: &Path, did: &str) -> PdsResult<Option<Self>> {
+        let db_path = actor_db_path(data_dir, did);
+
+        if let Some(pool) = pool_cache()
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&db_path).cloned())
+        {
+            return Ok(Some(Self {
+                did: did.to_string(),
+                pool,
+            }));
+        }
+
+        if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let conn_str = format!("sqlite://{}", db_path.display());
+        let opts = SqliteConnectOptions::from_str(&conn_str)
+            .map_err(|e| PdsError::Storage {
+                reason: format!("SqliteConnectOptions::from_str({conn_str}): {e}"),
+            })?
+            .create_if_missing(false)
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("foreign_keys", "ON")
+            .busy_timeout(std::time::Duration::from_secs(5));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("connect_with({db_path:?}): {e}"),
+            })?;
+
+        Ok(Some(Self {
+            did: did.to_string(),
+            pool,
+        }))
+    }
+
     /// Open (and migrate) the per-actor DB for `did` under `data_dir`.
     ///
     /// Creates the parent `actors/` directory if missing. The DB file itself
