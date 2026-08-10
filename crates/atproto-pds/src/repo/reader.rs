@@ -539,14 +539,11 @@ impl RepoReader {
                     })?;
             row.map(|(r,)| r)
         };
+        let (active, status) = account.state.active_and_status();
         Ok(RepoStatusResponse {
             did: account.did,
-            active: account.state.allows_public_read(),
-            status: if account.state == AccountState::Active {
-                None
-            } else {
-                Some(account.state.as_str().to_string())
-            },
+            active,
+            status,
             rev,
         })
     }

@@ -731,3 +731,37 @@ async fn session_token(app: &axum::Router, handle: &str) -> String {
         .expect("createSession should return an access token")
         .to_string()
 }
+
+/// What a relay sees after an account deactivates.
+///
+/// `getRepoStatus` derived `active` from whether the repo could be read, which
+/// is true for a deactivated account -- so it answered `active: true` next to
+/// `status: "deactivated"`. A relay told through the firehose that the account
+/// is inactive would call this, be told otherwise, and resume indexing.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_repo_status_agrees_that_a_deactivated_account_is_inactive() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.deactivateAccount",
+        json!({"deleteAfter": null}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.sync.getRepoStatus?did=did:plc:alice",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["active"], false,
+        "a deactivated account must not be reported active: {body}"
+    );
+    assert_eq!(body["status"], "deactivated", "{body}");
+}

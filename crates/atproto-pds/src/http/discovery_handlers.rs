@@ -127,17 +127,6 @@ pub struct ListReposResponse {
     pub repos: Vec<ListReposRepo>,
 }
 
-/// Map an account's lifecycle state onto the `active`/`status` pair.
-///
-/// `status` is only meaningful when `active` is false, and the lexicon's
-/// `knownValues` are exactly the non-active states.
-fn active_and_status(state: AccountState) -> (bool, Option<String>) {
-    match state {
-        AccountState::Active => (true, None),
-        other => (false, Some(other.as_str().to_string())),
-    }
-}
-
 /// Handler for `com.atproto.sync.listRepos`. Unauthenticated.
 ///
 /// Accounts with no commits yet are omitted rather than reported with an empty
@@ -164,7 +153,7 @@ pub async fn list_repos(
         let Some(commit) = state.reader.get_latest_commit(&account.did).await? else {
             continue;
         };
-        let (active, status) = active_and_status(account.state);
+        let (active, status) = AccountState::active_and_status(account.state);
         repos.push(ListReposRepo {
             did: account.did,
             head: commit.cid,
@@ -311,7 +300,10 @@ mod tests {
 
     #[test]
     fn active_accounts_report_no_status() {
-        assert_eq!(active_and_status(AccountState::Active), (true, None));
+        assert_eq!(
+            AccountState::active_and_status(AccountState::Active),
+            (true, None)
+        );
     }
 
     #[test]
@@ -322,7 +314,7 @@ mod tests {
             AccountState::Deactivated,
             AccountState::Deleted,
         ] {
-            let (active, status) = active_and_status(state);
+            let (active, status) = AccountState::active_and_status(state);
             assert!(!active, "{state:?} should not be active");
             assert_eq!(status.as_deref(), Some(state.as_str()));
         }

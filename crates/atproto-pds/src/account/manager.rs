@@ -624,11 +624,11 @@ impl AccountManager {
         // `status` is optional, not nullable: an active account carries none.
         // Emitting `status: "active"` alongside `active: true` says the same
         // thing twice and is not a value the lexicon lists.
-        let active = matches!(new_state, AccountState::Active);
+        let (active, status) = new_state.active_and_status();
         let bytes = crate::sequencer::payload::encode(&crate::sequencer::payload::AccountBody {
             did: did.to_string(),
             active,
-            status: (!active).then(|| new_state.as_str().to_string()),
+            status,
         })?;
         self.sequencer()
             .append(did, crate::sequencer::EventType::Account.as_str(), bytes)

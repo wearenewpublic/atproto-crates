@@ -58,6 +58,28 @@ impl AccountState {
         matches!(self, AccountState::Active | AccountState::Deactivated)
     }
 
+    /// The `active` / `status` pair the sync lexicon asks for.
+    ///
+    /// One function because there were three, and one of them disagreed.
+    /// `getRepoStatus` derived `active` from `allows_public_read`, which is
+    /// true for `Deactivated` as well as `Active` -- so it answered
+    /// `active: true` beside `status: "deactivated"`, which is not a state an
+    /// account can be in. A relay told through the firehose that an account is
+    /// inactive would call `getRepoStatus`, be told it is active, and resume
+    /// indexing it.
+    ///
+    /// `status` is only meaningful when `active` is false, and the lexicon's
+    /// `knownValues` are exactly the non-active states. Reading from a repo and
+    /// being active are different questions: a deactivated account is still
+    /// readable, and is still not active.
+    #[must_use]
+    pub fn active_and_status(self) -> (bool, Option<String>) {
+        match self {
+            AccountState::Active => (true, None),
+            other => (false, Some(other.as_str().to_string())),
+        }
+    }
+
     /// `true` if the account can perform writes.
     #[must_use]
     pub fn allows_writes(self) -> bool {
@@ -74,6 +96,43 @@ impl fmt::Display for AccountState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deactivated account is readable and is not active. Deriving `active`
+    /// from `allows_public_read` conflated the two, so `getRepoStatus`
+    /// answered `active: true` beside `status: "deactivated"`.
+    #[test]
+    fn a_deactivated_account_is_not_active() {
+        let (active, status) = AccountState::Deactivated.active_and_status();
+        assert!(!active, "deactivated is not active, however readable it is");
+        assert_eq!(status.as_deref(), Some("deactivated"));
+        assert!(
+            AccountState::Deactivated.allows_public_read(),
+            "and it is still readable, which is the distinction that was lost"
+        );
+    }
+
+    /// `status` is only meaningful when `active` is false, so an active
+    /// account carries none.
+    #[test]
+    fn an_active_account_carries_no_status() {
+        assert_eq!(AccountState::Active.active_and_status(), (true, None));
+    }
+
+    /// Every non-active state reports itself, and none of them claims to be
+    /// active.
+    #[test]
+    fn no_non_active_state_reports_itself_active() {
+        for state in [
+            AccountState::Deactivated,
+            AccountState::Suspended,
+            AccountState::Takendown,
+            AccountState::Deleted,
+        ] {
+            let (active, status) = state.active_and_status();
+            assert!(!active, "{state} must not report active");
+            assert_eq!(status.as_deref(), Some(state.as_str()));
+        }
+    }
 
     #[test]
     fn round_trip() {
