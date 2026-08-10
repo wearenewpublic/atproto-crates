@@ -2498,3 +2498,131 @@ async fn get_session_discloses_the_email_to_the_granular_read_scope() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["email"], "alice@example.com", "{body}");
 }
+
+/// A resolver whose answer the test sets, which is what a client editing its
+/// own permission-set record looks like to this server.
+#[derive(Clone)]
+struct SwappablePermissionSet(Arc<std::sync::Mutex<Value>>);
+
+#[async_trait::async_trait]
+impl atproto_pds::repo::lexicon::LexiconResolver for SwappablePermissionSet {
+    async fn resolve(&self, _nsid: &str) -> Option<Value> {
+        Some(self.0.lock().unwrap().clone())
+    }
+}
+
+fn permission_set(collections: Value, actions: Value) -> Value {
+    json!({
+        "lexicon": 1,
+        "id": "app.example.access",
+        "defs": {"main": {
+            "type": "permission-set",
+            "title": "Example",
+            "permissions": [
+                {"resource": "repo", "collection": collections, "action": actions}
+            ]
+        }}
+    })
+}
+
+/// A permission set lives in the client's own repository, and it was resolved
+/// again at redemption to decide what the token carried. So a client could
+/// republish a wider set after the account holder approved the narrow one, and
+/// the read that counted was the later one.
+///
+/// The swap happens between approval and redemption deliberately: that is the
+/// window, and a test that runs the whole flow in one go never opens it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_permission_set_widened_after_approval_does_not_widen_the_token() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+
+    let published = Arc::new(std::sync::Mutex::new(permission_set(
+        json!(["app.example.note"]),
+        json!(["create"]),
+    )));
+    let resolver: Arc<dyn atproto_pds::repo::lexicon::LexiconResolver> =
+        Arc::new(SwappablePermissionSet(published.clone()));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_lexicon_resolver(resolver);
+    let app = build_router(state);
+
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let (verifier, challenge) = pkce_pair();
+
+    let (_, par_body) = post_json(
+        app.clone(),
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "atproto include:app.example.access", "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par_body["request_uri"].as_str().unwrap().to_string();
+
+    // The holder approves the narrow set.
+    let (_, authz) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.example",
+            "password": "pw", "approve": true,
+        }),
+    )
+    .await;
+    let code = authz["code"].as_str().unwrap().to_string();
+
+    // The client republishes a wider set before redeeming.
+    *published.lock().unwrap() =
+        permission_set(json!(["*"]), json!(["create", "update", "delete"]));
+
+    let (status, tokens) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {tokens}");
+
+    let granted = tokens["access_token"].as_str().unwrap();
+    let payload = granted.split('.').nth(1).expect("compact JWS");
+    let bytes = B64URL.decode(payload).expect("payload");
+    let claims: Value = serde_json::from_slice(&bytes).expect("claims");
+    let scope = claims["scope"].as_str().expect("scope claim");
+
+    assert!(
+        scope.contains("repo:app.example.note?action=create"),
+        "the token should carry the set as it stood at approval: {scope}"
+    );
+    assert!(
+        !scope.contains("repo:*"),
+        "a set republished after approval must not widen the token: {scope}"
+    );
+}

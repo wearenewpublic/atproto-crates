@@ -117,6 +117,25 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str, include_aud: Option<&st
         );
         return Vec::new();
     }
+    // A lexicon document names itself. Resolution is by NSID, but nothing
+    // required the document that came back to agree that it *is* that NSID --
+    // so a resolver returning the wrong document, or a client publishing one
+    // under a name it does not claim, expanded into permissions attributed to
+    // an NSID the account holder was shown and the document disowns.
+    //
+    // Absent `id` is tolerated: the check is that a stated identity matches,
+    // not that one is stated.
+    if let Some(id) = doc["id"].as_str()
+        && id != nsid
+    {
+        tracing::warn!(
+            nsid = %nsid,
+            id = %id,
+            "permission set resolved to a document naming a different lexicon; granting nothing"
+        );
+        return Vec::new();
+    }
+
     let Some(permissions) = main["permissions"].as_array() else {
         return Vec::new();
     };
@@ -287,6 +306,108 @@ mod tests {
         async fn resolve(&self, _nsid: &str) -> Option<serde_json::Value> {
             None
         }
+    }
+
+    /// A resolver whose answer changes between calls, which is what a client
+    /// editing its own permission-set record looks like from here.
+    struct Swappable(std::sync::Mutex<Vec<serde_json::Value>>);
+
+    #[async_trait::async_trait]
+    impl LexiconResolver for Swappable {
+        async fn resolve(&self, _nsid: &str) -> Option<serde_json::Value> {
+            let mut answers = self.0.lock().unwrap();
+            if answers.len() > 1 {
+                Some(answers.remove(0))
+            } else {
+                answers.first().cloned()
+            }
+        }
+    }
+
+    /// A permission set widened after it was first read must not widen a grant
+    /// that has already been expanded.
+    ///
+    /// This is the property the pin in `authorize` buys: expansion happens once
+    /// and its result is what the code carries. Expanding a second time later
+    /// -- which is what redemption used to do -- reads whatever the client has
+    /// published by then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_set_edited_after_expansion_does_not_widen_the_grant() {
+        let narrow = serde_json::json!({
+            "lexicon": 1,
+            "id": "app.example.access",
+            "defs": {"main": {
+                "type": "permission-set",
+                "title": "Example",
+                "permissions": [
+                    {"resource": "repo", "collection": ["app.example.note"], "action": ["create"]}
+                ]
+            }}
+        });
+        let wide = serde_json::json!({
+            "lexicon": 1,
+            "id": "app.example.access",
+            "defs": {"main": {
+                "type": "permission-set",
+                "title": "Example",
+                "permissions": [
+                    {"resource": "repo", "collection": ["*"],
+                     "action": ["create", "update", "delete"]}
+                ]
+            }}
+        });
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Swappable(std::sync::Mutex::new(vec![
+            narrow.clone(),
+            wide.clone(),
+        ])));
+
+        // The expansion the holder approved.
+        let pinned = expand(Some(&resolver), "include:app.example.access").await;
+        assert!(
+            pinned.contains("repo:app.example.note?action=create"),
+            "the narrow set should expand to its one collection: {pinned}"
+        );
+        assert!(
+            !pinned.contains("repo:*"),
+            "the narrow set must not grant every collection: {pinned}"
+        );
+
+        // The client has since republished a wider set. Whatever the token
+        // carries must still be the pinned string -- nothing re-reads it.
+        let second_read = expand(Some(&resolver), "include:app.example.access").await;
+        assert!(
+            second_read.contains("repo:*"),
+            "the fixture must actually serve the wider set second: {second_read}"
+        );
+        assert_ne!(
+            pinned, second_read,
+            "the fixture must distinguish the two reads, or this proves nothing"
+        );
+    }
+
+    /// A document that names a different lexicon than the one requested grants
+    /// nothing. Resolution is by NSID; nothing required the answer to agree
+    /// that it *is* that NSID.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_set_whose_id_disagrees_with_the_request_grants_nothing() {
+        let impostor = serde_json::json!({
+            "lexicon": 1,
+            "id": "app.attacker.access",
+            "defs": {"main": {
+                "type": "permission-set",
+                "title": "Something else entirely",
+                "permissions": [
+                    {"resource": "repo", "collection": ["*"],
+                     "action": ["create", "update", "delete"]}
+                ]
+            }}
+        });
+        let resolver: Arc<dyn LexiconResolver> = Arc::new(Fixed(impostor));
+        let expanded = expand(Some(&resolver), "include:app.example.access").await;
+        assert_eq!(
+            expanded, "include:app.example.access",
+            "a disowned document must contribute no permissions: {expanded}"
+        );
     }
 
     /// The record that started this: Bulleted's own permission set.

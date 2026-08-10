@@ -295,9 +295,11 @@ async fn handle_code(
     // permission-set record lives in the *client's* repository, and a client
     // that could re-expand on every refresh could widen a grant the account
     // holder approved once and never sees again.
-    let granted =
-        crate::oauth::permission_set::expand(state.lexicon_resolver.as_ref(), &auth.request.scope)
-            .await;
+    // Already expanded, when the holder approved. Re-expanding here is what
+    // let a client widen its own grant in the window before redemption by
+    // editing the permission-set record in its own repository; see the note at
+    // the pin in `authorize`.
+    let granted = auth.request.scope.clone();
 
     issue_pair(
         &state,

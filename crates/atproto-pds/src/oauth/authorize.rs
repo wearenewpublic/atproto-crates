@@ -189,6 +189,24 @@ pub async fn authorize_handler(
         ));
     }
 
+    // Pin the expansion here, at the moment the holder approves.
+    //
+    // A permission set lives in the *client's* repository. It used to be
+    // resolved twice: once by the consent page to describe it, and again at
+    // redemption to decide what the token actually carries. Between those two
+    // reads the client could edit its own record, so the grant a token came
+    // away with was not required to be the grant the account holder was shown
+    // -- and the second read is the one that counted.
+    //
+    // `permission_set` states the rule this restores: "A grant is what was
+    // shown at consent, and it has to stop moving after that." Expanding once,
+    // now, is what makes that true. There is no later reader of the
+    // unexpanded form: after a code exists the only thing that consults its
+    // scope is token issuance, and what that needs is the granted scope.
+    let mut request = request;
+    request.scope =
+        crate::oauth::permission_set::expand(state.lexicon_resolver.as_ref(), &request.scope).await;
+
     let code = random_code();
     let response = AuthorizeResponse {
         code: code.clone(),
