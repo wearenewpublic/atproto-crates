@@ -191,7 +191,11 @@ async fn proxy_call(
             "account management is not configured on this PDS",
         )
     })?;
-    let parts = build_parts_for_authn(&headers, &method)?;
+    // `nsid` is the request path with `/xrpc/` stripped, so this reconstructs
+    // exactly what the client addressed. The query is deliberately absent:
+    // `htu` excludes it (RFC 9449 §4.2) and `request_htm_htu` would strip it
+    // again anyway.
+    let parts = build_parts_for_authn(&headers, &method, &format!("/xrpc/{nsid}"))?;
     let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
     let subject = crate::http::auth::require_authn(&parts, state, &htm, &htu).await?;
 
@@ -322,13 +326,25 @@ async fn proxy_call(
 
 /// Build a `Parts` shim from the inbound headers + method for the auth
 /// extractor. The DPoP layer derives `htm`/`htu` from this.
+///
+/// `path` has to be the path the client actually requested. It used to be
+/// `"/"`, and `request_htm_htu` reads `parts.uri.path()`, so every proxied
+/// call derived an `htu` of `https://host/` however it was addressed.
+///
+/// That is wrong in both directions. A conformant client signs the URL it is
+/// calling, so its proof named `/xrpc/app.bsky.feed.getTimeline`, did not
+/// match, and was refused -- on all four proxied namespaces. A client written
+/// until this server accepted it ended up emitting proofs bound to
+/// `https://host/`, which match every proxied method equally, so a proof
+/// captured from one call authorises any other.
 fn build_parts_for_authn(
     headers: &HeaderMap,
     method: &Method,
+    path: &str,
 ) -> Result<axum::http::request::Parts, XrpcError> {
     let mut req = axum::http::Request::builder()
         .method(method.clone())
-        .uri("/")
+        .uri(path)
         .body(())
         .map_err(|e| {
             XrpcError::new(
@@ -435,6 +451,53 @@ mod tests {
             .unwrap();
         let reader = std::sync::Arc::new(crate::repo::RepoReader::new(accounts, dir));
         HttpState::new(reader)
+    }
+
+    /// The `htu` a proxied call is checked against must be the URL the client
+    /// addressed.
+    ///
+    /// The shim used `"/"`, so every proxied method derived the same `htu`.
+    /// A conformant client signs the URL it is calling and was refused; a
+    /// client written until this server accepted it emitted proofs bound to
+    /// the bare origin, which match every proxied method equally.
+    #[test]
+    fn the_authn_shim_carries_the_method_path() {
+        let parts = build_parts_for_authn(
+            &HeaderMap::new(),
+            &Method::GET,
+            "/xrpc/app.bsky.feed.getTimeline",
+        )
+        .expect("shim");
+        let (htm, htu) = crate::http::auth::request_htm_htu(&parts, 0);
+        assert_eq!(htm, "GET");
+        assert!(
+            htu.ends_with("/xrpc/app.bsky.feed.getTimeline"),
+            "the htu must name the method the client called, got {htu}"
+        );
+    }
+
+    /// Two different proxied methods must not share an `htu`, or a proof
+    /// captured from one authorises the other.
+    #[test]
+    fn two_proxied_methods_do_not_share_an_htu() {
+        let one = build_parts_for_authn(
+            &HeaderMap::new(),
+            &Method::GET,
+            "/xrpc/app.bsky.feed.getTimeline",
+        )
+        .expect("shim");
+        let two = build_parts_for_authn(
+            &HeaderMap::new(),
+            &Method::GET,
+            "/xrpc/chat.bsky.convo.sendMessage",
+        )
+        .expect("shim");
+        let (_, htu_one) = crate::http::auth::request_htm_htu(&one, 0);
+        let (_, htu_two) = crate::http::auth::request_htm_htu(&two, 0);
+        assert_ne!(
+            htu_one, htu_two,
+            "a proof bound to one proxied method must not satisfy another"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

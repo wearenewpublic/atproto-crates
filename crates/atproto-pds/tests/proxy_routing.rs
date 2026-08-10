@@ -392,3 +392,120 @@ async fn an_upstream_client_error_stays_quiet() {
         "a 404 from upstream is not a fault of this server"
     );
 }
+
+/// Obtain a DPoP-bound OAuth access token for `handle`.
+///
+/// The proxy tests otherwise use session tokens, which carry no `cnf` and so
+/// never reach the DPoP path -- which is why the `htu` this server derives for
+/// a proxied call went unexercised.
+async fn oauth_token(app: &axum::Router, key: &atproto_identity::key::KeyData) -> String {
+    use base64::Engine as _;
+    use sha2::Digest;
+
+    const CLIENT_ID: &str = "http://localhost";
+    const REDIRECT_URI: &str = "http://127.0.0.1/";
+    let verifier = "x".repeat(43);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+
+    let post = |path: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .uri(path)
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let body: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            body
+        }
+    };
+
+    let par = post(
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "atproto transition:generic", "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par["request_uri"].as_str().expect("PAR").to_string();
+
+    let authz = post(
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.test",
+            "password": "pw", "approve": true,
+        }),
+    )
+    .await;
+    let code = authz["code"].as_str().expect("authorize").to_string();
+
+    // The token endpoint wants a proof bound to itself.
+    let (dpop, _, _) =
+        atproto_oauth::dpop::auth_dpop(key, "POST", "https://test.example/oauth/token")
+            .expect("token-endpoint proof");
+    let req = Request::builder()
+        .uri("/oauth/token")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "grant_type": "authorization_code", "client_id": CLIENT_ID,
+                "code": code, "redirect_uri": REDIRECT_URI,
+                "code_verifier": verifier,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("token exchange: {body}"))
+        .to_string()
+}
+
+/// A conformant client signs the URL it is calling. The proxy derived an `htu`
+/// of `https://host/` for every proxied method, so that proof did not match
+/// and was refused -- on all four proxied namespaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proof_bound_to_the_real_url_is_accepted_on_a_proxied_call() {
+    let upstream = start_upstream().await;
+    let (app, manager, _tmp) = build_app(Some(&upstream)).await;
+    create_account(&app, &manager, "did:plc:alice", "alice.test").await;
+    let key = atproto_identity::key::generate_key(KeyType::P256Private).unwrap();
+    let token = oauth_token(&app, &key).await;
+
+    let path = "/xrpc/app.bsky.feed.getTimeline";
+    // No proxy is declared for this app, so the scheme the server derives is
+    // the one it was reached over. A client signs what it is calling.
+    let url = format!("http://test.example{path}");
+    let (dpop, _, _) =
+        atproto_oauth::dpop::request_dpop(&key, "GET", &url, &token).expect("resource proof");
+
+    let req = Request::builder()
+        .uri(path)
+        .method("GET")
+        .header("authorization", format!("DPoP {token}"))
+        .header("host", "test.example")
+        .header("DPoP", dpop)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a proof naming the URL the client called must be accepted"
+    );
+}
