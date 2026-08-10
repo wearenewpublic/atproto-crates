@@ -18,9 +18,9 @@
 //! is syntactic: it does not resolve DNS, so it does not defend against
 //! rebinding or a public name pointing into a private range.
 
+#[cfg(test)]
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atproto_identity::model::Document;
 
@@ -50,11 +50,11 @@ pub trait DidDocumentResolver: Send + Sync {
     async fn resolve(&self, did: &str) -> Option<Document>;
 }
 
-/// One cached resolution, successful or not.
-struct CacheEntry {
-    stored_at: Instant,
-    target: Option<ProxyTarget>,
-}
+/// How many resolutions this cache holds.
+///
+/// Large enough that a real working set stays resident, small enough that a
+/// caller producing distinct keys cannot turn the cache into a memory leak.
+const CACHE_CAPACITY: usize = 4_096;
 
 /// A [`DidDocumentResolver`] with a TTL cache in front of it.
 ///
@@ -64,8 +64,7 @@ struct CacheEntry {
 /// one.
 pub struct CachingProxyResolver {
     inner: std::sync::Arc<dyn DidDocumentResolver>,
-    ttl: Duration,
-    cache: Mutex<HashMap<String, CacheEntry>>,
+    cache: crate::ttl_cache::TtlCache<Option<ProxyTarget>>,
 }
 
 impl CachingProxyResolver {
@@ -74,8 +73,7 @@ impl CachingProxyResolver {
     pub fn new(inner: std::sync::Arc<dyn DidDocumentResolver>, ttl: Duration) -> Self {
         Self {
             inner,
-            ttl,
-            cache: Mutex::new(HashMap::new()),
+            cache: crate::ttl_cache::TtlCache::new(ttl, CACHE_CAPACITY),
         }
     }
 
@@ -110,25 +108,11 @@ impl CachingProxyResolver {
     }
 
     fn cached(&self, key: &str) -> Option<Option<ProxyTarget>> {
-        let guard = self.cache.lock().ok()?;
-        let entry = guard.get(key)?;
-        if entry.stored_at.elapsed() < self.ttl {
-            Some(entry.target.clone())
-        } else {
-            None
-        }
+        self.cache.get(key)
     }
 
     fn store(&self, key: &str, target: Option<ProxyTarget>) {
-        if let Ok(mut guard) = self.cache.lock() {
-            guard.insert(
-                key.to_string(),
-                CacheEntry {
-                    stored_at: Instant::now(),
-                    target,
-                },
-            );
-        }
+        self.cache.put(key, target);
     }
 }
 

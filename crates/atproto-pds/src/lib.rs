@@ -79,6 +79,9 @@ pub mod shutdown;
 pub mod space;
 pub mod takedown;
 pub mod telemetry;
+
+/// A bounded, time-to-live cache for resolver results.
+pub mod ttl_cache;
 #[cfg(feature = "valkey")]
 pub mod valkey_backend;
 

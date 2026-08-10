@@ -37,8 +37,8 @@
 use atproto_lexicon::validation::schema_file::SchemaFile;
 use atproto_lexicon::validation::validate::BaseCatalog;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// How many schema documents one validation may pull in.
 ///
@@ -126,15 +126,26 @@ impl LexiconResolver for NetworkLexiconResolver {
     }
 }
 
+/// How many resolutions each resolver cache holds.
+///
+/// Large enough that a real working set -- the collections one server writes,
+/// the services it proxies to -- stays resident, small enough that a caller
+/// producing distinct keys cannot turn the cache into a memory leak. The
+/// number is a bound, not a target: nothing pre-allocates it.
+const CACHE_CAPACITY: usize = 4_096;
+
 /// A resolver that remembers answers, including the negative ones.
 ///
 /// Caching a miss matters as much as caching a hit: an unresolvable NSID costs
 /// a DNS lookup and a DID resolution to discover, and a repo writing records in
 /// an unpublished collection would pay it on every single write.
+///
+/// The cache is bounded. It was a `HashMap` that only ever grew: the read path
+/// ignored an expired entry and the write path only inserted, so a caller
+/// writing records in many distinct collections could grow it without limit.
 pub struct CachingLexiconResolver {
     inner: Arc<dyn LexiconResolver>,
-    ttl: Duration,
-    entries: Mutex<HashMap<String, (Instant, Option<serde_json::Value>)>>,
+    entries: crate::ttl_cache::TtlCache<Option<serde_json::Value>>,
 }
 
 impl CachingLexiconResolver {
@@ -143,31 +154,19 @@ impl CachingLexiconResolver {
     pub fn new(inner: Arc<dyn LexiconResolver>, ttl: Duration) -> Self {
         Self {
             inner,
-            ttl,
-            entries: Mutex::new(HashMap::new()),
+            entries: crate::ttl_cache::TtlCache::new(ttl, CACHE_CAPACITY),
         }
-    }
-
-    fn cached(&self, nsid: &str) -> Option<Option<serde_json::Value>> {
-        let entries = self.entries.lock().ok()?;
-        let (at, value) = entries.get(nsid)?;
-        if at.elapsed() > self.ttl {
-            return None;
-        }
-        Some(value.clone())
     }
 }
 
 #[async_trait::async_trait]
 impl LexiconResolver for CachingLexiconResolver {
     async fn resolve(&self, nsid: &str) -> Option<serde_json::Value> {
-        if let Some(hit) = self.cached(nsid) {
+        if let Some(hit) = self.entries.get(nsid) {
             return hit;
         }
         let result = self.inner.resolve(nsid).await;
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.insert(nsid.to_string(), (Instant::now(), result.clone()));
-        }
+        self.entries.put(nsid, result.clone());
         result
     }
 }

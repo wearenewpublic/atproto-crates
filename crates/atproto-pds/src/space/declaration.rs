@@ -30,10 +30,10 @@
 
 use atproto_lexicon::validation::schema::SchemaDef;
 use atproto_lexicon::validation::schema_file::SchemaFile;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A resolved space-type declaration (`defs.main` with `"type": "space"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,24 +224,24 @@ async fn lexicon_authority_did(
     if dids.len() == 1 { dids.pop() } else { None }
 }
 
-/// One cache slot: the resolution result (positive or fail-closed `None`) and
-/// when it was stored.
-#[derive(Clone)]
-struct CacheEntry {
-    stored_at: Instant,
-    result: Option<SpaceDeclaration>,
-}
+/// How many resolutions this cache holds.
+///
+/// Large enough that a real working set stays resident, small enough that a
+/// caller producing distinct keys cannot turn the cache into a memory leak.
+const CACHE_CAPACITY: usize = 4_096;
 
 /// TTL cache wrapper over any [`SpaceDeclarationResolver`].
 ///
 /// Caches both successful resolutions and fail-closed `None` results (negative
 /// caching) for `ttl`, so a hot authorization path does not re-resolve — or
-/// re-fail — on every request. The cache is unbounded; the space-type NSID
-/// keyspace is small and operator-controlled in practice.
+/// re-fail — on every request.
+///
+/// Bounded, despite the space-type NSID keyspace being small in practice. The
+/// key still arrives on a request, and "small in practice" is a description of
+/// how it is used rather than a limit on how it can be used.
 pub struct CachingSpaceDeclarationResolver {
     inner: Arc<dyn SpaceDeclarationResolver>,
-    ttl: Duration,
-    cache: Mutex<HashMap<String, CacheEntry>>,
+    cache: crate::ttl_cache::TtlCache<Option<SpaceDeclaration>>,
 }
 
 impl CachingSpaceDeclarationResolver {
@@ -250,33 +250,18 @@ impl CachingSpaceDeclarationResolver {
     pub fn new(inner: Arc<dyn SpaceDeclarationResolver>, ttl: Duration) -> Self {
         Self {
             inner,
-            ttl,
-            cache: Mutex::new(HashMap::new()),
+            cache: crate::ttl_cache::TtlCache::new(ttl, CACHE_CAPACITY),
         }
     }
 
     /// Return a cached, non-expired result for `nsid`, if any.
     fn cached(&self, nsid: &str) -> Option<Option<SpaceDeclaration>> {
-        let guard = self.cache.lock().ok()?;
-        let entry = guard.get(nsid)?;
-        if entry.stored_at.elapsed() < self.ttl {
-            Some(entry.result.clone())
-        } else {
-            None
-        }
+        self.cache.get(nsid)
     }
 
     /// Store a resolution result for `nsid`.
     fn store(&self, nsid: &str, result: Option<SpaceDeclaration>) {
-        if let Ok(mut guard) = self.cache.lock() {
-            guard.insert(
-                nsid.to_string(),
-                CacheEntry {
-                    stored_at: Instant::now(),
-                    result,
-                },
-            );
-        }
+        self.cache.put(nsid, result);
     }
 }
 
