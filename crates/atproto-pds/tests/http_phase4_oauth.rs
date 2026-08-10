@@ -2626,3 +2626,84 @@ async fn a_permission_set_widened_after_approval_does_not_widen_the_token() {
         "a set republished after approval must not widen the token: {scope}"
     );
 }
+
+/// A code presented twice revokes the grant it issued.
+///
+/// RFC 6749 §4.1.2 says the authorization server SHOULD revoke the tokens it
+/// previously issued from a replayed code. Nothing did: the second
+/// presentation got a generic `invalid_grant` while whoever redeemed it first
+/// kept their session, so the one signal a stolen code produces was discarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn replaying_an_authorization_code_revokes_the_grant_it_issued() {
+    let (app, manager, _tmp) = build_app().await;
+    create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+    let key = dpop_key();
+    let (verifier, challenge) = pkce_pair();
+
+    let (_, par_body) = post_json(
+        app.clone(),
+        "/oauth/par",
+        json!({
+            "client_id": CLIENT_ID, "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": "atproto", "state": "s",
+            "code_challenge": challenge, "code_challenge_method": "S256",
+        }),
+    )
+    .await;
+    let request_uri = par_body["request_uri"].as_str().unwrap().to_string();
+    let (_, authz) = post_json(
+        app.clone(),
+        "/oauth/authorize",
+        json!({
+            "request_uri": request_uri, "identifier": "alice.example",
+            "password": "pw", "approve": true,
+        }),
+    )
+    .await;
+    let code = authz["code"].as_str().unwrap().to_string();
+
+    // The legitimate redemption.
+    let (status, tokens) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier.clone(),
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    // The replay. It fails, as it always did.
+    let (status, _) = post_token(
+        app.clone(),
+        json!({
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "code": code, "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // What is new: the session the code issued is gone. Without this the
+    // replay is detected and nothing is done about it.
+    let (status, body) = post_token(
+        app,
+        json!({
+            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+            "refresh_token": refresh,
+        }),
+        &key,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the grant issued by a replayed code must be revoked: {body}"
+    );
+}

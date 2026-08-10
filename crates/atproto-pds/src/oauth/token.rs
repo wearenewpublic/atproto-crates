@@ -186,18 +186,39 @@ async fn handle_code(
     let code = input.code.as_deref().ok_or_else(|| {
         XrpcError::new(StatusCode::BAD_REQUEST, "invalid_request", "code required")
     })?;
-    let auth = state
-        .oauth
-        .take_code(code)
-        .await
-        .map_err(XrpcError::from)?
-        .ok_or_else(|| {
-            XrpcError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "code unknown or expired",
-            )
-        })?;
+    let Some(auth) = state.oauth.take_code(code).await.map_err(XrpcError::from)? else {
+        // The code is unknown: either it never existed, or it has already been
+        // redeemed and this is a replay.
+        //
+        // RFC 6749 §4.1.2 says the authorization server SHOULD revoke the
+        // tokens it previously issued from a code presented twice, and nothing
+        // did -- the second presentation got a generic `invalid_grant` while
+        // whoever redeemed it first kept their session. PKCE and the pinned
+        // `dpop_jkt` make stealing a code hard, which is why this is not worse
+        // than it is, but a second presentation is a signal that was being
+        // discarded for free.
+        //
+        // The grant to revoke is found without having stored anything: the
+        // family a code issues is derived from the code, so a replayed code
+        // names its own descendants. A code that never existed derives a family
+        // nobody holds and revokes nothing.
+        let revoked = state
+            .oauth
+            .revoke_refresh_family(&family_for_code(code))
+            .await
+            .map_err(XrpcError::from)?;
+        if revoked > 0 {
+            tracing::warn!(
+                revoked,
+                "an authorization code was presented twice; revoking the grant it issued"
+            );
+        }
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "code unknown or expired",
+        ));
+    };
 
     if auth.request.client_id != input.client_id {
         return Err(XrpcError::new(
@@ -307,8 +328,9 @@ async fn handle_code(
         &auth.request.client_id,
         &granted,
         &proof_jkt,
-        // A code exchange begins a new grant, so it begins a new chain.
-        &random_jti(),
+        // A code exchange begins a new grant, so it begins a new chain --
+        // named after the code, so a replay of that code can find it.
+        &family_for_code(code),
         client_kid.as_deref(),
     )
     .await
@@ -498,6 +520,29 @@ async fn handle_refresh(
     )
     .await
     .map(Json)
+}
+
+/// The refresh-token family a code issues.
+///
+/// Derived from the code rather than random so that a *replayed* code can name
+/// the grant it produced, without a row recording the association -- the code
+/// row is deleted when it is redeemed, which is precisely the state a replay
+/// arrives in.
+///
+/// Deriving rather than using the code itself keeps the code out of the
+/// database: `family_id` is stored on every refresh row, and an authorization
+/// code is a credential even after it has been spent, since presenting it is
+/// what triggers the revocation above.
+///
+/// Predictability is not a weakness here. Computing a family id requires the
+/// code, and holding the code is already the precondition for everything this
+/// guards.
+fn family_for_code(code: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"atproto-pds-refresh-family");
+    hasher.update(code.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Refuse a refresh whose client assertion was signed by a different key than
