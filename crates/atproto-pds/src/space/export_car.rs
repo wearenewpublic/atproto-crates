@@ -51,24 +51,76 @@ pub const EXPORT_PAGE: u32 = 100;
 /// [`PdsError::Storage`] when a stored CID does not parse, when the index
 /// cannot be encoded, or on a CAR write failure.
 pub async fn build_repo_car(commit_block: &[u8], records: Vec<RecordRow>) -> PdsResult<Vec<u8>> {
-    let commit_cid = atproto_dasl::cid::compute_cid(commit_block);
+    let mut sorted = SortedRecords::default();
+    sorted.extend(records)?;
+    build_repo_car_sorted(commit_block, sorted).await
+}
 
-    // A BTreeMap gives the lexicographic ordering the lexicon asks for, and it
-    // is the same ordering the index needs — so sorting happens once, here,
-    // rather than being asserted in two places.
-    let mut by_key: BTreeMap<String, (cid::Cid, Vec<u8>)> = BTreeMap::new();
-    for row in records {
-        let parsed: cid::Cid = row.cid.parse().map_err(|e: cid::Error| PdsError::Storage {
-            reason: format!(
-                "stored permissioned record CID {} does not parse: {e}",
-                row.cid
-            ),
-        })?;
-        by_key.insert(
-            format!("{}/{}", row.collection, row.rkey),
-            (parsed, row.value),
-        );
+/// Records held in the order the CAR has to write them.
+///
+/// A `BTreeMap` because the sort is not optional: the format declares an index
+/// root and requires the record blocks to follow in lexicographic key order,
+/// so every record has to be in hand before the first byte of the header can
+/// be written. That is why an export is bounded by the size of the repo rather
+/// than by a page — and why filling this incrementally, as the pages arrive,
+/// is worth doing even though it cannot change that bound.
+#[derive(Default)]
+pub struct SortedRecords {
+    by_key: BTreeMap<String, (cid::Cid, Vec<u8>)>,
+}
+
+impl SortedRecords {
+    /// Add one page of records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if a stored record CID does not parse.
+    pub fn extend(&mut self, records: Vec<RecordRow>) -> PdsResult<()> {
+        for row in records {
+            let parsed: cid::Cid = row.cid.parse().map_err(|e: cid::Error| PdsError::Storage {
+                reason: format!(
+                    "stored permissioned record CID {} does not parse: {e}",
+                    row.cid
+                ),
+            })?;
+            self.by_key.insert(
+                format!("{}/{}", row.collection, row.rkey),
+                (parsed, row.value),
+            );
+        }
+        Ok(())
     }
+
+    /// How many records are held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Whether no records are held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    /// Total size of the record values, for the caller's own accounting.
+    #[must_use]
+    pub fn value_bytes(&self) -> usize {
+        self.by_key.values().map(|(_, v)| v.len()).sum()
+    }
+}
+
+/// [`build_repo_car`] over records a caller has already accumulated.
+///
+/// # Errors
+///
+/// As [`build_repo_car`].
+pub async fn build_repo_car_sorted(
+    commit_block: &[u8],
+    sorted: SortedRecords,
+) -> PdsResult<Vec<u8>> {
+    let commit_cid = atproto_dasl::cid::compute_cid(commit_block);
+    let by_key = sorted.by_key;
 
     // The index is a DRISL map of key -> link. Built through the atproto-JSON
     // encoder — the same one that produced these record CIDs — so `$link`
@@ -290,5 +342,37 @@ mod tests {
         let index: serde_json::Value =
             atproto_dasl::atproto_json::from_slice(&index_bytes).unwrap();
         assert_eq!(index.as_object().unwrap().len(), 0);
+    }
+
+    /// Paging an export does not rebuild the actor's pool per page.
+    ///
+    /// The audit read this as "two SQLite pools per 100-record page", which
+    /// would make a 100k-record export two thousand pool builds and migration
+    /// runs inside one request. That was true when it was written and is not
+    /// now: every `SqlActorStore::open` reads through a process-wide pool
+    /// cache, so the pages after the first cost a clone. Pinned here because
+    /// the export is the path where losing that would be most expensive, and
+    /// nothing else on it would notice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paging_an_export_opens_the_actor_once() {
+        use crate::actor_store::sql::{SqlActorStore, pools_built_for_did};
+        let tmp = tempfile::tempdir().unwrap();
+        let did = "did:plc:exportpaging";
+
+        SqlActorStore::open(tmp.path(), did).await.unwrap();
+        let after_first = pools_built_for_did(tmp.path(), did);
+
+        // Twenty pages' worth of opens, which is what draining a 2,000-record
+        // repo costs the export loop.
+        for _ in 0..20 {
+            SqlActorStore::open(tmp.path(), did).await.unwrap();
+        }
+
+        assert_eq!(
+            pools_built_for_did(tmp.path(), did),
+            after_first,
+            "paging rebuilt the actor's pool; an export would pay a pool build \
+             and a migration run per page"
+        );
     }
 }

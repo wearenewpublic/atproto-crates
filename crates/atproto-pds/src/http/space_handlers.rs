@@ -1623,7 +1623,12 @@ pub async fn get_repo(
     // lexicon's 100, and an export that issued one unbounded query would be
     // reaching around the contract every other reader honours.
     let reader = space_reader(&state)?;
-    let mut records = Vec::new();
+    // Pages fold into the sorted set as they arrive rather than piling up in a
+    // second `Vec` first. This does not change what an export costs -- the
+    // format declares an index root and requires lexicographic block order, so
+    // every record has to be in hand before the header can be written -- but
+    // it stops the same records being held twice on the way there.
+    let mut records = crate::space::export_car::SortedRecords::default();
     let collections = reader
         .list_collections(&uri, &q.repo)
         .await
@@ -1646,7 +1651,7 @@ pub async fn get_repo(
                 .await
                 .map_err(XrpcError::from)?;
             let drained = page.records.len();
-            records.extend(page.records);
+            records.extend(page.records).map_err(XrpcError::from)?;
             // A page shorter than the limit is the last one. Relying on the
             // cursor going `None` would spin forever if a page were entirely
             // filtered by a takedown.
@@ -1660,7 +1665,7 @@ pub async fn get_repo(
         }
     }
 
-    let car = crate::space::export_car::build_repo_car(&commit_block, records)
+    let car = crate::space::export_car::build_repo_car_sorted(&commit_block, records)
         .await
         .map_err(XrpcError::from)?;
 
