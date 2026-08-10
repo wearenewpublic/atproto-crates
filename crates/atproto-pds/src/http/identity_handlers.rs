@@ -852,12 +852,59 @@ pub async fn refresh_identity(
         }
     }
 
+    // Check the half of the handle this server does not control: the domain
+    // resolving back to the DID. `alsoKnownAs` above is the DID's claim, and
+    // reading it proves nothing on its own -- a handle whose DNS record
+    // expired still appears there, unchanged, forever.
+    //
+    // Only for handles this server does not issue. A service handle resolves
+    // because this server answers for it, so checking it asks this process
+    // whether it is running.
+    let handle_to_check = match manager.lookup_handle(&input.did).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(did = %input.did, error = ?e, "refreshIdentity: handle lookup failed");
+            None
+        }
+    };
+    let mut handle_invalid = false;
+    if let Some(ref handle) = handle_to_check
+        && !crate::handle::is_service_domain(handle, &state.service_handle_domains)
+    {
+        let resolved = prove_handle_ownership(&state, &input.did, handle)
+            .await
+            .is_ok();
+        handle_invalid = !resolved;
+        if let Err(e) =
+            crate::account::handle_validation::record(&manager.account_pool(), &input.did, resolved)
+                .await
+        {
+            tracing::warn!(did = %input.did, error = ?e, "refreshIdentity: recording handle validity failed");
+        } else if !resolved {
+            tracing::info!(
+                did = %input.did,
+                handle = %handle,
+                "refreshIdentity: handle no longer resolves; serving handle.invalid"
+            );
+        }
+    }
+
     // Emit an `#identity` event onto the firehose stream. Best-effort:
     // failures log and we still return Ok with `identityEventEmitted=false`.
+    //
+    // A handle that failed the check is announced without one. The lexicon
+    // makes `handle` optional precisely so a server can say "re-resolve this
+    // DID, and do not take my word for its handle"; sending the stored handle
+    // would tell consumers the opposite of what this server just learned.
+    let announced_handle = if handle_invalid {
+        None
+    } else {
+        observed_handle.as_deref()
+    };
     let event_emitted = match emit_identity_event(
         &manager.sequencer(),
         &input.did,
-        observed_handle.as_deref(),
+        announced_handle,
     )
     .await
     {

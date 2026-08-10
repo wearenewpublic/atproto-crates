@@ -743,3 +743,203 @@ async fn submit_plc_operation_lets_a_conformant_operation_through_to_plc() {
         "expected the unroutable directory to fail the submission, got {status}: {body}"
     );
 }
+
+/// A handle that has stopped resolving is served as `handle.invalid`.
+///
+/// The account keeps its handle -- the record is untouched -- but callers are
+/// told a name they can act on rather than one the rest of the network will
+/// refuse to honour. Before this, a handle whose DNS record expired was served
+/// as live indefinitely, and `describeRepo` asserted `handleIsCorrect: true`
+/// on the strength of a proof taken when the handle was first set.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalidated_handle_is_served_as_handle_invalid() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    atproto_pds::account::handle_validation::record(
+        &manager.account_pool(),
+        "did:plc:alice",
+        false,
+    )
+    .await
+    .expect("record the failed check");
+
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handle"], "handle.invalid", "{body}");
+    assert_eq!(
+        body["did"], "did:plc:alice",
+        "the DID is unaffected: {body}"
+    );
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.describeRepo?repo=did:plc:alice",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handle"], "handle.invalid", "{body}");
+    assert_eq!(
+        body["handleIsCorrect"], false,
+        "the lexicon has a field for exactly this: {body}"
+    );
+    // The DID document is a statement of what this DID claims to be known as,
+    // and a lapsed DNS record does not retract the claim. Putting
+    // `handle.invalid` here would publish a DID document asserting an identity
+    // that cannot exist.
+    assert_eq!(
+        body["didDoc"]["alsoKnownAs"][0], "at://alice.example",
+        "the document keeps the account's own handle: {body}"
+    );
+}
+
+/// An account nobody has checked keeps its handle.
+///
+/// This is the failure mode that would matter most: every account starts
+/// unchecked, so treating "no record" as "invalid" would serve
+/// `handle.invalid` for the whole server the moment this shipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchecked_handle_is_served_as_itself() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handle"], "alice.example", "{body}");
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.describeRepo?repo=did:plc:alice",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handle"], "alice.example", "{body}");
+    assert_eq!(body["handleIsCorrect"], true, "{body}");
+}
+
+/// A handle that resolves again is served again.
+///
+/// The recovery path is the one an account holder actually walks: the DNS
+/// record comes back, the next check passes, and nothing on this server should
+/// need an operator to undo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recovered_handle_is_served_again() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    atproto_pds::account::handle_validation::record(
+        &manager.account_pool(),
+        "did:plc:alice",
+        false,
+    )
+    .await
+    .expect("record the failed check");
+    atproto_pds::account::handle_validation::record(&manager.account_pool(), "did:plc:alice", true)
+        .await
+        .expect("record the passing check");
+
+    let (status, body) = get_json(app, "/xrpc/com.atproto.server.getSession", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handle"], "alice.example", "{body}");
+}
+
+/// `refreshIdentity` is what notices.
+///
+/// It read the DID document's `alsoKnownAs` and stopped there, which proves
+/// nothing on its own -- a handle whose DNS record expired still appears
+/// there, unchanged, forever. The half that can go wrong is the domain
+/// resolving back to the DID, and nothing checked it after the handle was
+/// first set.
+///
+/// `alice.example` is a reserved domain with no `.well-known` and no DNS
+/// record, so the check fails the way a real broken handle does.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_identity_marks_a_handle_that_no_longer_resolves() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account(&app, &manager, "did:web:alice.example", "alice.example").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.repo.describeRepo?repo=did:web:alice.example",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handleIsCorrect"], true, "unchecked, so far: {body}");
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.identity.refreshIdentity",
+        json!({"did": "did:web:alice.example"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.describeRepo?repo=did:web:alice.example",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["handleIsCorrect"], false,
+        "the refresh checked the handle and it did not resolve: {body}"
+    );
+    assert_eq!(body["handle"], "handle.invalid", "{body}");
+}
+
+/// A handle this server issues is not checked against the open internet.
+///
+/// A service handle resolves because this server answers for it, so checking
+/// one asks this process whether it is running -- and the answer arrives over
+/// a network round-trip that can fail for reasons that have nothing to do with
+/// the handle. Getting this wrong is not a small error: every account on a
+/// server that issues its own handles would go `handle.invalid` together, on
+/// one bad DNS moment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_handle_is_not_checked() {
+    let (app, manager, _tmp) = build_app_with_service_domain().await;
+    let token = create_account(
+        &app,
+        &manager,
+        "did:web:alice.example.test",
+        "alice.example.test",
+    )
+    .await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.identity.refreshIdentity",
+        json!({"did": "did:web:alice.example.test"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = get_json(
+        app,
+        "/xrpc/com.atproto.repo.describeRepo?repo=did:web:alice.example.test",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["handle"], "alice.example.test", "{body}");
+    assert_eq!(
+        body["handleIsCorrect"], true,
+        "a handle this server issues must not be invalidated by a lookup: {body}"
+    );
+}

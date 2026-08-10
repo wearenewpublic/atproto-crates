@@ -187,6 +187,26 @@ fn session_account_fields(
     )
 }
 
+/// The handle to report for an account, which is not always the one stored.
+///
+/// A handle that has stopped resolving back to its DID is reported as
+/// `handle.invalid` rather than as itself, so a client is not told a name the
+/// rest of the network will refuse to honour. The stored handle is untouched:
+/// this is what callers are told, not what the account is.
+///
+/// A storage failure serves the stored handle. Being unable to read the check
+/// is not evidence the handle is broken, and invalidating every handle on the
+/// server because one query failed is the worse of the two mistakes.
+async fn served_handle(pool: &crate::account::AccountPool, did: &str, stored: &str) -> String {
+    match crate::account::handle_validation::validity(pool, did).await {
+        Ok(validity) => validity.serve(stored).to_string(),
+        Err(e) => {
+            tracing::warn!(did = %did, error = ?e, "handle validity lookup failed; serving the stored handle");
+            stored.to_string()
+        }
+    }
+}
+
 fn account_manager(state: &HttpState) -> Result<&account::AccountManager, XrpcError> {
     state.account_manager.as_deref().ok_or_else(|| {
         XrpcError::new(
@@ -664,10 +684,16 @@ pub async fn create_session(
     .map_err(XrpcError::from)?;
 
     let (email, email_confirmed, active, status) = session_account_fields(&account);
+    let handle = served_handle(
+        &state.reader.accounts().account_pool(),
+        &account.did,
+        &account.handle,
+    )
+    .await;
     Ok(Json(SessionResponse {
         access_jwt: tokens.access_jwt,
         refresh_jwt: tokens.refresh_jwt,
-        handle: account.handle,
+        handle,
         did: account.did,
         email,
         email_confirmed,
@@ -749,8 +775,14 @@ pub async fn get_session(
     // the one the scope system is making here.
     let disclose_email = !subject.is_oauth() || subject.scopes().allows_account_email_read();
 
+    let handle = served_handle(
+        &state.reader.accounts().account_pool(),
+        &account.did,
+        &account.handle,
+    )
+    .await;
     Ok(Json(GetSessionResponse {
-        handle: account.handle,
+        handle,
         did: account.did,
         email: disclose_email.then_some(account.email).flatten(),
         email_confirmed: disclose_email.then_some(account.email_confirmed_at.is_some()),
@@ -819,10 +851,21 @@ pub async fn refresh_session(
             .as_ref()
             .map(session_account_fields)
             .unwrap_or((None, false, false, None));
+        let handle = match account_row {
+            Some(ref row) => {
+                served_handle(
+                    &state.reader.accounts().account_pool(),
+                    &claims.sub,
+                    &row.handle,
+                )
+                .await
+            }
+            None => String::new(),
+        };
         return Ok(Json(SessionResponse {
             access_jwt: existing.access_jwt,
             refresh_jwt: existing.refresh_jwt,
-            handle: account_row.map(|a| a.handle).unwrap_or_default(),
+            handle,
             did: claims.sub,
             email,
             email_confirmed,
@@ -903,10 +946,16 @@ pub async fn refresh_session(
         .insert(&claims.jti, &tokens, presented_from);
 
     let (email, email_confirmed, active, status) = session_account_fields(&account);
+    let handle = served_handle(
+        &state.reader.accounts().account_pool(),
+        &account.did,
+        &account.handle,
+    )
+    .await;
     Ok(Json(SessionResponse {
         access_jwt: tokens.access_jwt,
         refresh_jwt: tokens.refresh_jwt,
-        handle: account.handle,
+        handle,
         did: account.did,
         email,
         email_confirmed,

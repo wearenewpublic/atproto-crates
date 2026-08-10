@@ -195,7 +195,12 @@ pub async fn describe_repo(
     Query(params): Query<DescribeRepoParams>,
 ) -> Result<Json<DescribeRepoResponse>, XrpcError> {
     let mut response = state.reader.describe_repo(&params.repo).await?;
-    response.did_doc = Some(local_did_document(&state, &response.did, &response.handle).await?);
+    // The stored handle, not the served one: a DID document says what this
+    // DID claims to be known as, and a lapsed DNS record does not retract the
+    // claim. Callers get `handle.invalid` in the `handle` field above, which
+    // is where "cannot be confirmed right now" belongs.
+    response.did_doc =
+        Some(local_did_document(&state, &response.did, &response.stored_handle).await?);
     Ok(Json(response))
 }
 

@@ -447,13 +447,25 @@ impl RepoReader {
     /// Implementation of `com.atproto.repo.describeRepo`.
     pub async fn describe_repo(&self, repo: &str) -> PdsResult<DescribeRepoResponse> {
         let account = self.require_available(repo).await?;
+        // `handleIsCorrect` is the lexicon's word for the bidirectional check
+        // -- the domain resolving back to this DID -- and it was answered
+        // `true` unconditionally, on the strength of a proof taken when the
+        // handle was set and never revisited.
+        let validity = crate::account::handle_validation::validity(
+            &self.accounts.account_pool(),
+            &account.did,
+        )
+        .await?;
+        let handle = validity.serve(&account.handle).to_string();
+        let handle_is_correct = !validity.is_invalid();
         if let Some(backend) = self.backend.as_ref() {
             let collections = backend.repo_record.list_collections(&account.did).await?;
             let latest = backend.commit_obj.latest(&account.did).await?;
             return Ok(DescribeRepoResponse {
-                handle: account.handle,
+                handle,
+                stored_handle: account.handle,
                 did: account.did,
-                handle_is_correct: true,
+                handle_is_correct,
                 did_doc: None,
                 collections,
                 head_cid: latest.as_ref().map(|c| c.cid.clone()),
@@ -482,9 +494,10 @@ impl RepoReader {
                 })?;
 
         Ok(DescribeRepoResponse {
-            handle: account.handle,
+            handle,
+            stored_handle: account.handle,
             did: account.did,
-            handle_is_correct: true,
+            handle_is_correct,
             did_doc: None,
             collections,
             head_cid: latest_commit.as_ref().map(|(c, _, _)| c.clone()),
@@ -595,6 +608,15 @@ pub struct DescribeRepoResponse {
     /// Whether the handle resolves correctly.
     #[serde(rename = "handleIsCorrect")]
     pub handle_is_correct: bool,
+    /// The handle on the account row, which differs from [`Self::handle`]
+    /// only when the handle has stopped resolving.
+    ///
+    /// Not part of the lexicon and never serialized. The DID document is a
+    /// statement of what this DID claims to be known as, and that claim does
+    /// not change because a DNS record lapsed -- `alsoKnownAs` must carry the
+    /// account's handle even while callers are being told `handle.invalid`.
+    #[serde(skip)]
+    pub stored_handle: String,
     /// The account's DID document.
     ///
     /// Required by the lexicon. Populated by the HTTP layer, which holds the

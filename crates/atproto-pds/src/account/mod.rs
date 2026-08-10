@@ -30,6 +30,9 @@ pub mod email_token;
 #[cfg(feature = "sqlite")]
 pub mod directory;
 
+/// Whether an account's handle still resolves to it.
+pub mod handle_validation;
+
 #[cfg(feature = "sqlite")]
 pub mod invite;
 
@@ -61,6 +64,7 @@ pub use app_password::{AppPasswordRow, CreatedAppPassword};
 
 #[cfg(feature = "sqlite")]
 pub use directory::{AccountDirectory, AccountRow};
+pub use handle_validation::{HandleValidity, INVALID_HANDLE};
 
 #[cfg(feature = "sqlite")]
 pub use invite::InviteCodeRow;
