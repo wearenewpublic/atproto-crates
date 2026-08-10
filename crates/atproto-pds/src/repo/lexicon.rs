@@ -212,9 +212,15 @@ fn referenced_nsids(value: &serde_json::Value, out: &mut HashSet<String>) {
 }
 
 /// The outcome of trying to build a validation catalog for one collection.
+///
+/// `Clone`, with the catalog behind an `Arc`, so the result can be cached.
+/// Building one parses every schema in the closure, and the closure for a
+/// collection does not change between two records written to it a millisecond
+/// apart.
+#[derive(Clone)]
 pub enum CatalogOutcome {
     /// The schema and everything it references resolved.
-    Ready(Box<BaseCatalog>),
+    Ready(Arc<BaseCatalog>),
     /// The collection's own schema could not be resolved — it is not a known
     /// lexicon.
     Unresolvable,
@@ -281,7 +287,7 @@ pub async fn resolve_catalog(resolver: &dyn LexiconResolver, nsid: &str) -> Cata
         }
     }
 
-    CatalogOutcome::Ready(Box::new(catalog))
+    CatalogOutcome::Ready(Arc::new(catalog))
 }
 
 /// Map an NSID to the DNS name its authority publishes.

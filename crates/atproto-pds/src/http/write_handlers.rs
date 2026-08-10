@@ -294,7 +294,27 @@ async fn validate_record(
         }
     };
 
-    let catalog = match resolve_catalog(resolver.as_ref(), collection).await {
+    // Built once per collection per TTL, not once per record.
+    //
+    // `applyWrites` validates every entry in a batch, and building a catalog
+    // parses every schema in the collection's closure -- so a hundred records
+    // written to one collection parsed the same schemas a hundred times before
+    // any storage work happened. The documents were already cached; the
+    // parsing of them was not.
+    //
+    // The negative outcomes are cached too. An unresolvable collection costs a
+    // resolution to discover, and a batch writing to one would otherwise pay
+    // that per entry.
+    let outcome = match state.lexicon_catalogs.get(collection) {
+        Some(hit) => hit,
+        None => {
+            let built = resolve_catalog(resolver.as_ref(), collection).await;
+            state.lexicon_catalogs.put(collection, built.clone());
+            built
+        }
+    };
+
+    let catalog = match outcome {
         CatalogOutcome::Ready(catalog) => catalog,
         CatalogOutcome::Unresolvable => {
             return unresolvable("no lexicon is published for this collection".to_string());

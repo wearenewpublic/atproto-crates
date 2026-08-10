@@ -35,6 +35,18 @@ pub struct PolicyDocuments {
     pub url: String,
 }
 
+/// How long a built validation catalog stays usable.
+///
+/// Matched to the lexicon resolver's own TTL: a catalog is a parse of the
+/// documents that resolver returns, so outliving them would mean validating
+/// against a schema the server would no longer fetch.
+const LEXICON_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How many collections' catalogs are held.
+///
+/// The collection NSID comes from the record being written, so this is
+/// caller-supplied and bounded for the same reason the resolver caches are.
+const LEXICON_CATALOG_CAPACITY: usize = 512;
 /// Shared state for the HTTP layer.
 ///
 /// `Arc`-wrapped so axum can `Clone` the state cheaply across handlers.
@@ -89,6 +101,18 @@ pub struct HttpState {
     /// `None` in tests and for embedders that do not run a shutdown
     /// controller; the subscription then lasts as long as the socket does.
     pub shutdown: Option<tokio_util::sync::CancellationToken>,
+    /// Validation catalogs, keyed by collection NSID.
+    ///
+    /// Building one parses every schema in the closure -- up to
+    /// `MAX_SCHEMAS` documents -- and `applyWrites` validates every entry in a
+    /// batch, so a hundred records written to one collection rebuilt the same
+    /// catalog a hundred times before any storage work happened. The documents
+    /// were already cached; the parsing of them was not.
+    ///
+    /// Per-state rather than global: a catalog is only meaningful against the
+    /// resolver that produced it, and two servers in one process -- which every
+    /// test is -- resolve the same NSID to different documents.
+    pub lexicon_catalogs: Arc<crate::ttl_cache::TtlCache<crate::repo::lexicon::CatalogOutcome>>,
     /// How many reverse proxies the operator says sit in front of this server.
     ///
     /// Zero means none, and therefore that `X-Forwarded-*` is caller-supplied
@@ -233,6 +257,10 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             shutdown: None,
+            lexicon_catalogs: Arc::new(crate::ttl_cache::TtlCache::new(
+                LEXICON_CATALOG_TTL,
+                LEXICON_CATALOG_CAPACITY,
+            )),
             trusted_proxy_hops: 0,
             dpop_nonce: None,
             jti_guard: JtiReplayGuard::new(100_000),
@@ -286,6 +314,10 @@ impl HttpState {
             lexicon_resolver: None,
             plc_service: None,
             shutdown: None,
+            lexicon_catalogs: Arc::new(crate::ttl_cache::TtlCache::new(
+                LEXICON_CATALOG_TTL,
+                LEXICON_CATALOG_CAPACITY,
+            )),
             trusted_proxy_hops: 0,
             dpop_nonce: None,
             jti_guard: JtiReplayGuard::new(100_000),

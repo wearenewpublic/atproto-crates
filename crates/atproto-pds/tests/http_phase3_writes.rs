@@ -932,3 +932,95 @@ async fn the_keys_the_protocol_allows_still_write() {
         assert_eq!(status, StatusCode::OK, "{rkey} — body: {body}");
     }
 }
+
+/// A lexicon resolver that counts what it was asked for.
+struct CountingResolver {
+    schema: Value,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl atproto_pds::repo::lexicon::LexiconResolver for CountingResolver {
+    async fn resolve(&self, nsid: &str) -> Option<Value> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (nsid == "app.example.note").then(|| self.schema.clone())
+    }
+}
+
+/// `applyWrites` validates every entry, and building a validation catalog
+/// parses every schema in the collection's closure. A hundred records written
+/// to one collection rebuilt the same catalog a hundred times before any
+/// storage work happened -- entirely CPU, and reachable by any authenticated
+/// account.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_builds_one_catalog_per_collection() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let schema = json!({
+        "lexicon": 1,
+        "id": "app.example.note",
+        "defs": {"main": {
+            "type": "record",
+            "key": "tid",
+            "record": {"type": "object", "properties": {"text": {"type": "string"}}}
+        }}
+    });
+    let resolver: Arc<dyn atproto_pds::repo::lexicon::LexiconResolver> =
+        Arc::new(CountingResolver {
+            schema,
+            calls: calls.clone(),
+        });
+
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_lexicon_resolver(resolver);
+    let app = build_router(state);
+
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let writes: Vec<Value> = (0..20)
+        .map(|i| {
+            json!({
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "app.example.note",
+                "value": {"$type": "app.example.note", "text": format!("note {i}")}
+            })
+        })
+        .collect();
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({"repo": "did:plc:alice", "validate": true, "writes": writes}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let resolutions = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        resolutions, 1,
+        "twenty records in one collection should resolve its schema once, not {resolutions} times"
+    );
+}
