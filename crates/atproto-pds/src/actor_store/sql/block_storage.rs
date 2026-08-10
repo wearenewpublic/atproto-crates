@@ -23,23 +23,98 @@ pub struct SqlBlockStorage {
     memory_usage: Arc<AtomicUsize>,
 }
 
+/// Seeded counters, one pair per actor database.
+///
+/// The counters are shared rather than per-handle, which is what lets the
+/// seeding happen once. Every handle for an actor increments the same atomics,
+/// so a count seeded on the first open stays accurate for the life of the
+/// process however many `SqlBlockStorage` values are constructed.
+///
+/// Not bounded. An entry is two `Arc<AtomicUsize>` and a path; one per actor
+/// this process has touched is not a growth vector worth the eviction logic,
+/// and unlike a pool it holds no file descriptor.
+///
+/// The fjall backend has the same defect -- a synchronous scan reading every
+/// value, on whatever thread the caller runs on -- and deliberately does not
+/// get this treatment. Its keyspace is one store for the whole process, so
+/// the only key available is the DID, and two stores over different paths
+/// would then share counters. `counters_recover_after_reopen` also requires
+/// that reopening rescans, which is a property this cache exists to remove.
+/// A SQLite pool names its own file, so the SQL backend has an identity to
+/// key on and fjall does not.
+type Counters = (Arc<AtomicUsize>, Arc<AtomicUsize>);
+static COUNTERS: std::sync::OnceLock<dashmap::DashMap<std::path::PathBuf, Counters>> =
+    std::sync::OnceLock::new();
+
+/// How many times the seeding query has run, for tests to observe that it does
+/// not run per operation.
+#[cfg(test)]
+static SEEDS_RUN: std::sync::OnceLock<dashmap::DashMap<std::path::PathBuf, usize>> =
+    std::sync::OnceLock::new();
+
 impl SqlBlockStorage {
-    /// Construct over a per-actor pool. Internal counters are seeded by
-    /// querying the table; subsequent mutations keep them in sync.
+    /// Construct over a per-actor pool.
+    ///
+    /// The counters are seeded once per actor database and shared by every
+    /// handle after that; subsequent mutations keep them in sync.
+    ///
+    /// Seeding used to happen here, on every construction, as
+    /// `SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM repo_block`.
+    /// `SUM(LENGTH(data))` walks the whole `repo_block` b-tree, and this runs
+    /// on `getRecord`, `listRecords`, `getRepo`, `getBlocks`, `sync.getRecord`
+    /// -- twice in that one -- and both writer paths. An O(log N) point lookup
+    /// was therefore preceded by an O(N) scan, so read latency grew linearly
+    /// with everything the account had ever written.
+    ///
+    /// Caching the pool did not fix it: the pool is per actor, but this query
+    /// was per *construction*, and a handle is constructed per operation.
     ///
     /// # Errors
     ///
     /// Returns the underlying `StorageError` on SQL failure.
     pub async fn open(pool: SqlitePool) -> Result<Self, StorageError> {
+        let key = pool.connect_options().get_filename().to_path_buf();
+        let cache = COUNTERS.get_or_init(dashmap::DashMap::new);
+
+        if let Some(existing) = cache.get(&key) {
+            let (block_count, memory_usage) = existing.clone();
+            return Ok(Self {
+                pool,
+                block_count,
+                memory_usage,
+            });
+        }
+
         let row: (i64, i64) =
             sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM repo_block")
                 .fetch_one(&pool)
                 .await
                 .map_err(sql_err_io("open count"))?;
+        #[cfg(test)]
+        {
+            *SEEDS_RUN
+                .get_or_init(dashmap::DashMap::new)
+                .entry(key.clone())
+                .or_insert(0) += 1;
+        }
+
+        // Another handle may have seeded the same actor while this one was
+        // querying. Both counts are correct, so take whichever landed first
+        // and let every handle share one pair.
+        let counters = cache
+            .entry(key)
+            .or_insert_with(|| {
+                (
+                    Arc::new(AtomicUsize::new(row.0 as usize)),
+                    Arc::new(AtomicUsize::new(row.1 as usize)),
+                )
+            })
+            .clone();
+
         Ok(Self {
             pool,
-            block_count: Arc::new(AtomicUsize::new(row.0 as usize)),
-            memory_usage: Arc::new(AtomicUsize::new(row.1 as usize)),
+            block_count: counters.0,
+            memory_usage: counters.1,
         })
     }
 
@@ -173,6 +248,60 @@ async fn verify_block(storage: &SqlBlockStorage, cid: &Cid) -> Result<bool, Stor
 
 #[cfg(test)]
 mod tests {
+    /// The seed is per actor, not per handle.
+    ///
+    /// `SUM(LENGTH(data))` walks the whole `repo_block` b-tree, and a handle
+    /// is constructed on `getRecord`, `listRecords`, `getRepo`, `getBlocks`,
+    /// `sync.getRecord` -- twice there -- and both writer paths. Caching the
+    /// pool did not help: the pool is per actor, this query was per
+    /// construction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_seed_scan_runs_once_per_actor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::actor_store::sql::SqlActorStore::open(tmp.path(), "did:plc:seed")
+            .await
+            .unwrap();
+        let key = store.pool().connect_options().get_filename().to_path_buf();
+
+        for _ in 0..10 {
+            SqlBlockStorage::open(store.pool().clone())
+                .await
+                .expect("open should succeed");
+        }
+
+        let seeds = SEEDS_RUN
+            .get_or_init(dashmap::DashMap::new)
+            .get(&key)
+            .map_or(0, |n| *n);
+        assert_eq!(seeds, 1, "ten handles for one actor should seed once");
+    }
+
+    /// A shared counter is what makes seeding once correct: a block written
+    /// through one handle is counted by the next.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handles_for_one_actor_share_their_counters() {
+        use atproto_dasl::storage::BlockStorage;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::actor_store::sql::SqlActorStore::open(tmp.path(), "did:plc:shared")
+            .await
+            .unwrap();
+
+        let mut first = SqlBlockStorage::open(store.pool().clone()).await.unwrap();
+        let before = first.block_count();
+
+        let cid = Cid::try_from("bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a")
+            .expect("a valid cid");
+        first.put(&cid, vec![1, 2, 3]).await.expect("put");
+
+        let second = SqlBlockStorage::open(store.pool().clone()).await.unwrap();
+        assert_eq!(
+            second.block_count(),
+            before + 1,
+            "a later handle must see what an earlier one wrote"
+        );
+    }
+
     use super::*;
     use crate::actor_store::sql::SqlActorStore;
 
