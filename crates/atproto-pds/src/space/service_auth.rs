@@ -31,11 +31,33 @@ pub const TYP_SERVICE_AUTH: &str = crate::http::service_auth_handlers::TYP_SERVI
 pub const NOTIFY_SERVICE_AUTH_TTL_SECS: u64 = 60;
 
 /// Service-auth JWT header.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct JwtHeader {
     alg: String,
     typ: String,
+    /// Which verification method in the issuer's DID document signed this.
+    ///
+    /// Proposal 0014: "The `kid` JWT header field will be allowed to identify
+    /// a signing key ('verification method') from the issuer DID document
+    /// (including the `#` character), with a default value of `#atproto`."
+    ///
+    /// Optional, so absent decodes as the default rather than as an error --
+    /// a peer that predates the field is not malformed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kid: Option<String>,
 }
+
+/// The only verification method this server will verify a service-auth token
+/// against.
+///
+/// Proposal 0014 is explicit that a verifier should not take the issuer's word
+/// for which key to use: "Receiving services should _not_ accept arbitrary key
+/// types (`kid` values): they should only accept key types relevant to their
+/// use-case. A safe default for SDKs and services is to only accept
+/// `#atproto`." Service auth is the atproto signing key's use-case and no
+/// other, so this is that default rather than a limitation to be widened
+/// later.
+const SERVICE_AUTH_KID: &str = "#atproto";
 
 /// Service-auth JWT claims. `iss`/`aud` are DIDs; `lxm` scopes the token to a
 /// single XRPC method.
@@ -95,6 +117,10 @@ pub fn mint_service_auth(
     let header = JwtHeader {
         alg: jws_alg(signing_key).to_string(),
         typ: TYP_SERVICE_AUTH.to_string(),
+        // Stated rather than left to the default. A verifier that resolves
+        // `kid` and one that assumes `#atproto` then agree explicitly instead
+        // of by coincidence.
+        kid: Some(SERVICE_AUTH_KID.to_string()),
     };
     let claims = ServiceAuthClaims {
         iss: iss.to_string(),
@@ -235,6 +261,26 @@ async fn verify_inner(
             )));
         }
     }
+    // The header was decoded for nothing but its bytes until now: `kid` was
+    // never read, so a token naming any other key was verified against
+    // `#atproto` regardless of what it claimed to be signed with. That fails
+    // closed -- the signature would not match -- but it fails with "signature
+    // invalid", which says nothing about the actual disagreement.
+    //
+    // Absent is the specified default and stays acceptable.
+    let header: JwtHeader = general_purpose::URL_SAFE_NO_PAD
+        .decode(header_b64.as_bytes())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| deny("service-auth header not JSON"))?;
+    if let Some(kid) = header.kid.as_deref()
+        && !is_atproto_kid(kid, &claims.iss)
+    {
+        return Err(deny(&format!(
+            "service-auth kid {kid} is not {SERVICE_AUTH_KID}"
+        )));
+    }
+
     let now = now_secs();
     if claims.exp <= now {
         return Err(deny("service-auth token expired"));
@@ -311,6 +357,22 @@ async fn verify_inner(
     Ok(claims)
 }
 
+/// Whether a verification-method identifier names *this* issuer's `#atproto`
+/// key.
+///
+/// A DID document may write a method id in full (`did:plc:abc#atproto`) or
+/// relative to itself (`#atproto`), and both mean the same key.
+///
+/// What it must not do is match on the fragment alone. `ends_with("#atproto")`
+/// accepted `did:web:somebody-else#atproto`, so a document listing a method
+/// belonging to another DID -- which a hostile `did:web` document is free to
+/// do, since it is served by whoever controls the domain -- supplied the key
+/// that service-auth tokens were then verified against. The identifier has to
+/// be the issuer's own.
+fn is_atproto_kid(id: &str, issuer_did: &str) -> bool {
+    id == SERVICE_AUTH_KID || id == format!("{issuer_did}{SERVICE_AUTH_KID}")
+}
+
 fn deny(reason: &str) -> PdsError {
     PdsError::AuthDenied {
         reason: reason.to_string(),
@@ -339,7 +401,7 @@ async fn atproto_signing_key(
             public_key_multibase,
             ..
         } = method
-            && id.ends_with("#atproto")
+            && is_atproto_kid(id, did)
         {
             let did_key = if public_key_multibase.starts_with("did:key:") {
                 public_key_multibase.clone()
@@ -401,6 +463,113 @@ mod tests {
             exp: now_secs() + 60,
             jti: "test-jti".to_string(),
         }
+    }
+
+    /// A verification method belonging to somebody else is not this issuer's
+    /// key, however its fragment reads.
+    ///
+    /// The match was `ends_with("#atproto")`, so a document listing
+    /// `did:web:somebody-else#atproto` supplied the key that this issuer's
+    /// tokens were verified against -- and a `did:web` document is served by
+    /// whoever controls the domain, so listing another DID's method is
+    /// something a hostile one is free to do.
+    #[test]
+    fn a_method_belonging_to_another_did_is_not_this_issuers_key() {
+        let issuer = "did:plc:writer";
+        assert!(is_atproto_kid("did:plc:writer#atproto", issuer));
+        // The relative form means the same key.
+        assert!(is_atproto_kid("#atproto", issuer));
+
+        assert!(
+            !is_atproto_kid("did:web:somebody-else#atproto", issuer),
+            "a method under another DID must not satisfy this issuer"
+        );
+    }
+
+    /// Proposal 0014: receiving services "should only accept key types
+    /// relevant to their use-case. A safe default ... is to only accept
+    /// `#atproto`". Service auth has exactly one use-case.
+    #[test]
+    fn only_the_atproto_key_is_accepted() {
+        let issuer = "did:plc:writer";
+        assert!(!is_atproto_kid("did:plc:writer#signing", issuer));
+        assert!(!is_atproto_kid("#some-other-key", issuer));
+    }
+
+    /// A token naming a key other than `#atproto` is refused for naming it,
+    /// rather than falling through to a signature check against a key it did
+    /// not claim and failing as "signature invalid".
+    #[tokio::test]
+    async fn verify_rejects_a_token_naming_another_key() {
+        let claims = claims_with_lxm(Some("com.atproto.space.notifyWrite"));
+        let header = general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "ES256K",
+                "typ": TYP_SERVICE_AUTH,
+                "kid": "#some-other-key",
+            }))
+            .unwrap(),
+        );
+        let payload = general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let token = format!("{header}.{payload}.c2ln");
+
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("a token naming another key must be refused");
+        assert!(
+            err.to_string().contains("kid"),
+            "expected a kid-specific denial, got: {err}"
+        );
+    }
+
+    /// A token with no `kid` is the specified default, not a malformed token.
+    #[tokio::test]
+    async fn verify_accepts_a_token_with_no_kid() {
+        let token = unsigned_token(&claims_with_lxm(Some("com.atproto.space.notifyWrite")));
+        let err = verify_service_auth(
+            &reqwest::Client::new(),
+            &token,
+            None,
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            None,
+        )
+        .await
+        .expect_err("the unsigned fixture cannot pass signature verification");
+        assert!(
+            !err.to_string().contains("kid"),
+            "an absent kid is the default and must not be refused: {err}"
+        );
+    }
+
+    /// What this server mints names the key it signed with, so a verifier that
+    /// resolves `kid` and one that assumes the default agree explicitly.
+    #[test]
+    fn a_minted_token_names_the_atproto_key() {
+        let key = generate_key(KeyType::P256Private).unwrap();
+        let token = mint_service_auth(
+            &key,
+            "did:plc:writer",
+            "did:plc:owner",
+            "com.atproto.space.notifyWrite",
+            60,
+        )
+        .unwrap();
+        let header_b64 = token.split('.').next().unwrap();
+        let header: serde_json::Value = serde_json::from_slice(
+            &general_purpose::URL_SAFE_NO_PAD
+                .decode(header_b64.as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["kid"], SERVICE_AUTH_KID);
     }
 
     /// A peer must be held to the lifetime this server holds itself to.
