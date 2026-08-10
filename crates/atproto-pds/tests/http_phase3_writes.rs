@@ -1024,3 +1024,111 @@ async fn a_batch_builds_one_catalog_per_collection() {
         "twenty records in one collection should resolve its schema once, not {resolutions} times"
     );
 }
+
+/// The sync specification: "at most 200 record operations can be included in a
+/// commit". The only ceiling before this was axum's implicit 2 MiB body, which
+/// admits on the order of 26,000 operations -- each an MST insert and a lexicon
+/// validation, in one transaction holding the write lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_refuses_a_batch_over_the_commit_limit() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let writes: Vec<Value> = (0..201)
+        .map(|i| {
+            json!({
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "app.bsky.feed.post",
+                "value": {"$type": "app.bsky.feed.post", "text": format!("post {i}")}
+            })
+        })
+        .collect();
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({"repo": "did:plc:alice", "writes": writes}),
+        Some(&token),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("200-operation limit"),
+        "the refusal should name the limit: {body}"
+    );
+}
+
+/// Exactly the limit is allowed -- it is a limit, not a margin.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_allows_a_batch_at_the_commit_limit() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let writes: Vec<Value> = (0..200)
+        .map(|i| {
+            json!({
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "app.bsky.feed.post",
+                "value": {"$type": "app.bsky.feed.post", "text": format!("post {i}")}
+            })
+        })
+        .collect();
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({"repo": "did:plc:alice", "writes": writes}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+/// The sync specification: "individual record blocks within the `blocks` field
+/// have a hard limit of one million bytes". A record over it cannot be carried
+/// in a conformant `#commit`, so accepting one produces a repository this
+/// server cannot broadcast.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_record_refuses_a_record_over_the_block_limit() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "record": {"$type": "app.bsky.feed.post", "text": "x".repeat(1_100_000)}
+        }),
+        Some(&token),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "RecordTooLarge", "{body}");
+}
+
+/// An ordinary record is unaffected.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_record_allows_an_ordinary_record() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "repo": "did:plc:alice",
+            "collection": "app.bsky.feed.post",
+            "record": {"$type": "app.bsky.feed.post", "text": "hello"}
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}

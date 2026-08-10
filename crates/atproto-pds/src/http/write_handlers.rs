@@ -229,6 +229,51 @@ async fn resolve_repo_did(state: &HttpState, repo: &str) -> Result<String, XrpcE
     Ok(account.did)
 }
 
+/// The largest a single record may be.
+///
+/// The sync specification: "individual record blocks within the `blocks` field
+/// have a hard limit of one million bytes". A record over it cannot be carried
+/// in a conformant `#commit`, so accepting one produces a repository this
+/// server cannot then broadcast -- the write succeeds and the firehose event
+/// is the thing that is wrong.
+const MAX_RECORD_BYTES: usize = 1_000_000;
+
+/// The largest number of operations one commit may carry.
+///
+/// The sync specification: "at most 200 record operations can be included in a
+/// commit". The only ceiling before this was axum's implicit 2 MiB body limit,
+/// which admits on the order of 26,000 operations -- each an MST insert and a
+/// lexicon validation, in one transaction holding the write lock.
+const MAX_WRITES_PER_BATCH: usize = 200;
+
+/// Refuse a record too large to be carried in a conformant commit.
+///
+/// Measured on the DAG-CBOR encoding, because that is what a `#commit` carries
+/// and what the limit is stated against -- the JSON a client sent is a
+/// different length and not the one that matters.
+///
+/// # Errors
+///
+/// Returns `RecordTooLarge` when the encoding exceeds [`MAX_RECORD_BYTES`].
+fn assert_record_size(record: &serde_json::Value) -> Result<(), XrpcError> {
+    let Ok(encoded) = atproto_dasl::to_vec(record) else {
+        // Not encodable at all is a different failure, and the paths that care
+        // report it with better context than a size check could.
+        return Ok(());
+    };
+    if encoded.len() > MAX_RECORD_BYTES {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "RecordTooLarge",
+            format!(
+                "record is {} bytes encoded; the limit is {MAX_RECORD_BYTES}",
+                encoded.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Handler for `com.atproto.repo.createRecord`.
 /// Validate a record against its collection's lexicon, as far as the lexicon
 /// is resolvable.
@@ -366,6 +411,7 @@ pub async fn create_record(
     )?;
 
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
+    assert_record_size(&input.record)?;
     let outcome = validate_record(&state, validate, &input.collection, &input.record).await?;
 
     let rkey = input.rkey.unwrap_or_else(|| Tid::new().to_string());
@@ -437,6 +483,7 @@ pub async fn put_record(
     )?;
 
     let validate = crate::repo::prepare::ValidateMode::from_flag(input.validate);
+    assert_record_size(&input.record)?;
     let outcome = validate_record(&state, validate, &input.collection, &input.record).await?;
 
     let result = writer
@@ -647,6 +694,16 @@ pub async fn apply_writes(
             "writes must be non-empty",
         ));
     }
+    if input.writes.len() > MAX_WRITES_PER_BATCH {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!(
+                "{} writes exceeds the {MAX_WRITES_PER_BATCH}-operation limit for one commit",
+                input.writes.len()
+            ),
+        ));
+    }
 
     // Captured before `input.writes` is consumed below.
     let swap_commit = input.swap_commit.clone();
@@ -681,6 +738,7 @@ pub async fn apply_writes(
             | ApplyWritesEntry::Update {
                 collection, value, ..
             } => {
+                assert_record_size(value)?;
                 validate_record(&state, validate, collection, value).await?;
             }
             ApplyWritesEntry::Delete { .. } => {}
