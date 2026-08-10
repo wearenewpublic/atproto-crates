@@ -999,3 +999,46 @@ async fn an_unknown_offer_falls_back_to_the_legacy_stream() {
         .expect("no protocol error");
     assert!(message.is_binary());
 }
+
+/// Backing off the idle poll must not slow live delivery.
+///
+/// The backstop poll used to run every five seconds per subscriber whether or
+/// not anything had happened -- at a thousand subscribers, 200 queries a
+/// second against the shared accounts database to learn that nothing had
+/// changed. It now backs off while the stream is quiet, which is only safe
+/// because delivery does not come from it: the broadcast wakes the subscriber
+/// the moment the stream moves.
+///
+/// So this waits past the first poll, by which point the interval has already
+/// doubled, and then requires the next write to arrive in less time than the
+/// backed-off poll would take. A frame that only turned up on the timer would
+/// miss that window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backed_off_subscriber_still_gets_events_immediately() {
+    let (app, manager, _tmp) = build_app().await;
+    let alice = "did:plc:idlealice";
+    let token = create_account(&app, &manager, alice, "alice.idle.example").await;
+
+    let addr = serve(app.clone()).await;
+    let uri: http::Uri = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?encoding=cbor")
+        .parse()
+        .unwrap();
+    let (mut socket, _) = ClientBuilder::from_uri(uri).connect().await.unwrap();
+
+    // Past the first backstop fire, so the interval has doubled at least once.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    write_record(&app, alice, &token, "after the poll backed off").await;
+
+    let started = std::time::Instant::now();
+    let message = tokio::time::timeout(std::time::Duration::from_secs(3), socket.next())
+        .await
+        .expect("a backed-off subscriber must still be woken by the broadcast")
+        .expect("the socket should stay open")
+        .expect("the frame should not be a protocol error");
+    assert!(message.is_binary(), "expected a CBOR frame");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "delivery waited for the backstop poll rather than the broadcast"
+    );
+}

@@ -129,6 +129,30 @@ enum SendOutcome {
     TooSlow,
 }
 
+/// How soon after a quiet period the backstop poll first fires.
+const POLL_BASE: Duration = Duration::from_secs(5);
+
+/// The longest the backstop poll will wait.
+///
+/// This is the worst-case delay for an event the broadcast failed to signal,
+/// which is a bug rather than a routine occurrence -- the bus covers the
+/// normal path and a lagged receiver already forces a drain. A minute is the
+/// point past which a backstop stops being one.
+const POLL_MAX: Duration = Duration::from_secs(60);
+
+/// The next backstop interval after a poll that found nothing.
+///
+/// Doubling rather than a fixed step so an idle connection reaches the ceiling
+/// in a handful of polls instead of grinding towards it.
+fn backed_off(current: Duration) -> Duration {
+    let doubled = current.saturating_mul(2);
+    if doubled > POLL_MAX {
+        POLL_MAX
+    } else {
+        doubled
+    }
+}
+
 /// Resolve when `token` is cancelled, or never if there is no token.
 ///
 /// `select!` needs a future in every arm; this supplies one for the case where
@@ -187,10 +211,20 @@ async fn run_subscriber(
     // streams live events only (subscribeRepos.ts:23-24).
     let mut cursor = params.cursor.or(head);
 
-    // Poll fallback runs at a longer interval since the broadcast covers most
-    // wakeups; we still poll occasionally to backfill anything the broadcast
-    // dropped.
-    let poll_interval = Duration::from_secs(5);
+    // The poll is a backstop, not the delivery path: the broadcast wakes a
+    // subscriber the moment the stream moves, and this exists only to catch
+    // anything the broadcast did not signal. Held at a fixed five seconds it
+    // was the dominant cost of an idle server -- every subscriber querying the
+    // shared accounts database twelve times a minute whether or not anything
+    // had happened, so a thousand idle subscribers cost 200 queries a second
+    // to learn that nothing had changed.
+    //
+    // So it backs off while nothing is arriving and snaps back to the base
+    // interval the moment something does. An idle subscriber walks 5s, 10s,
+    // 20s, 40s, 60s and stays there; the same thousand cost about 17 queries
+    // a second. Live delivery is untouched, because it does not come from
+    // here.
+    let mut poll_interval = POLL_BASE;
 
     // Subscribe to live events *before* the initial backfill so we don't lose
     // any commit that lands while we're draining the log.
@@ -202,6 +236,11 @@ async fn run_subscriber(
     let mut drain = true;
 
     loop {
+        // Reset on delivery rather than on the wakeup that caused it: a
+        // broadcast for a DID this subscriber filters out is not traffic as
+        // far as this connection is concerned, and treating it as such would
+        // hold a filtered subscriber at the base interval forever.
+        let mut delivered = false;
         // Drain the log up to its current head. `read_after` caps each read, so
         // a subscriber resuming from far behind catches up over several passes
         // rather than buffering the whole backlog.
@@ -286,6 +325,7 @@ async fn run_subscriber(
                     }
                 }
                 cursor = Some(row.seq);
+                delivered = true;
             }
             if drained < 100 {
                 drain = false;
@@ -300,6 +340,10 @@ async fn run_subscriber(
         //
         // Wait for either a live wakeup, the poll-interval timer, or the
         // client closing the socket.
+        if delivered {
+            poll_interval = POLL_BASE;
+        }
+
         tokio::select! {
             ev = live_rx.recv() => {
                 match ev {
@@ -323,7 +367,10 @@ async fn run_subscriber(
                     }
                 }
             }
-            _ = sleep(poll_interval) => { drain = true; }
+            _ = sleep(poll_interval) => {
+                drain = true;
+                poll_interval = backed_off(poll_interval);
+            }
             () = cancelled_or_pending(shutdown.as_ref()) => {
                 // Close deliberately rather than letting the process drop the
                 // socket. A consumer that sees a close frame reconnects; one
@@ -341,5 +388,41 @@ async fn run_subscriber(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_backoff_tests {
+    use super::*;
+
+    /// The backstop doubles and then stops.
+    ///
+    /// The ceiling is what makes this safe to reason about: it is the
+    /// worst-case delay for an event the broadcast never signalled, and an
+    /// unbounded backoff would turn a missed wakeup into a subscriber that
+    /// looks alive and is hours behind.
+    #[test]
+    fn the_backstop_doubles_up_to_a_ceiling() {
+        assert_eq!(backed_off(POLL_BASE), Duration::from_secs(10));
+        assert_eq!(backed_off(Duration::from_secs(10)), Duration::from_secs(20));
+        assert_eq!(backed_off(Duration::from_secs(20)), Duration::from_secs(40));
+        assert_eq!(backed_off(Duration::from_secs(40)), POLL_MAX);
+        assert_eq!(backed_off(POLL_MAX), POLL_MAX, "the ceiling holds");
+    }
+
+    /// An idle connection reaches the ceiling in a handful of polls.
+    ///
+    /// Four, from the base -- which is the difference between an idle
+    /// subscriber costing twelve queries a minute and costing one.
+    #[test]
+    fn an_idle_subscriber_reaches_the_ceiling_quickly() {
+        let mut interval = POLL_BASE;
+        let mut polls = 0;
+        while interval < POLL_MAX {
+            interval = backed_off(interval);
+            polls += 1;
+            assert!(polls < 10, "backoff is not converging");
+        }
+        assert_eq!(polls, 4, "took {polls} polls to reach the ceiling");
     }
 }
