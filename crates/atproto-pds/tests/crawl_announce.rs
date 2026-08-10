@@ -9,11 +9,18 @@
 //! announcement and serves normally; the relay never subscribes; writes commit
 //! to a repo nobody reads.
 
+use atproto_pds::account::AccountDirectory;
+use atproto_pds::http::{HttpState, build_router};
+use atproto_pds::repo::RepoReader;
 use axum::Json;
+use axum::body::Body;
 use axum::extract::State;
+use axum::http::{Request, StatusCode};
 use axum::routing::post;
-use serde_json::Value;
+use base64::Engine as _;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use tower::ServiceExt as _;
 
 /// A crawler that records what it was told. Returns its base URL and the log.
 async fn recording_crawler(status: axum::http::StatusCode) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -93,5 +100,107 @@ async fn one_bad_crawler_does_not_stop_the_others() {
         seen.lock().unwrap().len(),
         1,
         "a crawler listed after a failing one was never told"
+    );
+}
+
+// ---------------------------------------------------------------------------
+//  The inbound endpoint.
+// ---------------------------------------------------------------------------
+
+/// A PDS whose only configured crawler is `crawler`, with an admin password.
+async fn pds_announcing_to(crawler: String) -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let reader = Arc::new(RepoReader::new(accounts, dir));
+    let state = HttpState::new(reader)
+        .with_crawlers(vec![crawler])
+        .with_admin_password("hunter2".to_string());
+    (build_router(state), tmp)
+}
+
+async fn post_request_crawl(
+    app: &axum::Router,
+    body: Value,
+    admin: Option<&str>,
+) -> axum::http::StatusCode {
+    let mut request = Request::builder()
+        .uri("/xrpc/com.atproto.sync.requestCrawl")
+        .method("POST")
+        .header("content-type", "application/json");
+    if let Some(password) = admin {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("admin:{password}"));
+        request = request.header("authorization", format!("Basic {encoded}"));
+    }
+    let request = request
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+/// An anonymous caller cannot make this server announce.
+///
+/// `requestCrawl` is a relay's method and this is not a relay; what it does
+/// here is the mirror image, firing outbound requests -- with retries -- at
+/// every configured crawler. Serving that to anyone made a bare POST into a
+/// free round of outbound traffic.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anonymous_caller_cannot_trigger_an_announcement() {
+    let (crawler, seen) = recording_crawler(StatusCode::OK).await;
+    let (app, _tmp) = pds_announcing_to(crawler).await;
+
+    let status = post_request_crawl(&app, json!({}), None).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "anyone could announce");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the crawler was contacted on an unauthenticated request"
+    );
+}
+
+/// A wrong password is no better than none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_admin_password_cannot_trigger_an_announcement() {
+    let (crawler, seen) = recording_crawler(StatusCode::OK).await;
+    let (app, _tmp) = pds_announcing_to(crawler).await;
+
+    let status = post_request_crawl(&app, json!({}), Some("wrong")).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// The announcement names this server, whatever the caller asked for.
+///
+/// The hostname used to come from the request body, so a caller could make
+/// this server introduce a host of their choosing to relays that trust it.
+/// A PDS can only answer for itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_announcement_names_this_server_and_not_the_callers_host() {
+    let (crawler, seen) = recording_crawler(StatusCode::OK).await;
+    let (app, _tmp) = pds_announcing_to(crawler).await;
+
+    let status = post_request_crawl(
+        &app,
+        json!({"hostname": "attacker.example"}),
+        Some("hunter2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the operator's announcement did not go out");
+    let told = seen[0].get("hostname").and_then(Value::as_str);
+    assert_ne!(
+        told,
+        Some("attacker.example"),
+        "this server announced a host the caller named"
+    );
+    assert_eq!(
+        told,
+        Some("localhost"),
+        "the announcement should name this server's own host"
     );
 }

@@ -39,7 +39,13 @@ pub const DEFAULT_ADMIN_PASSWORD: &str = "admin-default-CHANGE-ME";
 /// Rate-limited and constant-time. One shared secret guards every admin verb,
 /// so a `!=` gave a timing oracle against it and an unbounded endpoint gave an
 /// online guessing oracle — the second being the larger of the two.
-async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
+///
+/// # Errors
+///
+/// `AdminAuthenticationRequired` when the header is absent or malformed,
+/// `AdminAuthenticationFailed` when the password does not match, and
+/// `RateLimited` when the shared attempt budget is exhausted.
+pub(crate) async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
     let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,

@@ -516,34 +516,47 @@ pub async fn sync_get_record(
 // ---------------------------------------------------------------------------
 
 /// Inputs for `com.atproto.sync.requestCrawl`.
+///
+/// The `hostname` a relay's copy of this method takes names the server to go
+/// and crawl. Accepted and ignored here, because this server is not a relay
+/// and the only host it can answer for is itself.
 #[derive(Debug, serde::Deserialize)]
 pub struct RequestCrawlInput {
-    /// Hostname this PDS exposes (the crawler will subscribe to its
-    /// firehose). Operators typically set this via the request body so a
-    /// single PDS can announce itself to multiple crawlers in one call.
-    /// Defaults to the configured `service_did` host when omitted.
+    /// Ignored. See the type's documentation.
     pub hostname: Option<String>,
 }
 
-/// Handler for `POST /xrpc/com.atproto.sync.requestCrawl`. For each entry in `PDS_CRAWLERS`, POSTs a minimal request-crawl
-/// payload announcing this PDS's hostname so the crawler starts
-/// consuming the firehose. Per-crawler failures log + continue; the
-/// handler always returns 200 so a partial outage doesn't fail the
-/// caller's outbound crawl.
+/// Handler for `POST /xrpc/com.atproto.sync.requestCrawl`.
+///
+/// This is a relay's method, and this is not a relay. What it does here is the
+/// mirror image: for each entry in `PDS_CRAWLERS`, POST a request-crawl
+/// announcing *this* PDS so the crawler starts consuming its firehose. That is
+/// a useful operator action -- a relay that has forgotten this server, or one
+/// added after startup -- but it is an outbound action this server takes, not
+/// a request it serves, and it was reachable by anyone.
+///
+/// Two things followed from that. The hostname came from the request body, so
+/// an anonymous caller could make this server tell its relays to crawl a host
+/// of the caller's choosing, using a PDS the relay already trusts as the one
+/// making the introduction. And a bare POST fired a round of outbound requests
+/// to every configured crawler, with retries, for free.
+///
+/// So: admin-authenticated, and the hostname is always this server's own. A
+/// caller that genuinely wants a relay to crawl something should ask a relay.
+///
+/// Per-crawler failures log and continue; a partial outage among crawlers is
+/// not the operator's error.
 pub async fn request_crawl(
     State(state): State<HttpState>,
-    body: Option<Json<RequestCrawlInput>>,
+    parts: axum::http::request::Parts,
+    _body: Option<Json<RequestCrawlInput>>,
 ) -> Result<StatusCode, XrpcError> {
-    let hostname = body
-        .as_ref()
-        .and_then(|b| b.hostname.clone())
-        .unwrap_or_else(|| {
-            state
-                .service_did
-                .strip_prefix("did:web:")
-                .unwrap_or(&state.service_did)
-                .to_string()
-        });
+    crate::admin::handlers::require_admin(&parts, &state).await?;
+    let hostname = state
+        .service_did
+        .strip_prefix("did:web:")
+        .unwrap_or(&state.service_did)
+        .to_string();
     crate::crawl::announce(&state.crawlers, &hostname).await;
     Ok(StatusCode::OK)
 }

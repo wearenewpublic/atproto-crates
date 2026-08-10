@@ -148,8 +148,11 @@ fn build_router_inner(
             "/xrpc/com.atproto.sync.subscribeRepos",
             get(crate::http::subscribe_handlers::subscribe_repos),
         )
-        // §11b — requestCrawl. Operators announce this PDS to the crawlers
-        // listed in PDS_CRAWLERS so they start consuming the firehose.
+        // §11b — requestCrawl. A relay's method, serving the mirror image
+        // here: an operator announces this PDS to the crawlers listed in
+        // PDS_CRAWLERS so they start consuming its firehose. Admin-gated,
+        // because it is outbound traffic this server sends rather than a
+        // request it answers.
         .route(
             "/xrpc/com.atproto.sync.requestCrawl",
             post(handlers::request_crawl),
