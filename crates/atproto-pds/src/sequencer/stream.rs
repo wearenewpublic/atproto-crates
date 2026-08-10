@@ -48,6 +48,16 @@ pub struct StreamRow {
     pub created_at: String,
 }
 
+/// Advisory-lock key serializing `stream_event` sequence allocation.
+///
+/// An arbitrary constant, but a *stable* one: it identifies this lock across
+/// every connection in the pool and across every process sharing the database,
+/// which is what makes it a lock rather than a local mutex. Postgres advisory
+/// locks share one namespace per database, so the value only has to be
+/// unlikely to collide with another application's.
+#[cfg(feature = "postgres")]
+pub const STREAM_SEQ_LOCK_KEY: i64 = 0x0a79_0705_5e90_0001;
+
 /// Append-and-read handle on the stream.
 ///
 /// Cheap to clone — it holds a connection pool.
@@ -90,6 +100,45 @@ impl Sequencer {
             }
             #[cfg(feature = "postgres")]
             AccountPoolKind::Postgres => {
+                // `BIGSERIAL` alone is not enough, and the difference is a
+                // permanent event skip rather than a reordering.
+                //
+                // `nextval` is deliberately non-transactional: it hands out
+                // numbers without waiting and never rolls them back, so two
+                // concurrent appends can take 10 and 11 and then commit in the
+                // other order. A subscriber polling `seq > cursor` in the
+                // window between those commits reads 11, sends it, and sets its
+                // cursor to 11. Seq 10 becomes visible a moment later, behind a
+                // cursor that has already passed it, and no live subscriber
+                // ever reads it. The event is not late; it is gone.
+                //
+                // So the allocation is serialized against commit. The advisory
+                // lock is transaction-scoped, which is the whole point: it is
+                // held from before `nextval` until the COMMIT that makes the
+                // row visible, so no second append can allocate inside another
+                // append's window. Allocation order becomes commit order --
+                // the property the SQLite schema comment claims for the stream
+                // and gets for free from a single writer.
+                //
+                // This serializes appends. That is not a cost being accepted
+                // reluctantly: the firehose is a total order, SQLite already
+                // serializes every write, and a stream whose numbering is
+                // allowed to race is not a stream.
+                let mut tx =
+                    self.pool
+                        .as_postgres()
+                        .begin()
+                        .await
+                        .map_err(|e| PdsError::Storage {
+                            reason: format!("stream append: begin: {e}"),
+                        })?;
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(STREAM_SEQ_LOCK_KEY)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| PdsError::Storage {
+                        reason: format!("stream append: lock: {e}"),
+                    })?;
                 let row: (i64,) = sqlx::query_as(
                     "INSERT INTO stream_event (did, event_type, payload, created_at)
                      VALUES ($1, $2, $3, $4) RETURNING seq",
@@ -98,10 +147,13 @@ impl Sequencer {
                 .bind(event_type)
                 .bind(&payload)
                 .bind(&now)
-                .fetch_one(self.pool.as_postgres())
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| PdsError::Storage {
                     reason: format!("stream append: {e}"),
+                })?;
+                tx.commit().await.map_err(|e| PdsError::Storage {
+                    reason: format!("stream append: commit: {e}"),
                 })?;
                 Ok(row.0)
             }

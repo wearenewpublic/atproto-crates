@@ -434,3 +434,227 @@ async fn service_auth_blacklist_add_contains_gc_round_trip() {
             .expect("contains live post-gc")
     );
 }
+
+// ---------------------------------------------------------------------------
+//  The stream sequence.
+// ---------------------------------------------------------------------------
+
+/// A `BIGSERIAL` alone lets a subscriber skip an event permanently.
+///
+/// This characterises Postgres rather than this server: `nextval` is
+/// non-transactional by design, so an unserialized insert can take seq 10 and
+/// commit after an insert that took seq 11. It is written down because the
+/// SQLite schema comment claims allocation order is commit order, which is
+/// true for a single writer and false here, and because it is the exact
+/// mechanism the fix has to close.
+///
+/// The reader below is the subscriber's loop in miniature: read everything
+/// after the cursor, advance the cursor to the last row read. Once it has
+/// passed 11, nothing brings it back to 10.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_bigserial_insert_can_be_committed_out_of_order() {
+    let Some(dir) = fresh_directory().await else {
+        return;
+    };
+    let pool = dir.account_pool();
+    let AccountPool::Postgres(pg) = pool.clone() else {
+        panic!("expected a postgres pool");
+    };
+    let did = unique_did("seqskew");
+
+    // Two transactions, allocating in one order and committing in the other.
+    let mut first = pg.begin().await.unwrap();
+    let (early,): (i64,) = sqlx::query_as(
+        "INSERT INTO stream_event (did, event_type, payload, created_at)
+         VALUES ($1, 'commit', $2, '2026-01-01T00:00:00Z') RETURNING seq",
+    )
+    .bind(&did)
+    .bind(vec![1u8])
+    .fetch_one(&mut *first)
+    .await
+    .unwrap();
+
+    let mut second = pg.begin().await.unwrap();
+    let (late,): (i64,) = sqlx::query_as(
+        "INSERT INTO stream_event (did, event_type, payload, created_at)
+         VALUES ($1, 'commit', $2, '2026-01-01T00:00:00Z') RETURNING seq",
+    )
+    .bind(&did)
+    .bind(vec![2u8])
+    .fetch_one(&mut *second)
+    .await
+    .unwrap();
+    assert!(early < late, "allocation order: {early} then {late}");
+
+    // The later allocation becomes visible first.
+    second.commit().await.unwrap();
+
+    let cursor: Option<i64> = sqlx::query_as::<_, (i64,)>(
+        "SELECT seq FROM stream_event WHERE did = $1 ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&did)
+    .fetch_optional(&pg)
+    .await
+    .unwrap()
+    .map(|(seq,)| seq);
+    assert_eq!(
+        cursor,
+        Some(late),
+        "a subscriber polling in this window sees only the later event"
+    );
+
+    first.commit().await.unwrap();
+
+    let after_cursor: Vec<(i64,)> =
+        sqlx::query_as("SELECT seq FROM stream_event WHERE did = $1 AND seq > $2 ORDER BY seq")
+            .bind(&did)
+            .bind(cursor.unwrap())
+            .fetch_all(&pg)
+            .await
+            .unwrap();
+    assert!(
+        after_cursor.is_empty(),
+        "nothing follows the cursor, so seq {early} is behind it forever"
+    );
+}
+
+/// `append` serializes allocation against commit.
+///
+/// Holding the same advisory lock from outside must stop an append from
+/// allocating at all. That is the guarantee: the lock spans `nextval` through
+/// COMMIT, so no second append can allocate inside another's window, and
+/// allocation order becomes commit order.
+#[tokio::test(flavor = "multi_thread")]
+async fn append_cannot_allocate_while_the_stream_lock_is_held() {
+    let Some(dir) = fresh_directory().await else {
+        return;
+    };
+    let AccountPool::Postgres(pg) = dir.account_pool() else {
+        panic!("expected a postgres pool");
+    };
+    let sequencer = atproto_pds::sequencer::Sequencer::new(dir.account_pool());
+    let did = unique_did("seqlock");
+
+    // A session lock rather than a transaction one, so the test holds it
+    // without holding a transaction open.
+    let mut holder = pg.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(atproto_pds::sequencer::stream::STREAM_SEQ_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let blocked = tokio::spawn({
+        let sequencer = sequencer.clone();
+        let did = did.clone();
+        async move { sequencer.append(&did, "commit", vec![7u8]).await }
+    });
+
+    let timed_out = tokio::time::timeout(std::time::Duration::from_millis(750), &mut { blocked })
+        .await
+        .is_err();
+    assert!(
+        timed_out,
+        "append allocated a sequence number while another holder had the lock;          allocation is not serialized against commit"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(atproto_pds::sequencer::stream::STREAM_SEQ_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+}
+
+/// A subscriber reading while writes are in flight sees every event.
+///
+/// This is the defect, end to end. The reader is the subscription loop:
+/// read everything after the cursor, advance the cursor to the last row read.
+/// Without serialized allocation a poll can land between two commits, take the
+/// higher sequence number, and leave the lower one behind a cursor that has
+/// already passed it -- so the event is not delayed, it is never delivered.
+///
+/// Filtered to this test's DID so that other tests appending to the same
+/// database cannot affect the result: the cursor only ever advances to a
+/// sequence number belonging to this run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_polling_during_concurrent_appends_misses_nothing() {
+    let Some(dir) = fresh_directory().await else {
+        return;
+    };
+    let sequencer = atproto_pds::sequencer::Sequencer::new(dir.account_pool());
+    let did = unique_did("seqpoll");
+    const EVENTS: usize = 96;
+
+    let start = sequencer.latest_seq().await.unwrap().unwrap_or(0);
+
+    let writers = tokio::spawn({
+        let sequencer = sequencer.clone();
+        let did = did.clone();
+        async move {
+            let mut tasks = Vec::new();
+            for i in 0..EVENTS {
+                let sequencer = sequencer.clone();
+                let did = did.clone();
+                tasks.push(tokio::spawn(async move {
+                    sequencer
+                        .append(&did, "commit", vec![u8::try_from(i % 251).unwrap()])
+                        .await
+                        .unwrap()
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        }
+    });
+
+    // Poll as hard as a subscriber ever would, so the window between two
+    // commits is landed in rather than waited out.
+    let mut cursor = Some(start);
+    let mut seen: Vec<i64> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while seen.len() < EVENTS && std::time::Instant::now() < deadline {
+        let rows = sequencer
+            .read_after(cursor, Some(&did), 100)
+            .await
+            .expect("read");
+        for row in rows {
+            cursor = Some(row.seq);
+            seen.push(row.seq);
+        }
+        tokio::task::yield_now().await;
+    }
+    writers.await.unwrap();
+
+    // Drain anything written after the last poll, the way a live subscriber
+    // would on its next wakeup.
+    loop {
+        let rows = sequencer
+            .read_after(cursor, Some(&did), 100)
+            .await
+            .expect("drain");
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            cursor = Some(row.seq);
+            seen.push(row.seq);
+        }
+    }
+
+    let stored: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM stream_event WHERE did = $1")
+        .bind(&did)
+        .fetch_one(match dir.account_pool() {
+            AccountPool::Postgres(ref pg) => pg,
+            _ => panic!("expected a postgres pool"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored.0 as usize, EVENTS, "fixture");
+    assert_eq!(
+        seen.len(),
+        EVENTS,
+        "the subscriber's cursor stepped over {} event(s) that are durably stored",
+        EVENTS - seen.len()
+    );
+}
