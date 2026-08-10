@@ -30,6 +30,31 @@ const RKEY: &str = "app.bulleted.authFull";
 async fn build_app() -> (axum::Router, TempDir) {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
+    let (app, manager, writer) = router_for(&dir, false).await;
+    seed(&manager, &writer).await;
+    (app, tmp)
+}
+
+/// One repository, two routers over it: one reading SQLite directly, one
+/// dispatching through the configured storage backend.
+///
+/// Serving the same bytes matters. Two separately built fixtures would have
+/// their own signing keys and their own revs, so their commit CIDs would
+/// differ for reasons that have nothing to do with the path under test.
+async fn build_app_both_ways() -> (axum::Router, axum::Router, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let (direct, manager, writer) = router_for(&dir, false).await;
+    seed(&manager, &writer).await;
+    let (via_backend, _, _) = router_for(&dir, true).await;
+    (direct, via_backend, tmp)
+}
+
+async fn router_for(
+    dir: &std::path::Path,
+    via_backend: bool,
+) -> (axum::Router, Arc<AccountManager>, Arc<RepoWriter>) {
+    let dir = dir.to_path_buf();
     let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
         .await
         .unwrap();
@@ -42,7 +67,7 @@ async fn build_app() -> (axum::Router, TempDir) {
     ));
     let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
     let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
-    let state = HttpState::with_account_manager(
+    let mut state = HttpState::with_account_manager(
         reader,
         manager.clone(),
         "did:web:test.example".to_string(),
@@ -51,7 +76,47 @@ async fn build_app() -> (axum::Router, TempDir) {
     )
     .with_writer(writer.clone())
     .with_service_handle_domains(vec!["test.example".to_string()]);
+    if via_backend {
+        state.public_realm_backend = Some(atproto_pds::actor_store::PublicRealmBackend::sql(dir));
+    }
+    (build_router(state), manager, writer)
+}
 
+/// A router whose accounts live in `dir` but whose repository blocks come from
+/// `backend_dir` -- the two stores hold different content for the same DID, so
+/// the CAR that comes back says which one the handler read.
+async fn router_reading_from(dir: &std::path::Path, backend_dir: &std::path::Path) -> axum::Router {
+    let dir = dir.to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let mut state = HttpState::with_account_manager(
+        reader,
+        manager,
+        "did:web:test.example".to_string(),
+        b"test-secret-do-not-use-in-prod-32!".to_vec(),
+        false,
+    )
+    .with_service_handle_domains(vec!["test.example".to_string()]);
+    state.public_realm_backend = Some(atproto_pds::actor_store::PublicRealmBackend::sql(
+        backend_dir.to_path_buf(),
+    ));
+    build_router(state)
+}
+
+async fn seed(manager: &Arc<AccountManager>, writer: &Arc<RepoWriter>) {
+    seed_with_title(manager, writer, "Bulleted").await;
+}
+
+async fn seed_with_title(manager: &Arc<AccountManager>, writer: &Arc<RepoWriter>, title: &str) {
     manager
         .create_account(CreateAccountParams::new(DID, HANDLE, "pw"))
         .await
@@ -67,15 +132,13 @@ async fn build_app() -> (axum::Router, TempDir) {
                 value: Some(serde_json::json!({
                     "lexicon": 1,
                     "id": RKEY,
-                    "defs": {"main": {"type": "permission-set", "title": "Bulleted"}},
+                    "defs": {"main": {"type": "permission-set", "title": title}},
                 })),
                 swap_record: None,
             }],
         )
         .await
         .expect("fixture record");
-
-    (build_router(state), tmp)
 }
 
 /// GET the method with no auth at all. Returns (status, content-type, body).
@@ -215,5 +278,99 @@ async fn an_unknown_did_is_refused() {
     assert!(
         text.contains("RepoNotFound") || text.contains("NotFound"),
         "expected RepoNotFound, got: {text}"
+    );
+}
+
+/// The proof is the same one whichever way the blocks are reached.
+///
+/// The handler opened SQLite directly, ignoring the configured storage
+/// backend, so on any profile that is not SQLite it read from a database that
+/// holds nothing -- the method that exists specifically so an authorization
+/// server can resolve a permission set answered as though the repository were
+/// empty. `getRepo` and `getBlocks` next to it both dispatch; this one did
+/// not.
+///
+/// Both paths run over SQLite here, which is what makes the comparison
+/// meaningful: the bytes must not depend on how the blocks were reached, so
+/// any difference is the dispatch itself and not the store underneath.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_backend_path_returns_the_same_proof_as_the_direct_path() {
+    let (direct, via_backend, _tmp) = build_app_both_ways().await;
+
+    let (direct_status, direct_ctype, direct_car) = get(&direct, &url(COLLECTION, RKEY)).await;
+    let (backend_status, backend_ctype, backend_car) =
+        get(&via_backend, &url(COLLECTION, RKEY)).await;
+
+    assert_eq!(direct_status, StatusCode::OK, "fixture");
+    assert_eq!(
+        backend_status, direct_status,
+        "the configured backend must answer this method too"
+    );
+    assert_eq!(backend_ctype, direct_ctype);
+    assert!(!backend_car.is_empty(), "an empty CAR proves nothing");
+    assert_eq!(
+        backend_car, direct_car,
+        "the proof must not depend on how the blocks were reached"
+    );
+}
+
+/// Absence proved through the backend as well.
+///
+/// Absence is the answer an authorization server gets most often while a
+/// permission set is being published, so it is the answer most likely to be
+/// read; a path that produces it by reading an empty database produces the
+/// same shape for the wrong reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_backend_path_proves_absence_the_same_way() {
+    let (direct, via_backend, _tmp) = build_app_both_ways().await;
+
+    let (_, _, direct_car) = get(&direct, &url(COLLECTION, "no.such.record")).await;
+    let (status, _, backend_car) = get(&via_backend, &url(COLLECTION, "no.such.record")).await;
+
+    assert_eq!(status, StatusCode::OK, "absence has a proof");
+    assert_eq!(
+        backend_car, direct_car,
+        "the absence proof must not depend on how the blocks were reached"
+    );
+}
+
+/// The proof comes from the store this server was configured with.
+///
+/// This is the defect itself: the handler opened SQLite under the data
+/// directory no matter what storage backend was configured, so on a profile
+/// whose blocks live elsewhere it read a database holding nothing and answered
+/// as though the repository were empty. The method that exists so an
+/// authorization server can resolve a permission set was the one method next
+/// to `getRepo` and `getBlocks` that did not dispatch.
+///
+/// Two stores hold the same DID with different records, so the CAR names which
+/// one was read. If the handler ignores the backend it returns the local one
+/// and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_proof_comes_from_the_configured_store() {
+    let local = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+
+    let (_, manager, writer) = router_for(local.path(), false).await;
+    seed(&manager, &writer).await;
+    let (_, other_manager, other_writer) = router_for(elsewhere.path(), false).await;
+    seed_with_title(&other_manager, &other_writer, "Elsewhere").await;
+
+    let app = router_reading_from(local.path(), elsewhere.path()).await;
+    let (status, _, car) = get(&app, &url(COLLECTION, RKEY)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the configured store holds the record"
+    );
+    let carries = |needle: &str| car.windows(needle.len()).any(|w| w == needle.as_bytes());
+    assert!(
+        carries("Elsewhere"),
+        "the proof must come from the configured store"
+    );
+    assert!(
+        !carries("Bulleted"),
+        "reading the local database is the defect this fixes"
     );
 }

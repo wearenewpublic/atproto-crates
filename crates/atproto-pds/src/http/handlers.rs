@@ -438,6 +438,7 @@ pub async fn sync_get_record(
     Query(params): Query<SyncGetRecordParams>,
 ) -> Result<axum::response::Response, XrpcError> {
     use crate::actor_store::sql::SqlActorStore;
+    use crate::repo::car_export::{export_record_proof_car, export_record_proof_car_via_backend};
     use axum::http::header;
     use axum::response::IntoResponse;
 
@@ -445,11 +446,13 @@ pub async fn sync_get_record(
     // takendown / suspended / deactivated errors come from.
     let did = state.reader.require_available(&params.did).await?.did;
 
-    let data_dir = state.reader.data_dir().clone();
-    let store = SqlActorStore::open(&data_dir, &did).await?;
-    let car_bytes =
-        crate::repo::car_export::export_record_proof_car(&store, &params.collection, &params.rkey)
-            .await?;
+    let car_bytes = if let Some(backend) = state.public_realm_backend.as_ref() {
+        export_record_proof_car_via_backend(backend, &did, &params.collection, &params.rkey).await?
+    } else {
+        let data_dir = state.reader.data_dir().clone();
+        let store = SqlActorStore::open(&data_dir, &did).await?;
+        export_record_proof_car(&store, &params.collection, &params.rkey).await?
+    };
 
     let mut response = (StatusCode::OK, car_bytes).into_response();
     response.headers_mut().insert(

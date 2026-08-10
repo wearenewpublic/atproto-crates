@@ -613,9 +613,6 @@ pub async fn export_record_proof_car(
     collection: &str,
     rkey: &str,
 ) -> PdsResult<Vec<u8>> {
-    use atproto_repo::mst::Mst;
-    use std::str::FromStr;
-
     let pool = store.pool();
     let row: Option<(String, String)> =
         sqlx::query_as("SELECT cid, data_cid FROM commit_obj ORDER BY rev DESC LIMIT 1")
@@ -639,9 +636,6 @@ pub async fn export_record_proof_car(
         .map_err(|e| PdsError::Storage {
             reason: format!("open block storage: {e}"),
         })?;
-
-    // The key as the MST holds it.
-    let key = format!("{collection}/{rkey}");
     // A second handle rather than a clone: `SqlBlockStorage` wraps the pool,
     // and the Mst takes ownership of the one it walks.
     let mst_storage = SqlBlockStorage::open(pool.clone())
@@ -649,6 +643,80 @@ pub async fn export_record_proof_car(
         .map_err(|e| PdsError::Storage {
             reason: format!("open block storage: {e}"),
         })?;
+
+    export_record_proof_car_from_storage(
+        storage,
+        mst_storage,
+        commit_cid,
+        data_cid,
+        collection,
+        rkey,
+    )
+    .await
+}
+
+/// `com.atproto.sync.getRecord` rooted at a [`PublicRealmBackend`].
+///
+/// The handler used to open SQLite directly, which produced no proof at all
+/// on a non-SQLite storage profile.
+///
+/// # Errors
+///
+/// Returns [`PdsError::NotFound`] if the repository has no commits;
+/// [`PdsError::Storage`] for any backend failure.
+pub async fn export_record_proof_car_via_backend(
+    backend: &PublicRealmBackend,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+) -> PdsResult<Vec<u8>> {
+    let head = backend
+        .commit_obj
+        .latest(did)
+        .await?
+        .ok_or_else(|| PdsError::NotFound {
+            what: "no commits in repo".to_string(),
+        })?;
+    let commit_cid = cid::Cid::from_str(&head.cid).map_err(|e| PdsError::Storage {
+        reason: format!("parse commit CID: {e}"),
+    })?;
+    let data_cid = cid::Cid::from_str(&head.data_cid).map_err(|e| PdsError::Storage {
+        reason: format!("parse data CID: {e}"),
+    })?;
+
+    // Two handles for the same reason the SQLite path opens two: the Mst
+    // takes ownership of the one it walks.
+    let storage = backend.open_block_storage(did).await?;
+    let mst_storage = backend.open_block_storage(did).await?;
+
+    export_record_proof_car_from_storage(
+        storage,
+        mst_storage,
+        commit_cid,
+        data_cid,
+        collection,
+        rkey,
+    )
+    .await
+}
+
+/// The proof itself, over whichever blockstore the caller opened.
+///
+/// `mst_storage` is a second handle on the same blocks, not a second store:
+/// the Mst takes ownership of the storage it walks, and the commit and record
+/// blocks are read outside that walk.
+async fn export_record_proof_car_from_storage<S: BlockStorage>(
+    storage: S,
+    mst_storage: S,
+    commit_cid: cid::Cid,
+    data_cid: cid::Cid,
+    collection: &str,
+    rkey: &str,
+) -> PdsResult<Vec<u8>> {
+    use atproto_repo::mst::Mst;
+
+    // The key as the MST holds it.
+    let key = format!("{collection}/{rkey}");
     let mst = Mst::from_root(data_cid, mst_storage, atproto_repo::RepoConfig::default());
     let proof = mst
         .covering_proof(&key)
