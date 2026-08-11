@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: a write to a space this server is the authority for fans out in process, and a
+  remote authority's notifications go to its **space host** rather than its PDS. Gap-analysis item
+  **E4** against proposal 0016 as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100).
+
+  Every write resolved the authority's DID document and POSTed `notifyWrite` to whatever came back —
+  including when the answer was this same server. A personal-data space is one whose authority *is*
+  the writing account, so every write to one paid a DNS or PLC lookup, an HTTP round trip to
+  localhost, and a service-auth token whose issuer and verifier were the same process. The hop
+  exists for the work the receiving side does, not for itself, so a local authority now does that
+  work directly: the membership check, the fan-out to registered subscribers, and the receipt
+  `listRepos` reports each repo's revision and hash from.
+
+  Skipping the self-POST without replacing it would have silently disabled all three, since the
+  inbound handler was the only thing that ran them.
+
+  For a remote authority, the endpoint is now resolved as `#atproto_space_host`, falling back to
+  `#atproto_pds`. Resolving `#atproto_pds` directly — as this did — ignores the entry the spec
+  defines for exactly this purpose, so an authority publishing a distinct space host had its
+  notifications delivered to the wrong service, and one publishing no PDS entry received none at
+  all. The resolver that prefers the right entry already existed and had no callers.
+
+
 - `atproto-pds`: the nightly sweep collects lapsed write-notification registrations. Delivery has
   always skipped a row past its `expires_at`, so these were inert — but nothing deleted them, and a
   registration is renewed by re-registering, so a syncer renewing on a timer left one dead row behind

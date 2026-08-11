@@ -470,6 +470,103 @@ impl SpaceWriter {
     /// path is logged and swallowed so a write never fails on a missed
     /// notification (the owner's `listRepoOps` is the authoritative catch-up
     /// source).
+    /// Whether the space authority is an account this server hosts.
+    async fn authority_is_local(&self, authority_did: &str) -> bool {
+        match self.accounts.lookup_handle(authority_did).await {
+            Ok(found) => found.is_some(),
+            Err(error) => {
+                tracing::warn!(
+                    error = ?error,
+                    authority = %authority_did,
+                    "notifyWrite: could not tell whether the authority is local; taking the network path"
+                );
+                false
+            }
+        }
+    }
+
+    /// The owner-side work `notifyWrite` exists to trigger, done in process.
+    ///
+    /// Mirrors the inbound handler's local-authority branch: refuse a writer
+    /// who is not a member, fan out to the registered subscribers, and record
+    /// the receipt that `listRepos` reports each repo's revision and hash
+    /// from. Best-effort throughout, as the network path is -- the write is
+    /// already durable and a lost notification is recovered by the next one or
+    /// by a syncer's sweep.
+    async fn fan_out_locally(
+        &self,
+        space: &SpaceUri,
+        writer_did: &str,
+        payload: &NotifyWritePayload,
+    ) {
+        let owner_did = &space.space_did;
+        let svc = crate::space::service::SpaceService::with_accounts(
+            self.data_dir.clone(),
+            self.accounts.clone(),
+        );
+        match svc.is_member(space, writer_did).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    space = %space,
+                    writer = %writer_did,
+                    "notifyWrite: writer is not a member of the space; not fanning out"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, space = %space, "notifyWrite: membership check failed");
+                return;
+            }
+        }
+
+        match crate::http::space_auth::local_signing_key(&self.accounts, owner_did).await {
+            Ok(owner_key) => {
+                if let Err(error) = crate::space::notify::enqueue_writes(
+                    self.accounts.pool(),
+                    &self.data_dir,
+                    space,
+                    payload,
+                    &owner_key,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = ?error,
+                        space = %space,
+                        "notifyWrite: fan-out enqueue failed; recipients may miss this revision"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = ?error,
+                    space = %space,
+                    "notifyWrite: fan-out skipped, owner signing key unavailable"
+                );
+            }
+        }
+
+        let body = match serde_json::to_vec(payload) {
+            Ok(b) => b,
+            Err(error) => {
+                tracing::warn!(error = ?error, space = %space, "notifyWrite: encode payload failed");
+                return;
+            }
+        };
+        if let Err(error) = crate::space::inbound::receive_write(
+            &reqwest::Client::new(),
+            self.plc_directory.as_deref(),
+            &self.data_dir,
+            owner_did,
+            &body,
+        )
+        .await
+        {
+            tracing::warn!(error = ?error, space = %space, "notifyWrite: receipt not recorded");
+        }
+    }
+
     async fn fire_notify_write(
         &self,
         space: &SpaceUri,
@@ -479,35 +576,48 @@ impl SpaceWriter {
         writer_signing_key: &KeyData,
     ) {
         let owner_did = space.space_did.clone();
+        let payload = build_notify_payload(space, writer_did, rev, commit_hash);
+
+        // When this server hosts the authority, the notification has nowhere
+        // to travel: resolving a DID document and POSTing to ourselves buys a
+        // network round trip, a DNS or PLC lookup, and a service-auth token
+        // whose issuer and verifier are the same process. Every write to a
+        // personal-data space took that path, and a personal space is one
+        // where the authority *is* the writer.
+        //
+        // What the hop is for is the work the inbound handler does, not the
+        // hop itself, so the local case does that work directly.
+        if self.authority_is_local(&owner_did).await {
+            self.fan_out_locally(space, writer_did, &payload).await;
+            return;
+        }
+
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .user_agent(crate::user_agent())
             .build()
             .unwrap_or_default();
 
-        // Resolve the owner's PDS endpoint from their DID document.
-        let owner_pds = match crate::space::recipient::resolve_service_endpoint(
+        // The authority's *space host*, which is what answers for a space and
+        // is only the same thing as its PDS when it does not say otherwise.
+        // Resolving `#atproto_pds` directly ignored `#atproto_space_host`
+        // entirely, so an authority that published a distinct space host had
+        // its notifications delivered to the wrong service -- or to none,
+        // if it published no PDS entry at all.
+        let owner_pds = match crate::http::space_auth::remote_space_host_endpoint(
             &http,
-            &format!("{owner_did}#atproto_pds"),
+            &owner_did,
             self.plc_directory.as_deref(),
         )
         .await
         {
-            Ok(Some(ep)) => ep,
-            Ok(None) => {
-                tracing::debug!(
-                    space = %space,
-                    owner = %owner_did,
-                    "notifyWrite: owner DID document has no #atproto_pds service; skipping fan-out hop"
-                );
-                return;
-            }
+            Ok(ep) => ep,
             Err(e) => {
                 tracing::warn!(
                     error = ?e,
                     space = %space,
                     owner = %owner_did,
-                    "notifyWrite: failed to resolve owner PDS endpoint; skipping fan-out hop"
+                    "notifyWrite: failed to resolve owner space host; skipping fan-out hop"
                 );
                 return;
             }
@@ -531,7 +641,6 @@ impl SpaceWriter {
             }
         };
 
-        let payload = build_notify_payload(space, writer_did, rev, commit_hash);
         let url = format!(
             "{}/xrpc/{}",
             owner_pds.trim_end_matches('/'),

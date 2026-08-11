@@ -1818,6 +1818,90 @@ async fn space_credential_app_allowlist_denies_unattested() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// A write to a space this server is the authority for fans out without a
+/// network hop.
+///
+/// Every such write used to resolve the authority's DID document and POST
+/// `notifyWrite` to this same server — a DNS or PLC lookup, a round trip, and
+/// a service-auth token whose issuer and verifier were the same process. For a
+/// personal-data space, where the authority *is* the writer, that was the only
+/// path there was.
+///
+/// What the hop exists for is the owner-side work: fan out to registered
+/// subscribers, and record the receipt `listRepos` reports each repo's
+/// revision from. This asserts that work still happens, which is the part a
+/// naive "skip the self-POST" would have silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_to_a_locally_hosted_space_fans_out_without_a_network_hop() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // A registered subscriber with a deliverable endpoint, so the fan-out has
+    // somewhere to go. (Minting a credential also registers its consumer, but
+    // without a client attestation that registration falls back to a stub
+    // endpoint the delivery path correctly refuses to sign a token for.)
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": uri, "endpoint": "https://consumer.example"}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "registerNotify: {body}");
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "repo": "did:plc:owner",
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c.d.e", "rkey": "r1",
+                "value": {"v": 1}
+            }]
+        }),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "write: {body}");
+
+    // The fan-out queued a delivery. There is no network in this test at all
+    // — `oneshot` drives the router directly — so a queued row can only have
+    // come from the in-process path.
+    let queued: Vec<(String, String)> =
+        sqlx::query_as("SELECT target_service_did, nsid FROM notify_attempt")
+            .fetch_all(manager.pool())
+            .await
+            .unwrap();
+    assert!(
+        queued
+            .iter()
+            .any(|(_, nsid)| nsid == "com.atproto.space.notifyWrite"),
+        "the write should have queued a notifyWrite: {queued:?}"
+    );
+
+    // And the receipt was recorded, which is what listRepos reads each repo's
+    // revision and hash from.
+    let (status, listed) = get_json_cred(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.listRepos?space={}",
+            urlencode(&uri)
+        ),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listRepos: {listed}");
+    let repos = listed["repos"].as_array().expect("repos array");
+    assert!(
+        repos.iter().any(|r| r["did"] == "did:plc:owner"),
+        "the writer must appear in the writer set: {listed}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn space_credential_registers_recipient_idempotently() {
     // build_app hides the data dir, so this test constructs the app inline
