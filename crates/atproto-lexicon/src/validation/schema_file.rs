@@ -1278,4 +1278,31 @@ mod definition_types {
     fn unknown_is_a_definition_type_despite_the_corpus() {
         assert!(doc(r#"{"type":"unknown"}"#).is_ok());
     }
+    /// The spec spells the space authority field `authority`; this crate
+    /// called it `did` first. A published set may use either, and a set that
+    /// scopes a permission to one authority must not be read as scoping it to
+    /// none — an alias that silently dropped the field would widen the grant
+    /// to every authority.
+    #[test]
+    fn a_space_permission_accepts_either_authority_spelling() {
+        for field in ["authority", "did"] {
+            let json = format!(
+                r#"{{"type":"permission","resource":"space","spaceType":"com.example.bookmarks","{field}":"did:plc:abc123"}}"#
+            );
+            let perm: Permission = serde_json::from_str(&json).expect("permission parses");
+            assert_eq!(
+                perm.did.as_deref(),
+                Some("did:plc:abc123"),
+                "{field} must reach the model"
+            );
+        }
+
+        // And a set this crate writes back out carries the spec's name.
+        let perm: Permission = serde_json::from_str(
+            r#"{"type":"permission","resource":"space","spaceType":"com.example.bookmarks","did":"did:plc:abc123"}"#,
+        )
+        .unwrap();
+        let out = serde_json::to_string(&perm).unwrap();
+        assert!(out.contains(r#""authority":"did:plc:abc123""#), "{out}");
+    }
 }

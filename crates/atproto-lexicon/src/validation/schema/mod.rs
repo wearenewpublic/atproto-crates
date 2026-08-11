@@ -329,11 +329,21 @@ pub struct Permission {
     #[serde(rename = "spaceType", skip_serializing_if = "Option::is_none")]
     pub space_type: Option<String>,
 
-    /// Owner DID for `space` resources.
+    /// Space authority DID for `space` resources.
     ///
-    /// Scopes the permission to spaces owned by a specific DID. May be the
-    /// `*` wildcard to match any owner.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Scopes the permission to spaces under a specific authority. May be the
+    /// `*` wildcard to match any authority, or `self` for the granting user's
+    /// own DID.
+    ///
+    /// The spec spells this field `authority`; `did` is the name this crate
+    /// used before it did, and is accepted as an alias so a set written
+    /// against either deserializes. Serialization emits `authority`, since
+    /// that is the name a published set should carry.
+    #[serde(
+        rename = "authority",
+        alias = "did",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub did: Option<String>,
 
     /// Record key for `space` resources.

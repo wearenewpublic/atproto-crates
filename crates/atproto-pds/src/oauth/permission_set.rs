@@ -146,6 +146,7 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str, include_aud: Option<&st
             Some("repo") => out.extend(repo_scopes(perm)),
             Some("blob") => out.extend(blob_scopes(perm)),
             Some("rpc") => out.extend(rpc_scopes(perm, nsid, include_aud)),
+            Some("space") => out.extend(space_scopes(perm, nsid)),
             other => {
                 // Deliberately not guessed at. See the module note.
                 tracing::warn!(
@@ -157,6 +158,85 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str, include_aud: Option<&st
         }
     }
     out
+}
+
+/// `space:<spaceType>[?authority=…][&skey=…][&collection=…][&action=…]` for a
+/// space permission.
+///
+/// # The space type must be concrete
+///
+/// A permission set is published once and reused by every client that names
+/// it, so `spaceType=*` inside one would let the publisher hand out access to
+/// every space type a user participates in — a cross-type grant is expressible
+/// only as a `space:` scope a client requests directly and a user sees on the
+/// consent screen for what it is. The lexicon layer refuses to publish such a
+/// set; refusing to expand one too means a set published elsewhere, or before
+/// that validation existed, cannot smuggle the wildcard past this server.
+///
+/// # `collection` is left alone when omitted
+///
+/// Unlike [`repo_scopes`], an omitted `collection` is *not* expanded into the
+/// actions' defaults. A space scope with no `collection` resolves against the
+/// space type's declaration every time it is evaluated, so the grant follows
+/// the declaration as it changes; enumerating the collections here would
+/// freeze them at the moment of expansion. The spec says an app that wants
+/// them frozen should list them explicitly, which a permission set can do.
+fn space_scopes(perm: &serde_json::Value, nsid: &str) -> Vec<String> {
+    let Some(space_type) = perm["spaceType"].as_str().filter(|t| !t.is_empty()) else {
+        tracing::warn!(
+            nsid = %nsid,
+            "skipping a space permission with no spaceType; a set permission must name a concrete space type"
+        );
+        return Vec::new();
+    };
+    if space_type == "*" {
+        tracing::warn!(
+            nsid = %nsid,
+            "skipping a space permission with spaceType=*; a cross-type grant is only expressible as a scope requested directly"
+        );
+        return Vec::new();
+    }
+
+    let mut params: Vec<String> = Vec::new();
+    // The spec spells this `authority`; `did` is the name this crate's
+    // permission model used before it did, and a set written against either
+    // means the same thing.
+    if let Some(authority) = perm["authority"]
+        .as_str()
+        .or_else(|| perm["did"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        params.push(format!("authority={authority}"));
+    }
+    if let Some(skey) = perm["skey"].as_str().filter(|v| !v.is_empty()) {
+        params.push(format!("skey={skey}"));
+    }
+    for collection in string_list(&perm["collection"]) {
+        params.push(format!("collection={collection}"));
+    }
+    // An omitted `action` means read + create + update + delete, matching how
+    // a bare `space:` scope parses. Naming them keeps the emitted scope exact
+    // rather than relying on that default holding.
+    let actions = string_list(&perm["action"]);
+    let actions = if actions.is_empty() {
+        vec![
+            "read".to_string(),
+            "create".to_string(),
+            "update".to_string(),
+            "delete".to_string(),
+        ]
+    } else {
+        actions
+    };
+    for action in actions {
+        params.push(format!("action={action}"));
+    }
+
+    vec![if params.is_empty() {
+        format!("space:{space_type}")
+    } else {
+        format!("space:{space_type}?{}", params.join("&"))
+    }]
 }
 
 /// `rpc:<lxm>?aud=<audience>` for each method the permission names.
@@ -509,6 +589,131 @@ mod tests {
         assert_eq!(
             out, "include:app.example.future",
             "an unrecognised resource must not become a grant: {out}"
+        );
+    }
+
+    /// A space permission expands to the `space:` scope it describes.
+    ///
+    /// Until it did, a set naming a space resource granted nothing: the
+    /// expander skipped it with a warning, so a client that requested the set
+    /// received every `repo:` grant in it and no space access at all, with a
+    /// 200 and a consent screen that had described the space.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_expands_to_a_space_scope() {
+        let r = resolver(serde_json::json!({
+            "defs": {"main": {"type": "permission-set", "permissions": [
+                {
+                    "type": "permission",
+                    "resource": "space",
+                    "spaceType": "com.atmoboards.forum",
+                    "authority": "*",
+                    "collection": ["com.atmoboards.thread", "com.atmoboards.reply"],
+                    "action": ["read", "create"]
+                }
+            ]}}
+        }));
+        let out = expand(Some(&r), "include:com.atmoboards.access").await;
+        assert!(
+            out.contains(
+                "space:com.atmoboards.forum?authority=*&collection=com.atmoboards.thread&collection=com.atmoboards.reply&action=read&action=create"
+            ),
+            "{out}"
+        );
+
+        // And what it emits is a grant this server honours, rather than a
+        // string that merely looks like one. Expansion feeding a scope the
+        // enforcement layer cannot read would fail exactly as silently as the
+        // skip it replaces.
+        let scopes = atproto_oauth::scopes::ScopesSet::from_scope_string_for(&out, "did:plc:me");
+        assert!(
+            scopes
+                .assert_space(&atproto_oauth::scopes::SpaceTarget::new(
+                    "com.atmoboards.forum",
+                    "did:plc:someone-else",
+                    "any-key",
+                    atproto_oauth::scopes::SpaceAction::Read,
+                ))
+                .is_ok(),
+            "the emitted scope must grant whole-space read under any authority: {out}"
+        );
+    }
+
+    /// The spec spells the authority field `authority`; this crate's own
+    /// permission model called it `did` first. A set written against either
+    /// means the same thing, and dropping one silently would widen the grant
+    /// to every authority.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_accepts_either_authority_spelling() {
+        for field in ["authority", "did"] {
+            let mut perm = serde_json::json!({
+                "type": "permission",
+                "resource": "space",
+                "spaceType": "com.example.bookmarks",
+                "action": ["read"]
+            });
+            perm[field] = serde_json::json!("did:plc:abc123");
+            let r = resolver(serde_json::json!({
+                "defs": {"main": {"type": "permission-set", "permissions": [perm]}}
+            }));
+            let out = expand(Some(&r), "include:com.example.access").await;
+            assert!(
+                out.contains("space:com.example.bookmarks?authority=did:plc:abc123&action=read"),
+                "{field}: {out}"
+            );
+        }
+    }
+
+    /// A wildcard space type is refused rather than expanded.
+    ///
+    /// A set is published once and reused by every client that names it, so a
+    /// cross-type grant inside one would be the publisher handing out access
+    /// to every space type a user participates in. It is expressible only as a
+    /// scope a client requests directly, where the consent screen shows it for
+    /// what it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_may_not_name_every_space_type() {
+        for space_type in [serde_json::json!("*"), serde_json::Value::Null] {
+            let mut perm = serde_json::json!({
+                "type": "permission",
+                "resource": "space",
+                "action": ["read"]
+            });
+            if !space_type.is_null() {
+                perm["spaceType"] = space_type.clone();
+            }
+            let r = resolver(serde_json::json!({
+                "defs": {"main": {"type": "permission-set", "permissions": [perm]}}
+            }));
+            let out = expand(Some(&r), "include:com.example.access").await;
+            assert!(
+                !out.contains("space:"),
+                "spaceType {space_type:?} must grant nothing: {out}"
+            );
+        }
+    }
+
+    /// An omitted `collection` stays omitted, so the grant keeps following the
+    /// space type's declaration instead of freezing it at expansion time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_does_not_freeze_the_declared_collections() {
+        let r = resolver(serde_json::json!({
+            "defs": {"main": {"type": "permission-set", "permissions": [
+                {
+                    "type": "permission",
+                    "resource": "space",
+                    "spaceType": "com.example.bookmarks"
+                }
+            ]}}
+        }));
+        let out = expand(Some(&r), "include:com.example.access").await;
+        assert!(!out.contains("collection="), "{out}");
+        // The action default is enumerated, which changes nothing about what
+        // is granted and keeps the emitted scope exact.
+        assert!(
+            out.contains(
+                "space:com.example.bookmarks?action=read&action=create&action=update&action=delete"
+            ),
+            "{out}"
         );
     }
 

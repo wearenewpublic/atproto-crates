@@ -6,7 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `atproto-pds`: a permission set's `space` permissions expand into `space:` scopes. Per proposal
+  0016's permission-set section, as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100).
+
+  **A set naming a space granted nothing.** The expander handled `repo`, `blob` and `rpc` and
+  skipped everything else with a warning, so a client that requested a set describing space access
+  received every `repo:` grant in it and no space access at all — with a 200, and a consent screen
+  that had told the user about the space. Granting too little fails loudly later with
+  `InsufficientScope`; this failed at the moment the grant was built, where nothing was watching.
+
+  A wildcard `spaceType` is refused rather than expanded. A set is published once and reused by
+  every client that names it, so a cross-type grant inside one would be the publisher handing out
+  access to every space type a user participates in; the spec makes it expressible only as a scope a
+  client requests directly, where the consent screen shows it for what it is. `atproto-lexicon`
+  already refused to *publish* such a set — refusing to expand one means a set published elsewhere
+  cannot smuggle the wildcard past this server.
+
+  An omitted `collection` stays omitted rather than being expanded, so the grant keeps resolving
+  against the space type's declaration as it changes instead of freezing it at expansion time. An
+  omitted `action` is enumerated, which changes nothing about what is granted and keeps the emitted
+  scope exact.
+
 ### Fixed
+- `atproto-lexicon`: a permission's space authority is read from `authority`, the name the spec
+  gives it, with `did` accepted as an alias for sets written against this crate's earlier model.
+  Serialization emits `authority`. A spec-shaped set previously had the field dropped silently,
+  which does not narrow a grant — it widens it, from one authority to every authority.
+
+
 - `atproto-pds`: `registerNotify` names its subscriber with a service identifier and resolves the
   delivery endpoint from that service's DID document, and a forwarded `notifyWrite` is accepted by
   the service it was forwarded to. Per proposal 0016 as amended by
