@@ -2061,7 +2061,7 @@ pub async fn get_space_credential(
         .map_err(|_| {
             XrpcError::new(
                 StatusCode::FORBIDDEN,
-                "InvalidToken",
+                "InvalidDelegationToken",
                 "delegation token already used (single-use replay)",
             )
         })?;
@@ -2109,8 +2109,13 @@ pub async fn get_space_credential(
         ));
     }
     if inputs.deleted {
+        // 400, like its siblings on this method. A deleted space is a fact
+        // about the space the caller named, not a missing route, and a client
+        // that switches on HTTP status before reading the error name should
+        // not have to treat this one differently from `SpaceNotFound` -- which
+        // this server deliberately normalised to 400 for the same reason.
         return Err(XrpcError::new(
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             "SpaceDeleted",
             format!("space deleted: {space}"),
         ));

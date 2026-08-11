@@ -538,7 +538,10 @@ async fn a_deleted_space_answers_space_deleted_at_renewal() {
         body["error"], "SpaceDeleted",
         "renewal against a deleted space must say so by name: {body}"
     );
-    assert_ne!(status, StatusCode::OK);
+    // The same status as its siblings on this method: a client switching on
+    // status before reading the name should not have to treat this one
+    // specially.
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // A space that never existed is a different answer, and a syncer that
     // conflated them would drop copies on a typo.
@@ -1619,6 +1622,49 @@ async fn a_proof_for_one_request_does_not_authorize_another() {
         StatusCode::UNAUTHORIZED,
         "a proof bound to another URL must not authorize this one"
     );
+}
+
+/// A delegation token that does not work says so by the name the lexicon
+/// gives that failure.
+///
+/// Every way a delegation token could fail — malformed, badly signed, aimed at
+/// the wrong space, expired, replayed — reported the generic `InvalidToken`,
+/// which `getSpaceCredential` also uses for other things. A client could not
+/// tell "mint me a fresh delegation token and retry" from "stop trying".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_delegation_token_is_named_as_one() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // Structurally broken.
+    let (status, body) = exchange_credential(&app, "not-a-jwt", &uri, TEST_DPOP_JKT, None).await;
+    assert_eq!(body["error"], "InvalidDelegationToken", "{body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Well-formed and not signed by anyone who could have issued it.
+    let forged = forge_space_credential("did:plc:owner", &uri);
+    let (_, body) = exchange_credential(&app, &forged.jwt, &uri, TEST_DPOP_JKT, None).await;
+    assert_eq!(body["error"], "InvalidDelegationToken", "{body}");
+
+    // Single-use: the second presentation of a real one is refused under the
+    // same name, because the remedy is the same — get another.
+    let oauth = mint_oauth_access("did:plc:owner", &read_scope());
+    let (_, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencode(&uri)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    let grant = body["token"].as_str().unwrap().to_string();
+    let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    assert_eq!(status, StatusCode::OK, "first use: {body}");
+    let (_, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    assert_eq!(body["error"], "InvalidDelegationToken", "replay: {body}");
 }
 
 /// `dpopJkt` is required, and a credential is never minted unbound.

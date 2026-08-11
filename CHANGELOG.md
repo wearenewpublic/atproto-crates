@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: `getSpaceCredential` reports a failed delegation token as `InvalidDelegationToken`,
+  the name the lexicon gives that failure, and answers `SpaceDeleted` with 400 like its siblings.
+
+  Every way a delegation token could fail — malformed, badly signed, aimed at the wrong space,
+  expired, replayed, or issued by a member whose DID document will not resolve — reported the
+  generic `InvalidToken`, a name `getSpaceCredential` also uses for other things. A client could not
+  tell "mint a fresh delegation token and retry", which is the remedy for all of these, from
+  anything else. The name existed nowhere in the repo despite being declared on the method.
+
+  The unresolvable-DID-document case additionally reported `AuthenticationRequired` at 401. That the
+  member's key cannot be fetched is a fact about the token presented, not about this request's
+  authentication, and the caller's next move is the same as for every other delegation failure.
+
+  `SpaceDeleted` moves from 404 to 400, matching the other errors on the method — this server
+  already normalised `SpaceNotFound` to 400 for the same reason, and a client switching on status
+  before reading the error name should not have to treat one of a method's errors specially.
+
+
 - `atproto-pds`: `com.atproto.repo.listMissingBlobs` reports permissioned blobs, and
   `checkAccountStatus` counts them among the expected ones. Both are migration correctness, and both
   failed silently.

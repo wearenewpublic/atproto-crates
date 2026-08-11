@@ -126,7 +126,7 @@ pub fn peek_delegation_token(grant_jwt: &str) -> Result<DelegationToken, XrpcErr
     let payload_b64 = grant_jwt.split('.').nth(1).ok_or_else(|| {
         XrpcError::new(
             StatusCode::BAD_REQUEST,
-            "InvalidToken",
+            "InvalidDelegationToken",
             "delegation token: missing payload",
         )
     })?;
@@ -135,14 +135,14 @@ pub fn peek_delegation_token(grant_jwt: &str) -> Result<DelegationToken, XrpcErr
         .map_err(|_| {
             XrpcError::new(
                 StatusCode::BAD_REQUEST,
-                "InvalidToken",
+                "InvalidDelegationToken",
                 "delegation token: payload not base64url",
             )
         })?;
     serde_json::from_slice(&payload_bytes).map_err(|_| {
         XrpcError::new(
             StatusCode::BAD_REQUEST,
-            "InvalidToken",
+            "InvalidDelegationToken",
             "delegation token: payload not JSON",
         )
     })
@@ -176,7 +176,7 @@ pub async fn verify_local_delegation_token(
     .map_err(|e| {
         XrpcError::new(
             StatusCode::FORBIDDEN,
-            "InvalidToken",
+            "InvalidDelegationToken",
             format!("delegation token verification: {e}"),
         )
     })?;
@@ -219,9 +219,14 @@ pub async fn verify_remote_delegation_token(
     let member_pub = remote_atproto_signing_key(http, &unverified.iss, plc_directory_hostname)
         .await
         .map_err(|e| {
+            // The member's DID document could not be resolved, so the
+            // token's signature cannot be checked. That is a fact about the
+            // token presented, not about this request's authentication, and
+            // the lexicon names one error for "this delegation token did not
+            // work".
             XrpcError::new(
-                StatusCode::UNAUTHORIZED,
-                "AuthenticationRequired",
+                StatusCode::FORBIDDEN,
+                "InvalidDelegationToken",
                 format!("resolve member DID document for {}: {e}", unverified.iss),
             )
         })?;
@@ -234,7 +239,7 @@ pub async fn verify_remote_delegation_token(
     .map_err(|e| {
         XrpcError::new(
             StatusCode::FORBIDDEN,
-            "InvalidToken",
+            "InvalidDelegationToken",
             format!("delegation token verification: {e}"),
         )
     })?;
