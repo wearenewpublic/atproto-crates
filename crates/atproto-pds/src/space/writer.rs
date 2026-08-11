@@ -390,7 +390,8 @@ impl SpaceWriter {
         // `space.getBlob` has no way to tell whether a CID belongs to the space
         // it was asked about, and the public `sync.getBlob` cannot tell a
         // permissioned blob from a public one.
-        self.maintain_blob_refs(space, member_did, &ref_work).await;
+        self.maintain_blob_refs(space, member_did, &rev, &ref_work)
+            .await;
 
         self.fire_notify_write(space, member_did, &rev, &commit_hash, &signing_key)
             .await;
@@ -424,6 +425,7 @@ impl SpaceWriter {
         &self,
         space: &SpaceUri,
         member_did: &str,
+        rev: &str,
         work: &[(String, Option<serde_json::Value>)],
     ) {
         let store =
@@ -448,6 +450,7 @@ impl SpaceWriter {
                     &space.to_string(),
                     record_uri,
                     &blob.inner.ref_.link,
+                    rev,
                 )
                 .await
                 {

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `atproto-pds`: `com.atproto.space.listBlobs` enumerates the blobs a repo references within a
+  space — the method proposal 0016 gained in
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), and the
+  enumeration primitive its sync and migration stories both rest on.
+
+  A permissioned repo's CAR carries no blobs; `getRepo` says so, and points at `getBlob` for them
+  individually. So a syncer that has pulled a whole repo still had no way to learn *which* blobs
+  those records name short of re-walking every record's value, and an account migrating its
+  permissioned repos had no way to enumerate what to carry. The amended spec's migration section now
+  names `listSpaces` and `listBlobs` as exactly that pair.
+
+  Takes `{space, repo, since?, limit 1-1000 default 500, cursor}` and answers `{cursor?, cids[]}`,
+  with either OAuth or a space credential — the syncers this exists for hold credentials, not
+  sessions. Blobs behind permissioned records remain invisible to the unauthenticated
+  `com.atproto.sync.listBlobs`; this is the authenticated, space-scoped counterpart.
+
+  **Schema change.** `space_blob_ref` gains a `rev` column, stamped with the commit revision of the
+  write that created the reference — the same revision `listRepoOps` reports for that record, so a
+  consumer can use one cursor for records and blobs alike. The table recorded which record in which
+  space named which blob and nothing about *when*, so `since` was not merely unimplemented, it was
+  unanswerable from the data. Existing rows get `''`, which sorts before every TID: a full listing
+  includes them and a `since` listing does not, which is the safe direction, since a caller passing
+  `since` is resuming from a point it has already seen while one that has never listed passes no
+  `since` at all.
+
+  Paging is by CID rather than by revision, because revisions repeat across the rows of one commit
+  and so cannot say which of them a page already delivered. A blob named by two records is listed
+  once, and is included when either naming is recent enough: the question is which blobs to fetch,
+  not how many times they were named.
+
+
 - `atproto-pds`: `com.atproto.space.unregisterNotify` withdraws a write-notification registration —
   the method proposal 0016 gained in
   [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), and the only

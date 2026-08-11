@@ -417,6 +417,10 @@ fn build_router_inner(
             get(space_handlers::list_records),
         )
         .route(
+            "/xrpc/com.atproto.space.listBlobs",
+            get(space_handlers::list_blobs),
+        )
+        .route(
             "/xrpc/com.atproto.space.getBlob",
             get(space_handlers::get_blob),
         )

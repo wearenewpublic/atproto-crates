@@ -2840,6 +2840,99 @@ pub async fn notify_write(
 // ---------------------------------------------------------------------------
 //  getBlob — permissioned blob fetch (com.atproto.space.getBlob).
 // ---------------------------------------------------------------------------
+//  listBlobs — enumerate the blobs a repo references within a space.
+// ---------------------------------------------------------------------------
+
+/// Query params for `com.atproto.space.listBlobs`.
+#[derive(Debug, Deserialize)]
+pub struct ListSpaceBlobsQuery {
+    /// Space URI.
+    pub space: String,
+    /// DID of the account whose blobs to list.
+    pub repo: String,
+    /// List only blobs named by records written after this repo revision.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Page size, clamped to the lexicon's 1..=1000 (default 500).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Last CID of the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Output of `listBlobs`: `{cursor?, cids[]}`.
+#[derive(Debug, Serialize)]
+pub struct ListSpaceBlobsResponse {
+    /// Cursor for the next page, absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// The blob CIDs.
+    pub cids: Vec<String>,
+}
+
+/// `GET /xrpc/com.atproto.space.listBlobs`.
+///
+/// The enumeration primitive the spec's sync and migration stories both rest
+/// on. A repo's CAR carries no blobs — `getRepo` says so explicitly — so a
+/// syncer that has pulled a repo still has to discover which blobs those
+/// records name, and an account migrating its permissioned repos has to carry
+/// them. Neither can be done by reading records alone without re-walking every
+/// record's value.
+///
+/// Blobs behind permissioned records are never enumerated by the public
+/// `com.atproto.sync.listBlobs`, which is unauthenticated; this is the
+/// authenticated counterpart, scoped to one space.
+pub async fn list_blobs(
+    State(state): State<HttpState>,
+    parts: Parts,
+    Query(q): Query<ListSpaceBlobsQuery>,
+) -> Result<Json<ListSpaceBlobsResponse>, XrpcError> {
+    let space = parse_space_uri(&q.space)?;
+    // `repo` is required by the lexicon, as it is for `getBlob`: a space
+    // credential is not bound to any one member's repo, so there is no
+    // sensible default.
+    let resolved = resolve_record_auth(&parts, &state, &space, Some(q.repo.as_str())).await?;
+    if let Some(subject) = &resolved.subject {
+        assert_space_scope(
+            &state,
+            subject,
+            &space,
+            atproto_oauth::scopes::SpaceAction::Read,
+            None,
+        )
+        .await?;
+    }
+    space_reader(&state)?
+        .verify_read_auth(&space, &resolved.auth)
+        .await
+        .map_err(XrpcError::from)?;
+
+    let manager = account_manager(&state)?;
+    let store = SqlActorStore::open(manager.data_dir(), &q.repo)
+        .await
+        .map_err(XrpcError::from)?;
+
+    let limit = page_limit(q.limit, 500, 1000);
+    let cids = crate::space::blob_ref::list_refs(
+        &store,
+        &space.to_string(),
+        q.since.as_deref(),
+        q.cursor.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+
+    // A full page means there may be more; a short one is the end. The cursor
+    // is the last CID, which is what the listing pages on.
+    let cursor = (cids.len() as u32 == limit)
+        .then(|| cids.last().cloned())
+        .flatten();
+    Ok(Json(ListSpaceBlobsResponse { cursor, cids }))
+}
+
+// ---------------------------------------------------------------------------
 
 /// Query params for `com.atproto.space.getBlob`.
 #[derive(Debug, Deserialize)]

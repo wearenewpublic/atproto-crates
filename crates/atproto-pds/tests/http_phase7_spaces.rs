@@ -2328,6 +2328,185 @@ async fn the_same_blob_is_served_to_a_member_through_the_space_endpoint() {
     );
 }
 
+/// `listBlobs` enumerates what a repo references in one space, so a syncer
+/// knows which blobs to fetch and a migration knows which to carry.
+///
+/// A repo's CAR carries no blobs at all, so without this a syncer that pulled
+/// a repo would have to re-walk every record's value to discover them.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_blobs_enumerates_the_blobs_a_repo_references_in_a_space() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    let other = create_space(&app, &owner, "elsewhere").await;
+
+    let in_space = upload_blob(&app, &owner, b"referenced here!").await;
+    let in_other = upload_blob(&app, &owner, b"referenced away!").await;
+    for (space, cid, rkey) in [(&uri, &in_space, "r1"), (&other, &in_other, "r2")] {
+        post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.applyWrites",
+            json!({
+                "repo": "did:plc:owner",
+                "space": space,
+                "writes": [{
+                    "action": "create", "collection": "c", "rkey": rkey,
+                    "value": {"embed": blob_embed(cid)}
+                }]
+            }),
+            Some(&owner),
+        )
+        .await;
+    }
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listBlobs?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listBlobs: {body}");
+    let cids: Vec<&str> = body["cids"]
+        .as_array()
+        .expect("cids array")
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert_eq!(cids, vec![in_space.as_str()], "{body}");
+    assert!(
+        !cids.contains(&in_other.as_str()),
+        "a blob referenced only from another space must not be listed here: {body}"
+    );
+}
+
+/// A space credential lists blobs too — this is a sync method, and the
+/// syncers it exists for hold credentials rather than OAuth sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_blobs_accepts_a_space_credential() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    let cid = upload_blob(&app, &owner, b"syncer fetches!!").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "repo": "did:plc:owner",
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c", "rkey": "r1",
+                "value": {"embed": blob_embed(&cid)}
+            }]
+        }),
+        Some(&owner),
+    )
+    .await;
+
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let (status, body) = get_json_cred(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.listBlobs?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listBlobs via credential: {body}");
+    assert_eq!(body["cids"][0], cid, "{body}");
+
+    // Unauthenticated, it is not an enumeration anyone can perform.
+    let (status, _) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.space.listBlobs?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// `since` lists only what was named after a revision, which is what makes
+/// catching up cheaper than re-listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_blobs_since_a_revision_returns_only_later_blobs() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let write = async |rkey: &str, cid: &str| {
+        post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.applyWrites",
+            json!({
+                "repo": "did:plc:owner",
+                "space": uri,
+                "writes": [{
+                    "action": "create", "collection": "c", "rkey": rkey,
+                    "value": {"embed": blob_embed(cid)}
+                }]
+            }),
+            Some(&owner),
+        )
+        .await
+    };
+
+    let first = upload_blob(&app, &owner, b"the earlier one!").await;
+    write("r1", &first).await;
+    // The revision to resume from is the one the repo is at after that write,
+    // read the way a syncer reads it.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getLatestCommit?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getLatestCommit: {body}");
+    let first_rev = body["commit"]["rev"]
+        .as_str()
+        .expect("a written repo has a commit revision")
+        .to_string();
+
+    let second = upload_blob(&app, &owner, b"the later one!!!").await;
+    write("r2", &second).await;
+
+    let list = async |since: Option<&str>| {
+        let mut path = format!(
+            "/xrpc/com.atproto.space.listBlobs?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        );
+        if let Some(s) = since {
+            path.push_str(&format!("&since={s}"));
+        }
+        let (status, body) = get_json(app.clone(), &path, Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "listBlobs: {body}");
+        body["cids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let all = list(None).await;
+    assert_eq!(all.len(), 2, "both blobs without a cursor: {all:?}");
+
+    let later = list(Some(&first_rev)).await;
+    assert_eq!(
+        later,
+        vec![second.clone()],
+        "only the blob named after {first_rev}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_public_blob_is_still_served_publicly() {
     // The other control. A gate that refused everything would pass the two
