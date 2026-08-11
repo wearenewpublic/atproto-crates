@@ -11,14 +11,22 @@
 
 #[cfg(feature = "otel")]
 mod inner {
-    use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
+    use opentelemetry::{global, trace::TracerProvider as _};
     use opentelemetry_otlp::WithExportConfig;
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
-    use opentelemetry_sdk::runtime;
-    use opentelemetry_sdk::trace::{self as sdktrace, RandomIdGenerator, Sampler};
+    use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
+    use std::sync::OnceLock;
     use tracing_subscriber::Layer;
     use tracing_subscriber::registry::LookupSpan;
+
+    /// Handle kept so [`shutdown`] can flush the batch processor.
+    ///
+    /// The SDK dropped `global::shutdown_tracer_provider` because
+    /// shutting down through the global slot could not guarantee the
+    /// exporter had actually drained. Flushing is now the provider's own
+    /// method, so the caller has to retain one.
+    static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
     /// Build a `tracing-opentelemetry` layer wired to an OTLP HTTP/protobuf
     /// exporter at `endpoint`.
@@ -51,17 +59,20 @@ mod inner {
                 return None;
             }
         };
-        let resource = Resource::new(vec![KeyValue::new(
-            "service.name",
-            service_name.to_string(),
-        )]);
-        let provider = sdktrace::TracerProvider::builder()
+        // `builder_empty` rather than `builder`: the latter runs the env
+        // detectors and stamps SDK metadata, which would change the
+        // attributes operators already filter on.
+        let resource = Resource::builder_empty()
+            .with_service_name(service_name.to_string())
+            .build();
+        let provider = SdkTracerProvider::builder()
             .with_resource(resource)
             .with_sampler(Sampler::AlwaysOn)
             .with_id_generator(RandomIdGenerator::default())
-            .with_batch_exporter(exporter, runtime::Tokio)
+            .with_batch_exporter(exporter)
             .build();
         let tracer = provider.tracer("atproto-pds");
+        let _ = PROVIDER.set(provider.clone());
         global::set_tracer_provider(provider);
         Some(tracing_opentelemetry::layer().with_tracer(tracer))
     }
@@ -70,7 +81,11 @@ mod inner {
     /// Called from `bin/pds.rs::shutdown_signal` when the OTLP layer is
     /// active.
     pub fn shutdown() {
-        opentelemetry::global::shutdown_tracer_provider();
+        if let Some(provider) = PROVIDER.get()
+            && let Err(err) = provider.shutdown()
+        {
+            tracing::warn!(error = ?err, "otel: span flush on shutdown failed");
+        }
     }
 }
 
