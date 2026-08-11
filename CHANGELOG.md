@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stacked Borrows). No API changes were needed.
 
   Six advisories remain and none is fixable by a version bump. `rsa` (RUSTSEC-2023-0071, Marvin
-  timing attack) and `rustls-pemfile` (unmaintained) have no fixed release. The other four are
+  timing attack) has no fixed release. (`rustls-pemfile` was also on this list; the `redis` upgrade
+  below drops it.) The other four are
   reachable only through optional features that are off by default: `rustls-webpki 0.101.7` (three
   advisories) and `lru 0.12.5` come in under `s3`, and `quick-xml 0.37.5` (two) under `panproto`.
 
@@ -44,6 +45,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves the same legacy stack, and additionally requires Rust 1.94.1 against this workspace's
   1.90 pin. Escaping it means changing which TLS stack the S3 backend asks for, which is a
   functional change to that backend rather than a dependency update.
+
+### Fixed
+- **The `s3` feature did not compile.** Twelve `aws-smithy` / `aws-runtime` crates had drifted to
+  releases requiring rustc 1.94.1 against the 1.90 pin, so `cargo check -p atproto-pds --features s3`
+  failed in the resolver before reaching any code. Nothing built that path — the release image
+  builds `-F clap,hickory-dns,zeroize,tokio,smtp`, `scripts/ci.sh` passes no `--features`, and
+  `--all-features` dies on the same resolver error rather than attributing it to a feature — so the
+  blob backend selected by `PDS_BLOB_STORE_URL=s3://...` was unbuildable from this tree.
+  Regenerating the lockfile lets the MSRV-aware resolver pick 1.90-compatible releases; only `aws`
+  crates move, all downgrades. Every optional feature now compiles in a single invocation, which was
+  not previously true.
+
+### Changed
+- Dependency upgrade sweep across the 68 declared workspace requirements; 20 were a major behind.
+
+  **Upgraded.** `base64` 0.22 → 0.23, `compact_str` 0.9 → 0.10, `prometheus-client` 0.23 → 0.25,
+  `tower-http` 0.6 → 0.7 and `ulid` 1.2 → 3.0 needed no source change beyond `Ulid::new()` becoming
+  `Ulid::generate()`. The `opentelemetry` trio 0.27 → 0.32 with `tracing-opentelemetry` 0.28 → 0.33
+  needed three: the batch span processor no longer takes a runtime handle (so the `rt-tokio` feature
+  comes off), `Resource::new` is private in favour of `builder_empty`, and
+  `global::shutdown_tracer_provider` is gone because it could not guarantee the exporter had
+  drained, so the provider is retained and flushed directly. `redis` 0.27 → 1.5 needed none, and
+  drops the unmaintained `rustls-pemfile`.
+
+  `redis` needing no source change is why `feature_valkey.rs` gained a live round-trip behind
+  `PDS_VALKEY_TEST_URL` (the `postgres-live-tests` opt-in shape). Both valkey guards read a reply
+  *shape* rather than a status code — the JTI guard separates `SET NX` returning `OK` from returning
+  nil, the limiter destructures a two-element pipeline reply — and both fail *open* on a client
+  error. A release that changed nil handling or pipeline typing would compile, pass every offline
+  test, and silently stop rejecting replays and enforcing rate limits. The existing coverage never
+  contacted a server, so it could not have seen that.
+
+  **Deferred, with reasons.** `sqlx` 0.9 requires rustc 1.94 against the 1.90 pin. `panproto-core`
+  0.70 is API-compatible and passes, but `panproto-io` still pins the same vulnerable `quick-xml
+  0.37.5`, so it fixes neither advisory while *adding* `bitmaps` (unmaintained + unsound) and `paste`
+  (unmaintained) and growing that feature's tree from 742 to 976 edges. The `quick-xml` requirement
+  cannot be forced past it; the fix is upstream's.
+
+  The RustCrypto stack (`ecdsa` 0.17, `elliptic-curve` 0.14, `k256`/`p256`/`p384` 0.14,
+  `ed25519-dalek` 3.0) and the `reqwest` stack (0.13 with `reqwest-middleware` 0.5,
+  `reqwest-chain` 2.0) each need their own branch. `elliptic-curve` 0.14 removes `JwkEcKey` and the
+  `jwk` feature outright with no in-crate successor, across 71 references in 8 files including the
+  JWKS endpoint, DPoP proof parsing and PAR client attestation — and JWK field serialization is what
+  RFC 7638 thumbprints are computed over, which is what `cnf.jkt` binds space credentials to, so a
+  hand-rolled replacement risks invalidating every credential already issued. `reqwest` 0.13 renames
+  `rustls-tls` to `rustls`, but that also swaps the `ring` provider for `aws-lc-rs` (whose build
+  tooling the builder image does not install) and removes bundled `webpki-roots` with no replacement
+  feature, moving the trust anchors for every outbound connection — PLC directory, PDS-to-PDS,
+  AppView — from the binary to the host trust store.
 
 
 ## [0.15.0-rc.3] - 2026-08-11
