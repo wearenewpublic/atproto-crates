@@ -421,21 +421,54 @@ pub async fn list_missing(
     limit: u32,
 ) -> PdsResult<Vec<BlobRefRow>> {
     let limit = limit.clamp(1, 1000);
+    // Both reference tables, because a migrating account has to be told about
+    // every blob it is missing and not merely the public ones.
+    //
+    // The prescribed migration flow is: import the repo, upload the blobs
+    // `listMissingBlobs` reports, activate. A permissioned blob that never
+    // appeared in that report was never asked for and never uploaded, so the
+    // records naming it arrived at the new host pointing at bytes that were
+    // left behind — and the account was activated as though the move were
+    // complete.
+    //
+    // `space_blob_ref` carries no `mime_type` or `size`; the columns are
+    // padded because `BlobRefRow` has them, and `listMissingBlobs` emits
+    // neither — a caller is being told which CIDs to upload, and it is
+    // uploading bytes it already holds.
     let sql = match cursor {
         Some(_) => {
-            "SELECT DISTINCT r.blob_cid, r.mime_type, r.size, r.record_uri
-             FROM repo_blob_ref r
-             LEFT JOIN repo_blob b ON b.cid = r.blob_cid
-             WHERE b.cid IS NULL AND r.blob_cid > ?
-             ORDER BY r.blob_cid ASC
+            "SELECT blob_cid, MIN(mime_type) AS mime_type, MIN(size) AS size,
+                     MIN(record_uri) AS record_uri FROM (
+                 SELECT r.blob_cid, r.mime_type, r.size, r.record_uri
+                 FROM repo_blob_ref r
+                 LEFT JOIN repo_blob b ON b.cid = r.blob_cid
+                 WHERE b.cid IS NULL
+                 UNION
+                 SELECT s.blob_cid, '' AS mime_type, 0 AS size, s.record_uri
+                 FROM space_blob_ref s
+                 LEFT JOIN repo_blob b ON b.cid = s.blob_cid
+                 WHERE b.cid IS NULL
+             )
+             WHERE blob_cid > ?
+             GROUP BY blob_cid
+             ORDER BY blob_cid ASC
              LIMIT ?"
         }
         None => {
-            "SELECT DISTINCT r.blob_cid, r.mime_type, r.size, r.record_uri
-             FROM repo_blob_ref r
-             LEFT JOIN repo_blob b ON b.cid = r.blob_cid
-             WHERE b.cid IS NULL
-             ORDER BY r.blob_cid ASC
+            "SELECT blob_cid, MIN(mime_type) AS mime_type, MIN(size) AS size,
+                     MIN(record_uri) AS record_uri FROM (
+                 SELECT r.blob_cid, r.mime_type, r.size, r.record_uri
+                 FROM repo_blob_ref r
+                 LEFT JOIN repo_blob b ON b.cid = r.blob_cid
+                 WHERE b.cid IS NULL
+                 UNION
+                 SELECT s.blob_cid, '' AS mime_type, 0 AS size, s.record_uri
+                 FROM space_blob_ref s
+                 LEFT JOIN repo_blob b ON b.cid = s.blob_cid
+                 WHERE b.cid IS NULL
+             )
+             GROUP BY blob_cid
+             ORDER BY blob_cid ASC
              LIMIT ?"
         }
     };
@@ -705,5 +738,105 @@ mod tests {
             "langs": ["en"],
         });
         assert!(walk_blob_refs(&record).is_empty());
+    }
+    /// A blob referenced only by a permissioned record is reported as missing.
+    ///
+    /// The prescribed migration flow is: import the repo, upload the blobs
+    /// `listMissingBlobs` reports, activate. A permissioned blob absent from
+    /// that report is never asked for and never uploaded, so the records
+    /// naming it arrive at the new host pointing at bytes left behind — and
+    /// the account is activated as though the move had completed. Nothing
+    /// fails; the data is simply gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permissioned_blob_is_reported_missing_like_a_public_one() {
+        let store = fresh_store().await;
+        const SPACE: &str = "at://did:plc:test/space/app.bsky.group/default";
+        const PUBLIC_CID: &str = "bafkreipublicmissing";
+        const SPACE_CID: &str = "bafkreispacemissing";
+
+        sqlx::query(
+            "INSERT INTO repo_blob_ref (record_uri, blob_cid, mime_type, size)
+             VALUES (?, ?, 'image/png', 7)",
+        )
+        .bind("at://did:plc:test/app.t.rec/pub")
+        .bind(PUBLIC_CID)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO space_blob_ref (space, record_uri, blob_cid, rev)
+             VALUES (?, ?, ?, '3jui7kd2z2y2e')",
+        )
+        .bind(SPACE)
+        .bind(format!("{SPACE}/did:plc:test/app.t.rec/priv"))
+        .bind(SPACE_CID)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let missing: Vec<String> = list_missing(&store, None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.cid)
+            .collect();
+        assert!(missing.contains(&PUBLIC_CID.to_string()), "{missing:?}");
+        assert!(
+            missing.contains(&SPACE_CID.to_string()),
+            "a permissioned reference must be reported too: {missing:?}"
+        );
+
+        // And uploading the bytes retires the report, from either table.
+        for (cid, bytes) in [(PUBLIC_CID, &b"public!"[..]), (SPACE_CID, &b"private"[..])] {
+            sqlx::query(
+                "INSERT INTO repo_blob (cid, mime_type, size, data, created_at)
+                 VALUES (?, ?, ?, ?, '2026-08-11T00:00:00Z')",
+            )
+            .bind(cid)
+            .bind("image/png")
+            .bind(bytes.len() as i64)
+            .bind(bytes)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        assert!(
+            list_missing(&store, None, 100).await.unwrap().is_empty(),
+            "nothing is missing once the bytes are present"
+        );
+    }
+
+    /// One blob named by both a public and a permissioned record is reported
+    /// once, not twice. A migrating client uploads bytes, not references.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_named_from_both_realms_is_reported_once() {
+        let store = fresh_store().await;
+        const CID: &str = "bafkreisharedmissing";
+        sqlx::query(
+            "INSERT INTO repo_blob_ref (record_uri, blob_cid, mime_type, size)
+             VALUES (?, ?, 'image/png', 7)",
+        )
+        .bind("at://did:plc:test/app.t.rec/pub")
+        .bind(CID)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO space_blob_ref (space, record_uri, blob_cid, rev)
+             VALUES (?, ?, ?, '3jui7kd2z2y2e')",
+        )
+        .bind("at://did:plc:test/space/app.bsky.group/default")
+        .bind("at://did:plc:test/space/app.bsky.group/default/did:plc:test/app.t.rec/priv")
+        .bind(CID)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let missing = list_missing(&store, None, 100).await.unwrap();
+        assert_eq!(
+            missing.iter().filter(|r| r.cid == CID).count(),
+            1,
+            "one CID, one upload to perform: {missing:?}"
+        );
     }
 }

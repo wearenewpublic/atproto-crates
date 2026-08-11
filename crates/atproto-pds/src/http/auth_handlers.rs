@@ -1640,11 +1640,24 @@ pub async fn check_account_status(
                 .fetch_one(pool)
                 .await
                 .unwrap_or((0,));
-            let expected: (i64,) =
-                sqlx::query_as("SELECT COUNT(DISTINCT blob_cid) FROM repo_blob_ref")
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or((0,));
+            // Expected counts both reference tables, because `imported`
+            // counts every row of `repo_blob` and permissioned blobs live
+            // there too -- they are uploaded through the ordinary
+            // `repo.uploadBlob`. Counting only public references made the two
+            // numbers incomparable for any account holding a permissioned
+            // blob: `imported` exceeded `expected` on a complete migration,
+            // and the endpoint whose entire job is to say whether a migration
+            // is finished could not answer.
+            let expected: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM (
+                     SELECT blob_cid FROM repo_blob_ref
+                     UNION
+                     SELECT blob_cid FROM space_blob_ref
+                 )",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or((0,));
             let imported: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM repo_blob")
                 .fetch_one(pool)
                 .await

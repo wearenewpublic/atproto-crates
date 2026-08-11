@@ -552,20 +552,42 @@ impl BlobStorage for SqlBlobStorage {
         let limit = limit.clamp(1, 1000);
         use sqlx::Row;
         let sql = match cursor {
+            // Both reference tables: a migrating account has to be told about
+            // every blob it is missing, not only the public ones. See
+            // `crate::blob::list_missing`.
             Some(_) => {
-                "SELECT DISTINCT r.blob_cid, r.mime_type, r.size, r.record_uri
-                 FROM repo_blob_ref r
-                 LEFT JOIN repo_blob b ON b.cid = r.blob_cid
-                 WHERE b.cid IS NULL AND r.blob_cid > ?
-                 ORDER BY r.blob_cid ASC
+                "SELECT blob_cid, MIN(mime_type) AS mime_type, MIN(size) AS size,
+                        MIN(record_uri) AS record_uri FROM (
+                     SELECT r.blob_cid, r.mime_type, r.size, r.record_uri
+                     FROM repo_blob_ref r
+                     LEFT JOIN repo_blob b ON b.cid = r.blob_cid
+                     WHERE b.cid IS NULL
+                     UNION
+                     SELECT s.blob_cid, '' AS mime_type, 0 AS size, s.record_uri
+                     FROM space_blob_ref s
+                     LEFT JOIN repo_blob b ON b.cid = s.blob_cid
+                     WHERE b.cid IS NULL
+                 )
+                 WHERE blob_cid > ?
+                 GROUP BY blob_cid
+                 ORDER BY blob_cid ASC
                  LIMIT ?"
             }
             None => {
-                "SELECT DISTINCT r.blob_cid, r.mime_type, r.size, r.record_uri
-                 FROM repo_blob_ref r
-                 LEFT JOIN repo_blob b ON b.cid = r.blob_cid
-                 WHERE b.cid IS NULL
-                 ORDER BY r.blob_cid ASC
+                "SELECT blob_cid, MIN(mime_type) AS mime_type, MIN(size) AS size,
+                        MIN(record_uri) AS record_uri FROM (
+                     SELECT r.blob_cid, r.mime_type, r.size, r.record_uri
+                     FROM repo_blob_ref r
+                     LEFT JOIN repo_blob b ON b.cid = r.blob_cid
+                     WHERE b.cid IS NULL
+                     UNION
+                     SELECT s.blob_cid, '' AS mime_type, 0 AS size, s.record_uri
+                     FROM space_blob_ref s
+                     LEFT JOIN repo_blob b ON b.cid = s.blob_cid
+                     WHERE b.cid IS NULL
+                 )
+                 GROUP BY blob_cid
+                 ORDER BY blob_cid ASC
                  LIMIT ?"
             }
         };

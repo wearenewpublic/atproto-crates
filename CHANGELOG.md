@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `atproto-pds`: `com.atproto.repo.listMissingBlobs` reports permissioned blobs, and
+  `checkAccountStatus` counts them among the expected ones. Both are migration correctness, and both
+  failed silently.
+
+  **A migration dropped permissioned blobs and reported success.** The prescribed flow is: create
+  the account, import the repo, upload the blobs `listMissingBlobs` reports, activate. That report
+  joined `repo_blob_ref` alone, so a blob referenced only by a permissioned record was never asked
+  for and never uploaded — the records naming it arrived at the new host pointing at bytes left
+  behind, and the account was activated as though the move had completed. Nothing failed; the data
+  was simply gone. Both reference tables are now consulted.
+
+  **`checkAccountStatus` could not answer the question it exists for.** `expectedBlobs` counted
+  distinct references from `repo_blob_ref` while `importedBlobs` counted *every* row of `repo_blob`
+  — and permissioned blobs live there too, since they are uploaded through the ordinary
+  `com.atproto.repo.uploadBlob`. For any account holding one, `imported` exceeded `expected` on a
+  complete migration, so the two counters could never agree and "is this migration finished" had no
+  answer. `expectedBlobs` now counts distinct CIDs across both tables.
+
+  One blob is reported once however many records name it, public and permissioned alike: a caller is
+  being told which bytes to upload, not how many references exist. That also makes the CID cursor
+  sound — duplicate rows for one CID could straddle a page boundary and be skipped, which was
+  possible before this change for two public records naming the same blob.
+
+  Not covered: the fjall storage profile's `list_missing_refs`, which scans a fjall keyspace and
+  cannot reach `space_blob_ref` — that table is per-actor SQLite on every profile. Closing it needs
+  a cross-store query the blob backend has no handle for, so it is left as a known gap rather than
+  papered over.
+
 ### Added
 - `atproto-pds`: a permission set's `space` permissions expand into `space:` scopes. Per proposal
   0016's permission-set section, as amended by
