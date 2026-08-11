@@ -145,10 +145,22 @@ async fn require_session_auth(
 
 /// Inputs for `com.atproto.simplespace.createSpace`.
 ///
-/// Matches the authoritative lexicon: `{did, type, skey?, config?}`. `did`
-/// is the DID of the space authority — it defaults to the authenticated
-/// caller and, if supplied, must equal the caller. `skey` auto-generates a
-/// TID when absent. `config` carries the initial `#spaceConfig`.
+/// The lexicon shape is `{type, skey?, policy, appAccess}`, with `policy` and
+/// `appAccess` as top-level open unions. `skey` auto-generates a TID when
+/// absent.
+///
+/// Two fields are kept beyond that shape. `did` is the DID of the space
+/// authority: it defaults to the authenticated caller and, if supplied, must
+/// equal the caller. `config` is the nested `#spaceConfig` object this server
+/// required before the unions were lifted to the top level; a caller sending
+/// both gets the top-level fields, which are the lexicon's.
+///
+/// `policy` and `appAccess` are optional here where the lexicon marks them
+/// required, so that a client written against the older shape keeps creating
+/// spaces. Omitting them applies the documented defaults (`member-list` /
+/// `#open`) — which is what the spec prose says an unconfigured space has.
+/// Nothing is silently discarded either way: what a caller sends is what the
+/// space gets.
 #[derive(Debug, Deserialize)]
 pub struct CreateSpaceInput {
     /// DID of the space (the authority). Defaults to the caller.
@@ -158,7 +170,13 @@ pub struct CreateSpaceInput {
     pub space_type: String,
     /// Space key. Auto-generated as a TID when omitted.
     pub skey: Option<String>,
-    /// Initial space configuration (`com.atproto.simplespace.defs#spaceConfig`).
+    /// User-authorization policy, as the lexicon's open union.
+    pub policy: Option<serde_json::Value>,
+    /// App-authorization policy, as the lexicon's open union.
+    #[serde(rename = "appAccess")]
+    pub app_access: Option<serde_json::Value>,
+    /// Initial space configuration (`com.atproto.simplespace.defs#spaceConfig`),
+    /// the pre-union nesting. Superseded by the two fields above.
     pub config: Option<serde_json::Value>,
 }
 
@@ -212,7 +230,26 @@ pub async fn create_space(
         &scope_uri,
         atproto_oauth::scopes::SpaceManageVerb::Create,
     )?;
-    let config = match input.config {
+    // The lexicon's top-level `policy`/`appAccess` win over the nested
+    // `config` this server used to require; either shape reaches the same
+    // parser, which is also what rejects a union variant we do not implement.
+    let config_value = match (&input.policy, &input.app_access) {
+        (None, None) => input.config.clone(),
+        _ => {
+            let mut obj = match input.config.clone() {
+                Some(serde_json::Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            if let Some(p) = input.policy.clone() {
+                obj.insert("policy".to_string(), p);
+            }
+            if let Some(a) = input.app_access.clone() {
+                obj.insert("appAccess".to_string(), a);
+            }
+            Some(serde_json::Value::Object(obj))
+        }
+    };
+    let config = match config_value {
         Some(ref v) => crate::space::SpaceConfig::from_create_input(v).map_err(XrpcError::from)?,
         None => crate::space::SpaceConfig::default(),
     };
@@ -225,18 +262,28 @@ pub async fn create_space(
 }
 
 /// Inputs for `com.atproto.simplespace.updateSpace`.
+///
+/// The lexicon shape is `{space, policy?, appAccess?}`, both config fields
+/// being open unions that replace the current value wholesale. Omitted fields
+/// are left unchanged.
 #[derive(Debug, Deserialize)]
 pub struct UpdateSpaceInput {
     /// Space URI to update.
     pub space: String,
-    /// New user-authorization policy, if provided. The lexicon names this
-    /// `policy`; `mintPolicy` is accepted as the name this server used to
-    /// require.
-    pub policy: Option<String>,
+    /// New user-authorization policy, if provided.
+    ///
+    /// Untyped because it carries either shape: the lexicon's `$type`-tagged
+    /// union, or the bare `knownValues` string this server used to require.
+    /// Typing it as `String` is what made a conformant client's union fail
+    /// deserialization with a generic 400 that named nothing.
+    pub policy: Option<serde_json::Value>,
     /// Deprecated spelling of [`UpdateSpaceInput::policy`].
     #[serde(rename = "mintPolicy")]
-    pub mint_policy: Option<String>,
+    pub mint_policy: Option<serde_json::Value>,
     /// New managing-app identifier. Empty string clears to NULL.
+    ///
+    /// Superseded by `#managingAppPolicy`, which carries its own; kept for the
+    /// legacy string `policy`, which cannot express one.
     #[serde(rename = "managingApp")]
     pub managing_app: Option<String>,
     /// New app-access union, if provided (replaces wholesale).
@@ -261,7 +308,7 @@ pub async fn update_space(
     // Reassemble the config-field object the patch parser expects.
     let mut obj = serde_json::Map::new();
     if let Some(p) = input.policy.or(input.mint_policy) {
-        obj.insert("policy".to_string(), serde_json::Value::String(p));
+        obj.insert("policy".to_string(), p);
     }
     if let Some(a) = input.managing_app {
         obj.insert("managingApp".to_string(), serde_json::Value::String(a));

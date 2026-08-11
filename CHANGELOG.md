@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `atproto-pds`: `createSpace` and `updateSpace` read the `policy` and `appAccess` open unions the
+  simplespace lexicons define, and refuse variants this host does not implement with the
+  `UnsupportedPolicy` / `UnsupportedAppAccess` errors those lexicons declare — per proposal 0016 as
+  amended by [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100),
+  which requires a host to reject values it cannot enforce at configuration time.
+
+  **A conformant client's configuration was being discarded in full.** `createSpace` took the two
+  fields nested inside a `config` object; the lexicon lifts them to the top level, and serde dropped
+  what it did not recognise. A client asking for a public, allow-listed space got a `member-list` /
+  `#open` one, HTTP 200, and nothing to say so — a space *less* gated than its owner asked for.
+  `updateSpace` failed in the opposite direction, typing `policy` as a string so that a union object
+  failed deserialization with a generic 400 naming nothing.
+
+  Unknown variants previously surfaced as 500 `InternalError`, via a storage error. These are *open*
+  unions: an unimplemented variant is well-formed input, not corruption, and it has to be refused
+  deliberately. Storing one would leave the owner believing their space is gated by a rule this
+  server never applies.
+
+  `managingApp` now comes from inside `#managingAppPolicy`, as the lexicon nests it. That makes
+  "managing-app policy with no managing app" unrepresentable through the union — previously it was
+  storable, and surfaced only at mint time as a refusal to issue credentials for a space whose owner
+  believed it was configured. Selecting a policy that consults no managing app clears the one that
+  was set, rather than leaving the space pointing at an app it no longer asks.
+
+  Both older shapes still work: the nested `config` object, the `mintPolicy` spelling, the bare
+  `knownValues` policy string, and the separate top-level `managingApp`. `policy`/`appAccess` are
+  also accepted as absent, where the lexicon marks them required, so a client written against the
+  older shape keeps creating spaces — omitting them applies the documented defaults. Whether to
+  tighten to strictly-required is deferred with the rest of the legacy-surface decision.
+
 ### Added
 - `atproto-space` / `atproto-pds`: space credentials are DPoP-bound at issuance.
   `com.atproto.space.getSpaceCredential` takes a **required** `dpopJkt` — the RFC 7638 thumbprint of

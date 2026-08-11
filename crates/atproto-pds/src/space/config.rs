@@ -27,6 +27,12 @@ pub const SPACE_CONFIG_TYPE: &str = "com.atproto.simplespace.defs#spaceConfig";
 pub const APP_ACCESS_OPEN_TYPE: &str = "com.atproto.simplespace.defs#open";
 /// `$type` of the `#allowList` app-access union variant.
 pub const APP_ACCESS_ALLOW_LIST_TYPE: &str = "com.atproto.simplespace.defs#allowList";
+/// `$type` of the `#publicPolicy` user-authorization union variant.
+pub const POLICY_PUBLIC_TYPE: &str = "com.atproto.simplespace.defs#publicPolicy";
+/// `$type` of the `#memberListPolicy` user-authorization union variant.
+pub const POLICY_MEMBER_LIST_TYPE: &str = "com.atproto.simplespace.defs#memberListPolicy";
+/// `$type` of the `#managingAppPolicy` user-authorization union variant.
+pub const POLICY_MANAGING_APP_TYPE: &str = "com.atproto.simplespace.defs#managingAppPolicy";
 
 /// How the authority decides whether to authorize a requesting user.
 ///
@@ -58,15 +64,81 @@ impl MintPolicy {
     }
 
     /// Parse the `knownValues` string form. Unknown values are rejected.
+    ///
+    /// A value read back from the `mint_policy` column is one this host wrote,
+    /// so an unrecognised one there is corruption rather than a bad request —
+    /// but the same parser also sees the legacy string form on input, where an
+    /// unknown value is the caller's. [`PdsError::UnsupportedPolicy`] answers
+    /// both correctly: a 400 naming the value the caller sent, and a log line
+    /// naming the value the column held.
     pub fn from_str_value(value: &str) -> Result<Self, PdsError> {
         match value {
             "public" => Ok(Self::Public),
             "member-list" => Ok(Self::MemberList),
             "managing-app" => Ok(Self::ManagingApp),
-            other => Err(PdsError::Storage {
-                reason: format!("invalid policy {other}"),
+            other => Err(PdsError::UnsupportedPolicy {
+                value: other.to_string(),
             }),
         }
+    }
+}
+
+/// Parse a `policy` open-union value into the stored `(policy, managingApp)`
+/// pair.
+///
+/// The lexicons carry `managingApp` *inside* the `#managingAppPolicy` variant
+/// rather than beside the policy, which is what makes "managing-app policy
+/// with no managing app" unrepresentable — a state this server can otherwise
+/// store and only discovers at mint time, when it refuses to issue a
+/// credential for a space whose owner believes it configured one. Parsing the
+/// union enforces it at the point the owner can still fix it.
+///
+/// Returns the managing app only for `#managingAppPolicy`; the other two
+/// variants carry none, and selecting one clears whatever was set.
+fn policy_from_wire(value: &serde_json::Value) -> Result<(MintPolicy, Option<String>), PdsError> {
+    let ty = value
+        .get("$type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| PdsError::UnsupportedPolicy {
+            value: "<missing $type>".to_string(),
+        })?;
+    match ty {
+        POLICY_PUBLIC_TYPE => Ok((MintPolicy::Public, None)),
+        POLICY_MEMBER_LIST_TYPE => Ok((MintPolicy::MemberList, None)),
+        POLICY_MANAGING_APP_TYPE => {
+            let managing_app = value
+                .get("managingApp")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| PdsError::InvalidSubject {
+                    reason: format!("{POLICY_MANAGING_APP_TYPE} requires a managingApp"),
+                })?;
+            Ok((MintPolicy::ManagingApp, Some(managing_app.to_string())))
+        }
+        other => Err(PdsError::UnsupportedPolicy {
+            value: other.to_string(),
+        }),
+    }
+}
+
+/// Read a `policy` input field in either accepted shape.
+///
+/// The lexicon shape is the `$type`-tagged union. The bare `knownValues`
+/// string is what this server required before the union existed, and is still
+/// accepted so a deployed client keeps working; it cannot express
+/// `managingApp`, so a legacy caller sets that separately as before.
+///
+/// `Ok(None)` means the field was absent — leave the current value alone.
+fn parse_policy_input(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<(MintPolicy, Option<String>)>, PdsError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some((MintPolicy::from_str_value(s)?, None))),
+        Some(v @ serde_json::Value::Object(_)) => policy_from_wire(v).map(Some),
+        Some(other) => Err(PdsError::UnsupportedPolicy {
+            value: other.to_string(),
+        }),
     }
 }
 
@@ -155,8 +227,8 @@ impl AppAccess {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::AllowList { allowed })
             }
-            other => Err(PdsError::Storage {
-                reason: format!("unknown appAccess $type {other}"),
+            other => Err(PdsError::UnsupportedAppAccess {
+                value: other.to_string(),
             }),
         }
     }
@@ -199,24 +271,27 @@ impl SpaceConfig {
         })
     }
 
-    /// Parse the `config` ref carried on a `createSpace` input. Missing fields
-    /// fall back to the host defaults (`member-list` / `#open` / no managing
-    /// app), as `#spaceConfig` documents `member-list` as the default policy.
-    /// The `appAccess` union is in wire form (`$type`-tagged).
+    /// Parse a `createSpace` config object. Missing fields fall back to the
+    /// host defaults (`member-list` / `#open` / no managing app), which is
+    /// what the spec documents as the default policy and app access.
+    ///
+    /// Both `policy` shapes are accepted (see [`parse_policy_input`]); a
+    /// `#managingAppPolicy` supplies its own `managingApp`, and the separate
+    /// top-level field is read only for the legacy string form.
     pub fn from_create_input(value: &serde_json::Value) -> Result<Self, PdsError> {
-        let mint_policy = match policy_field(value) {
-            Some(s) => MintPolicy::from_str_value(s)?,
-            None => MintPolicy::default(),
-        };
+        let (mint_policy, policy_managing_app): (MintPolicy, Option<String>) =
+            parse_policy_input(policy_field(value))?.unwrap_or_default();
         let app_access = match value.get("appAccess") {
             Some(v) if !v.is_null() => AppAccess::from_wire(v)?,
             _ => AppAccess::default(),
         };
-        let managing_app = value
-            .get("managingApp")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let managing_app = policy_managing_app.or_else(|| {
+            value
+                .get("managingApp")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
         Ok(Self {
             mint_policy,
             app_access,
@@ -240,18 +315,22 @@ impl SpaceConfig {
     }
 }
 
-/// Read the user-authorization policy from a `#spaceConfig` or `updateSpace`
+/// Read the raw user-authorization policy field from a config or `updateSpace`
 /// input object.
 ///
 /// The lexicon names this field `policy`. This server previously read and wrote
 /// `mintPolicy`, so a conformant client's `policy` was silently ignored and the
 /// default applied instead. Both names are accepted on input — `policy` wins —
 /// and only `policy` is emitted.
-fn policy_field(value: &serde_json::Value) -> Option<&str> {
+///
+/// The value is returned untyped because the field carries either shape: the
+/// lexicon's `$type`-tagged union object, or the legacy `knownValues` string.
+/// [`parse_policy_input`] decides which it is.
+fn policy_field(value: &serde_json::Value) -> Option<&serde_json::Value> {
     value
         .get("policy")
         .or_else(|| value.get("mintPolicy"))
-        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_null())
 }
 
 /// A field-level patch applied by `updateSpace`. Each `Option::None` leaves
@@ -271,21 +350,35 @@ pub struct SpaceConfigPatch {
 impl SpaceConfigPatch {
     /// Parse an `updateSpace` input object into a patch. The `space` field is
     /// handled by the caller; only the config fields are read here.
+    ///
+    /// A `policy` union replaces the managing app as part of the same field:
+    /// `#managingAppPolicy` sets it, and the other two variants clear it,
+    /// because a space whose policy no longer consults a managing app should
+    /// not keep pointing at one. The legacy string form cannot say either, so
+    /// it leaves the column to the separate `managingApp` field as before.
     pub fn from_update_input(value: &serde_json::Value) -> Result<Self, PdsError> {
-        let mint_policy = match policy_field(value) {
-            Some(s) => Some(MintPolicy::from_str_value(s)?),
-            None => None,
-        };
+        let policy = parse_policy_input(policy_field(value))?;
         let app_access = match value.get("appAccess") {
             Some(v) if !v.is_null() => Some(AppAccess::from_wire(v)?),
             _ => None,
         };
-        let managing_app = value
-            .get("managingApp")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+        let managing_app = match &policy {
+            // `#managingAppPolicy` — take the app the variant carries.
+            Some((MintPolicy::ManagingApp, Some(app))) => Some(app.clone()),
+            // A union naming a policy that consults no app clears the column;
+            // `Some("")` is the patch's existing "clear to NULL" signal.
+            Some((MintPolicy::Public | MintPolicy::MemberList, None))
+                if policy_field(value).is_some_and(serde_json::Value::is_object) =>
+            {
+                Some(String::new())
+            }
+            _ => value
+                .get("managingApp")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        };
         Ok(Self {
-            mint_policy,
+            mint_policy: policy.map(|(p, _)| p),
             app_access,
             managing_app,
         })
@@ -469,6 +562,137 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(patch.mint_policy, Some(MintPolicy::ManagingApp));
+    }
+
+    /// The lexicon's `$type`-tagged union is the shape a conformant client
+    /// sends, and it must reach the same stored config as the legacy string.
+    #[test]
+    fn the_policy_union_parses_to_the_same_config_as_the_legacy_string() {
+        for (union_type, legacy, expected) in [
+            (POLICY_PUBLIC_TYPE, "public", MintPolicy::Public),
+            (
+                POLICY_MEMBER_LIST_TYPE,
+                "member-list",
+                MintPolicy::MemberList,
+            ),
+        ] {
+            let from_union = SpaceConfig::from_create_input(&serde_json::json!({
+                "policy": { "$type": union_type },
+            }))
+            .unwrap();
+            let from_legacy =
+                SpaceConfig::from_create_input(&serde_json::json!({ "policy": legacy })).unwrap();
+            assert_eq!(from_union.mint_policy, expected);
+            assert_eq!(from_union, from_legacy, "{union_type} vs {legacy}");
+        }
+    }
+
+    /// `managingApp` lives *inside* `#managingAppPolicy`, so a policy that
+    /// consults a managing app cannot be configured without naming one. This
+    /// server can otherwise store that state and only notices at mint time,
+    /// where it refuses to issue a credential — telling the owner their space
+    /// is broken long after the request that broke it.
+    #[test]
+    fn the_managing_app_policy_carries_its_own_app_and_cannot_omit_it() {
+        let cfg = SpaceConfig::from_create_input(&serde_json::json!({
+            "policy": {
+                "$type": POLICY_MANAGING_APP_TYPE,
+                "managingApp": "did:web:forum.example#forum",
+            },
+        }))
+        .unwrap();
+        assert_eq!(cfg.mint_policy, MintPolicy::ManagingApp);
+        assert_eq!(
+            cfg.managing_app.as_deref(),
+            Some("did:web:forum.example#forum")
+        );
+
+        for missing in [
+            serde_json::json!({ "$type": POLICY_MANAGING_APP_TYPE }),
+            serde_json::json!({ "$type": POLICY_MANAGING_APP_TYPE, "managingApp": "" }),
+        ] {
+            let result = SpaceConfig::from_create_input(&serde_json::json!({ "policy": missing }));
+            assert!(
+                matches!(result, Err(PdsError::InvalidSubject { .. })),
+                "a managing-app policy with no app must be refused, got {result:?}"
+            );
+        }
+    }
+
+    /// A union is an open union: a value this host does not implement decodes
+    /// perfectly well, so it has to be refused deliberately. Storing one would
+    /// leave the owner believing their space is gated by a rule nothing
+    /// enforces.
+    #[test]
+    fn a_variant_this_host_does_not_implement_is_refused_per_axis() {
+        let policy = SpaceConfig::from_create_input(&serde_json::json!({
+            "policy": { "$type": "com.example.custom#inviteOnly" },
+        }));
+        assert!(
+            matches!(policy, Err(PdsError::UnsupportedPolicy { ref value }) if value == "com.example.custom#inviteOnly"),
+            "got {policy:?}"
+        );
+
+        // The legacy string form answers on the same axis.
+        let legacy =
+            SpaceConfig::from_create_input(&serde_json::json!({ "policy": "invite-only" }));
+        assert!(
+            matches!(legacy, Err(PdsError::UnsupportedPolicy { .. })),
+            "got {legacy:?}"
+        );
+
+        let app_access = SpaceConfig::from_create_input(&serde_json::json!({
+            "appAccess": { "$type": "com.example.custom#paidOnly" },
+        }));
+        assert!(
+            matches!(app_access, Err(PdsError::UnsupportedAppAccess { ref value }) if value == "com.example.custom#paidOnly"),
+            "got {app_access:?}"
+        );
+
+        // And on update, not just create.
+        let on_update = SpaceConfigPatch::from_update_input(&serde_json::json!({
+            "policy": { "$type": "com.example.custom#inviteOnly" },
+        }));
+        assert!(
+            matches!(on_update, Err(PdsError::UnsupportedPolicy { .. })),
+            "got {on_update:?}"
+        );
+    }
+
+    /// Switching to a policy that consults no managing app clears the one
+    /// that was set: a space left pointing at a managing app it no longer
+    /// asks reads as configured when it is inert.
+    #[test]
+    fn a_policy_union_replaces_the_managing_app_wholesale() {
+        let patch = SpaceConfigPatch::from_update_input(&serde_json::json!({
+            "policy": {
+                "$type": POLICY_MANAGING_APP_TYPE,
+                "managingApp": "did:web:forum.example#forum",
+            },
+        }))
+        .unwrap();
+        assert_eq!(patch.mint_policy, Some(MintPolicy::ManagingApp));
+        assert_eq!(
+            patch.managing_app.as_deref(),
+            Some("did:web:forum.example#forum")
+        );
+
+        let patch = SpaceConfigPatch::from_update_input(&serde_json::json!({
+            "policy": { "$type": POLICY_PUBLIC_TYPE },
+        }))
+        .unwrap();
+        assert_eq!(patch.mint_policy, Some(MintPolicy::Public));
+        assert_eq!(
+            patch.managing_app.as_deref(),
+            Some(""),
+            "the empty string is the patch's clear-to-NULL signal"
+        );
+
+        // The legacy string cannot express a managing app either way, so it
+        // leaves the column to the separate field.
+        let patch = SpaceConfigPatch::from_update_input(&serde_json::json!({ "policy": "public" }))
+            .unwrap();
+        assert!(patch.managing_app.is_none());
     }
 
     #[test]

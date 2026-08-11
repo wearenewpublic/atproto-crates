@@ -149,6 +149,23 @@ impl From<PdsError> for XrpcError {
                 "NotSpaceOwner",
                 format!("not the owner of {uri}"),
             ),
+            // `policy` and `appAccess` are open unions, so a value this host
+            // does not implement parses perfectly well and has to be refused
+            // deliberately. The lexicons name one error per axis and a caller
+            // acts on which it got — an unimplemented policy is a different
+            // fix from an unimplemented appAccess. Storing either would be
+            // worse than refusing: a host that cannot enforce a policy it
+            // accepted has told the owner their space is gated when it is not.
+            PdsError::UnsupportedPolicy { value } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "UnsupportedPolicy",
+                format!("this host does not implement the policy {value}"),
+            ),
+            PdsError::UnsupportedAppAccess { value } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "UnsupportedAppAccess",
+                format!("this host does not implement the appAccess variant {value}"),
+            ),
             // The lexicons name one error per state and a caller acts on
             // which it got: a deactivated repo may come back, a taken-down one
             // is a moderation decision. `Deleted` reports as not-found rather

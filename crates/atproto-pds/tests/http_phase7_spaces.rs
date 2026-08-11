@@ -3039,6 +3039,166 @@ async fn update_space_honours_the_lexicon_policy_field() {
     assert_eq!(body["config"]["policy"], "public", "{body}");
 }
 
+/// `createSpace` reads the lexicon's top-level `policy` and `appAccess`
+/// unions.
+///
+/// The failure this guards was silent and total: the input struct had neither
+/// field, so serde dropped both, and a client that asked for a public,
+/// allow-listed space got a member-list `#open` one with a 200 and no
+/// indication that anything had been ignored. The space was *less* gated than
+/// the owner asked for, which is the direction that matters.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_reads_the_top_level_policy_and_app_access_unions() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({
+            "type": "app.bsky.group",
+            "skey": "unions",
+            "policy": { "$type": "com.atproto.simplespace.defs#publicPolicy" },
+            "appAccess": {
+                "$type": "com.atproto.simplespace.defs#allowList",
+                "allowed": ["https://app.example/client-metadata.json"],
+            },
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "createSpace: {body}");
+    let uri = body["uri"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getSpace: {body}");
+    assert_eq!(body["config"]["policy"], "public", "{body}");
+    assert_eq!(
+        body["config"]["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
+        "{body}"
+    );
+    assert_eq!(
+        body["config"]["appAccess"]["allowed"][0], "https://app.example/client-metadata.json",
+        "{body}"
+    );
+}
+
+/// A `#managingAppPolicy` carries its own `managingApp`, and one without is
+/// refused at the request that sets it rather than at mint time.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_managing_app_policy_union_supplies_its_own_app() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "managed").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.updateSpace",
+        json!({
+            "space": uri,
+            "policy": {
+                "$type": "com.atproto.simplespace.defs#managingAppPolicy",
+                "managingApp": "did:web:forum.example#forum",
+            },
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "updateSpace: {body}");
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["config"]["policy"], "managing-app", "{body}");
+    assert_eq!(
+        body["config"]["managingApp"], "did:web:forum.example#forum",
+        "{body}"
+    );
+
+    // Without the app the variant requires, the space would be gated on a
+    // check it cannot make.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.updateSpace",
+        json!({
+            "space": uri,
+            "policy": { "$type": "com.atproto.simplespace.defs#managingAppPolicy" },
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// A union variant this host does not implement is refused, per axis, with
+/// the name the lexicon declares.
+///
+/// These are *open* unions, so an unknown `$type` is well-formed input — it
+/// parses, and nothing about it is malformed. Accepting one would leave the
+/// owner believing their space is gated by a rule this server never applies,
+/// which is worse than telling them it cannot.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unimplemented_config_variant_is_refused_by_name() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    for (field, value, expected) in [
+        (
+            "policy",
+            json!({ "$type": "com.example.custom#inviteOnly" }),
+            "UnsupportedPolicy",
+        ),
+        (
+            "appAccess",
+            json!({ "$type": "com.example.custom#paidOnly" }),
+            "UnsupportedAppAccess",
+        ),
+    ] {
+        let mut input = json!({ "type": "app.bsky.group", "skey": format!("bad-{field}") });
+        input[field] = value.clone();
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.simplespace.createSpace",
+            input,
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "createSpace {field}: {body}"
+        );
+        assert_eq!(body["error"], expected, "createSpace {field}: {body}");
+
+        // The same refusal on update, where a space already exists to break.
+        let uri = create_space(&app, &owner, &format!("upd-{field}")).await;
+        let mut input = json!({ "space": uri });
+        input[field] = value;
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.simplespace.updateSpace",
+            input,
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "updateSpace {field}: {body}"
+        );
+        assert_eq!(body["error"], expected, "updateSpace {field}: {body}");
+    }
+}
+
 /// `applyWrites` returns a `results` array of `$type`-tagged union members,
 /// one per write, in request order.
 #[tokio::test(flavor = "multi_thread")]

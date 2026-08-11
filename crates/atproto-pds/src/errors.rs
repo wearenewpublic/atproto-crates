@@ -85,6 +85,24 @@ pub enum PdsError {
         uri: String,
     },
 
+    /// error-atproto-pds-space-4: the requested user-authorization policy is
+    /// not one this host implements. Surfaced to clients as the
+    /// `UnsupportedPolicy` XRPC error.
+    #[error("error-atproto-pds-space-4 unsupported policy: {value}")]
+    UnsupportedPolicy {
+        /// The `$type` (or legacy string) the caller asked for.
+        value: String,
+    },
+
+    /// error-atproto-pds-space-5: the requested app-authorization variant is
+    /// not one this host implements. Surfaced to clients as the
+    /// `UnsupportedAppAccess` XRPC error.
+    #[error("error-atproto-pds-space-5 unsupported appAccess: {value}")]
+    UnsupportedAppAccess {
+        /// The `$type` the caller asked for.
+        value: String,
+    },
+
     /// error-atproto-pds-account-1: account state transition rejected.
     #[error("error-atproto-pds-account-1 invalid account state transition: {from} -> {to}")]
     InvalidAccountTransition {
