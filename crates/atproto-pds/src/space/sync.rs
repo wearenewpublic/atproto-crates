@@ -42,8 +42,20 @@ impl SpaceSync {
     /// `getRepoState` — current `{set_hash, rev}` for `(space, repo)`'s
     /// record commitment. Reads from the *repo account's* per-actor store,
     /// since each account's writes live in their own store.
-    pub async fn get_repo_state(&self, space: &SpaceUri, repo_did: &str) -> PdsResult<RepoState> {
-        ensure_space_live(&self.data_dir, space).await?;
+    ///
+    /// `own_account` exempts the read from the deleted-space gate: a member
+    /// keeps reading their own repo after the space is deleted, which is only
+    /// visible here when one PDS hosts both the authority and the member, and
+    /// is always the case for a personal-data space.
+    pub async fn get_repo_state(
+        &self,
+        space: &SpaceUri,
+        repo_did: &str,
+        own_account: bool,
+    ) -> PdsResult<RepoState> {
+        if !own_account {
+            ensure_space_live(&self.data_dir, space).await?;
+        }
         let store = SqlActorStore::open(&self.data_dir, repo_did).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
@@ -122,7 +134,7 @@ mod tests {
         let _ = manager;
         let sync = SpaceSync::new(dir);
         let state = sync
-            .get_repo_state(&test_space(), "did:plc:alice")
+            .get_repo_state(&test_space(), "did:plc:alice", false)
             .await
             .unwrap();
         assert!(state.set_hash.is_none());
@@ -151,7 +163,10 @@ mod tests {
             .unwrap();
 
         let sync = SpaceSync::new(dir);
-        let state = sync.get_repo_state(&uri, "did:plc:alice").await.unwrap();
+        let state = sync
+            .get_repo_state(&uri, "did:plc:alice", false)
+            .await
+            .unwrap();
         assert!(state.set_hash.is_some());
         assert!(state.rev.is_some());
 

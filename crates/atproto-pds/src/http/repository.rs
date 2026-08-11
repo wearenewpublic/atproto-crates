@@ -883,7 +883,13 @@ pub async fn space_collections(
     require_member(&state, &space, &account.did).await?;
     let reader = space_reader(&state)?;
     let collections = reader
-        .list_collections(&space, &account.did)
+        .list_collections(
+            &space,
+            &crate::space::reader::SpaceReadAuth::OwnPds {
+                account_did: account.did.clone(),
+            },
+            &account.did,
+        )
         .await
         .map_err(XrpcError::from)?;
 

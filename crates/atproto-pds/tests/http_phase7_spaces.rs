@@ -496,6 +496,153 @@ async fn update_space_reflects_in_get_space() {
     );
 }
 
+/// A deleted space answers `SpaceDeleted` at credential renewal, distinctly
+/// from `SpaceNotFound`.
+///
+/// That distinction is the whole signal a syncer which missed the deletion
+/// notification has to go on: `SpaceDeleted` means drop every copy, and any
+/// other failure — a network error, an expired grant, a space that was never
+/// there — means keep them. Nothing asserted it at the HTTP layer before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_space_answers_space_deleted_at_renewal() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.deleteSpace",
+        json!({"space": uri}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A delegation token minted after deletion still reaches the mint, which
+    // is where the distinct error has to be raised.
+    let oauth = mint_oauth_access("did:plc:owner", &read_scope());
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencode(&uri)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
+    let grant = body["token"].as_str().unwrap().to_string();
+
+    let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    assert_eq!(
+        body["error"], "SpaceDeleted",
+        "renewal against a deleted space must say so by name: {body}"
+    );
+    assert_ne!(status, StatusCode::OK);
+
+    // A space that never existed is a different answer, and a syncer that
+    // conflated them would drop copies on a typo.
+    let oauth = mint_oauth_access("did:plc:owner", &read_scope());
+    let (_, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencode("at://did:plc:owner/space/app.bsky.group/never-existed")
+        ),
+        Some(&oauth),
+    )
+    .await;
+    if let Some(grant) = body["token"].as_str() {
+        let (_, body) = exchange_credential(
+            &app,
+            grant,
+            "at://did:plc:owner/space/app.bsky.group/never-existed",
+            TEST_DPOP_JKT,
+            None,
+        )
+        .await;
+        assert_eq!(body["error"], "SpaceNotFound", "{body}");
+    }
+}
+
+/// Deleting a space leaves the member's own records readable by the member.
+///
+/// This is the co-located case: one PDS hosting both the authority and a
+/// member, which is every personal-data space. The authority's tombstone is
+/// local, so before this the member lost access to their own records the
+/// moment the space was deleted — for a personal space, data nobody else could
+/// ever read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_space_keeps_its_members_own_records_readable_by_them() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let alice = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+    let uri = create_space(&app, &owner, "default").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner),
+    )
+    .await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "repo": "did:plc:alice",
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c.d.e", "rkey": "mine",
+                "value": {"v": 1}
+            }]
+        }),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed write: {body}");
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.deleteSpace",
+        json!({"space": uri}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Alice still reads her own record through her own account.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&repo=did:plc:alice&collection=c.d.e&rkey=mine",
+            urlencode(&uri)
+        ),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a member's own records survive the space's deletion: {body}"
+    );
+    assert_eq!(body["value"]["v"], 1, "{body}");
+
+    // And can still list and export them, which is what "clean up no longer
+    // used data" requires of the application.
+    for path in ["listRecords", "getRepo"] {
+        let (status, _) = get_json(
+            app.clone(),
+            &format!(
+                "/xrpc/com.atproto.space.{path}?space={}&repo=did:plc:alice",
+                urlencode(&uri)
+            ),
+            Some(&alice),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path} after deletion");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_space_then_get_space_fails() {
     let (app, manager, _tmp) = build_app().await;

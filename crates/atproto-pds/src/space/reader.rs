@@ -133,7 +133,25 @@ impl SpaceReader {
     /// lives in the space-authority's (`space.space_did`) per-actor store; the
     /// check is a no-op when that store is not local (cross-PDS spaces, where
     /// the authority enforces deletion on its own side).
-    async fn ensure_space_live(&self, space: &SpaceUri) -> PdsResult<()> {
+    ///
+    /// **An account reading its own repo is exempt.** A deleted space stops
+    /// being readable *by others*: the authority stops issuing credentials, so
+    /// every credentialed reader falls away on its own within a credential's
+    /// lifetime. The member's records are the member's own data and remain
+    /// readable through the member's own account, which is what the amended
+    /// 0016 means by "unreadable to everyone but the member's own account".
+    ///
+    /// Without the exemption that holds only when the authority is hosted
+    /// somewhere else. When one PDS hosts both the authority and a member —
+    /// including every personal-data space, where they are the same account —
+    /// the authority's tombstone is local, so the member lost access to their
+    /// own records the moment the space was deleted. That is stricter than the
+    /// spec and, for a personal space, means the account cannot read data
+    /// nobody else ever could.
+    async fn ensure_space_live(&self, space: &SpaceUri, auth: &SpaceReadAuth<'_>) -> PdsResult<()> {
+        if matches!(auth, SpaceReadAuth::OwnPds { .. }) {
+            return Ok(());
+        }
         ensure_space_live(&self.data_dir, space).await?;
         Ok(())
     }
@@ -159,7 +177,7 @@ impl SpaceReader {
         rkey: &str,
     ) -> PdsResult<Option<RecordRow>> {
         self.verify_auth(space, &auth).await?;
-        self.ensure_space_live(space).await?;
+        self.ensure_space_live(space, &auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
 
         // Takedown gate — admin moderation hides the record at read time.
@@ -178,10 +196,11 @@ impl SpaceReader {
     /// Every collection with at least one record in this repo's slice of the
     /// space.
     ///
-    /// Used by `getRepo` to enumerate what to export. Auth is the caller's
-    /// responsibility — `getRepo` has already resolved and verified it, and
-    /// re-checking here would mean threading a second auth argument for no
-    /// additional guarantee.
+    /// Used by `getRepo` to enumerate what to export. The caller has already
+    /// resolved and verified auth; `auth` is taken here not to re-check it but
+    /// because the tombstone gate reads it — an account exporting its own repo
+    /// from a deleted space is exempt, exactly as its record reads are, and
+    /// deciding that requires knowing whose read this is.
     ///
     /// # Errors
     ///
@@ -189,9 +208,10 @@ impl SpaceReader {
     pub async fn list_collections(
         &self,
         space: &SpaceUri,
+        auth: &SpaceReadAuth<'_>,
         target_repo: &str,
     ) -> PdsResult<Vec<String>> {
-        self.ensure_space_live(space).await?;
+        self.ensure_space_live(space, auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
@@ -232,7 +252,7 @@ impl SpaceReader {
             reverse,
         } = listing;
         self.verify_auth(space, &auth).await?;
-        self.ensure_space_live(space).await?;
+        self.ensure_space_live(space, &auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =

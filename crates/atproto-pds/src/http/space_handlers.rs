@@ -360,22 +360,30 @@ pub async fn delete_space(
     Ok(StatusCode::OK)
 }
 
-/// Best-effort fan-out of `notifySpaceDeleted` to every registered recipient
-/// and member of `uri` after the authority deletes the space. Resolves each
-/// target's PDS endpoint, mints a service-auth token (iss = authority, aud =
-/// target), and POSTs. All errors are logged and swallowed.
+/// Best-effort fan-out of `notifySpaceDeleted` to the services registered for
+/// `uri`, after the authority deletes the space.
+///
+/// **Only** the registered services. This used to notify every member of the
+/// space as well, which the amended 0016 repeals: a member's records are the
+/// member's own data, and deleting the space does not entitle the authority to
+/// reach into the repos that hold them. Those records simply become
+/// unreadable to everyone but the member's own account.
+///
+/// Worse than being wrong about the members, the old target selection was
+/// close to inverted. It re-resolved every target through `#atproto_pds`
+/// rather than using the endpoint the service registered, and a syncer service
+/// typically publishes no `#atproto_pds` at all — so the recipients the spec
+/// requires were the ones silently dropped, while the recipients it forbids
+/// resolved reliably.
+///
+/// Delivery now goes through the notifier queue, which is what "over the same
+/// best-effort path as write notifications" asks for: a failed POST is retried
+/// rather than lost, expired registrations are filtered, and each endpoint is
+/// re-validated before anything is signed for it.
 async fn fire_notify_space_deleted(state: &HttpState, uri: &SpaceUri, authority_did: &str) {
     let Ok(manager) = account_manager(state) else {
         return;
     };
-    let plc_dir = state.plc_service.as_ref().map(|p| p.directory_hostname());
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent(crate::user_agent())
-        .build()
-        .unwrap_or_default();
-
-    // Owner signing key to mint the outbound service-auth tokens.
     let signing_key = match crate::http::space_auth::local_signing_key(manager, authority_did).await
     {
         Ok(k) => k,
@@ -384,70 +392,20 @@ async fn fire_notify_space_deleted(state: &HttpState, uri: &SpaceUri, authority_
             return;
         }
     };
-
-    // Open the owner's per-actor store to read recipients + members.
-    let owner_store = match SqlActorStore::open(manager.data_dir(), authority_did).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = ?e, space = %uri, "notifySpaceDeleted: owner store unavailable; skipping fan-out");
-            return;
-        }
-    };
-
-    // Collect distinct target DIDs: recipient services + members.
-    let mut targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if let Ok(rows) = sqlx::query_as::<_, (String,)>(
-        "SELECT DISTINCT service_did FROM space_credential_recipient WHERE space = ?",
+    match crate::space::notify::enqueue_space_deleted(
+        manager.pool(),
+        manager.data_dir(),
+        uri,
+        &signing_key,
     )
-    .bind(uri.to_string())
-    .fetch_all(owner_store.pool())
     .await
     {
-        for (did,) in rows {
-            targets.insert(did);
+        Ok(count) => {
+            tracing::debug!(space = %uri, recipients = count, "notifySpaceDeleted enqueued");
         }
-    }
-    if let Ok(rows) = sqlx::query_as::<_, (String,)>("SELECT did FROM space_member WHERE space = ?")
-        .bind(uri.to_string())
-        .fetch_all(owner_store.pool())
-        .await
-    {
-        for (did,) in rows {
-            targets.insert(did);
+        Err(e) => {
+            tracing::warn!(error = ?e, space = %uri, "notifySpaceDeleted fan-out could not be enqueued");
         }
-    }
-    targets.remove(authority_did);
-
-    for target in targets {
-        if !target.starts_with("did:") {
-            continue;
-        }
-        let endpoint = match crate::space::recipient::resolve_service_endpoint(
-            &http,
-            &format!("{target}#atproto_pds"),
-            plc_dir,
-        )
-        .await
-        {
-            Ok(Some(ep)) => ep,
-            _ => continue,
-        };
-        let token = match crate::space::service_auth::mint_service_auth(
-            &signing_key,
-            authority_did,
-            &target,
-            "com.atproto.space.notifySpaceDeleted",
-            crate::space::service_auth::NOTIFY_SERVICE_AUTH_TTL_SECS,
-        ) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let url = format!(
-            "{}/xrpc/com.atproto.space.notifySpaceDeleted",
-            endpoint.trim_end_matches('/')
-        );
-        let body = serde_json::json!({ "space": uri.to_string() });
-        let _ = http.post(&url).bearer_auth(&token).json(&body).send().await;
     }
 }
 
@@ -1638,7 +1596,11 @@ pub async fn get_repo_state(
             )
         })?;
     let st = space_sync(&state)?
-        .get_repo_state(&uri, &q.repo)
+        .get_repo_state(
+            &uri,
+            &q.repo,
+            resolved.subject.as_ref().is_some_and(|s| s.sub() == q.repo),
+        )
         .await
         .map_err(XrpcError::from)?;
     let manager = account_manager(&state)?;
@@ -1683,7 +1645,11 @@ pub async fn get_repo(
         .map_err(XrpcError::from)?;
 
     let st = space_sync(&state)?
-        .get_repo_state(&uri, &q.repo)
+        .get_repo_state(
+            &uri,
+            &q.repo,
+            resolved.subject.as_ref().is_some_and(|s| s.sub() == q.repo),
+        )
         .await
         .map_err(XrpcError::from)?;
     let manager = account_manager(&state)?;
@@ -1711,7 +1677,7 @@ pub async fn get_repo(
     // it stops the same records being held twice on the way there.
     let mut records = crate::space::export_car::SortedRecords::default();
     let collections = reader
-        .list_collections(&uri, &q.repo)
+        .list_collections(&uri, &resolved.auth, &q.repo)
         .await
         .map_err(XrpcError::from)?;
     for collection in collections {
@@ -3457,18 +3423,27 @@ pub struct NotifySpaceDeletedInput {
 /// `POST /xrpc/com.atproto.space.notifySpaceDeleted`.
 ///
 /// Service-auth: the JWT `iss` must equal the space's `spaceDid` (the
-/// authority) and `aud` the recipient (a repo host or syncing service hosted
-/// here). Marks the recipient-side space row as deleted (`deleted_at`).
-/// Best-effort: a no-op when the recipient is not local or the space row is
-/// unknown.
+/// authority) and `aud` a service hosted here.
 ///
-/// This PDS acts as a **repo host** here, so it implements the repo-host
-/// behavior of the 0016 draft (line 365): flag the member's repo as belonging
-/// to a deleted space rather than erase it (the data is the user's own). The
-/// **syncer** behavior of line 367 — "delete every copy of the space's data it
-/// holds, both the repos it pulled and any derived state" — is a syncer-role
-/// responsibility and does not apply to the PDS-as-repo-host; this handler
-/// therefore tombstones rather than purges.
+/// The notification is **acknowledged and no local state is changed**. That is
+/// not a stub — it is the behaviour the amended 0016 asks of a repo host, and
+/// the reversal of what this used to do.
+///
+/// This handler tombstoned the recipient's own space row, which is the
+/// repealed repo-host behaviour: flagging a member's repo as belonging to a
+/// deleted space. A member's records are the member's own data, and an
+/// authority deleting a space it anchors does not thereby get to reach into
+/// the repos other people hold. Under the amended spec a member's repo host is
+/// not notified at all; the records stay, and simply become unreadable to
+/// everyone but the member's own account, because the credentials that reached
+/// them stop being issued.
+///
+/// The **syncer** duty — "delete every copy of the space's data it holds, both
+/// the repos it pulled and any derived state" — is real, and still has no home
+/// here: this codebase implements the authority, repo-host and notification
+/// roles, and pulls no remote space's repos, so there are no copies to drop.
+/// A syncer added later handles this notification, and a `SpaceDeleted` at
+/// credential renewal, by purging what it pulled.
 pub async fn notify_space_deleted(
     State(state): State<HttpState>,
     parts: Parts,
@@ -3533,23 +3508,14 @@ pub async fn notify_space_deleted(
         return Ok(StatusCode::OK);
     }
 
-    // Mark the recipient-side space row deleted; no-op if unknown.
-    let store = SqlActorStore::open(manager.data_dir(), &recipient_did)
-        .await
-        .map_err(XrpcError::from)?;
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query("UPDATE space SET deleted_at = ? WHERE uri = ? AND deleted_at IS NULL")
-        .bind(&now)
-        .bind(space.to_string())
-        .execute(store.pool())
-        .await
-        .map_err(|e| {
-            XrpcError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                format!("notifySpaceDeleted mark deleted: {e}"),
-            )
-        })?;
+    // Nothing local is mutated. The recipient is a member's repo host, and its
+    // member's records are not the authority's to retire; a syncer role, which
+    // this codebase does not implement, is what would drop pulled copies here.
+    tracing::info!(
+        space = %space,
+        recipient = %recipient_did,
+        "notifySpaceDeleted acknowledged; member repos are left intact"
+    );
     Ok(StatusCode::OK)
 }
 

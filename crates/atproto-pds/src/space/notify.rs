@@ -42,6 +42,9 @@ use sqlx::SqlitePool;
 /// NSID for outbound `notifyWrite` POSTs.
 pub const NOTIFY_WRITE_NSID: &str = "com.atproto.space.notifyWrite";
 
+/// Lexicon method notified when a space is deleted.
+pub const NOTIFY_SPACE_DELETED_NSID: &str = "com.atproto.space.notifySpaceDeleted";
+
 /// Wire-shape of `com.atproto.space.notifyWrite` request body
 /// (`application/json`). Near-contentless: it announces that `repo` advanced to
 /// `rev` within `space`, and carries the resulting commit hash; consumers PULL
@@ -245,6 +248,48 @@ pub async fn enqueue_writes(
     .await
 }
 
+/// Enqueue `notifySpaceDeleted` for every service registered for the space.
+///
+/// Only the registered services: a member's repo host is not told that a space
+/// it holds a repo in was deleted, because the records in that repo are the
+/// member's own data and the authority deleting the space does not entitle it
+/// to reach into them. They simply become unreadable to everyone but the
+/// member's own account.
+///
+/// Travels the same queue write notifications do, so a delivery that fails is
+/// retried rather than lost, and inherits the same expiry filtering and
+/// endpoint validation.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] on a queue or lookup failure.
+pub async fn enqueue_space_deleted(
+    accounts_pool: &SqlitePool,
+    data_dir: &std::path::Path,
+    space: &SpaceUri,
+    owner_signing_key: &KeyData,
+) -> PdsResult<u32> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({ "space": space.to_string() })).map_err(|e| {
+            PdsError::Storage {
+                reason: format!("encode notifySpaceDeleted payload: {e}"),
+            }
+        })?;
+    enqueue_for_space(
+        accounts_pool,
+        data_dir,
+        space,
+        // Whole-space registrations only: a per-repo subscriber asked about
+        // one repo's writes, not about the space's lifetime.
+        None,
+        NOTIFY_SPACE_DELETED_NSID,
+        "application/json",
+        &body,
+        Some(owner_signing_key),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_for_space(
     accounts_pool: &SqlitePool,
@@ -315,6 +360,7 @@ async fn enqueue_for_space(
 mod tests {
     use super::*;
     use crate::account::AccountDirectory;
+    use atproto_identity::key::{KeyType, generate_key};
     use atproto_space::types::{SpaceKey, SpaceType};
     use chrono::Utc;
     use tempfile::TempDir;
@@ -565,5 +611,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recipients.len(), 0);
+    }
+
+    /// Deletion notifies the services registered for the space, and only
+    /// those.
+    ///
+    /// The fan-out used to add every member of the space as a target, which
+    /// the amended spec repeals: a member's repo host is not told, because the
+    /// records are the member's own data. And because it re-resolved each
+    /// target through `#atproto_pds` rather than using the endpoint the
+    /// service registered, the registered syncers — the recipients the spec
+    /// *requires* — were the ones most likely to be dropped. The target set
+    /// was close to inverted, so it is worth asserting directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn space_deletion_notifies_registered_services_and_not_members() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let accounts = AccountDirectory::open(&data_dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        let uri = test_space();
+        let owner_store = SqlActorStore::open(data_dir, &uri.space_did).await.unwrap();
+        ensure_space_row(owner_store.pool(), &uri).await;
+
+        // One registered syncer, and one member who is not a syncer.
+        upsert_subscription(
+            owner_store.pool(),
+            &uri,
+            None,
+            "did:web:syncer.example",
+            "https://syncer.example",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO space_member (space, did, member_rev, added_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(uri.to_string())
+        .bind("did:plc:member")
+        .bind("3jui7kd2z2y2e")
+        .bind("2026-08-11T00:00:00Z")
+        .execute(owner_store.pool())
+        .await
+        .unwrap();
+
+        let key = generate_key(KeyType::P256Private).unwrap();
+        let count = enqueue_space_deleted(accounts.pool(), data_dir, &uri, &key)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "one registered service, not two targets");
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT target_service_did, nsid FROM notify_attempt")
+                .fetch_all(accounts.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "did:web:syncer.example");
+        assert_eq!(rows[0].1, NOTIFY_SPACE_DELETED_NSID);
+    }
+
+    /// A lapsed registration is not notified either. The write path has always
+    /// filtered on expiry; the deletion fan-out read the same table without
+    /// it, so registrations that had already stopped receiving writes still
+    /// received an authority-signed deletion notice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn space_deletion_skips_a_lapsed_registration() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+        let accounts = AccountDirectory::open(&data_dir.join("accounts.sqlite"))
+            .await
+            .unwrap();
+        let uri = test_space();
+        let owner_store = SqlActorStore::open(data_dir, &uri.space_did).await.unwrap();
+        ensure_space_row(owner_store.pool(), &uri).await;
+        upsert_subscription(
+            owner_store.pool(),
+            &uri,
+            None,
+            "did:web:lapsed.example",
+            "https://lapsed.example",
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+        let key = generate_key(KeyType::P256Private).unwrap();
+        let count = enqueue_space_deleted(accounts.pool(), data_dir, &uri, &key)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "an expired registration receives nothing");
     }
 }

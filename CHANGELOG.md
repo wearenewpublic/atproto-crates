@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: space deletion stops reaching into members' repos. Per proposal 0016 as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which
+  reverses what a deletion does to everyone except the authority.
+
+  **The notification target set was close to inverted.** `notifySpaceDeleted` fanned out to every
+  registered service *plus every member* of the space — and it re-resolved each target through
+  `#atproto_pds` instead of using the endpoint the service registered. A syncer service typically
+  publishes no `#atproto_pds` at all, so the recipients the spec *requires* were the ones silently
+  dropped, while the recipients it now *forbids* resolved reliably. Delivery also bypassed the
+  notifier queue, so a transient failure lost the notice permanently, and skipped the expiry filter
+  and endpoint validation the write path applies. It now goes through the same queue write
+  notifications use, to registered services only.
+
+  **A member's repo host no longer flags the member's repo.** The inbound handler tombstoned the
+  recipient's own space row, which hid the space from that member's `listSpaces`. Under the amended
+  spec a member's repo host is not notified at all: the records are the member's own data, and an
+  authority deleting a space does not thereby get to retire the repos other people hold. The
+  notification is acknowledged and no local state changes.
+
+  **A member keeps reading their own records after deletion.** The tombstone lives in the
+  authority's store, so when one PDS hosts both the authority and a member — which is *every*
+  personal-data space, where they are the same account — the member lost access to their own records
+  the moment the space was deleted. Own-account reads are now exempt from the gate; credentialed
+  reads still fall away, because the authority stops issuing credentials.
+
+  **Deleting a space releases the authority's blobs.** `delete_space` purged the authority's
+  records, oplog and set-hash state but left `space_blob_ref`, and blob GC treats any referenced CID
+  as live — so the bytes were pinned against collection permanently, outliving the space that was
+  the only reason to keep them.
+
+
 - `atproto-pds`: `com.atproto.simplespace.listMembers` is readable by a member of the space, not only
   by its authority. Per proposal 0016 as amended by
   [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which drops

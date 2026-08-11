@@ -348,16 +348,29 @@ impl SpaceService {
             }
         }
 
-        // Per the 0016 Permissioned Data draft (line 363): "The authority also
-        // deletes its own repo in the space." The `space` row itself is kept as
-        // a tombstone (repo-host flag behavior, spec line 365 — the host flags
-        // rather than erases), but the authority's *own* repo data within the
-        // space (records, repo set-hash state, and the record oplog) is erased.
+        // "The authority also deletes its own repo in the space." The `space`
+        // row is kept as a tombstone, so the authority can still answer
+        // `SpaceDeleted` rather than `SpaceNotFound` when a syncer comes back
+        // to renew — that distinction is the whole signal a syncer that missed
+        // the notification has to go on. Everything the authority's own repo
+        // held is erased.
         //
-        // Note: spec line 367's "a syncer should delete every copy" is a
-        // *syncer-role* behavior, not applicable to this PDS acting as the
-        // repo-host/authority; see `notify_space_deleted` for the recipient side.
-        for table in ["space_record", "space_record_oplog", "space_repo"] {
+        // `space_blob_ref` is in that list because it is not just an index:
+        // blob GC treats any referenced CID as live, so references surviving
+        // the records that made them pin the bytes against collection
+        // permanently. The authority's blobs would outlive the space that was
+        // the only reason to keep them.
+        //
+        // Only the authority's own repo. Members' repos are untouched, here
+        // and in the notification: their records are their own data, and the
+        // records simply stop being reachable through credentials the
+        // authority no longer issues.
+        for table in [
+            "space_record",
+            "space_record_oplog",
+            "space_repo",
+            "space_blob_ref",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE space = ?"))
                 .bind(uri.to_string())
                 .execute(store.pool())
