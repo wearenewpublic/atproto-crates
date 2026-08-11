@@ -1136,7 +1136,7 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // Space-type declarations (NSID → declared `collections`, for the bare
-        // `space:` grant default, spec line 413) come off the same chain.
+        // `space:` grant default, the spec's "Matching" section) come off the same chain.
         //
         // A declaration is a lexicon document, so resolving it a second way was
         // always duplication -- and the second way was network-only, which made

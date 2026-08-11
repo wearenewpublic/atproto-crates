@@ -11,7 +11,7 @@
 //! instead of opaque scope strings. Space scopes follow the 0016 spec grammar
 //! (`space:<spaceType>[?did&skey&collection&action&manage]`): the space type
 //! renders its declaration `name` resolved from its `com.atproto.lexicon.schema`
-//! record (NSID fallback; spec line 434), the owner DID renders its
+//! record (NSID fallback; the spec's "Consent" section), the owner DID renders its
 //! bidirectionally-verified handle (DID fallback), and a prominent warning is
 //! shown when an app requests access to every space on the network
 //! (`type=* && did=*`). The `describe_scope` helper is the single source of
@@ -149,7 +149,7 @@ pub async fn consent_page(
     let handles = resolve_space_owner_handles(&state, &request.scope).await;
 
     // Best-effort: resolve the space-type NSIDs named in any `space:` scope to
-    // their declaration `name` (spec line 434). Failures fall back to the NSID.
+    // their declaration `name` (the spec's "Consent" section). Failures fall back to the NSID.
     let type_names = resolve_space_type_names(&state, &request.scope).await;
     let permission_sets = resolve_permission_sets(&state, &request.scope).await;
 
@@ -206,7 +206,7 @@ async fn resolve_space_owner_handles(state: &HttpState, scope: &str) -> BTreeMap
 }
 
 /// Collect the distinct, concrete space-type NSIDs referenced by `space:`
-/// scopes in `scope`, resolve each to its declaration `name` (spec line 434),
+/// scopes in `scope`, resolve each to its declaration `name` (the spec's "Consent" section),
 /// and return the NSID→name map. NSIDs that fail to resolve are omitted
 /// (callers fall back to the raw NSID).
 /// Resolve every `include:` in `scope` to what its permission set says it is.
@@ -332,7 +332,7 @@ async fn resolve_space_type_names(state: &HttpState, scope: &str) -> BTreeMap<St
 }
 
 /// Resolve a space-type NSID to its declaration `name` for the consent screen
-/// (spec lines 126, 434), via the shared
+/// (the spec's "Space type declarations" and "Consent" sections), via the shared
 /// [`SpaceDeclarationResolver`](crate::space::SpaceDeclarationResolver)
 /// configured on [`HttpState`].
 ///
@@ -649,7 +649,7 @@ fn has_universal_space_scope(scope: &str) -> bool {
 /// `handles` maps space-owner DIDs to their bidirectionally-verified handles;
 /// space scopes render the handle when present, the DID otherwise.
 /// `type_names` maps space-type NSIDs to their resolved declaration names
-/// (spec line 434); absent entries fall back to the raw NSID.
+/// (the spec's "Consent" section); absent entries fall back to the raw NSID.
 pub fn describe_scope(
     scope: &str,
     handles: &BTreeMap<String, String>,
@@ -767,7 +767,7 @@ pub fn describe_space_scope(
     out
 }
 
-/// Render a space-type NSID's declaration `name` (spec line 434), falling back
+/// Render a space-type NSID's declaration `name` (the spec's "Consent" section), falling back
 /// to the raw NSID when the declaration could not be resolved.
 ///
 /// `type_names` is the NSID→declaration-name map produced by
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn describe_scope_space_renders_declaration_name() {
-        // A resolved declaration name replaces the raw NSID (spec line 434).
+        // A resolved declaration name replaces the raw NSID (the spec's "Consent" section).
         let mut names = BTreeMap::new();
         names.insert("app.bsky.group".to_string(), "Bluesky Group".to_string());
         let d = describe_scope(

@@ -882,7 +882,7 @@ mod tests {
         let uri = info.uri.parse::<SpaceUri>().unwrap();
 
         // Seed an authority-owned record in the space so we can assert the
-        // authority's own repo is erased on delete (spec line 363).
+        // authority's own repo is erased on delete (the spec's "Space deletion" section).
         {
             let store = SqlActorStore::open(&svc.data_dir, "did:plc:owner")
                 .await

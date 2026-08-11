@@ -93,7 +93,7 @@ pub struct HttpState {
     pub space_sync: Option<Arc<SpaceSync>>,
     /// Resolver for space-type declarations (NSID → declared `collections`),
     /// used to expand a bare `space:` grant's omitted-`collection` default
-    /// (spec line 413). `None` disables the default (bare grants confer no
+    /// (the spec's "Matching" section). `None` disables the default (bare grants confer no
     /// write targets); typically a TTL-cached network resolver.
     pub space_declaration_resolver: Option<Arc<dyn SpaceDeclarationResolver>>,
     /// Resolves lexicon NSIDs to schema documents, for record validation.
@@ -488,7 +488,7 @@ impl HttpState {
 
     /// Attach a space-type declaration resolver. When set, a bare `space:`
     /// grant's omitted-`collection` default expands to the declaration's
-    /// `collections` (spec line 413). Typically a
+    /// `collections` (the spec's "Matching" section). Typically a
     /// [`CachingSpaceDeclarationResolver`](crate::space::CachingSpaceDeclarationResolver)
     /// wrapping a
     /// [`NetworkSpaceDeclarationResolver`](crate::space::NetworkSpaceDeclarationResolver).

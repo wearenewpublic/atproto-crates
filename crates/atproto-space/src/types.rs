@@ -366,7 +366,7 @@ mod tests {
         // Reserved record-key values.
         assert!(SpaceKey::new(".").is_err());
         assert!(SpaceKey::new("..").is_err());
-        // Out-of-charset values rejected (rkey syntax, spec line 134).
+        // Out-of-charset values rejected (rkey syntax, the spec's "Space key (skey)" section).
         assert!(SpaceKey::new("has space").is_err());
         assert!(SpaceKey::new("a@b").is_err());
         assert!(SpaceKey::new("emoji\u{1f600}").is_err());
@@ -415,7 +415,7 @@ mod tests {
         );
         // wrong scheme.
         assert!(RecordUri::parse("https://x/y/z/a/b/c").is_err());
-        // collection segment must be a valid NSID (spec line 73).
+        // collection segment must be a valid NSID (the spec's "Addressing" section).
         assert!(
             RecordUri::parse(
                 "ats://did:plc:auth/app.bsky.group/default/did:plc:alice/notanNSID/rk"

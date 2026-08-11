@@ -15,7 +15,7 @@
 //! `ctx` is the single context string reused for both the signature and the
 //! MAC's HKDF info. It uses the TLS 1.3 (§3.4) variable-length-vector encoding:
 //! a fixed protocol tag followed by each field length-prefixed with a
-//! big-endian `uint16`, per spec lines 288–297:
+//! big-endian `uint16`, per the spec's "Commit signature" section:
 //!
 //! ```text
 //! ctx = "atproto-space-v1"                          // fixed protocol tag, NO length prefix
@@ -30,7 +30,7 @@
 //! commit proves nothing about repo contents. The repo hash is bound to the
 //! context by the *symmetric* MAC (key derived from the public `ikm`), so anyone
 //! holding the commit can recompute a valid MAC for any hash — authenticity of
-//! the *content* is not transferable (spec lines 286, 305).
+//! the *content* is not transferable (the spec's "Commit signature" section).
 //!
 //! [`verify_commit`] recomputes the MAC and compares it; a consumer that wants
 //! authenticity additionally calls [`verify_commit_signature`], which verifies
@@ -219,7 +219,7 @@ fn derive_mac(ikm: &[u8], hash: &[u8], ctx: &[u8]) -> SpaceResult<Vec<u8>> {
 /// Verify a commit's MAC against the supplied `SpaceContext`.
 ///
 /// Recomputes `ctx` from `space`, `rev`, and the commit's `ikm`, then recomputes
-/// the MAC over `hash` and compares it constant-time (spec line 305). It does
+/// the MAC over `hash` and compares it constant-time (the spec's "Commit signature" section). It does
 /// **not** verify the signature (see [`verify_commit_signature`]).
 ///
 /// # Errors
@@ -263,7 +263,7 @@ pub fn verify_commit(context: &SpaceContext, commit: &Commit) -> SpaceResult<()>
 
 /// Verify that a commit's `sig` was produced over its `ctx` by `verifying_key`.
 ///
-/// Per spec line 305 a reader verifies `sig` against the user's signing key for
+/// Per the spec's "Commit signature" section a reader verifies `sig` against the user's signing key for
 /// authenticity. The `ctx` is reconstructed from `context` (`space`, `rev`) and
 /// the commit's `ikm`.
 ///

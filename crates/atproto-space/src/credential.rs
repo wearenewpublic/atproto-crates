@@ -47,22 +47,22 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `typ` header value for a delegation token (spec line 152).
+/// `typ` header value for a delegation token (the spec's "Delegation token" section).
 pub const TYP_DELEGATION_TOKEN: &str = "atproto-space-delegation+jwt";
 
-/// `typ` header value for a space credential (spec line 206).
+/// `typ` header value for a space credential (the spec's "Space credential" section).
 pub const TYP_SPACE_CREDENTIAL: &str = "atproto-space-credential+jwt";
 
-/// `kid` header value a delegation token MUST carry (spec line 162).
+/// `kid` header value a delegation token MUST carry (the spec's "Delegation token" section).
 pub const KID_DELEGATION_TOKEN: &str = "#atproto";
 
-/// `kid` header value a space credential MUST carry (spec line 216).
+/// `kid` header value a space credential MUST carry (the spec's "Space credential" section).
 pub const KID_SPACE_CREDENTIAL: &str = "#atproto_space";
 
-/// Delegation-token default TTL: 60 seconds (spec lines 149, 169).
+/// Delegation-token default TTL: 60 seconds (the spec's "Delegation token" section).
 pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60;
 
-/// SpaceCredential default TTL: 2 hours / 7200 seconds (spec line 223).
+/// SpaceCredential default TTL: 2 hours / 7200 seconds (the spec's "Space credential" section).
 pub const SPACE_CREDENTIAL_TTL_SECS: u64 = 7200;
 
 /// Shortest SpaceCredential TTL a host may configure, in seconds.
@@ -85,7 +85,7 @@ const _: () = assert!(SPACE_CREDENTIAL_TTL_MIN_SECS <= SPACE_CREDENTIAL_TTL_SECS
 const _: () = assert!(SPACE_CREDENTIAL_TTL_SECS <= SPACE_CREDENTIAL_TTL_MAX_SECS);
 
 /// The `aud` of a delegation token: the space host service fragment of the
-/// authority DID (`<spaceDid>#atproto_space_host`, spec line 166).
+/// authority DID (`<spaceDid>#atproto_space_host`, the spec's "Delegation token" section).
 #[must_use]
 pub fn space_host_audience(space_did: &str) -> String {
     format!("{space_did}#atproto_space_host")
@@ -98,7 +98,7 @@ struct JwtHeader {
     kid: String,
 }
 
-/// Decoded delegation-token payload (spec lines 164-171).
+/// Decoded delegation-token payload (the spec's "Delegation token" section).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationToken {
     /// Issuer DID — the member (user) delegating to the app.
@@ -165,7 +165,7 @@ pub struct Cnf {
     pub jkt: String,
 }
 
-/// Decoded SpaceCredential payload (spec lines 218-225).
+/// Decoded SpaceCredential payload (the spec's "Space credential" section).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceCredential {
     /// Issuer DID — the space authority.
@@ -181,7 +181,7 @@ pub struct SpaceCredential {
     pub cnf: Cnf,
     /// Attested application identity (the verified client attestation's
     /// `iss`). Omitted on the wire when the request carried no attestation
-    /// (spec lines 221, 228).
+    /// (the spec's "Space credential" section).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub client_id: Option<String>,
     /// Issued-at timestamp.
@@ -230,8 +230,7 @@ fn random_jti() -> String {
 }
 
 /// Resolve the JWS `alg` header for `key`, restricted to the two algorithms
-/// the spec permits in space-token headers (ES256 / ES256K, spec lines 161,
-/// 215). Other key types (P-384, Ed25519) are rejected here so the minted
+/// the spec permits in space-token headers (ES256 / ES256K, the spec's token sections). Other key types (P-384, Ed25519) are rejected here so the minted
 /// header can never carry a non-conformant `alg`.
 fn space_jws_alg(key: &KeyData) -> SpaceResult<&'static str> {
     match atproto_identity::key::jws_alg(key) {
@@ -367,7 +366,7 @@ fn check_time_claims(iat: u64, exp: u64) -> SpaceResult<()> {
 ///
 /// The token's `aud` is set to the space host service fragment
 /// (`<spaceDid>#atproto_space_host`) and `sub` to the space `at://` URI, per
-/// spec lines 166-167. The header carries `kid="#atproto"`.
+/// the spec's "Delegation token" section. The header carries `kid="#atproto"`.
 ///
 /// # Errors
 ///
@@ -450,7 +449,7 @@ pub fn verify_delegation_token(
 ///
 /// `client_id` is the attested application identity (the verified client
 /// attestation's `iss`); pass `None` when the request carried no attestation,
-/// in which case the claim is omitted (spec lines 221, 228). The header
+/// in which case the claim is omitted (the spec's "Space credential" section). The header
 /// carries `kid="#atproto_space"` and the payload has no `aud`.
 ///
 /// # Errors

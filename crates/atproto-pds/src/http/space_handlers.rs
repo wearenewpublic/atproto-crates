@@ -1903,7 +1903,7 @@ pub struct DelegationTokenResponse {
 }
 
 /// Output of `getSpaceCredential` — `{ credential }`, the bare JWT, per the
-/// `com.atproto.space.getSpaceCredential` lexicon (spec lines 246).
+/// `com.atproto.space.getSpaceCredential` lexicon (the spec's "Space credential" section).
 #[derive(Debug, Serialize)]
 pub struct SpaceCredentialResponse {
     /// The compact-form space-credential JWT.
@@ -2051,8 +2051,8 @@ pub async fn get_space_credential(
             Err(e) => return Err(e),
         };
 
-    // Enforce single-use of the delegation token via its `jti` (spec line
-    // 149). Consume it before minting so a replayed token is refused.
+    // Enforce single-use of the delegation token via its `jti` (the spec's "Delegation token" section
+    //). Consume it before minting so a replayed token is refused.
     let dt_ttl = std::time::Duration::from_secs(payload.exp.saturating_sub(now_secs()));
     state
         .jti_guard
@@ -2075,7 +2075,7 @@ pub async fn get_space_credential(
     // established solely by the optional client attestation: when one is
     // presented we verify it (which yields the attested client_id) and use
     // that for the APP axis and the credential's `client_id`. When none is
-    // presented the credential's `client_id` is omitted (spec lines 221, 228).
+    // presented the credential's `client_id` is omitted (the spec's "Space credential" section).
     let mint_http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(crate::user_agent())
@@ -2377,7 +2377,7 @@ async fn require_space_credential(
 // ---------------------------------------------------------------------------
 //  OAuth `space:` scope enforcement.
 //
-//  Enforces the 0016 `space:` OAuth scope rules (spec lines 369-419): only
+//  Enforces the 0016 `space:` OAuth scope rules (the spec's "OAuth scopes" section): only
 //  OAuth credentials carry granular `space:` permissions. App-password
 //  sessions (`access`) and SpaceCredential auth pre-authorize at the auth
 //  layer and skip the scope check entirely. A missing scope maps to 403.
@@ -2500,8 +2500,7 @@ async fn assert_space_scope(
         ),
     };
     // Resolve the space type declaration's collections so a bare grant's
-    // omitted-`collection` default matches the declared collections (spec line
-    // 413). Whole-space `read` ignores collection, so the lookup is skipped.
+    // omitted-`collection` default matches the declared collections (the spec's "Matching" section). Whole-space `read` ignores collection, so the lookup is skipped.
     let declared = match action {
         atproto_oauth::scopes::SpaceAction::Read => Vec::new(),
         _ => declared_collections(state, uri.space_type.as_str()).await,
@@ -2528,7 +2527,7 @@ async fn assert_space_scope(
 }
 
 /// Assert that the OAuth scope set granted to `subject` permits the
-/// space-management `verb` on the space `uri` (spec lines 415-419). The verb
+/// space-management `verb` on the space `uri` (the spec's "Matching" section). The verb
 /// maps onto the management surface at the call site (e.g. `update` authorizes
 /// `updateSpace`/`addMember`/`removeMember`). No-op for non-OAuth subjects.
 fn assert_space_manage(
@@ -2594,7 +2593,7 @@ async fn assert_space_record_read(
 
 /// Resolve the `collections` declared by the space type's declaration for the
 /// `space_type` NSID, used to expand a bare `space:` grant's
-/// omitted-`collection` default (spec line 413).
+/// omitted-`collection` default (the spec's "Matching" section).
 ///
 /// Resolution is delegated to the configured
 /// [`SpaceDeclarationResolver`](crate::space::SpaceDeclarationResolver). It is
@@ -2603,7 +2602,7 @@ async fn assert_space_record_read(
 /// empty list — a bare grant then confers no write targets. Explicit
 /// `collection=` grants are unaffected (they never consult the default).
 async fn declared_collections(state: &HttpState, space_type: &str) -> Vec<String> {
-    // `spaceType=*` has no declaration (spec line 413); skip resolution.
+    // `spaceType=*` has no declaration (the spec's "Matching" section); skip resolution.
     if space_type == "*" {
         return Vec::new();
     }
@@ -3090,7 +3089,7 @@ const LIST_REPOS_SQL: &str = "SELECT o.issuer_did, o.rev, o.set_hash
 /// The writer set: distinct issuer DIDs observed in the owner's inbound
 /// write-receipt log (`space_received_op`), each paired with its current `rev`
 /// (`MAX(rev)` over that issuer's receipts), ordered by DID, paginated by
-/// `did > cursor`. Output is `{ did, rev }` per writer (spec line 357).
+/// `did > cursor`. Output is `{ did, rev }` per writer (the spec's "The sync boundary (writer set)" section).
 /// `SpaceNotFound` when the space row is absent.
 ///
 /// Auth is **space credential only** (spec XRPC table: `listRepos` is "space
@@ -3951,7 +3950,7 @@ mod scope_gate_tests {
     async fn bare_grant_defaults_to_declared_collections() {
         // A bare `space:app.bsky.group` grant (omits `collection` and `action`)
         // must default its write targets to the declaration's `collections`
-        // (spec line 413). With a resolver mapping the type to a declaration
+        // (the spec's "Matching" section). With a resolver mapping the type to a declaration
         // listing `app.bsky.feed.post`, a create on that collection is allowed.
         let state = test_state_with_declaration().await;
         let subject = oauth_subject("space:app.bsky.group?did=did:plc:owner&skey=default");

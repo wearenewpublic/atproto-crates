@@ -143,10 +143,10 @@ pub fn app_axis(access: &AppAccess, attested_client_id: Option<&str>) -> Result<
     }
 }
 
-/// `typ` header value a client attestation MUST carry (spec line 184).
+/// `typ` header value a client attestation MUST carry (the spec's "Client attestation" section).
 pub const TYP_CLIENT_ATTESTATION: &str = "atproto-client-attestation+jwt";
 
-/// Header of a client-attestation JWT (spec lines 183-187). We read `typ`
+/// Header of a client-attestation JWT (the spec's "Client attestation" section). We read `typ`
 /// (to reject token-type confusion) and `kid` (to select the verifying key
 /// from the resolved JWKS).
 #[derive(Debug, Deserialize)]
@@ -158,7 +158,7 @@ struct AttestationHeader {
     kid: Option<String>,
 }
 
-/// Payload of a client-attestation JWT (spec lines 188-195). Per the spec,
+/// Payload of a client-attestation JWT (the spec's "Client attestation" section). Per the spec,
 /// `iss == sub == client_id` (the client-metadata URL) and `aud` identifies
 /// the space host. `iat`/`exp`/`jti` provide freshness and replay protection.
 #[derive(Debug, Deserialize)]
@@ -194,7 +194,7 @@ struct ClientMetadata {
 
 /// The audience a client attestation (and delegation token) must target: the
 /// space host service fragment derived from the space DID
-/// (`<spaceDid>#atproto_space_host`, spec line 166/191).
+/// (`<spaceDid>#atproto_space_host`, the spec's "Delegation token" and "Client attestation" sections).
 #[must_use]
 pub fn space_host_audience(space_did: &str) -> String {
     atproto_space::credential::space_host_audience(space_did)
@@ -294,7 +294,7 @@ pub async fn verify_client_attestation(
     }
 
     // iat and exp are required; the attestation must be unexpired and bounded
-    // to a short lifetime (spec lines 192-193).
+    // to a short lifetime (the spec's "Client attestation" section).
     let now = now_secs();
     let iat = payload
         .iat
@@ -311,7 +311,7 @@ pub async fn verify_client_attestation(
         )));
     }
 
-    // jti is required and single-use (spec line 194). Consume it before the
+    // jti is required and single-use (the spec's "Client attestation" section). Consume it before the
     // signature is checked so a replayed nonce is rejected regardless.
     let jti = payload
         .jti

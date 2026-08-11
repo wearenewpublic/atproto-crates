@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: the nightly sweep collects lapsed write-notification registrations. Delivery has
+  always skipped a row past its `expires_at`, so these were inert — but nothing deleted them, and a
+  registration is renewed by re-registering, so a syncer renewing on a timer left one dead row behind
+  per renewal, for ever. Skipping a row on every fan-out is cheap; storing it for ever is not.
+
+  Rows with no expiry are left alone: those are the perpetual registrations `getSpaceCredential`
+  creates, which are withdrawn deliberately through `unregisterNotify` rather than aged out from
+  underneath their owner. The sweep now also runs whenever a data directory is configured, so
+  disabling the oplog and blob retention windows no longer disables this too.
+
+### Removed
+- `atproto-pds`: `src/space/export.rs`, 693 lines implementing `exportSpaces`/`importSpaces` — method
+  names that appear in no version of proposal 0016 and no draft lexicon. It was not merely unrouted
+  and unreferenced: it was never declared as a module, so the compiler had never seen it. Its import
+  path also wrote the manifest's claimed `set_hash` without recomputing it from the records it
+  imported, which is not a property any replacement should inherit.
+
+### Changed
+- Doc comments across the space crates cite the spec by section name instead of by line number.
+  Every one of them was stale: PR #99 inserted a "DPoP binding" section around line 250, shifting
+  everything below it, so citations pointing into the second half of the document named the wrong
+  text. Section names survive edits that line numbers cannot.
+
+### Fixed
 - `atproto-pds`: `getSpaceCredential` reports a failed delegation token as `InvalidDelegationToken`,
   the name the lexicon gives that failure, and answers `SpaceDeleted` with 400 like its siblings.
 

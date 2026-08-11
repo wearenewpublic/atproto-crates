@@ -1,10 +1,10 @@
 //! Space-type **declaration** resolution — maps a space-type NSID to the
 //! `com.atproto.lexicon.schema` record that publishes it and extracts the
-//! `defs.main` space declaration (spec lines 100-130, 407-413).
+//! `defs.main` space declaration (the spec's "Space type declarations" and "Matching" sections).
 //!
 //! A bare `space:<concreteType>` OAuth grant (one that omits `collection`)
 //! defaults its write targets to the **declared** `collections` of the space
-//! type (spec line 413). To honor that default the PDS must resolve the
+//! type (the spec's "Matching" section). To honor that default the PDS must resolve the
 //! declaration at request time. The resolution path mirrors AT Protocol
 //! lexicon resolution:
 //!
@@ -43,7 +43,7 @@ pub struct SpaceDeclaration {
     /// Recommended space-key (`skey`) type for spaces of this type.
     pub key: String,
     /// Declared record-collection NSIDs — the default `collection` set for a
-    /// bare `space:` grant of this type (spec line 413).
+    /// bare `space:` grant of this type (the spec's "Matching" section).
     pub collections: Vec<String>,
 }
 

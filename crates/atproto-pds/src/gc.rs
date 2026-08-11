@@ -77,6 +77,9 @@ pub struct GcReport {
     /// Blob rows deleted because nothing referenced them any more, summed
     /// across all accounts.
     pub orphan_blobs: u64,
+    /// Lapsed `space_credential_recipient` rows deleted, summed across all
+    /// accounts.
+    pub expired_notify_registrations: u64,
 }
 
 /// Optional knobs the unified GC tick honors.
@@ -185,11 +188,23 @@ pub async fn tick_with(
         let blob_cutoff = (opts.blob_grace_hours > 0)
             .then(|| (now - chrono::Duration::hours(opts.blob_grace_hours)).to_rfc3339());
 
-        if cutoff_tid.is_some() || blob_cutoff.is_some() {
-            match prune_per_actor(pool, dir, cutoff_tid.as_deref(), blob_cutoff.as_deref()).await {
-                Ok((oplog, blobs)) => {
+        // The sweep runs whenever a data dir is configured: lapsed notify
+        // registrations are collected unconditionally, so disabling the oplog
+        // and blob windows must not also disable that.
+        {
+            match prune_per_actor(
+                pool,
+                dir,
+                cutoff_tid.as_deref(),
+                blob_cutoff.as_deref(),
+                &now.to_rfc3339(),
+            )
+            .await
+            {
+                Ok((oplog, blobs, registrations)) => {
                     report.space_oplog = oplog;
                     report.orphan_blobs = blobs;
+                    report.expired_notify_registrations = registrations;
                 }
                 Err(e) => {
                     tracing::warn!(error = ?e, "unified GC: per-actor sweep failed");
@@ -260,10 +275,12 @@ async fn prune_per_actor(
     data_dir: &std::path::Path,
     cutoff_tid: Option<&str>,
     blob_cutoff: Option<&str>,
-) -> PdsResult<(u64, u64)> {
+    now_iso: &str,
+) -> PdsResult<(u64, u64, u64)> {
     use crate::actor_store::sql::SqlActorStore;
     let mut oplog_total = 0u64;
     let mut blob_total = 0u64;
+    let mut registration_total = 0u64;
     let mut cursor: Option<String> = None;
     loop {
         let rows: Vec<(String,)> = match cursor.as_deref() {
@@ -324,10 +341,35 @@ async fn prune_per_actor(
                     }
                 }
             }
+
+            // Lapsed notify registrations. Delivery has always skipped rows
+            // past their `expires_at`, so these are already inert -- but
+            // nothing ever deleted them, and a registration is renewed by
+            // re-registering, so a subscriber that renews on a timer leaves
+            // one dead row behind per renewal, for ever. Skipping a row on
+            // every fan-out is cheap; storing it for ever is not.
+            //
+            // Rows with a NULL `expires_at` are left alone: those are the
+            // perpetual registrations `getSpaceCredential` creates, which are
+            // withdrawn through `unregisterNotify` rather than aged out.
+            match sqlx::query(
+                "DELETE FROM space_credential_recipient WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            )
+            .bind(now_iso)
+            .execute(store.pool())
+            .await
+            {
+                Ok(r) => {
+                    registration_total = registration_total.saturating_add(r.rows_affected());
+                }
+                Err(e) => {
+                    tracing::warn!(did = %did, error = ?e, "expired notify registrations: prune failed");
+                }
+            }
         }
         cursor = last;
     }
-    Ok((oplog_total, blob_total))
+    Ok((oplog_total, blob_total, registration_total))
 }
 
 /// Delete blob bytes nothing refers to any more.
@@ -663,11 +705,12 @@ mod tests {
         .await
         .unwrap();
 
-        let (oplog, blobs) = prune_per_actor(
+        let (oplog, blobs, _) = prune_per_actor(
             &pool,
             tmp.path(),
             Some("3zzzzzzzzzzzz"),
             Some("2099-01-01T00:00:00Z"),
+            &chrono::Utc::now().to_rfc3339(),
         )
         .await
         .expect("sweep");
@@ -717,9 +760,15 @@ mod tests {
         // sweep starts -- which is the state the sweep must not disturb.
         SqlActorStore::open(tmp.path(), live).await.unwrap();
         let before = crate::actor_store::sql::pools_built_for_did(tmp.path(), live);
-        prune_per_actor(&pool, tmp.path(), Some("3zzzzzzzzzzzz"), None)
-            .await
-            .expect("sweep");
+        prune_per_actor(
+            &pool,
+            tmp.path(),
+            Some("3zzzzzzzzzzzz"),
+            None,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .expect("sweep");
         SqlActorStore::open(tmp.path(), live).await.unwrap();
         let after = crate::actor_store::sql::pools_built_for_did(tmp.path(), live);
 
@@ -773,5 +822,80 @@ mod tests {
                 "{table} prune still reads the whole table; plan was:\n{rendered}"
             );
         }
+    }
+    /// Lapsed notify registrations are collected; live and perpetual ones are
+    /// not.
+    ///
+    /// Delivery already skips a row past its expiry, so these are inert — but
+    /// nothing deleted them, and a subscriber renews by re-registering, so a
+    /// syncer on a renewal timer left one dead row behind per renewal for
+    /// ever. The rows with no expiry are the ones `getSpaceCredential`
+    /// creates; those are withdrawn deliberately through `unregisterNotify`,
+    /// not aged out underneath their owner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sweep_collects_lapsed_notify_registrations() {
+        use crate::actor_store::sql::SqlActorStore;
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref)
+             VALUES ('did:plc:owner', 'owner.example', 'x', '2026-01-01T00:00:00Z', 'active', 'k')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = SqlActorStore::open(tmp.path(), "did:plc:owner")
+            .await
+            .unwrap();
+        let space = "at://did:plc:owner/space/app.bsky.group/default";
+        sqlx::query("INSERT INTO space (uri, is_owner, is_member, created_at) VALUES (?, 1, 1, ?)")
+            .bind(space)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        for (service, expires) in [
+            ("did:web:lapsed.example", Some("2000-01-01T00:00:00Z")),
+            ("did:web:live.example", Some("2099-01-01T00:00:00Z")),
+            ("did:web:perpetual.example", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO space_credential_recipient
+                   (space, repo, service_did, service_endpoint, last_issued_at, expires_at)
+                 VALUES (?, '', ?, 'https://x.example', '2026-01-01T00:00:00Z', ?)",
+            )
+            .bind(space)
+            .bind(service)
+            .bind(expires)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        let (_, _, collected) = prune_per_actor(
+            &pool,
+            tmp.path(),
+            None,
+            None,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(collected, 1, "only the lapsed registration");
+
+        let left: Vec<String> = sqlx::query_scalar(
+            "SELECT service_did FROM space_credential_recipient ORDER BY service_did",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            left,
+            vec![
+                "did:web:live.example".to_string(),
+                "did:web:perpetual.example".to_string()
+            ],
+            "a live registration and one with no expiry both survive"
+        );
     }
 }
