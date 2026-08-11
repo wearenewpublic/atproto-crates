@@ -54,6 +54,38 @@ pub async fn verify_dpop_proof(
         Some(jkt) => jkt.clone(),
         None => return Ok(()),
     };
+    verify_bound_dpop_proof(
+        headers,
+        &bound_jkt,
+        htm,
+        htu,
+        access_token,
+        jti_guard,
+        nonce_issuer,
+    )
+    .await
+}
+
+/// Verify a DPoP proof against a thumbprint the caller already holds.
+///
+/// The proof-checking half of [`verify_dpop_proof`], with the binding passed in
+/// rather than read out of `OAuthClaims`. Space credentials carry their own
+/// `cnf.jkt` and are not OAuth tokens, so they need the same five checks
+/// against a thumbprint that reaches this function from somewhere else.
+///
+/// Unlike [`verify_dpop_proof`] there is no unbound case: a caller that has a
+/// thumbprint is asserting the token is bound, so a missing `DPoP` header is a
+/// failure rather than a skip.
+pub async fn verify_bound_dpop_proof(
+    headers: &HeaderMap,
+    bound_jkt: &str,
+    htm: &str,
+    htu: &str,
+    token: &str,
+    jti_guard: &JtiReplayGuard,
+    nonce_issuer: Option<&crate::oauth::nonce::NonceIssuer>,
+) -> Result<(), XrpcError> {
+    let access_token = token;
     let proof = headers.get(DPOP_HEADER).ok_or_else(|| {
         XrpcError::new(
             StatusCode::UNAUTHORIZED,

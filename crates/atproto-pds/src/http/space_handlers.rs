@@ -31,7 +31,8 @@
 use crate::account::AccountManager;
 use crate::actor_store::sql::SqlActorStore;
 use crate::http::auth::{
-    authorization_token, bearer_token, request_htm_htu, require_authn, require_authn_sub,
+    AuthScheme, authorization_token, bearer_token, request_htm_htu, require_authn,
+    require_authn_sub, require_scheme,
 };
 use crate::http::errors::XrpcError;
 use crate::http::extract::{XrpcJson as Json, XrpcQuery as Query};
@@ -1362,13 +1363,17 @@ async fn resolve_record_auth<'a>(
     space: &SpaceUri,
     repo: Option<&str>,
 ) -> Result<ResolvedRecordAuth<'a>, XrpcError> {
-    // Scheme-tolerant: a space credential is a Bearer token, but the
-    // fall-through below is `require_authn`, which also accepts a DPoP-bound
-    // OAuth token. Extracting Bearer-only here would refuse that token before
-    // it ever reached the branch that handles it.
-    let (_, raw) = authorization_token(parts)?;
+    // Both token kinds that reach here are DPoP-bound -- a `cnf`-bound OAuth
+    // token and a space credential -- so the scheme is read rather than
+    // assumed, and each branch requires the one its binding implies.
+    let (scheme, raw) = authorization_token(parts)?;
     match classify(raw) {
         Some(SpaceTokenKind::SpaceCredential) => {
+            require_scheme(
+                scheme,
+                AuthScheme::Dpop,
+                "a space credential is bound to a key",
+            )?;
             let repo = repo.ok_or_else(|| {
                 XrpcError::new(
                     StatusCode::BAD_REQUEST,
@@ -1376,8 +1381,12 @@ async fn resolve_record_auth<'a>(
                     "repo is required for space credential auth",
                 )
             })?;
-            // The credential itself is verified downstream; what is checked
-            // here is that the repo it names belongs to this space.
+            // Proof of possession before anything else this credential could
+            // buy: the signature is checked downstream by the reader, and
+            // neither check stands in for the other.
+            crate::http::space_auth::require_credential_dpop_proof(parts, state, raw).await?;
+            // What is checked here is that the repo it names belongs to this
+            // space.
             assert_space_membership(state, space, None, repo).await?;
             Ok(ResolvedRecordAuth {
                 auth: SpaceReadAuth::SpaceCredential { token: raw },
@@ -2311,9 +2320,16 @@ async fn require_any_authn(
     state: &HttpState,
     space: &SpaceUri,
 ) -> Result<Option<crate::http::auth::AuthSubject>, XrpcError> {
-    // Scheme-tolerant for the same reason as `resolve_record_auth`.
-    let (_, raw) = authorization_token(parts)?;
+    // Both token kinds that reach here are DPoP-bound; see
+    // `resolve_record_auth`.
+    let (scheme, raw) = authorization_token(parts)?;
     if let Some(SpaceTokenKind::SpaceCredential) = classify(raw) {
+        require_scheme(
+            scheme,
+            AuthScheme::Dpop,
+            "a space credential is bound to a key",
+        )?;
+        crate::http::space_auth::require_credential_dpop_proof(parts, state, raw).await?;
         space_reader(state)?
             .verify_space_credential_for(space, raw)
             .await
@@ -2339,7 +2355,9 @@ async fn require_space_credential(
     state: &HttpState,
     space: &SpaceUri,
 ) -> Result<(), XrpcError> {
-    let raw = bearer_token(parts)?;
+    // `bearer_token` refuses the DPoP scheme outright, so this could not read
+    // a conformant presentation at all.
+    let (scheme, raw) = authorization_token(parts)?;
     if classify(raw) != Some(SpaceTokenKind::SpaceCredential) {
         return Err(XrpcError::new(
             StatusCode::UNAUTHORIZED,
@@ -2347,6 +2365,12 @@ async fn require_space_credential(
             "this method requires a space credential",
         ));
     }
+    require_scheme(
+        scheme,
+        AuthScheme::Dpop,
+        "a space credential is bound to a key",
+    )?;
+    crate::http::space_auth::require_credential_dpop_proof(parts, state, raw).await?;
     space_reader(state)?
         .verify_space_credential_for(space, raw)
         .await
@@ -2356,7 +2380,8 @@ async fn require_space_credential(
                 "Unauthorized",
                 format!("invalid space credential: {e}"),
             )
-        })
+        })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3098,8 +3123,10 @@ pub async fn register_notify(
     let manager = account_manager(&state)?;
     let _ = space_service(&state)?; // gate on Spaces being enabled
 
-    // Require a space-credential bearer.
-    let token = bearer_token(&parts)?;
+    // Require a space credential, presented under the scheme its binding
+    // implies. `bearer_token` used to read this, which refuses the DPoP scheme
+    // outright -- a conformant presentation could not reach the handler.
+    let (scheme, token) = authorization_token(&parts)?;
     if classify(token) != Some(SpaceTokenKind::SpaceCredential) {
         return Err(XrpcError::new(
             StatusCode::UNAUTHORIZED,
@@ -3107,6 +3134,12 @@ pub async fn register_notify(
             "registerNotify requires a space credential",
         ));
     }
+    require_scheme(
+        scheme,
+        AuthScheme::Dpop,
+        "a space credential is bound to a key",
+    )?;
+    crate::http::space_auth::require_credential_dpop_proof(&parts, &state, token).await?;
 
     // SpaceNotFound when the owner's space row is absent.
     let owner_store = SqlActorStore::open(manager.data_dir(), &space.space_did)
@@ -3131,24 +3164,25 @@ pub async fn register_notify(
         ));
     }
 
-    // Verify the space credential: signature over the authority's
-    // #atproto_space key, bound to this space, not expired. The authority is
-    // local to this host PDS, and per 0016 line 92 #atproto_space coincides
-    // with the account's #atproto signing key (resolved via local_public_key).
-    let owner_pub = crate::http::space_auth::local_public_key(manager, &space.space_did).await?;
-    let credential = atproto_space::credential::verify_space_credential(
-        token,
-        &space.space_did,
-        &space,
-        &owner_pub,
-    )
-    .map_err(|e| {
-        XrpcError::new(
-            StatusCode::FORBIDDEN,
-            "InvalidToken",
-            format!("SpaceCredential verification: {e}"),
-        )
-    })?;
+    // Verify the space credential: signature over the authority's key, bound
+    // to this space, not expired.
+    //
+    // Resolved the same way every other credentialed endpoint resolves it --
+    // the local account first, then the authority's DID document, preferring
+    // `#atproto_space` over `#atproto`. Reading only the local account's
+    // `#atproto` key, as this did, assumed both that the authority is hosted
+    // here and that it publishes no separate space key; an authority that does
+    // either had its own valid credentials refused.
+    let credential = space_reader(&state)?
+        .verify_space_credential_for(&space, token)
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "InvalidToken",
+                format!("SpaceCredential verification: {e}"),
+            )
+        })?;
 
     // The credential's advisory `client_id` (the attested application)
     // identifies the subscribing service. When the credential carried no

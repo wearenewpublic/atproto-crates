@@ -182,9 +182,10 @@ impl AuthScheme {
 /// Read an `Authorization: Bearer <token>` **or** `Authorization: DPoP
 /// <token>` header, returning the scheme and the raw token.
 ///
-/// This is the extractor for *access tokens*, whose scheme varies. Tokens
-/// that are Bearer by definition — service auth, space credentials,
-/// delegation grants — use [`bearer_token`] instead.
+/// This is the extractor for tokens whose scheme varies: OAuth access tokens,
+/// which are `DPoP` when `cnf`-bound and `Bearer` otherwise, and space
+/// credentials, which are `DPoP` always. Tokens that are Bearer by definition
+/// — service auth, delegation grants — use [`bearer_token`] instead.
 ///
 /// The scheme is matched case-sensitively against the names RFC 6750 and
 /// RFC 9449 register. Failure is a 401 `AuthenticationRequired`.
@@ -400,7 +401,11 @@ pub async fn require_authn(
 /// Split out so both directions read the same way: a bound token under
 /// `Bearer` and an unbound token under `DPoP` are both mismatches, and
 /// neither is more acceptable than the other.
-fn require_scheme(got: AuthScheme, want: AuthScheme, why: &str) -> Result<(), XrpcError> {
+pub(crate) fn require_scheme(
+    got: AuthScheme,
+    want: AuthScheme,
+    why: &str,
+) -> Result<(), XrpcError> {
     if got == want {
         return Ok(());
     }

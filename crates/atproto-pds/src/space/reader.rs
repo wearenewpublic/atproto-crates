@@ -316,7 +316,7 @@ impl SpaceReader {
         space: &SpaceUri,
         auth: &SpaceReadAuth<'_>,
     ) -> PdsResult<()> {
-        self.verify_auth(space, auth).await
+        self.verify_auth(space, auth).await.map(|_| ())
     }
 
     /// Verify a presented `SpaceCredential` JWT against `space` without reading
@@ -332,9 +332,10 @@ impl SpaceReader {
         &self,
         space: &SpaceUri,
         token: &str,
-    ) -> PdsResult<()> {
+    ) -> PdsResult<SpaceCredential> {
         self.verify_auth(space, &SpaceReadAuth::SpaceCredential { token })
             .await
+            .map(|claims| claims.expect("a verified credential always yields claims"))
     }
 
     /// Verify the read auth. For SpaceCredential, performs JWT signature
@@ -342,19 +343,30 @@ impl SpaceReader {
     /// plus `iss`/`sub`/`exp` checks. The credential's `client_id` is advisory
     /// and not enforced. For OwnPds, this is a no-op — the HTTP-layer
     /// OAuth/session check already validated the bearer.
-    async fn verify_auth(&self, space: &SpaceUri, auth: &SpaceReadAuth<'_>) -> PdsResult<()> {
+    /// Verify the request's authorization, returning the credential's claims
+    /// when it presented one.
+    ///
+    /// `None` for own-PDS OAuth, which carries no credential. The claims are
+    /// returned rather than discarded because `registerNotify` keys its
+    /// subscription on them, and re-parsing a token this function has already
+    /// parsed invites the two readings to disagree.
+    async fn verify_auth(
+        &self,
+        space: &SpaceUri,
+        auth: &SpaceReadAuth<'_>,
+    ) -> PdsResult<Option<SpaceCredential>> {
         match auth {
-            SpaceReadAuth::OwnPds { .. } => Ok(()),
+            SpaceReadAuth::OwnPds { .. } => Ok(None),
             SpaceReadAuth::SpaceCredential { token } => {
                 let authority_did = &space.space_did;
                 let authority_pub = self.authority_public_key(authority_did).await?;
-                let _payload: SpaceCredential =
+                let payload: SpaceCredential =
                     verify_space_credential(token, authority_did, space, &authority_pub).map_err(
                         |e| PdsError::AuthDenied {
                             reason: format!("invalid SpaceCredential: {e}"),
                         },
                     )?;
-                Ok(())
+                Ok(Some(payload))
             }
         }
     }

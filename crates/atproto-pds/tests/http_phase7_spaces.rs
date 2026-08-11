@@ -26,7 +26,8 @@
 //! requires an OAuth token carrying a `client_id`, so those flows mint an
 //! HS256 OAuth access token directly (mirroring `tests/dpop_enforcement.rs`).
 
-use atproto_identity::key::KeyType;
+use atproto_identity::key::{KeyData, KeyType, generate_key};
+use atproto_oauth::dpop::{extract_jwk_thumbprint, request_dpop};
 use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
@@ -132,11 +133,54 @@ fn mint_oauth_access(sub: &str, scope: &str) -> String {
     )
 }
 
+/// A space credential together with the key it is bound to.
+///
+/// The two travel together because neither is usable alone: the credential
+/// names a key in its `cnf.jkt`, and every request presenting it has to carry
+/// a proof signed by that key. Returning the JWT on its own, as this harness
+/// used to, produces a credential no test can actually present.
+struct SpaceCred {
+    jwt: String,
+    key: KeyData,
+}
+
+impl SpaceCred {
+    /// A DPoP proof for one request, bound to this credential and that URL.
+    ///
+    /// `request_dpop` puts `ath` over the credential and strips the query
+    /// string from `htu`, which matters here: every space read carries
+    /// `?space=…&repo=…`, and the server recomputes `htu` the same way.
+    fn proof(&self, method: &str, path: &str) -> String {
+        let (proof, _, _) = request_dpop(
+            &self.key,
+            method,
+            &format!("http://test.example{path}"),
+            &self.jwt,
+        )
+        .expect("mint DPoP proof");
+        proof
+    }
+}
+
+/// RFC 7638 thumbprint of a key, as `dpopJkt` wants it.
+///
+/// Taken from a throwaway proof rather than computed directly, so the value
+/// sent as `dpopJkt` is by construction the one the server derives from a real
+/// proof's `jwk` header.
+fn jkt_of(key: &KeyData) -> String {
+    let (proof, _, _) = request_dpop(key, "POST", "http://test.example/", "t").unwrap();
+    extract_jwk_thumbprint(&proof).unwrap()
+}
+
 /// Mint a *real*, authority-signed space credential for `member_did` over
 /// `space_uri` by running the full `getDelegationToken` -> `getSpaceCredential`
 /// flow. `member_did` must already be authorized to mint (a member under the
-/// default member-list policy). Returns the compact credential JWT.
-async fn mint_space_credential(app: &axum::Router, member_did: &str, space_uri: &str) -> String {
+/// default member-list policy).
+///
+/// Generates the ephemeral P-256 key the credential binds to. Ephemeral is
+/// what the spec expects — losing one costs a single extra call — and P-256
+/// because DPoP proofs are ES256.
+async fn mint_space_credential(app: &axum::Router, member_did: &str, space_uri: &str) -> SpaceCred {
     let oauth = mint_oauth_access(member_did, &read_scope());
     let (status, body) = get_json(
         app.clone(),
@@ -149,9 +193,13 @@ async fn mint_space_credential(app: &axum::Router, member_did: &str, space_uri: 
     .await;
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
-    let (status, body) = exchange_credential(app, &grant, space_uri, None).await;
+    let key = generate_key(KeyType::P256Private).unwrap();
+    let (status, body) = exchange_credential(app, &grant, space_uri, &jkt_of(&key), None).await;
     assert_eq!(status, StatusCode::OK, "getSpaceCredential: {body}");
-    body["credential"].as_str().unwrap().to_string()
+    SpaceCred {
+        jwt: body["credential"].as_str().unwrap().to_string(),
+        key,
+    }
 }
 
 /// Forge a JWT that merely *classifies* as a space credential — correct
@@ -159,7 +207,8 @@ async fn mint_space_credential(app: &axum::Router, member_did: &str, space_uri: 
 /// `iss`/`sub`/`exp` claims, but a bogus (non-cryptographic) signature. The
 /// host/sync read methods must reject this: it is never signed by the space
 /// authority's `#atproto_space` key.
-fn forge_space_credential(authority_did: &str, space_uri: &str) -> String {
+fn forge_space_credential(authority_did: &str, space_uri: &str) -> SpaceCred {
+    let key = generate_key(KeyType::P256Private).unwrap();
     let header = json!({
         "alg": "ES256",
         "typ": "atproto-space-credential+jwt",
@@ -169,6 +218,7 @@ fn forge_space_credential(authority_did: &str, space_uri: &str) -> String {
     let payload = json!({
         "iss": authority_did,
         "sub": space_uri,
+        "cnf": { "jkt": jkt_of(&key) },
         "iat": now,
         "exp": now + 3600,
     });
@@ -177,7 +227,10 @@ fn forge_space_credential(authority_did: &str, space_uri: &str) -> String {
     // 64-byte all-zero "signature" — structurally a P-256 sig, cryptographically
     // invalid.
     let sig = B64URL.encode([0u8; 64]);
-    format!("{h}.{p}.{sig}")
+    SpaceCred {
+        jwt: format!("{h}.{p}.{sig}"),
+        key,
+    }
 }
 
 async fn post_json(
@@ -211,6 +264,45 @@ async fn get_json(app: axum::Router, path: &str, bearer: Option<&str>) -> (Statu
     }
     let request = req.body(Body::empty()).unwrap();
     let resp = app.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// `get_json`, presenting a space credential the way RFC 9449 requires:
+/// `Authorization: DPoP <credential>` plus a `DPoP` proof for this request.
+async fn get_json_cred(app: &axum::Router, path: &str, cred: &SpaceCred) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(path)
+        .header("host", "test.example")
+        .header("authorization", format!("DPoP {}", cred.jwt))
+        .header("DPoP", cred.proof("GET", path))
+        .body(Body::empty())
+        .unwrap();
+    read_response(app.clone().oneshot(request).await.unwrap()).await
+}
+
+/// `post_json`, presenting a space credential under the DPoP scheme.
+async fn post_json_cred(
+    app: &axum::Router,
+    path: &str,
+    body: Value,
+    cred: &SpaceCred,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("host", "test.example")
+        .header("authorization", format!("DPoP {}", cred.jwt))
+        .header("DPoP", cred.proof("POST", path))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    read_response(app.clone().oneshot(request).await.unwrap()).await
+}
+
+async fn read_response(resp: axum::response::Response) -> (StatusCode, Value) {
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -256,15 +348,11 @@ async fn create_space(app: &axum::Router, owner_token: &str, skey: &str) -> Stri
     body["uri"].as_str().unwrap().to_string()
 }
 
-/// The DPoP key thumbprint these tests bind minted credentials to.
+/// A fixed, well-formed RFC 7638 thumbprint for tests that assert what the
+/// mint does with the value rather than presenting the credential afterwards.
 ///
-/// A syntactically valid RFC 7638 thumbprint (43 unpadded base64url
-/// characters) that corresponds to no key anyone here holds. That is enough
-/// for every test in this file, because the read endpoints do not yet demand a
-/// proof — they verify the authority's signature and stop. When presentation
-/// lands, the tests that read with a credential need a thumbprint they can
-/// actually sign for, and this constant gets replaced by a generated keypair
-/// threaded out of [`mint_space_credential`].
+/// Tests that actually *use* a credential get a generated key from
+/// [`mint_space_credential`] instead — they have to sign proofs with it.
 const TEST_DPOP_JKT: &str = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I";
 
 /// Exchange a delegation token for a space credential at
@@ -278,9 +366,10 @@ async fn exchange_credential(
     app: &axum::Router,
     delegation_token: &str,
     space: &str,
+    dpop_jkt: &str,
     client_attestation: Option<&str>,
 ) -> (StatusCode, Value) {
-    let mut body = json!({ "space": space, "dpopJkt": TEST_DPOP_JKT });
+    let mut body = json!({ "space": space, "dpopJkt": dpop_jkt });
     if let Some(att) = client_attestation {
         body["clientAttestation"] = json!(att);
     }
@@ -1023,7 +1112,7 @@ async fn delegation_token_then_space_credential_member_allowed() {
     // Exchange the grant for a space credential (member-list + #open => allow).
     // The delegation token rides in the Authorization header; the body carries
     // only the target space. The response is {credential} (spec lines 200-251).
-    let (status, body) = exchange_credential(&app, &grant, &uri, None).await;
+    let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
     assert_eq!(status, StatusCode::OK, "getSpaceCredential: {body}");
     let credential = body["credential"].as_str().unwrap();
     // No legacy {token, expiresAt} shape.
@@ -1046,6 +1135,120 @@ async fn delegation_token_then_space_credential_member_allowed() {
     );
     assert_eq!(sc_payload["cnf"]["jkt"], TEST_DPOP_JKT);
     assert!(sc_payload.get("client_id").is_none());
+}
+
+/// A space credential is a capability its holder exercises, not a secret it
+/// hands over: every presentation carries a proof of possession, and the four
+/// ways of not having one are all refused.
+///
+/// The threat is concrete. A credential reads *every* repo in its space and is
+/// presented to each of their hosts in turn, so a host given one in order to
+/// serve its own repo holds a token that opens all the others. Only the proof
+/// requirement stops it replaying that against them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_credential_is_refused_without_proof_of_possession() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let cred = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let path = format!(
+        "/xrpc/com.atproto.space.listRepos?space={}",
+        urlencode(&uri)
+    );
+
+    let send = async |scheme: &str, proof: Option<String>| {
+        let mut req = Request::builder()
+            .uri(path.clone())
+            .header("host", "test.example")
+            .header("authorization", format!("{scheme} {}", cred.jwt));
+        if let Some(p) = proof {
+            req = req.header("DPoP", p);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.status()
+    };
+
+    // The proof is what the presentation is for; without it there is nothing
+    // tying the request to the key the credential names.
+    assert_eq!(
+        send("DPoP", None).await,
+        StatusCode::UNAUTHORIZED,
+        "no DPoP header"
+    );
+
+    // A proof signed by some other key proves possession of the wrong key.
+    let impostor = SpaceCred {
+        jwt: cred.jwt.clone(),
+        key: generate_key(KeyType::P256Private).unwrap(),
+    };
+    assert_eq!(
+        send("DPoP", Some(impostor.proof("GET", &path))).await,
+        StatusCode::UNAUTHORIZED,
+        "proof signed by a key the credential does not name"
+    );
+
+    // RFC 9449 §7.1: a bound token offered under the unbound scheme asks the
+    // server to skip the proof. Refused even when a valid proof is attached,
+    // so the scheme cannot be used to opt out of the binding.
+    assert_eq!(
+        send("Bearer", Some(cred.proof("GET", &path))).await,
+        StatusCode::UNAUTHORIZED,
+        "bound credential presented as Bearer"
+    );
+
+    // A proof is single-use. Replaying one is how a host that saw a request
+    // would try to reuse it.
+    let proof = cred.proof("GET", &path);
+    assert_eq!(send("DPoP", Some(proof.clone())).await, StatusCode::OK);
+    assert_eq!(
+        send("DPoP", Some(proof)).await,
+        StatusCode::UNAUTHORIZED,
+        "replayed proof jti"
+    );
+}
+
+/// A proof is bound to the request it was minted for, not just to the key.
+///
+/// This is the replay that matters between hosts: a proof captured serving one
+/// repo, presented to a different host for a different repo, with the same
+/// credential and the same key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proof_for_one_request_does_not_authorize_another() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let cred = mint_space_credential(&app, "did:plc:owner", &uri).await;
+
+    let listed = format!(
+        "/xrpc/com.atproto.space.listRepos?space={}",
+        urlencode(&uri)
+    );
+    let other = format!(
+        "/xrpc/com.atproto.space.getLatestCommit?space={}&repo=did:plc:owner",
+        urlencode(&uri)
+    );
+
+    // A proof minted for `listRepos` carries that `htu`; presenting it on a
+    // different path is the mismatch RFC 9449 §4.3 requires a host to catch.
+    let request = Request::builder()
+        .uri(other)
+        .header("host", "test.example")
+        .header("authorization", format!("DPoP {}", cred.jwt))
+        .header("DPoP", cred.proof("GET", &listed))
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(request).await.unwrap().status();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a proof bound to another URL must not authorize this one"
+    );
 }
 
 /// `dpopJkt` is required, and a credential is never minted unbound.
@@ -1148,7 +1351,7 @@ async fn space_credential_non_member_denied() {
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
 
-    let (status, _) = exchange_credential(&app, &grant, &uri, None).await;
+    let (status, _) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-member must be denied");
 }
 
@@ -1195,7 +1398,7 @@ async fn space_credential_app_allowlist_denies_unattested() {
 
     // No client attestation -> the #allowList app axis denies (spec lines
     // 533-535: only the apps named in `allowed` may access the space).
-    let (status, _) = exchange_credential(&app, &grant, &uri, None).await;
+    let (status, _) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -1262,7 +1465,7 @@ async fn space_credential_registers_recipient_idempotently() {
         )
         .await;
         let grant = body["token"].as_str().unwrap().to_string();
-        let (status, body) = exchange_credential(&app, &grant, &uri, None).await;
+        let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
         assert_eq!(status, StatusCode::OK, "getSpaceCredential: {body}");
     }
 
@@ -1293,13 +1496,13 @@ async fn list_repos_wrong_space_credential_rejected() {
     // URI: the `sub` claim must match the requested space, so the verify gate
     // rejects it (401) before any SpaceNotFound lookup.
     let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
-    let (status, _) = get_json(
-        app,
+    let (status, _) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
             urlencode("at://did:plc:owner/space/app.bsky.group/missing")
         ),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1314,13 +1517,13 @@ async fn list_repos_empty_writer_set() {
     // listRepos is space-credential-only: mint a real, authority-signed
     // credential for the owner (an implicit member of their own space).
     let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
-    let (status, body) = get_json(
-        app.clone(),
+    let (status, body) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
             urlencode(&uri)
         ),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -1376,46 +1579,46 @@ async fn forged_space_credential_rejected_on_read_methods() {
     let forged = forge_space_credential("did:plc:owner", &uri);
 
     // getSpace
-    let (status, _) = get_json(
-        app.clone(),
+    let (status, _) = get_json_cred(
+        &app,
         &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
-        Some(&forged),
+        &forged,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "getSpace forged");
 
     // getRepoState
-    let (status, _) = get_json(
-        app.clone(),
+    let (status, _) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.getRepoState?space={}&repo=did:plc:owner",
             urlencode(&uri)
         ),
-        Some(&forged),
+        &forged,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "getRepoState forged");
 
     // listRepoOps
-    let (status, _) = get_json(
-        app.clone(),
+    let (status, _) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepoOps?space={}&repo=did:plc:owner",
             urlencode(&uri)
         ),
-        Some(&forged),
+        &forged,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "listRepoOps forged");
 
     // listRepos
-    let (status, _) = get_json(
-        app,
+    let (status, _) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
             urlencode(&uri)
         ),
-        Some(&forged),
+        &forged,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "listRepos forged");
@@ -1505,11 +1708,11 @@ async fn register_notify_refuses_an_impermissible_endpoint() {
         // Credentials smuggled into the authority component.
         "https://user:pass@consumer.example",
     ] {
-        let (status, body) = post_json(
-            app.clone(),
+        let (status, body) = post_json_cred(
+            &app,
             "/xrpc/com.atproto.space.registerNotify",
             json!({"space": uri, "endpoint": hostile}),
-            Some(&credential),
+            &credential,
         )
         .await;
         assert_eq!(
@@ -1530,11 +1733,11 @@ async fn register_notify_accepts_an_ordinary_https_endpoint() {
     let uri = create_space(&app, &owner_token, "default").await;
     let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
 
-    let (status, body) = post_json(
-        app,
+    let (status, body) = post_json_cred(
+        &app,
         "/xrpc/com.atproto.space.registerNotify",
         json!({"space": uri, "endpoint": "https://consumer.example"}),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "registerNotify: {body}");
@@ -2911,13 +3114,13 @@ async fn list_repos_reports_the_hash_belonging_to_the_latest_rev() {
     }
 
     let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
-    let (status, listed) = get_json(
-        app.clone(),
+    let (status, listed) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
             urlencode(&uri)
         ),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "listRepos: {listed}");
@@ -2949,13 +3152,13 @@ async fn a_notify_write_without_a_hash_is_accepted_and_reports_none() {
     .await;
 
     let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
-    let (status, listed) = get_json(
-        app.clone(),
+    let (status, listed) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
             urlencode(&uri)
         ),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "listRepos: {listed}");
@@ -3446,7 +3649,7 @@ async fn space_not_found_uses_one_status_everywhere() {
     .await;
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
-    let (status, body) = exchange_credential(&app, &grant, missing, None).await;
+    let (status, body) = exchange_credential(&app, &grant, missing, TEST_DPOP_JKT, None).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
@@ -3466,22 +3669,22 @@ async fn space_not_found_uses_one_status_everywhere() {
     .await;
     assert_eq!(status, StatusCode::OK, "deleteSpace: {body}");
 
-    let (status, body) = get_json(
-        app.clone(),
+    let (status, body) = get_json_cred(
+        &app,
         &format!(
             "/xrpc/com.atproto.space.listRepos?space={}",
             urlencode(&real)
         ),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_ne!(status, StatusCode::NOT_FOUND, "listRepos: {body}");
 
-    let (status, body) = post_json(
-        app,
+    let (status, body) = post_json_cred(
+        &app,
         "/xrpc/com.atproto.space.registerNotify",
         json!({"space": real}),
-        Some(&credential),
+        &credential,
     )
     .await;
     assert_ne!(status, StatusCode::NOT_FOUND, "registerNotify: {body}");

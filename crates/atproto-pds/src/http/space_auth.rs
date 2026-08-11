@@ -22,7 +22,8 @@ use crate::account::AccountManager;
 use crate::http::errors::XrpcError;
 use atproto_identity::key::{KeyData, to_public};
 use atproto_space::credential::{
-    DelegationToken, TYP_DELEGATION_TOKEN, TYP_SPACE_CREDENTIAL, verify_delegation_token,
+    DelegationToken, SpaceCredential, TYP_DELEGATION_TOKEN, TYP_SPACE_CREDENTIAL,
+    verify_delegation_token,
 };
 use atproto_space::types::SpaceUri;
 use axum::http::StatusCode;
@@ -347,6 +348,84 @@ fn space_host_endpoint(document: &atproto_identity::model::Document) -> Option<&
     document
         .service_endpoint("atproto_space_host")
         .or_else(|| document.service_endpoint("atproto_pds"))
+}
+
+// ---------------------------------------------------------------------------
+//  SpaceCredential presentation: DPoP
+// ---------------------------------------------------------------------------
+
+/// Read a space credential's payload without verifying its signature.
+///
+/// Only the `cnf.jkt` binding is wanted here, to check the proof against. The
+/// signature is verified separately, on every path that calls this, before the
+/// credential authorizes anything — see [`require_credential_dpop_proof`] for
+/// why reading it first is safe.
+///
+/// # Errors
+///
+/// 401 `InvalidToken` when the payload is missing, not base64url, or not the
+/// JSON of a credential (which includes a credential carrying no `cnf`).
+pub fn peek_space_credential(credential: &str) -> Result<SpaceCredential, XrpcError> {
+    let invalid = |why: &str| {
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "InvalidToken",
+            format!("space credential: {why}"),
+        )
+    };
+    let payload_b64 = credential
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| invalid("missing payload"))?;
+    let payload_bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .map_err(|_| invalid("payload not base64url"))?;
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|_| invalid("payload is not a bound credential (no cnf.jkt?)"))
+}
+
+/// Require the DPoP proof that a space credential's `cnf.jkt` binding calls
+/// for (RFC 9449).
+///
+/// A credential reads every repo in its space and is presented to each of
+/// their hosts in turn, so without a proof any host it reaches can replay it
+/// against the others. The proof is what makes it a capability the holder
+/// exercises rather than a secret the holder hands out.
+///
+/// Checks, in RFC 9449's order: the proof's signature against the `jwk` in its
+/// own header, that key's RFC 7638 thumbprint against the credential's
+/// `cnf.jkt`, `ath` against the presented credential, `htm`/`htu` against the
+/// request as received, `iat` recency, and `jti` single-use.
+///
+/// # On reading `cnf` before the signature is verified
+///
+/// The binding is taken from an unverified payload, which is safe only because
+/// it is not what authorizes anything: every caller verifies the authority's
+/// signature over the same credential before serving a byte. A forged
+/// credential naming an attacker's key passes this check and fails that one.
+/// Doing it in this order keeps the proof check at the HTTP boundary, where
+/// the request headers it must bind to actually are.
+///
+/// # Errors
+///
+/// 401 `InvalidDpopProof` when the header is absent or any check fails.
+pub async fn require_credential_dpop_proof(
+    parts: &axum::http::request::Parts,
+    state: &crate::http::state::HttpState,
+    credential: &str,
+) -> Result<(), XrpcError> {
+    let bound = peek_space_credential(credential)?.cnf.jkt;
+    let (htm, htu) = crate::http::auth::request_htm_htu(parts, state.trusted_proxy_hops);
+    crate::oauth::dpop::verify_bound_dpop_proof(
+        &parts.headers,
+        &bound,
+        &htm,
+        &htu,
+        credential,
+        &state.jti_guard,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]

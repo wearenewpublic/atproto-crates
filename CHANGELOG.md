@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: every endpoint that accepts a space credential now demands the DPoP proof its
+  `cnf.jkt` calls for (RFC 9449), completing the binding added on the issuing side. Per proposal 0016
+  as amended by [bluesky-social/proposals#99](https://github.com/bluesky-social/proposals/pull/99).
+
+  **A credential was a bearer token in the hands of every host it reached.** A credential reads
+  *every* repo in its space and is presented to each of their hosts in turn, so a host given one so
+  it could serve its own repo held a token that opened all the others, and nothing distinguished its
+  replay from the legitimate holder's request. Nine routes accepted one: `getRecord`, `listRecords`,
+  `getBlob`, `getLatestCommit`/`getRepoState`, `getRepo`, `listRepoOps`, `getSpace`, `listRepos`,
+  and `registerNotify`.
+
+  The two extraction paths failed in opposite directions against a conformant client. `getRecord`
+  and friends stripped a `DPoP` scheme prefix and then ignored the proof entirely — accepting the
+  credential *without* verifying possession — while `listRepos` and `registerNotify` used a
+  Bearer-only reader that rejected the DPoP scheme outright, so a correct presentation could not
+  reach them at all.
+
+  All five RFC 9449 checks now run: the proof's signature against the `jwk` in its own header, that
+  key's thumbprint against the credential's `cnf.jkt`, `ath` against the presented credential,
+  `htm`/`htu` against the request as received, `iat` recency, and `jti` single-use. Scheme discipline
+  (§7.1) applies as it already did for OAuth: a bound credential offered as `Bearer` is refused even
+  with a valid proof attached, so the scheme cannot be used to opt out of the binding.
+
+  `registerNotify` also stops resolving the authority's key from the local account only. It now uses
+  the same resolution every other credentialed endpoint uses — local account first, then the
+  authority's DID document, preferring `#atproto_space` over `#atproto`. The old path assumed both
+  that the authority is hosted here and that it publishes no separate space key; an authority doing
+  either had its own valid credentials refused.
+
+  Existing OAuth behaviour is untouched: `verify_dpop_proof` keeps its signature and its unbound
+  short-circuit, with the proof-checking half factored out as `verify_bound_dpop_proof` for callers
+  that hold a thumbprint from somewhere other than `OAuthClaims`.
+
+
 - `atproto-pds`: `com.atproto.space.getRepo` emits record blocks in canonical DAG-CBOR key order, so
   they follow the index the same CAR declares. Per proposal 0016 as amended by
   [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which
