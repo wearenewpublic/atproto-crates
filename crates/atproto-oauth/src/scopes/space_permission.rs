@@ -40,9 +40,11 @@
 //!   `*` or equals the target component.
 //! - `read` covers every repo in the space and **ignores** `collection`. It
 //!   also grants `getDelegationToken`.
-//! - `read_self` covers only the holder's **own** repo, is **constrained by**
-//!   `collection`, and does **not** grant `getDelegationToken`. A `read` grant
-//!   also satisfies a `read_self` request (`read` implies `read_self`).
+//! - `read_self` covers only the holder's **own** repo and also **ignores**
+//!   `collection` — it narrows which *repo* is reachable, not which
+//!   collections within it — and does **not** grant `getDelegationToken`. A
+//!   `read` grant also satisfies a `read_self` request (`read` implies
+//!   `read_self`).
 //! - `create` / `update` / `delete` act on a specific record and are
 //!   constrained by `collection` (the action must be granted **and** the target
 //!   collection covered).
@@ -68,7 +70,7 @@ const SKEY_MAX_LENGTH: usize = 512;
 /// `read_self`, `read`, `create`, `update`, `delete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SpaceAction {
-    /// Read the holder's **own** repo only; collection-constrained; does not
+    /// Read the holder's **own** repo only; ignores `collection`; does not
     /// grant `getDelegationToken`. A `read` grant also satisfies a `read_self`
     /// request.
     ReadSelf,
@@ -297,8 +299,8 @@ pub struct SpaceTarget {
     pub skey: String,
     /// The action being attempted.
     pub action: SpaceAction,
-    /// The collection being acted on. Required for writes and `read_self`;
-    /// ignored for whole-space `read`.
+    /// The collection being acted on. Required for writes; ignored for both
+    /// read actions, which are all-or-nothing at the space boundary.
     pub collection: Option<String>,
 }
 
@@ -708,8 +710,8 @@ impl SpacePermission {
     ///    target.
     /// 2. `read`: granted if the action set includes `read`; ignores collection.
     /// 3. `read_self`: granted if the action set includes `read_self` **or**
-    ///    `read` (read implies read_self) **and** the target collection is
-    ///    covered.
+    ///    `read` (read implies read_self). Collection is ignored, as it is for
+    ///    whole-space read.
     /// 4. `create` / `update` / `delete`: granted if the action set includes
     ///    the action **and** the target collection is covered.
     pub fn matches_with(
@@ -725,18 +727,14 @@ impl SpacePermission {
         match target.action {
             // Whole-space read ignores collection.
             SpaceAction::Read => self.action.contains(&SpaceAction::Read),
-            // Own-repo read: read implies read_self; collection-constrained.
+            // Own-repo read ignores collection, exactly as whole-space read
+            // does. Read access is all-or-nothing at the space boundary: there
+            // is no partial, per-record, per-collection or per-author read
+            // grant, and `read_self` narrows the *repo* it reaches, not the
+            // collections within it. `read` implies `read_self`.
             SpaceAction::ReadSelf => {
-                if !(self.action.contains(&SpaceAction::ReadSelf)
-                    || self.action.contains(&SpaceAction::Read))
-                {
-                    return false;
-                }
-                // A `read` grant covers every collection for the own repo too.
-                if self.action.contains(&SpaceAction::Read) {
-                    return true;
-                }
-                self.collection_covers(target.collection.as_deref(), declared)
+                self.action.contains(&SpaceAction::ReadSelf)
+                    || self.action.contains(&SpaceAction::Read)
             }
             // Writes require the action AND collection coverage.
             SpaceAction::Create | SpaceAction::Update | SpaceAction::Delete => {
@@ -783,14 +781,15 @@ impl SpacePermission {
     /// Build the minimal `space:` scope string that would satisfy the given
     /// record target.
     ///
-    /// For whole-space `read` the result is collection-independent; for
-    /// `read_self` and write actions the target's collection is included.
+    /// Both read actions are collection-independent; write actions include
+    /// the target's collection.
     pub fn scope_needed_for(target: &SpaceTarget) -> String {
         let space_type = nsid_or_all(&target.space_type);
         let did = did_or_all(&target.did);
         let skey = skey_or_all(&target.skey);
 
-        let collection_independent = matches!(target.action, SpaceAction::Read);
+        let collection_independent =
+            matches!(target.action, SpaceAction::Read | SpaceAction::ReadSelf);
 
         let collection = if collection_independent {
             SpaceCollections::Explicit(BTreeSet::new())
@@ -1204,34 +1203,75 @@ mod tests {
         ));
     }
 
+    /// `read_self` ignores `collection`, exactly as whole-space `read` does.
+    ///
+    /// Read access is all-or-nothing at the space boundary: `read_self`
+    /// narrows which *repo* is reachable, not which collections within it. A
+    /// grant naming one collection therefore reads every collection of the
+    /// holder's own repo — the narrowing that a collection list expresses
+    /// applies to writes.
     #[test]
-    fn test_match_read_self_is_collection_constrained() {
-        // A read_self grant covers only the listed collection on the own repo.
+    fn test_read_self_ignores_collection() {
         let grant = parse("space:com.example.space?action=read_self&collection=com.example.note");
+        for collection in ["com.example.note", "com.example.photo"] {
+            assert!(
+                grant.matches(
+                    &SpaceTarget::with_collection(
+                        "com.example.space",
+                        "did:plc:abc",
+                        "s1",
+                        SpaceAction::ReadSelf,
+                        collection,
+                    ),
+                    SUBJECT,
+                ),
+                "{collection} must be readable on the own repo"
+            );
+        }
+        // Including a listing that names no collection at all, which is what a
+        // cross-collection read of one's own repo asks for. Requiring `*` here
+        // is what made an ordinary read_self grant unable to list its own repo.
+        assert!(grant.matches(
+            &SpaceTarget::new(
+                "com.example.space",
+                "did:plc:abc",
+                "s1",
+                SpaceAction::ReadSelf,
+            ),
+            SUBJECT,
+        ));
+        // What read_self still does not confer: the rest of the space.
+        assert!(!grant.matches(
+            &SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read,),
+            SUBJECT,
+        ));
+    }
+
+    /// Writes stay collection-constrained. The change is to reads only, and a
+    /// grant that reads every collection must not write every collection.
+    #[test]
+    fn test_read_self_does_not_widen_writes() {
+        let grant = parse(
+            "space:com.example.space?action=read_self&action=create&collection=com.example.note",
+        );
         assert!(grant.matches(
             &SpaceTarget::with_collection(
                 "com.example.space",
                 "did:plc:abc",
                 "s1",
-                SpaceAction::ReadSelf,
+                SpaceAction::Create,
                 "com.example.note",
             ),
             SUBJECT,
         ));
-        // A different collection is not covered.
         assert!(!grant.matches(
             &SpaceTarget::with_collection(
                 "com.example.space",
                 "did:plc:abc",
                 "s1",
-                SpaceAction::ReadSelf,
+                SpaceAction::Create,
                 "com.example.photo",
             ),
-            SUBJECT,
-        ));
-        // read_self does NOT confer whole-space read.
-        assert!(!grant.matches(
-            &SpaceTarget::new("com.example.space", "did:plc:abc", "s1", SpaceAction::Read,),
             SUBJECT,
         ));
     }

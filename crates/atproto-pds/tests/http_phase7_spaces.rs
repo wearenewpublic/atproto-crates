@@ -1075,6 +1075,152 @@ fn read_scope() -> String {
     "atproto space:app.bsky.group?did=did:plc:owner&skey=default&action=read".to_string()
 }
 
+/// A `read_self` grant naming one collection, which under the baseline rule
+/// reached only that collection of the own repo.
+fn read_self_scope() -> String {
+    "atproto space:app.bsky.group?did=did:plc:owner&skey=default&action=read_self&collection=app.bsky.feed.post"
+        .to_string()
+}
+
+/// `read_self` reads the holder's own repo across every collection, including
+/// the cross-collection listing that names none.
+///
+/// No integration test exercised a `read_self` scope at all before this, which
+/// is how the collection constraint survived: the unit tests asserted the rule
+/// and nothing asked whether an app holding that grant could actually read its
+/// own repo. It could not list it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_self_grant_reads_every_collection_of_its_own_repo() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // Two collections, one of them absent from the grant.
+    for (collection, rkey) in [("app.bsky.feed.post", "p1"), ("app.bsky.feed.like", "l1")] {
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.applyWrites",
+            json!({
+                "repo": "did:plc:owner",
+                "space": uri,
+                "writes": [{
+                    "action": "create", "collection": collection, "rkey": rkey,
+                    "value": {"v": 1}
+                }]
+            }),
+            Some(&owner_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "seed {collection}: {body}");
+    }
+
+    let oauth = mint_oauth_access("did:plc:owner", &read_self_scope());
+
+    // The collection the grant names, and the one it does not.
+    for collection in ["app.bsky.feed.post", "app.bsky.feed.like"] {
+        let (status, body) = get_json(
+            app.clone(),
+            &format!(
+                "/xrpc/com.atproto.space.listRecords?space={}&repo=did:plc:owner&collection={collection}",
+                urlencode(&uri)
+            ),
+            Some(&oauth),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "listRecords {collection}: {body}");
+        assert_eq!(body["records"].as_array().unwrap().len(), 1, "{body}");
+    }
+
+    // And the cross-collection listing, which is the one that used to demand
+    // a whole-space `read` grant.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cross-collection listRecords: {body}"
+    );
+    assert_eq!(body["records"].as_array().unwrap().len(), 2, "{body}");
+
+    // The sync methods too: a repo's own holder can back it up.
+    for path in ["getLatestCommit", "getRepo", "listRepoOps", "listBlobs"] {
+        let (status, _) = get_json(
+            app.clone(),
+            &format!(
+                "/xrpc/com.atproto.space.{path}?space={}&repo=did:plc:owner",
+                urlencode(&uri)
+            ),
+            Some(&oauth),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path} under a read_self grant");
+    }
+
+    // `getSpace` accepts it as well.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getSpace under read_self: {body}");
+}
+
+/// What `read_self` still does not confer: the rest of the space, or the
+/// delegation token that would reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_self_grant_reaches_neither_another_repo_nor_a_delegation_token() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner_token),
+    )
+    .await;
+
+    let oauth = mint_oauth_access("did:plc:owner", &read_self_scope());
+
+    // Another member's repo needs whole-space read.
+    let (status, _) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&repo=did:plc:alice",
+            urlencode(&uri)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "another member's repo");
+
+    // And a delegation token is the key to every repo in the space, which is
+    // exactly what this grant is not.
+    let (status, _) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencode(&uri)
+        ),
+        Some(&oauth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "getDelegationToken");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn delegation_token_then_space_credential_member_allowed() {
     let (app, manager, _tmp) = build_app().await;

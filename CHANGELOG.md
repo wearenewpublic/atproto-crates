@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `atproto-oauth` / `atproto-pds`: a `space:` `read_self` grant reads the holder's own repo across
+  every collection, rather than only the collections it names. Per proposal 0016 as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which states
+  that read access is all-or-nothing at the space boundary and that neither read action is
+  constrained by `collection`.
+
+  **A `read_self` grant could not list its own repo.** `read_self` narrows which *repo* is reachable,
+  not which collections within it, but the matcher applied the grant's collection set to it — so a
+  cross-collection listing, which names no collection, matched only a grant whose collections
+  resolved to `*`. The PDS compounded this by escalating any own-repo read that named no collection
+  to a whole-space `read` requirement, which is a grant over *every member's* repo. An app that
+  asked for the narrow thing was told to ask for the broad one.
+
+  Four read/sync methods hardcoded whole-space `read` even for the caller's own repo — `getBlob`,
+  `getLatestCommit`/`getRepoState`, `getRepo`, `listRepoOps`, and the newly added `listBlobs`. A
+  backup or export tool holding `read_self` could read individual records and not fetch the repo,
+  the commit, the oplog, or a blob. All now take the own-repo path.
+
+  `com.atproto.simplespace.getSpace` accepts a `read_self` grant, as the amended spec requires.
+  Describing a space one holds a repo in is not access to the other repos in it.
+
+  Writes are unchanged and stay collection-constrained, as does `getDelegationToken`, which remains
+  gated on whole-space `read`: a delegation token is exchanged for a credential over every repo in
+  the space, which is precisely what `read_self` is not.
+
 ### Added
 - `atproto-pds`: `com.atproto.space.listBlobs` enumerates the blobs a repo references within a
   space — the method proposal 0016 gained in

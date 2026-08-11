@@ -729,9 +729,9 @@ pub fn describe_space_scope(
         actions.join(", ")
     };
 
-    // Collections constrain write and read_self actions. `Default` defers to the
-    // declaration's collections (not enumerable here); an explicit empty list
-    // means no write targets.
+    // Collections constrain the write actions; neither read action consults
+    // them. `Default` defers to the declaration's collections (not enumerable
+    // here); an explicit empty list means no write targets.
     let collections_label = match &perm.collection {
         atproto_oauth::scopes::SpaceCollections::Default => {
             Some("the space type's declared collections".to_string())

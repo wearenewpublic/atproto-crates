@@ -1616,14 +1616,9 @@ pub async fn get_repo_state(
     let uri = parse_space_uri(&q.space)?;
     let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
-        assert_space_scope(
-            &state,
-            subject,
-            &uri,
-            atproto_oauth::scopes::SpaceAction::Read,
-            None,
-        )
-        .await?;
+        // An own-repo read is a `read_self` read; only reaching
+        // another member's repo needs whole-space `read`.
+        assert_space_record_read(&state, subject, &uri, &q.repo, None).await?;
     }
     // 401 rather than the `AuthDenied` default of 403: a credential that does
     // not verify is a failure to authenticate, not a permission shortfall, and
@@ -1676,14 +1671,9 @@ pub async fn get_repo(
     let uri = parse_space_uri(&q.space)?;
     let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
-        assert_space_scope(
-            &state,
-            subject,
-            &uri,
-            atproto_oauth::scopes::SpaceAction::Read,
-            None,
-        )
-        .await?;
+        // An own-repo read is a `read_self` read; only reaching
+        // another member's repo needs whole-space `read`.
+        assert_space_record_read(&state, subject, &uri, &q.repo, None).await?;
     }
     space_reader(&state)?
         .verify_read_auth(&uri, &resolved.auth)
@@ -1850,14 +1840,9 @@ pub async fn list_repo_ops(
     let uri = parse_space_uri(&q.space)?;
     let resolved = resolve_record_auth(&parts, &state, &uri, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
-        assert_space_scope(
-            &state,
-            subject,
-            &uri,
-            atproto_oauth::scopes::SpaceAction::Read,
-            None,
-        )
-        .await?;
+        // An own-repo read is a `read_self` read; only reaching
+        // another member's repo needs whole-space `read`.
+        assert_space_record_read(&state, subject, &uri, &q.repo, None).await?;
     }
     // See `get_repo_state`: an unverifiable credential stays a 401.
     space_reader(&state)?
@@ -2434,9 +2419,9 @@ async fn require_space_credential(
 /// reference `auth.credentials.type !== 'oauth'` early-return. A scope
 /// shortfall on an OAuth subject becomes a 403 `InvalidToken` carrying the
 /// minimal scope that would have satisfied the request.
-/// Gate the `read` action for a sync/read endpoint whose auth was resolved
-/// via [`require_any_authn`]: `Some(subject)` runs the OAuth scope check,
-/// `None` (SpaceCredential auth) skips it.
+/// Gate a read endpoint whose auth was resolved via [`require_any_authn`]:
+/// `Some(subject)` runs the OAuth scope check, `None` (SpaceCredential auth)
+/// skips it, the credential being whole-space read access already.
 async fn assert_space_read_opt(
     state: &HttpState,
     subject: &Option<crate::http::auth::AuthSubject>,
@@ -2444,11 +2429,15 @@ async fn assert_space_read_opt(
 ) -> Result<(), XrpcError> {
     match subject {
         Some(s) => {
+            // `read_self` suffices, and `read` implies it. Describing a space
+            // one holds a repo in is not access to the other repos in it, so
+            // requiring the whole-space grant asked for more than the answer
+            // discloses.
             assert_space_scope(
                 state,
                 s,
                 uri,
-                atproto_oauth::scopes::SpaceAction::Read,
+                atproto_oauth::scopes::SpaceAction::ReadSelf,
                 None,
             )
             .await
@@ -2602,15 +2591,17 @@ fn assert_space_manage(
 }
 
 /// Assert that the OAuth scope set granted to `subject` permits reading the
-/// record(s) at `uri` from `target_repo` (spec lines 392-413).
+/// record(s) at `uri` from `target_repo`.
 ///
 /// - Reading the holder's **own** repo (`target_repo == subject.sub()`) is
-///   satisfied by either a whole-space `read` grant or a collection-covering
-///   `read_self` grant. A `read_self` grant is collection-constrained, so a
-///   cross-collection listing (`collection == None`) of the own repo falls
-///   back to requiring whole-space `read`.
-/// - Reading **another** member's repo requires whole-space `read`
-///   (collection-independent).
+///   satisfied by a `read_self` grant, or by `read`, which implies it. Neither
+///   is constrained by collection: read access is all-or-nothing at the space
+///   boundary, and `read_self` narrows which *repo* is reachable rather than
+///   which collections within it.
+/// - Reading **another** member's repo requires whole-space `read`.
+///
+/// The collection is therefore not consulted at all, and is taken only so the
+/// call sites read the same as the write ones.
 ///
 /// No-op for non-OAuth subjects (app-password sessions).
 async fn assert_space_record_read(
@@ -2618,34 +2609,14 @@ async fn assert_space_record_read(
     subject: &crate::http::auth::AuthSubject,
     uri: &SpaceUri,
     target_repo: &str,
-    collection: Option<&str>,
+    _collection: Option<&str>,
 ) -> Result<(), XrpcError> {
-    let own_repo = subject.sub() == target_repo;
-    match (own_repo, collection) {
-        // Own repo, single collection: read_self (also satisfied by read).
-        (true, Some(c)) => {
-            assert_space_scope(
-                state,
-                subject,
-                uri,
-                atproto_oauth::scopes::SpaceAction::ReadSelf,
-                Some(c),
-            )
-            .await
-        }
-        // Own repo across all collections, or any other member's repo: the
-        // collection-independent whole-space `read` grant is required.
-        _ => {
-            assert_space_scope(
-                state,
-                subject,
-                uri,
-                atproto_oauth::scopes::SpaceAction::Read,
-                None,
-            )
-            .await
-        }
-    }
+    let action = if subject.sub() == target_repo {
+        atproto_oauth::scopes::SpaceAction::ReadSelf
+    } else {
+        atproto_oauth::scopes::SpaceAction::Read
+    };
+    assert_space_scope(state, subject, uri, action, None).await
 }
 
 /// Resolve the `collections` declared by the space type's declaration for the
@@ -2894,14 +2865,9 @@ pub async fn list_blobs(
     // sensible default.
     let resolved = resolve_record_auth(&parts, &state, &space, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
-        assert_space_scope(
-            &state,
-            subject,
-            &space,
-            atproto_oauth::scopes::SpaceAction::Read,
-            None,
-        )
-        .await?;
+        // An own-repo read is a `read_self` read; only reaching
+        // another member's repo needs whole-space `read`.
+        assert_space_record_read(&state, subject, &space, &q.repo, None).await?;
     }
     space_reader(&state)?
         .verify_read_auth(&space, &resolved.auth)
@@ -2968,14 +2934,9 @@ pub async fn get_blob(
     // always passing the explicit repo param.
     let resolved = resolve_record_auth(&parts, &state, &space, Some(q.repo.as_str())).await?;
     if let Some(subject) = &resolved.subject {
-        assert_space_scope(
-            &state,
-            subject,
-            &space,
-            atproto_oauth::scopes::SpaceAction::Read,
-            None,
-        )
-        .await?;
+        // An own-repo read is a `read_self` read; only reaching
+        // another member's repo needs whole-space `read`.
+        assert_space_record_read(&state, subject, &space, &q.repo, None).await?;
     }
     space_reader(&state)?
         .verify_read_auth(&space, &resolved.auth)
@@ -3721,37 +3682,35 @@ mod scope_gate_tests {
         }
     }
 
+    /// `read_self` reads the holder's own repo in full, and nobody else's.
+    ///
+    /// The boundary it draws is the repo, not the collection: read access is
+    /// all-or-nothing at the space boundary, so a grant naming one collection
+    /// still reads the rest of the holder's own repo. What it does not reach
+    /// is another member's — that is what whole-space `read` is for.
     #[tokio::test]
-    async fn oauth_read_self_own_repo_collection_constrained() {
-        // read_self on the holder's own repo is collection-constrained.
+    async fn oauth_read_self_reads_the_whole_of_the_holders_own_repo() {
         let state = test_state().await;
         let subject = oauth_subject(
             "space:app.bsky.group?did=did:plc:owner&skey=default&action=read_self&collection=app.bsky.feed.post",
         );
-        // sub() == "did:plc:member"; reading own repo + covered collection.
-        assert!(
-            assert_space_record_read(
-                &state,
-                &subject,
-                &space_uri(),
-                "did:plc:member",
-                Some("app.bsky.feed.post"),
-            )
-            .await
-            .is_ok()
-        );
-        // Uncovered collection denied.
-        let err = assert_space_record_read(
-            &state,
-            &subject,
-            &space_uri(),
-            "did:plc:member",
-            Some("app.bsky.feed.like"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        // Reading ANOTHER member's repo requires whole-space read → denied.
+        // sub() == "did:plc:member". Every collection of the own repo, named
+        // or not, and the cross-collection listing that names none.
+        for collection in [Some("app.bsky.feed.post"), Some("app.bsky.feed.like"), None] {
+            assert!(
+                assert_space_record_read(
+                    &state,
+                    &subject,
+                    &space_uri(),
+                    "did:plc:member",
+                    collection,
+                )
+                .await
+                .is_ok(),
+                "own repo, collection {collection:?}"
+            );
+        }
+        // Another member's repo still requires whole-space read.
         let err = assert_space_record_read(
             &state,
             &subject,
