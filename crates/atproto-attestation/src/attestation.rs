@@ -630,7 +630,7 @@ mod tests {
     async fn create_inline_attestation_full_workflow() -> Result<(), Box<dyn std::error::Error>> {
         let private_key = generate_key(KeyType::K256Private)?;
         let public_key = to_public(&private_key)?;
-        let key_reference = format!("{}", &public_key);
+        let key_reference = format!("{}", public_key);
         let repository_did = "did:plc:testrepository123";
 
         let base_record = json!({

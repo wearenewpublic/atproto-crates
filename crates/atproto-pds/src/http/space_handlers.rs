@@ -742,11 +742,7 @@ fn apply_writes_results(
         ));
     }
     let mut out = Vec::with_capacity(actions.len());
-    for ((action, uri), cid) in actions
-        .iter()
-        .zip(result.uris.into_iter())
-        .zip(result.cids.into_iter())
-    {
+    for ((action, uri), cid) in actions.iter().zip(result.uris).zip(result.cids) {
         match action {
             SpaceWriteAction::Delete => out.push(ApplyWritesResult::Delete {}),
             SpaceWriteAction::Create | SpaceWriteAction::Update => {

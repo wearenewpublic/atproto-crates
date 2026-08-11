@@ -63,7 +63,7 @@ pub fn create_genesis(
         }
     };
 
-    let multikey = format!("{}", &public_key)
+    let multikey = format!("{}", public_key)
         .strip_prefix("did:key:")
         .ok_or_else(|| WebVHDIDError::GenesisCreationFailed {
             details: "failed to extract multikey from public key".to_string(),
@@ -232,7 +232,7 @@ pub fn create_update_entry(
     let public_key = key::to_public(signing_key).map_err(|e| WebVHDIDError::SigningFailed {
         details: format!("failed to derive public key: {}", e),
     })?;
-    let multikey = format!("{}", &public_key)
+    let multikey = format!("{}", public_key)
         .strip_prefix("did:key:")
         .ok_or_else(|| WebVHDIDError::SigningFailed {
             details: "failed to extract multikey from public key".to_string(),

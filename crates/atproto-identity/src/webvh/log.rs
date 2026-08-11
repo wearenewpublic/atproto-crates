@@ -704,7 +704,7 @@ mod tests {
     fn make_ed25519_keypair() -> (ed25519_dalek::SigningKey, String) {
         let private_key = generate_key(KeyType::Ed25519Private).unwrap();
         let public_key = to_public(&private_key).unwrap();
-        let did_key = format!("{}", &public_key);
+        let did_key = format!("{}", public_key);
         let multikey = did_key.strip_prefix("did:key:").unwrap().to_string();
         let signing_key =
             ed25519_dalek::SigningKey::from_bytes(private_key.bytes().try_into().unwrap());

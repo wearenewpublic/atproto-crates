@@ -617,7 +617,7 @@ mod tests {
     async fn resolves_direct_did_key() -> Result<()> {
         let private_key = generate_key(KeyType::K256Private)?;
         let public_key = to_public(&private_key)?;
-        let key_reference = format!("{}", &public_key);
+        let key_reference = format!("{}", public_key);
 
         let resolver = IdentityDocumentKeyResolver::new(Arc::new(StubIdentityResolver {
             expected: String::new(),
@@ -653,7 +653,7 @@ mod tests {
     async fn resolves_via_identity_document() -> Result<()> {
         let private_key = generate_key(KeyType::P256Private)?;
         let public_key = to_public(&private_key)?;
-        let public_key_multibase = format!("{}", &public_key)
+        let public_key_multibase = format!("{}", public_key)
             .strip_prefix("did:key:")
             .unwrap()
             .to_string();

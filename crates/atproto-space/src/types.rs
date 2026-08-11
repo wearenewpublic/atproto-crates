@@ -168,10 +168,9 @@ fn split_space_path(s: &str, expected: usize) -> Option<Vec<&str>> {
         let mut v = vec![all[0]];
         v.extend_from_slice(&all[2..]);
         v
-    } else if let Some(rest) = s.strip_prefix(ATS_SCHEME) {
-        rest.split('/').collect()
     } else {
-        return None;
+        let rest = s.strip_prefix(ATS_SCHEME)?;
+        rest.split('/').collect()
     };
     if parts.len() != expected || parts.iter().any(|p| p.is_empty()) {
         return None;

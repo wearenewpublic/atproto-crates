@@ -844,7 +844,7 @@ mod tests {
         // A TID for 2026-01-01T00:00:00Z, which falls between the two ops.
         let rev = tid_at("2026-01-01T00:00:00Z");
 
-        let ops = vec![
+        let ops = [
             op_at("2025-06-01T00:00:00Z", &genesis_key),
             op_at("2026-06-01T00:00:00Z", &rotated_key),
         ];
@@ -864,7 +864,7 @@ mod tests {
         let (genesis_key, rotated_key) = two_keys();
         let rev = tid_at("2026-07-01T00:00:00Z");
 
-        let ops = vec![
+        let ops = [
             op_at("2025-06-01T00:00:00Z", &genesis_key),
             op_at("2026-06-01T00:00:00Z", &rotated_key),
         ];
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn a_rev_that_is_not_a_tid_falls_back_to_the_current_key() {
         let (genesis_key, rotated_key) = two_keys();
-        let ops = vec![
+        let ops = [
             op_at("2025-06-01T00:00:00Z", &genesis_key),
             op_at("2026-06-01T00:00:00Z", &rotated_key),
         ];

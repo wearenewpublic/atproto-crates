@@ -1,8 +1,9 @@
 # Multi-stage build for atproto-identity-rs workspace
 # Builds and installs all 15 binaries from the workspace
 
-# Build stage - use 1.90 to support resolver = "3" and edition = "2024"
-FROM rust:1.90-slim-bookworm AS builder
+# Build stage. Keep in step with `rust-version` in Cargo.toml and
+# `channel` in rust-toolchain.toml.
+FROM rust:1.97-slim-bookworm AS builder
 
 # Install system dependencies needed for building
 RUN apt-get update && apt-get install -y \

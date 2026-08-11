@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- **Minimum supported Rust version raised from 1.90 to 1.97**, in the three places that declare it:
+  `rust-version` in the workspace Cargo.toml, `channel` in `rust-toolchain.toml`, and the
+  `FROM rust:<version>` builder stage in the Dockerfile.
+
+  This removes a constraint the dependency sweep kept hitting — `sqlx` 0.9 needs 1.94, and the `aws`
+  chain needs 1.94.1 — rather than fixing anything by itself. The `aws` crates the previous commit
+  had to walk *backwards* to stay inside 1.90 now move forward again (`aws-sdk-s3` 1.119 → 1.141,
+  `aws-config` 1.8.13 → 1.10.1).
+
+  It buys no security. `cargo audit` reports the same six advisories before and after, and the four
+  under `s3` in particular are unreachable this way: at `aws-sdk-s3` 1.141.0 the vulnerable
+  `rustls-webpki 0.101.7` and `lru 0.12.5` are still in the tree, because `aws-smithy-runtime`
+  *defines* `tls-rustls` as `aws-smithy-http-client/legacy-rustls-ring` and `aws-sdk-s3` exposes no
+  other rustls door. Modern `rustls-ring` / `rustls-aws-lc` features do exist on
+  `aws-smithy-http-client`; reaching them means constructing the HTTP client directly and handing it
+  to the SDK config, which is a change to the blob backend and was never gated on the compiler.
+
+  `sqlx` 0.9 is now unblocked but not taken here: it splits `runtime-tokio-rustls` into separate
+  runtime and TLS features, drops a lifetime parameter from `SqliteArguments`, renames
+  `fetch_one_or_none`, and adds a lint that refuses dynamic SQL strings until each is audited —
+  which flags 24 sites across 7 files. `sqlx` carries no advisory, so that is a migration to schedule
+  on its own merits, and the injection audit it forces is the reason to want it.
+
+  The raise itself is nearly free: the workspace compiles clean and all tests pass on 1.97. The one
+  cost is lint drift. `cargo clippy --workspace --all-targets -- -D warnings` is a CI gate, and 1.97
+  fires `redundant reference in format! argument`, `useless use of vec!`,
+  `explicit call to .into_iter()` and `this block may be rewritten with the ? operator` where 1.90
+  did not — 12 warnings across 8 files, all mechanical, all fixed here. That drift is precisely what
+  `rust-toolchain.toml` exists to keep out of `main`.
+
 ### Security
 - Dependency updates closing two RUSTSEC advisories, from a `cargo audit` sweep prompted by the
   hickory pin.

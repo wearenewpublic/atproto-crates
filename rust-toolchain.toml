@@ -10,5 +10,5 @@
 #   - `rust-version` in the workspace Cargo.toml (the MSRV crates publish)
 #   - the `FROM rust:<version>` builder stage in the Dockerfile
 [toolchain]
-channel = "1.90"
+channel = "1.97"
 components = ["rustfmt", "clippy"]

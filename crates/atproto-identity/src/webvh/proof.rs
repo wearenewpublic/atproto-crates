@@ -332,7 +332,7 @@ mod tests {
         let private_key = generate_key(KeyType::Ed25519Private).unwrap();
         let public_key = to_public(&private_key).unwrap();
         // Display formats as did:key:z..
-        let did_key = format!("{}", &public_key);
+        let did_key = format!("{}", public_key);
         let multikey = did_key.strip_prefix("did:key:").unwrap().to_string();
 
         let signing_key =
@@ -760,7 +760,7 @@ mod tests {
         // Test using the key module's Ed25519 support
         let private_key = generate_key(KeyType::Ed25519Private).unwrap();
         let public_key = to_public(&private_key).unwrap();
-        let multikey = format!("{}", &public_key)
+        let multikey = format!("{}", public_key)
             .strip_prefix("did:key:")
             .unwrap()
             .to_string();
