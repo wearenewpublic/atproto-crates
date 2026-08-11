@@ -1,6 +1,6 @@
 [package]
 name = "atproto-oauth-axum"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 description = "Axum web framework integration for AT Protocol OAuth workflows"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

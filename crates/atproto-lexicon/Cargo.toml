@@ -1,6 +1,6 @@
 [package]
 name = "atproto-lexicon"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 description = "AT Protocol lexicon resolution and validation"
 readme = "README.md"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"

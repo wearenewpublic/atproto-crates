@@ -170,7 +170,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atpmcp"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-attestation"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-client"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-dasl"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-extras"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-identity"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-jetstream"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-lexicon"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-oauth-axum"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-pds"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-record"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-repo"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "atproto-dasl",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-space"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-tap"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "atproto-client",
  "atproto-identity",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "atproto-xrpcs"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "atpxrpc"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "atproto-client",

@@ -1,6 +1,6 @@
 [package]
 name = "atpmcp"
-version = "0.15.0-rc.2"
+version = "0.15.0-rc.3"
 description = "AT Protocol MCP server for DAG-CBOR CID generation"
 homepage = "https://tangled.org/ngerakines.me/atproto-crates"
 documentation = "https://docs.rs/atpmcp"

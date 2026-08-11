@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.15.0-rc.3] - 2026-08-11
 ### Fixed
 - `atproto-pds`: a write to a space this server is the authority for fans out in process, and a
   remote authority's notifications go to its **space host** rather than its PDS. Gap-analysis item
@@ -2865,6 +2867,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.15.0-rc.3]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.3
 [0.15.0-rc.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.2
 [0.15.0-rc.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.1
 [0.15.0-alpha.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-alpha.2
