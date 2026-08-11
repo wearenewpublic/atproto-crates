@@ -144,6 +144,26 @@ pub fn mint_service_auth(
     Ok(format!("{}.{}", signing_input, b64url(&sig)))
 }
 
+/// Whether a token's `aud` satisfies an expected audience, allowing the token
+/// to name a service fragment the expectation leaves open.
+///
+/// `did:web:x#atproto_space_syncer` satisfies an expectation of `did:web:x`,
+/// because the fragment selects which of the receiver's service entries the
+/// delivery is for and the receiver is the same either way. It does **not**
+/// satisfy `did:web:y`, and an expectation that names a fragment must be met
+/// exactly — a token for one of a service's entries is not a token for
+/// another.
+fn audience_matches(token_aud: &str, expected: &str) -> bool {
+    if token_aud == expected {
+        return true;
+    }
+    // Only the token may carry the extra fragment, never the expectation.
+    !expected.contains('#')
+        && token_aud
+            .split_once('#')
+            .is_some_and(|(did, _)| did == expected)
+}
+
 /// Verify an inbound service-auth `token`. Resolves the `iss` DID document's
 /// `#atproto` signing key, checks the signature over `header.payload`, then
 /// validates `aud == expected_aud`, `lxm == expected_lxm` (when the token
@@ -236,8 +256,16 @@ async fn verify_inner(
         .map_err(|_| deny("service-auth payload not JSON"))?;
 
     // Claim checks before the (more expensive) DID-document resolution.
+    //
+    // A service identifier may carry a fragment naming which entry of its DID
+    // document a delivery is for -- `did:web:syncer.example#atproto_space_syncer`
+    // -- and a notification forwarded to a registered subscriber is addressed
+    // to the identifier it registered, fragment and all. A receiver knows its
+    // own DID, not necessarily which fragment the sender used, so the fragment
+    // is compared only when the expectation carries one. What is never relaxed
+    // is the DID: an exact match on the part that says *who* the token is for.
     if let Some(expected_aud) = expected_aud
-        && claims.aud != expected_aud
+        && !audience_matches(&claims.aud, expected_aud)
     {
         return Err(deny(&format!(
             "service-auth aud mismatch: token={}, expected={}",
@@ -785,5 +813,38 @@ mod tests {
             err.to_string().contains("lxm mismatch"),
             "expected an lxm mismatch denial, got: {err}"
         );
+    }
+
+    /// A token addressed to one of a service's DID-document entries is
+    /// addressed to that service.
+    ///
+    /// A forwarded `notifyWrite` is minted for the identifier its subscriber
+    /// registered, which may name a fragment
+    /// (`did:web:syncer.example#atproto_space_syncer`). The receiver knows its
+    /// own DID; it does not necessarily know which of its fragments the sender
+    /// picked. What is never relaxed is the DID.
+    #[test]
+    fn a_fragment_bearing_audience_reaches_the_did_that_owns_it() {
+        assert!(audience_matches("did:web:x", "did:web:x"));
+        assert!(audience_matches(
+            "did:web:x#atproto_space_syncer",
+            "did:web:x"
+        ));
+
+        // A different DID is a different service, fragment or not.
+        assert!(!audience_matches(
+            "did:web:y#atproto_space_syncer",
+            "did:web:x"
+        ));
+        assert!(!audience_matches("did:web:x", "did:web:y"));
+
+        // An expectation that names a fragment must be met exactly: a token
+        // for one of a service's entries is not a token for another.
+        assert!(audience_matches("did:web:x#a", "did:web:x#a"));
+        assert!(!audience_matches("did:web:x#b", "did:web:x#a"));
+        assert!(!audience_matches("did:web:x", "did:web:x#a"));
+
+        // And the relaxation is not a prefix match on the DID itself.
+        assert!(!audience_matches("did:web:xyz#a", "did:web:x"));
     }
 }

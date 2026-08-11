@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: `registerNotify` names its subscriber with a service identifier and resolves the
+  delivery endpoint from that service's DID document, and a forwarded `notifyWrite` is accepted by
+  the service it was forwarded to. Per proposal 0016 as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100).
+
+  **Notifications were addressed to something no recipient could verify.** `registerNotify` took a
+  bare endpoint URL and inferred *who* was subscribing from the presenting credential — the attested
+  `client_id`, which is an OAuth client-metadata URL, falling back to the credential's issuer. That
+  identity became the `aud` of every service-auth token minted for the subscription, and a URL is
+  not an audience any AT Protocol service-auth verifier will accept. Deliveries to attested
+  consumers were therefore unverifiable by the consumer.
+
+  A `service` identifier (a DID with an optional service fragment, e.g.
+  `did:web:syncer.example#atproto_space_syncer`) now supplies both halves: it is the audience
+  deliveries are addressed to, and its DID-document entry is where they go. An identifier that
+  cannot be resolved — unreachable, absent, or present without a matching service entry — is refused
+  with the lexicon's `ServiceNotResolvable` rather than stored as a subscription nothing can be
+  delivered to. A resolved endpoint is still checked against the service-endpoint policy: a DID
+  document is not this server's to trust either.
+
+  **This server rejected its own forwarded notifications.** `notifyWrite` arrives on two legs — repo
+  host to space host (`iss` = the writer, `aud` = the authority), then space host to each registered
+  subscriber (`iss` = the authority, `aud` = the subscriber's identifier). The inbound handler
+  demanded leg 1's shape unconditionally, so a server acting as a subscriber refused every
+  notification this same codebase forwards, and the non-owner branch that exists to record exactly
+  those was unreachable. Service auth also compared `aud` by exact string, so an identifier carrying
+  a fragment could never match. A token addressed to one of a service's DID-document entries now
+  satisfies that service; the DID itself is still matched exactly, and an expectation that names a
+  fragment must be met exactly.
+
+  The pre-lexicon `endpoint` field still registers, so a deployed subscriber keeps receiving
+  notifications; supplying `service` is how one fixes the unverifiable-audience problem for itself.
+  Sending neither is a request error rather than a silent whole-space registration keyed on the
+  credential.
+
+
 - `atproto-pds`: space deletion stops reaching into members' repos. Per proposal 0016 as amended by
   [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which
   reverses what a deletion does to everyone except the authority.

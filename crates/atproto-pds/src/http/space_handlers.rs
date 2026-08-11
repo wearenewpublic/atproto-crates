@@ -2685,14 +2685,26 @@ pub async fn notify_write(
     })?;
     let space = parse_space_uri(&payload.space)?;
 
-    // Service-auth: signature over the writer's key, aud = owner DID,
-    // lxm scoped to notifyWrite.
+    // `notifyWrite` arrives on two legs, and this accepted only the first.
+    //
+    //   1. repo host -> space host. `iss` is the writing account, `aud` the
+    //      space authority. The receiver fans the notification out.
+    //   2. space host -> a registered subscriber. `iss` is the authority,
+    //      `aud` the identifier that subscriber registered. The receiver
+    //      records it and pulls.
+    //
+    // Demanding `iss == payload.repo` and `aud == space.space_did` is leg 1's
+    // shape, so a server acting as a subscriber refused every forwarded
+    // notification this same codebase sends -- and the non-owner branch below,
+    // which exists to record exactly those, was unreachable.
+    //
+    // The audience is checked after verification rather than supplied to it,
+    // because which audience is correct depends on which leg this is.
     let token = bearer_token(&parts)?;
-    let claims = crate::space::service_auth::verify_service_auth(
+    let claims = crate::space::service_auth::verify_service_auth_unaudienced(
         &http,
         token,
         plc_dir,
-        &space.space_did,
         crate::space::notify::NOTIFY_WRITE_NSID,
         state
             .account_manager
@@ -2701,24 +2713,55 @@ pub async fn notify_write(
     )
     .await
     .map_err(XrpcError::from)?;
-    // The JWT issuer must match the claimed writer so a PDS can't deliver a
-    // notification on someone else's behalf (reference `notifyWrite.ts`).
-    if claims.iss != payload.repo {
-        return Err(XrpcError::new(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
-            "notifyWrite iss does not match claimed writer",
-        ));
+
+    let forwarded = claims.iss == space.space_did && claims.iss != payload.repo;
+    if forwarded {
+        // Leg 2. The authority vouches for the notification; the writer's own
+        // signature was checked by the authority on leg 1. `aud` must name a
+        // service this server answers for, or the token was minted for
+        // somebody else and merely delivered here.
+        let audience_did = claims.aud.split('#').next().unwrap_or(claims.aud.as_str());
+        if manager
+            .lookup_handle(audience_did)
+            .await
+            .map_err(XrpcError::from)?
+            .is_none()
+        {
+            return Err(XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                "notifyWrite aud does not name a service hosted here",
+            ));
+        }
+    } else {
+        // Leg 1. The issuer must be the account that wrote, so a PDS cannot
+        // deliver a notification on someone else's behalf (reference
+        // `notifyWrite.ts`), and the audience must be the space authority.
+        if claims.aud != space.space_did {
+            return Err(XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                "notifyWrite aud must be the space authority",
+            ));
+        }
+        if claims.iss != payload.repo {
+            return Err(XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                "notifyWrite iss does not match claimed writer",
+            ));
+        }
     }
 
     // Owner-side fan-out (HOP 2): only the owner's PDS holds the member list +
     // recipient subscriptions. For a non-owner host this is a best-effort
     // no-op (the receipt below is still recorded).
-    let owner_is_local = manager
-        .lookup_handle(&space.space_did)
-        .await
-        .map_err(XrpcError::from)?
-        .is_some();
+    let owner_is_local = !forwarded
+        && manager
+            .lookup_handle(&space.space_did)
+            .await
+            .map_err(XrpcError::from)?
+            .is_some();
     if owner_is_local {
         let is_member = space_service(&state)?
             .is_member(&space, &payload.repo)
@@ -3147,8 +3190,24 @@ pub struct RegisterNotifyInput {
     /// DID of a specific repo to subscribe to (repo host). Omit for whole-space.
     #[serde(default)]
     pub repo: Option<String>,
+    /// Service identifier of the subscriber: a DID with an optional service
+    /// fragment naming the entry in its DID document to deliver to, e.g.
+    /// `did:web:syncer.example#atproto_space_syncer`.
+    ///
+    /// The subscriber is named rather than located because `notifyWrite` is
+    /// delivered with service auth *addressed to* this identifier: a bare URL
+    /// cannot be an audience, so a caller supplying one leaves the delivery
+    /// unverifiable by whoever receives it. The endpoint is resolved from the
+    /// DID document instead.
+    #[serde(default)]
+    pub service: Option<String>,
     /// Endpoint to which `notifyWrite` events should be delivered.
-    pub endpoint: String,
+    ///
+    /// The pre-lexicon shape, kept so a deployed subscriber keeps receiving
+    /// notifications. Superseded by `service`, which supplies both the
+    /// audience and the endpoint; when both are sent, `service` decides.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// Output of `registerNotify`.
@@ -3238,23 +3297,82 @@ pub async fn register_notify(
             )
         })?;
 
-    // The credential's advisory `client_id` (the attested application)
-    // identifies the subscribing service. When the credential carried no
-    // attestation we key the subscription on the credential issuer (the space
-    // authority) instead, so registration still succeeds.
-    let service_did = credential
-        .client_id
-        .clone()
-        .unwrap_or_else(|| credential.iss.clone());
+    // Who is subscribing, and where deliveries go.
+    //
+    // With a `service` identifier both come from the DID document: the
+    // identifier is the audience `notifyWrite` will be addressed to, and its
+    // service entry is the endpoint. That is the whole reason the lexicon
+    // names a service rather than a URL — an audience has to be something the
+    // receiver can verify was meant for it, and a URL is not.
+    //
+    // Without one, the pre-lexicon behaviour: the endpoint is taken from the
+    // request and the identity inferred from the credential's attested
+    // `client_id`, falling back to its issuer. That identity is frequently an
+    // OAuth client-metadata URL, which no service-auth verifier will accept as
+    // an audience, so notifications addressed to it are unverifiable by the
+    // recipient. Supplying `service` is how a subscriber fixes that.
+    let (service_did, endpoint) = match input.service.as_deref() {
+        Some(service) => {
+            let plc_dir = state.plc_service.as_ref().map(|p| p.directory_hostname());
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent(crate::user_agent())
+                .build()
+                .unwrap_or_default();
+            // Unreachable, absent, or present without a matching service
+            // entry are one answer to the caller: this identifier cannot be
+            // delivered to. The lexicon names exactly one error for it, and a
+            // 500 would implicate the server in what is usually a typo'd DID.
+            // The underlying cause is logged rather than returned.
+            let not_resolvable = || {
+                XrpcError::new(
+                    StatusCode::BAD_REQUEST,
+                    "ServiceNotResolvable",
+                    format!(
+                        "could not resolve {service} to a DID document with a matching service endpoint"
+                    ),
+                )
+            };
+            let resolved =
+                match crate::space::recipient::resolve_service_endpoint(&http, service, plc_dir)
+                    .await
+                {
+                    Ok(Some(endpoint)) => endpoint,
+                    Ok(None) => return Err(not_resolvable()),
+                    Err(error) => {
+                        tracing::debug!(
+                            error = ?error,
+                            service = %service,
+                            "registerNotify: service identifier did not resolve"
+                        );
+                        return Err(not_resolvable());
+                    }
+                };
+            (service.to_string(), resolved)
+        }
+        None => {
+            let endpoint = input.endpoint.clone().ok_or_else(|| {
+                XrpcError::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "registerNotify requires a service identifier",
+                )
+            })?;
+            let did = credential
+                .client_id
+                .clone()
+                .unwrap_or_else(|| credential.iss.clone());
+            (did, endpoint)
+        }
+    };
     // The endpoint is a URL this server will later POST to, carrying a JWT
     // signed with the space authority's key. Storing it unchecked made
     // `registerNotify` a request generator pointed wherever the caller liked:
     // an SSRF sink reaching whatever the PDS can reach, and a delivery
     // mechanism for an authority-signed token to a host of the caller's
-    // choosing. The same guard already gates the two other places this server
-    // takes a URL from a caller and dereferences it -- `mint_authz` for
-    // `client_id` and `jwks_uri`, and `recipient` for a resolved host.
-    atproto_identity::validation::validate_service_endpoint(&input.endpoint).map_err(|err| {
+    // choosing. A resolved endpoint gets the same check as a supplied one --
+    // a DID document is not this server's to trust either.
+    atproto_identity::validation::validate_service_endpoint(&endpoint).map_err(|err| {
         XrpcError::new(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -3269,7 +3387,7 @@ pub async fn register_notify(
         &space,
         input.repo.as_deref(),
         &service_did,
-        &input.endpoint,
+        &endpoint,
         Some(&expires_at),
     )
     .await

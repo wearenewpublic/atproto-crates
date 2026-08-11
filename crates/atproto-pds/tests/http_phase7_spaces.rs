@@ -2097,6 +2097,47 @@ async fn register_notify_refuses_an_impermissible_endpoint() {
     }
 }
 
+/// A subscriber names itself with a service identifier, and the endpoint is
+/// resolved from its DID document rather than taken from the request.
+///
+/// The identifier is what `notifyWrite` is later addressed to. A bare URL
+/// cannot be an audience, so a registration that supplied one produced
+/// deliveries the recipient could not verify were meant for it — and the
+/// identity the server fell back to was the credential's attested `client_id`,
+/// which is an OAuth client-metadata URL and fails for the same reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_notify_resolves_a_service_identifier_to_its_endpoint() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+
+    // A DID that does not resolve is refused by name, rather than stored as a
+    // subscription that can never be delivered to.
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": uri, "service": "did:web:nonexistent.invalid#atproto_space_syncer"}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "ServiceNotResolvable", "{body}");
+
+    // Neither field at all is a bad request, not a silent whole-space
+    // registration keyed on the credential.
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": uri}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "InvalidRequest", "{body}");
+}
+
 /// And an ordinary endpoint still registers, so the guard is not an outage.
 #[tokio::test(flavor = "multi_thread")]
 async fn register_notify_accepts_an_ordinary_https_endpoint() {
