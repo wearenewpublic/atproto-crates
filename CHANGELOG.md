@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- `atproto-pds`: `getSpace` moved to `com.atproto.simplespace.getSpace` and answers
+  `{uri, policy, appAccess}` with both config fields as top-level open unions — per proposal 0016 as
+  amended by [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100).
+
+  The namespace move is the substantive part. Describing a space's `policy` and `appAccess` is a
+  question about the *management implementation*, not about the permissioned-data protocol every
+  space host implements, so the method belongs beside the `simplespace` methods that define those
+  fields. It is now advertised under that name in the service description.
+
+  The output loses the `config` wrapper, whose `$type`
+  (`com.atproto.simplespace.defs#spaceConfig`) names a def that no longer exists in the amended
+  lexicons — every emitted value carried a dangling discriminator. `managingApp` loses its top-level
+  field and is carried inside the `#managingAppPolicy` variant that names it, so a managing app
+  configured under a policy that does not consult one is no longer described as though it gated
+  anything.
+
+  **`com.atproto.space.getSpace` keeps answering**, as a deprecated alias, and returns a superset:
+  the lexicon's `policy`/`appAccess` *and* the old `config` wrapper. A caller written against either
+  shape keeps working and can migrate in place rather than in lockstep with the rename.
+
 ### Fixed
 - `atproto-pds`: every endpoint that accepts a space credential now demands the DPoP proof its
   `cnf.jkt` calls for (RFC 9449), completing the binding added on the issuing side. Per proposal 0016

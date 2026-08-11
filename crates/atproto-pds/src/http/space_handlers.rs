@@ -458,27 +458,59 @@ pub struct GetSpaceQuery {
     pub space: String,
 }
 
-/// `GET /xrpc/com.atproto.space.getSpace`.
+/// `GET /xrpc/com.atproto.simplespace.getSpace` — describe a space and its
+/// configuration.
 ///
-/// A **host** query authorized by a **space credential** (spec XRPC table line
-/// 481). A space credential confers whole-space read access, so this accepts
-/// either a space credential or a covering OAuth `read` scope, mirroring the
-/// other host/repo read methods. The `read` scope is whole-space and so is not
-/// collection-constrained.
+/// Accepts a space credential or an OAuth session covering the space. The
+/// space authority hosts the config, so this reads the authority's store and
+/// takes no viewer: authorization decides *who may ask*, and the answer does
+/// not depend on who asked.
 pub async fn get_space(
     State(state): State<HttpState>,
     parts: Parts,
     Query(q): Query<GetSpaceQuery>,
 ) -> Result<Json<GetSpaceOutput>, XrpcError> {
-    let uri = parse_space_uri(&q.space)?;
-    let subject = require_any_authn(&parts, &state, &uri).await?;
-    assert_space_read_opt(&state, &subject, &uri).await?;
-    // The space authority hosts the space config, so `get_space` reads the
-    // authority's store and takes no viewer. Authorization above still decides
-    // *who may ask*; the answer does not depend on who asked.
-    let svc = space_service(&state)?;
-    let out = svc.get_space(&uri).await.map_err(XrpcError::from)?;
+    let mut out = describe_space(&state, &parts, &q).await?;
+    // The lexicon's output is `{uri, policy, appAccess}`; the wrapper is the
+    // alias's business, not this endpoint's.
+    out.config = None;
     Ok(Json(out))
+}
+
+/// `GET /xrpc/com.atproto.space.getSpace` — deprecated alias.
+///
+/// PR #100 moved `getSpace` into `com.atproto.simplespace`, where it belongs:
+/// describing a space's `policy` and `appAccess` is a question about the
+/// management implementation, not about the permissioned-data protocol every
+/// space host implements.
+///
+/// The alias answers with a superset — the lexicon's top-level `policy` and
+/// `appAccess` *plus* the `config` wrapper this server used to nest them in —
+/// so a caller written against either shape keeps working and can migrate in
+/// place rather than in lockstep with the rename.
+pub async fn get_space_deprecated_alias(
+    State(state): State<HttpState>,
+    parts: Parts,
+    Query(q): Query<GetSpaceQuery>,
+) -> Result<Json<GetSpaceOutput>, XrpcError> {
+    tracing::debug!(
+        space = %q.space,
+        "com.atproto.space.getSpace is deprecated; use com.atproto.simplespace.getSpace"
+    );
+    Ok(Json(describe_space(&state, &parts, &q).await?))
+}
+
+/// Shared body of the two `getSpace` routes.
+async fn describe_space(
+    state: &HttpState,
+    parts: &Parts,
+    q: &GetSpaceQuery,
+) -> Result<GetSpaceOutput, XrpcError> {
+    let uri = parse_space_uri(&q.space)?;
+    let subject = require_any_authn(parts, state, &uri).await?;
+    assert_space_read_opt(state, &subject, &uri).await?;
+    let svc = space_service(state)?;
+    svc.get_space(&uri).await.map_err(XrpcError::from)
 }
 
 /// Query params for `listSpaces`.

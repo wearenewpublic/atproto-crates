@@ -377,10 +377,16 @@ fn build_router_inner(
             "/xrpc/com.atproto.simplespace.listMembers",
             get(space_handlers::get_members),
         )
+        .route(
+            "/xrpc/com.atproto.simplespace.getSpace",
+            get(space_handlers::get_space),
+        )
         // com.atproto.space.* — permissioned realm
+        // Deprecated: getSpace moved to com.atproto.simplespace in PR #100.
+        // Kept as an alias so callers can migrate without a flag day.
         .route(
             "/xrpc/com.atproto.space.getSpace",
-            get(space_handlers::get_space),
+            get(space_handlers::get_space_deprecated_alias),
         )
         .route(
             "/xrpc/com.atproto.space.listSpaces",

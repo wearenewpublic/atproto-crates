@@ -6,7 +6,7 @@
 //! - `com.atproto.simplespace.createSpace` (`{did?, type, skey?, config?}` ->
 //!   `{uri}`), `updateSpace`, `deleteSpace`, `addMember`, `removeMember`,
 //!   `listMembers`.
-//! - `com.atproto.space.getSpace` (`{uri, config}`), `listSpaces`.
+//! - `com.atproto.simplespace.getSpace` (`{uri, policy, appAccess}`), `listSpaces`.
 //! - `applyWrites` + single-op `createRecord` / `putRecord` / `deleteRecord`.
 //! - `getRecord` (`{uri, cid, value}`) / `listRecords` (keys-only
 //!   `{collection, rkey, cid}`).
@@ -402,16 +402,22 @@ async fn create_space_round_trip() {
     let uri = body["uri"].as_str().unwrap();
     assert_eq!(uri, "at://did:plc:owner/space/app.bsky.group/default");
 
-    // getSpace returns {uri, config}; config carries the default mint policy.
+    // getSpace returns {uri, policy, appAccess}; the policy union is the default.
     let (status, info) = get_json(
         app,
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(uri)
+        ),
         Some(&token),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {info}");
     assert_eq!(info["uri"], uri);
-    assert_eq!(info["config"]["policy"], "member-list");
+    assert_eq!(
+        info["policy"]["$type"],
+        "com.atproto.simplespace.defs#memberListPolicy"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -476,12 +482,18 @@ async fn update_space_reflects_in_get_space() {
 
     let (status, info) = get_json(
         app,
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         Some(&token),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {info}");
-    assert_eq!(info["config"]["policy"], "public");
+    assert_eq!(
+        info["policy"]["$type"],
+        "com.atproto.simplespace.defs#publicPolicy"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -502,7 +514,10 @@ async fn delete_space_then_get_space_fails() {
     // getSpace on a tombstoned space reads as SpaceNotFound.
     let (status, body) = get_json(
         app.clone(),
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         Some(&token),
     )
     .await;
@@ -1581,7 +1596,10 @@ async fn forged_space_credential_rejected_on_read_methods() {
     // getSpace
     let (status, _) = get_json_cred(
         &app,
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         &forged,
     )
     .await;
@@ -2332,7 +2350,7 @@ async fn get_space(app: &axum::Router, space: &str, token: &str) -> (StatusCode,
     get_json(
         app.clone(),
         &format!(
-            "/xrpc/com.atproto.space.getSpace?space={}",
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
             urlencode(space)
         ),
         Some(token),
@@ -2363,8 +2381,8 @@ async fn a_member_who_never_wrote_can_describe_the_space() {
     );
     assert_eq!(body["uri"], uri);
     assert_eq!(
-        body["config"]["$type"],
-        "com.atproto.simplespace.defs#spaceConfig"
+        body["policy"]["$type"],
+        "com.atproto.simplespace.defs#memberListPolicy"
     );
 }
 
@@ -2424,11 +2442,11 @@ async fn the_authoritys_config_is_reported_not_the_callers_defaults() {
     let (status, body) = get_space(&app, &uri, &alice).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
-        body["config"]["policy"], "public",
+        body["policy"]["$type"], "com.atproto.simplespace.defs#publicPolicy",
         "the caller's defaulted row must not be the answer: {body}"
     );
     assert_eq!(
-        body["config"]["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
+        body["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
         "a client told `open` for an allowList space cannot make a correct \
          minting decision: {body}"
     );
@@ -2437,7 +2455,8 @@ async fn the_authoritys_config_is_reported_not_the_callers_defaults() {
     // depend on who asked.
     let (status, owner_body) = get_space(&app, &uri, &owner).await;
     assert_eq!(status, StatusCode::OK, "body: {owner_body}");
-    assert_eq!(owner_body["config"], body["config"]);
+    assert_eq!(owner_body["policy"], body["policy"]);
+    assert_eq!(owner_body["appAccess"], body["appAccess"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3201,17 +3220,20 @@ async fn create_space_honours_the_lexicon_policy_field() {
 
     let (status, body) = get_json(
         app,
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         Some(&owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "getSpace: {body}");
     assert_eq!(
-        body["config"]["policy"], "public",
+        body["policy"]["$type"], "com.atproto.simplespace.defs#publicPolicy",
         "the lexicon's `policy` must round-trip: {body}"
     );
     assert!(
-        body["config"].get("mintPolicy").is_none(),
+        body["policy"].get("mintPolicy").is_none(),
         "the non-lexicon name must not be emitted: {body}"
     );
 }
@@ -3234,12 +3256,104 @@ async fn update_space_honours_the_lexicon_policy_field() {
 
     let (status, body) = get_json(
         app,
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         Some(&owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["config"]["policy"], "public", "{body}");
+    assert_eq!(
+        body["policy"]["$type"], "com.atproto.simplespace.defs#publicPolicy",
+        "{body}"
+    );
+}
+
+/// `getSpace` answers under `com.atproto.simplespace`, with the two config
+/// fields as top-level unions and no wrapper.
+///
+/// The move is the point: describing a space's `policy` and `appAccess` is a
+/// question about the management implementation, not about the
+/// permissioned-data protocol every space host implements, so the method
+/// belongs in the namespace that defines those fields.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_space_answers_under_simplespace_with_top_level_unions() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "renamed").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "simplespace.getSpace: {body}");
+    assert_eq!(body["uri"], uri);
+    assert_eq!(
+        body["policy"]["$type"],
+        "com.atproto.simplespace.defs#memberListPolicy"
+    );
+    assert_eq!(
+        body["appAccess"]["$type"],
+        "com.atproto.simplespace.defs#open"
+    );
+    assert!(
+        body.get("config").is_none(),
+        "the lexicon output has no config wrapper: {body}"
+    );
+
+    // The service description advertises the name it actually serves, so a
+    // caller discovering this server finds the method where the lexicon says
+    // it is.
+    let (status, described) = get_json(app, "/xrpc/community.lexicon.service.describe", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<&str> = described["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .filter_map(|m| m["value"].as_str())
+        .collect();
+    assert!(
+        listed.contains(&"com.atproto.simplespace.getSpace"),
+        "the service description must list the new name: {listed:?}"
+    );
+}
+
+/// The old path keeps answering, and answers a superset.
+///
+/// A rename that breaks every existing caller on the day it lands buys
+/// nothing: the alias returns the lexicon's `policy`/`appAccess` *and* the
+/// `config` wrapper those callers parse, so they can migrate in place instead
+/// of in lockstep with the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_old_get_space_path_still_answers_with_both_shapes() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "aliased").await;
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "deprecated alias: {body}");
+    // The shape its callers were written against.
+    assert_eq!(
+        body["config"]["$type"],
+        "com.atproto.simplespace.defs#spaceConfig"
+    );
+    assert_eq!(body["config"]["policy"], "member-list");
+    // And the shape they are migrating to, from the same response.
+    assert_eq!(
+        body["policy"]["$type"],
+        "com.atproto.simplespace.defs#memberListPolicy"
+    );
 }
 
 /// `createSpace` reads the lexicon's top-level `policy` and `appAccess`
@@ -3275,18 +3389,24 @@ async fn create_space_reads_the_top_level_policy_and_app_access_unions() {
 
     let (status, body) = get_json(
         app.clone(),
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         Some(&owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "getSpace: {body}");
-    assert_eq!(body["config"]["policy"], "public", "{body}");
     assert_eq!(
-        body["config"]["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
+        body["policy"]["$type"], "com.atproto.simplespace.defs#publicPolicy",
         "{body}"
     );
     assert_eq!(
-        body["config"]["appAccess"]["allowed"][0], "https://app.example/client-metadata.json",
+        body["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
+        "{body}"
+    );
+    assert_eq!(
+        body["appAccess"]["allowed"][0], "https://app.example/client-metadata.json",
         "{body}"
     );
 }
@@ -3316,14 +3436,20 @@ async fn the_managing_app_policy_union_supplies_its_own_app() {
 
     let (status, body) = get_json(
         app.clone(),
-        &format!("/xrpc/com.atproto.space.getSpace?space={}", urlencode(&uri)),
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
         Some(&owner),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["config"]["policy"], "managing-app", "{body}");
     assert_eq!(
-        body["config"]["managingApp"], "did:web:forum.example#forum",
+        body["policy"]["$type"], "com.atproto.simplespace.defs#managingAppPolicy",
+        "{body}"
+    );
+    assert_eq!(
+        body["policy"]["managingApp"], "did:web:forum.example#forum",
         "{body}"
     );
 
@@ -3623,7 +3749,7 @@ async fn space_not_found_uses_one_status_everywhere() {
     let (baseline, body) = get_json(
         app.clone(),
         &format!(
-            "/xrpc/com.atproto.space.getSpace?space={}",
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
             urlencode(missing)
         ),
         Some(&owner),

@@ -299,8 +299,33 @@ impl SpaceConfig {
         })
     }
 
-    /// Render the `getSpace` wire-form `config` union value (with the
-    /// `#spaceConfig` `$type` discriminator).
+    /// Render the user-authorization policy as the lexicon's open union.
+    ///
+    /// `managingApp` is carried *inside* `#managingAppPolicy` rather than
+    /// beside the policy, matching where the lexicon puts it and where
+    /// [`policy_from_wire`] reads it back from. A managing app configured
+    /// under a policy that does not consult one is not emitted: it is not part
+    /// of any other variant, and surfacing it would describe a gate that is
+    /// not applied.
+    #[must_use]
+    pub fn policy_to_wire(&self) -> serde_json::Value {
+        match self.mint_policy {
+            MintPolicy::Public => serde_json::json!({ "$type": POLICY_PUBLIC_TYPE }),
+            MintPolicy::MemberList => serde_json::json!({ "$type": POLICY_MEMBER_LIST_TYPE }),
+            MintPolicy::ManagingApp => serde_json::json!({
+                "$type": POLICY_MANAGING_APP_TYPE,
+                "managingApp": self.managing_app.clone().unwrap_or_default(),
+            }),
+        }
+    }
+
+    /// Render the `#spaceConfig` wire value this server used to nest under a
+    /// `config` key.
+    ///
+    /// Retained for the deprecated `com.atproto.space.getSpace` alias, whose
+    /// callers parse this shape. The lexicon's `getSpace` returns `policy` and
+    /// `appAccess` at the top level instead — see
+    /// [`SpaceConfig::policy_to_wire`].
     #[must_use]
     pub fn to_wire(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({

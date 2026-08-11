@@ -166,7 +166,9 @@ impl SpaceService {
         let config = SpaceConfig::from_columns(&mint_policy, &app_access, managing_app)?;
         Ok(GetSpaceOutput {
             uri: uri.to_string(),
-            config: config.to_wire(),
+            policy: config.policy_to_wire(),
+            app_access: config.app_access.to_wire(),
+            config: Some(config.to_wire()),
         })
     }
 
@@ -596,14 +598,28 @@ pub struct SpaceInfo {
     pub created_at: String,
 }
 
-/// `com.atproto.space.getSpace` output: the space URI plus the open-union
-/// `config` (a `com.atproto.simplespace.defs#spaceConfig` wire value).
+/// `com.atproto.simplespace.getSpace` output: `{uri, policy, appAccess}`.
+///
+/// The two config fields are open unions at the top level, which is where the
+/// lexicon puts them. `managingApp` has no field of its own — it belongs to
+/// the `#managingAppPolicy` variant that names it.
+///
+/// `config` is the shape this server returned before the unions were lifted
+/// out of a wrapper. It is emitted only by the deprecated
+/// `com.atproto.space.getSpace` alias, which is the one endpoint whose callers
+/// were written against it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSpaceOutput {
     /// URI of the space.
     pub uri: String,
-    /// Implementation-specific configuration union (carries `$type`).
-    pub config: serde_json::Value,
+    /// User-authorization policy, as an open union.
+    pub policy: serde_json::Value,
+    /// App-authorization policy, as an open union.
+    #[serde(rename = "appAccess")]
+    pub app_access: serde_json::Value,
+    /// Legacy `#spaceConfig` wrapper; omitted on the lexicon endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
 /// Mint-time authorization inputs loaded by
@@ -653,10 +669,13 @@ mod tests {
         let uri = info.uri.parse::<SpaceUri>().unwrap();
         let got = svc.get_space(&uri).await.unwrap();
         assert_eq!(got.uri, info.uri);
-        // Defaults surface as member-list + #open.
-        assert_eq!(got.config["policy"], "member-list");
+        // Defaults surface as the #memberListPolicy + #open unions.
         assert_eq!(
-            got.config["appAccess"]["$type"],
+            got.policy["$type"],
+            crate::space::config::POLICY_MEMBER_LIST_TYPE
+        );
+        assert_eq!(
+            got.app_access["$type"],
             crate::space::config::APP_ACCESS_OPEN_TYPE
         );
     }
@@ -687,12 +706,21 @@ mod tests {
             .unwrap();
 
         let got = svc.get_space(&uri).await.unwrap();
-        assert_eq!(got.config["policy"], "public");
-        assert_eq!(got.config["managingApp"], "did:web:m.example#svc");
         assert_eq!(
-            got.config["appAccess"]["$type"],
+            got.policy["$type"],
+            crate::space::config::POLICY_PUBLIC_TYPE
+        );
+        assert_eq!(
+            got.app_access["$type"],
             crate::space::config::APP_ACCESS_ALLOW_LIST_TYPE
         );
+        // `#publicPolicy` consults no managing app, so the one still stored
+        // against the row is not described as though it gated anything.
+        assert!(got.policy.get("managingApp").is_none());
+        // The deprecated alias still carries the old wrapper verbatim.
+        let legacy = got.config.as_ref().unwrap();
+        assert_eq!(legacy["policy"], "public");
+        assert_eq!(legacy["managingApp"], "did:web:m.example#svc");
 
         // Clearing managingApp with empty string drops the field.
         let clear = SpaceConfigPatch {
@@ -703,7 +731,8 @@ mod tests {
             .await
             .unwrap();
         let got = svc.get_space(&uri).await.unwrap();
-        assert!(got.config.get("managingApp").is_none());
+        assert!(got.policy.get("managingApp").is_none());
+        assert!(got.config.as_ref().unwrap().get("managingApp").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
