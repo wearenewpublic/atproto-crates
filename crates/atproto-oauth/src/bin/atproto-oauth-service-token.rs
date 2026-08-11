@@ -176,7 +176,7 @@ fn main() -> Result<()> {
                 "jti" => {
                     // If value is empty, generate a random ULID
                     jti = if value.is_empty() {
-                        Some(Ulid::new().to_string().to_lowercase())
+                        Some(Ulid::generate().to_string().to_lowercase())
                     } else {
                         Some(value.to_string())
                     };
@@ -224,7 +224,7 @@ fn main() -> Result<()> {
     };
 
     // Generate JWT ID if not provided
-    let jwt_id = jti.unwrap_or_else(|| Ulid::new().to_string().to_lowercase());
+    let jwt_id = jti.unwrap_or_else(|| Ulid::generate().to_string().to_lowercase());
 
     // Create standard JOSE claims
     let jose = JoseClaims {

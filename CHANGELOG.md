@@ -49,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **The `s3` feature did not compile.** Twelve `aws-smithy` / `aws-runtime` crates had drifted to
   releases requiring rustc 1.94.1 against the 1.90 pin, so `cargo check -p atproto-pds --features s3`
-  failed in the resolver before reaching any code. Nothing built that path — the release image
-  builds `-F clap,hickory-dns,zeroize,tokio,smtp`, `scripts/ci.sh` passes no `--features`, and
+  failed in the resolver before reaching any code. Nothing built that path — CI
+  (`.tangled/workflows/ci.yml`) passes no `--features` to its clippy or test steps, its release-build
+  step uses only the Dockerfile's set (`-F clap,hickory-dns,zeroize,tokio,smtp`), and
   `--all-features` dies on the same resolver error rather than attributing it to a feature — so the
   blob backend selected by `PDS_BLOB_STORE_URL=s3://...` was unbuildable from this tree.
   Regenerating the lockfile lets the MSRV-aware resolver pick 1.90-compatible releases; only `aws`
