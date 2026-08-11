@@ -580,6 +580,68 @@ async fn create_space_seeds_owner_in_member_list() {
     assert_eq!(members[0]["did"], "did:plc:owner");
 }
 
+/// A member can enumerate the space they are in; a non-member cannot.
+///
+/// The list belongs to the authority, and reading it used to require *being*
+/// the authority — so a member could not see who else was in their own space,
+/// which is the ordinary case a forum or group client needs. What replaces
+/// that gate is a covering read grant plus membership: consent from the user,
+/// and admission to the space.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_can_list_the_space_and_a_stranger_cannot() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:mallory", "mallory.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner_token),
+    )
+    .await;
+
+    let path = format!(
+        "/xrpc/com.atproto.simplespace.listMembers?space={}",
+        urlencode(&uri)
+    );
+
+    // Alice is a member and holds a read_self grant over the space.
+    let alice = mint_oauth_access("did:plc:alice", &read_self_scope());
+    let (status, body) = get_json(app.clone(), &path, Some(&alice)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a member must be able to list: {body}"
+    );
+    let dids: Vec<&str> = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["did"].as_str().unwrap())
+        .collect();
+    assert!(dids.contains(&"did:plc:alice"), "{body}");
+
+    // Mallory holds the same grant — the user consented — but was never
+    // admitted to the space. A scope is not an admission.
+    let mallory = mint_oauth_access("did:plc:mallory", &read_self_scope());
+    let (status, body) = get_json(app.clone(), &path, Some(&mallory)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-member must not enumerate the space: {body}"
+    );
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+
+    // And a space credential is still not sufficient, whoever holds it: the
+    // list is host-internal, so members hosted elsewhere cannot read it.
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let (status, _) = get_json_cred(&app, &path, &credential).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "space credential");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn add_remove_then_list_members() {
     let (app, manager, _tmp) = build_app().await;

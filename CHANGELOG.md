@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: `com.atproto.simplespace.listMembers` is readable by a member of the space, not only
+  by its authority. Per proposal 0016 as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which drops
+  this method from the management scope to a read grant.
+
+  **A member could not see who else was in their own space.** The service refused unless the caller
+  *was* the space authority, which conflated two questions: whose store holds the member list (always
+  the authority's) and who is allowed to read it. Only the first is a fact about the space. A forum
+  or group client asking the ordinary question — who is in this space — was refused unless it
+  happened to be acting for the account the space is anchored on.
+
+  Authorization is now a covering read grant (`read_self`, which `read` implies) **plus** membership.
+  Both halves are needed and neither substitutes for the other: the scope is the user's consent to
+  the app, and membership is the space's admission of the user, so a local account that was granted a
+  `space:` scope but never admitted still cannot enumerate the space. A space credential remains
+  insufficient, as the lexicon requires — the list is host-internal, so members hosted elsewhere
+  cannot read it.
+
+  A space whose authority is hosted elsewhere now answers `SpaceNotFound` rather than an empty list.
+  Opening a non-existent actor store created one, so this host reported a space with no members
+  instead of a space it does not answer for.
+
+
 - `atproto-oauth` / `atproto-pds`: a `space:` `read_self` grant reads the holder's own repo across
   every collection, rather than only the collections it names. Per proposal 0016 as amended by
   [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which states

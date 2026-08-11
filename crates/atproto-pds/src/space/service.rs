@@ -4,7 +4,7 @@
 //! `listMembers`. Operates against the per-actor SQLite store.
 
 use crate::account::AccountManager;
-use crate::actor_store::sql::{SqlActorStore, SqlSpaceMembersStorage};
+use crate::actor_store::sql::{SqlActorStore, SqlSpaceMembersStorage, actor_db_path};
 use crate::errors::{PdsError, PdsResult};
 use crate::realm::PdsSetHash;
 use crate::space::config::{SpaceConfig, SpaceConfigPatch, ensure_not_deleted};
@@ -524,17 +524,27 @@ impl SpaceService {
     /// `listMembers` — paginated.
     pub async fn list_members(
         &self,
-        owner_did: &str,
         uri: &SpaceUri,
         cursor: Option<&str>,
         limit: u32,
     ) -> PdsResult<MemberPage> {
-        if uri.space_did != owner_did {
-            return Err(PdsError::NotSpaceOwner {
+        // The member list belongs to the space authority, so this always reads
+        // the authority's store rather than the caller's. It used to take the
+        // caller's DID and refuse unless it *was* the authority, which
+        // conflated "whose store holds the list" with "who is allowed to read
+        // it" — the first is a fact about the space, the second is the
+        // caller's business and is settled before this is called.
+        //
+        // A space whose authority is hosted elsewhere has no list here to
+        // read, and `SqlActorStore::open` would create an empty store and
+        // report a space with no members rather than a space this host does
+        // not answer for.
+        if !actor_db_path(&self.data_dir, &uri.space_did).exists() {
+            return Err(PdsError::SpaceNotFound {
                 uri: uri.to_string(),
             });
         }
-        let store = SqlActorStore::open(&self.data_dir, owner_did).await?;
+        let store = SqlActorStore::open(&self.data_dir, &uri.space_did).await?;
         ensure_not_deleted(store.pool(), uri).await?;
         let storage = SqlSpaceMembersStorage::new(store.pool().clone());
         let members: SpaceMembers<SqlSpaceMembersStorage, PdsSetHash> =
@@ -945,10 +955,7 @@ mod tests {
             .await
             .unwrap();
 
-        let page = svc
-            .list_members("did:plc:owner", &uri, None, 10)
-            .await
-            .unwrap();
+        let page = svc.list_members(&uri, None, 10).await.unwrap();
         // createSpace seeds the owner as the first member, then add_member
         // appends alice + bob.
         assert_eq!(page.members.len(), 3);
@@ -994,10 +1001,7 @@ mod tests {
         svc.remove_member("did:plc:owner", &uri, "did:plc:alice")
             .await
             .unwrap();
-        let page = svc
-            .list_members("did:plc:owner", &uri, None, 10)
-            .await
-            .unwrap();
+        let page = svc.list_members(&uri, None, 10).await.unwrap();
         // Owner remains after alice is removed.
         assert_eq!(page.members.len(), 1);
         assert_eq!(page.members[0].did, "did:plc:owner");

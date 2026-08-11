@@ -653,23 +653,25 @@ pub async fn get_members(
     Query(q): Query<GetMembersQuery>,
 ) -> Result<Json<GetMembersResponse>, XrpcError> {
     let subject = require_session_auth(&parts, &state).await?;
-    let owner = subject.sub().to_string();
+    let caller = subject.sub().to_string();
     let uri = parse_space_uri(&q.space)?;
+    // A read grant over the space, not a management one: enumerating who is in
+    // a space you are in is reading, and `read` implies `read_self`.
     assert_space_scope(
         &state,
         &subject,
         &uri,
-        atproto_oauth::scopes::SpaceAction::Read,
+        atproto_oauth::scopes::SpaceAction::ReadSelf,
         None,
     )
     .await?;
+    // Holding a covering scope is the user's consent to the app, not evidence
+    // that the user is in the space. Membership is the other half, and is what
+    // stops any local account that happened to be granted a `space:` scope
+    // from enumerating a space it was never admitted to.
+    assert_space_membership(&state, &uri, Some(&caller), &caller).await?;
     let page = space_service(&state)?
-        .list_members(
-            &owner,
-            &uri,
-            q.cursor.as_deref(),
-            page_limit(q.limit, 100, 1000),
-        )
+        .list_members(&uri, q.cursor.as_deref(), page_limit(q.limit, 100, 1000))
         .await
         .map_err(XrpcError::from)?;
     Ok(Json(GetMembersResponse {
