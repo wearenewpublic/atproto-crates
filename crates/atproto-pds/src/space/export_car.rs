@@ -12,12 +12,28 @@
 //! design:
 //!
 //! > *"The CAR declares two roots in order: the signed commit, then a DRISL
-//! > (DAG-CBOR) index mapping `'{collection}/{rkey}'` to record CID. Record
-//! > blocks follow in lexicographic order. Blobs are not included and are
-//! > fetched separately via getBlob."*
+//! > (DAG-CBOR) index mapping `'{collection}/{rkey}'` to record CID, with keys
+//! > in canonical DAG-CBOR map order. Record blocks follow in the same order as
+//! > their index entries. Blobs are not included and are fetched separately via
+//! > getBlob."*
 //!
 //! So: header with `[commit_cid, index_cid]`, then the commit block, then the
 //! index block, then record blocks ordered by `{collection}/{rkey}`.
+//!
+//! # The order is canonical, not lexicographic
+//!
+//! DAG-CBOR sorts map keys by their *encoded* bytes, and a definite-length text
+//! string encodes its length first, so the effective order over the raw keys is
+//! **shortest first, then bytewise** — not plain lexicographic. The two agree
+//! only while every key is the same length. `c.d.e/apple` (11 bytes) precedes
+//! `c.d.a/middle` (12) canonically and follows it lexicographically, and that
+//! is reachable inside a single collection: rkey `b` sorts before rkey `ab`.
+//!
+//! The index gets this for free — the DRISL encoder sorts every map it writes —
+//! so ordering the record blocks any other way produces a CAR that contradicts
+//! its own index. [`RecordPath`] therefore carries the canonical order as its
+//! `Ord`, which is what keeps the blocks and the index in step: they are
+//! emitted from one `BTreeMap`, and the map's ordering is the format's.
 //!
 //! # Record blocks go in exactly as stored
 //!
@@ -56,17 +72,63 @@ pub async fn build_repo_car(commit_block: &[u8], records: Vec<RecordRow>) -> Pds
     build_repo_car_sorted(commit_block, sorted).await
 }
 
+/// A record's path within a repo (`{collection}/{rkey}`), ordered the way
+/// DAG-CBOR orders map keys.
+///
+/// The order is the point of the type. DAG-CBOR compares *encoded* keys, and a
+/// text string encodes its length ahead of its bytes, so keys sort shortest
+/// first and only then bytewise — the opposite of `String`'s own `Ord` for any
+/// pair whose lengths differ. Holding the paths in a `BTreeMap<RecordPath, _>`
+/// makes the CAR's block order a property of the collection rather than
+/// something the writer has to remember to sort, so it cannot drift from the
+/// index the encoder canonicalises independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordPath(String);
+
+impl RecordPath {
+    /// Build the path for a record.
+    #[must_use]
+    pub fn new(collection: &str, rkey: &str) -> Self {
+        Self(format!("{collection}/{rkey}"))
+    }
+
+    /// The `{collection}/{rkey}` string, as it appears as an index key.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Ord for RecordPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Length first, then bytes: comparing the CBOR-encoded forms of two
+        // definite-length text strings compares their length headers before
+        // their contents, and a longer string always carries the larger
+        // header.
+        self.0
+            .len()
+            .cmp(&other.0.len())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for RecordPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Records held in the order the CAR has to write them.
 ///
 /// A `BTreeMap` because the sort is not optional: the format declares an index
-/// root and requires the record blocks to follow in lexicographic key order,
-/// so every record has to be in hand before the first byte of the header can
-/// be written. That is why an export is bounded by the size of the repo rather
-/// than by a page — and why filling this incrementally, as the pages arrive,
-/// is worth doing even though it cannot change that bound.
+/// root and requires the record blocks to follow in the same order as their
+/// index entries, so every record has to be in hand before the first byte of
+/// the header can be written. That is why an export is bounded by the size of
+/// the repo rather than by a page — and why filling this incrementally, as the
+/// pages arrive, is worth doing even though it cannot change that bound.
 #[derive(Default)]
 pub struct SortedRecords {
-    by_key: BTreeMap<String, (cid::Cid, Vec<u8>)>,
+    by_key: BTreeMap<RecordPath, (cid::Cid, Vec<u8>)>,
 }
 
 impl SortedRecords {
@@ -84,7 +146,7 @@ impl SortedRecords {
                 ),
             })?;
             self.by_key.insert(
-                format!("{}/{}", row.collection, row.rkey),
+                RecordPath::new(&row.collection, &row.rkey),
                 (parsed, row.value),
             );
         }
@@ -124,11 +186,20 @@ pub async fn build_repo_car_sorted(
 
     // The index is a DRISL map of key -> link. Built through the atproto-JSON
     // encoder — the same one that produced these record CIDs — so `$link`
-    // becomes CBOR tag 42 and the map keys come out canonically ordered.
+    // becomes CBOR tag 42 and the map keys come out canonically ordered. That
+    // canonicalisation happens at encode time regardless of what order the
+    // entries arrive in, which is why the block loop below has to sort the
+    // same way rather than trusting insertion order: `RecordPath`'s `Ord` is
+    // the one that has to agree with the encoder's.
     let index_json = serde_json::Value::Object(
         by_key
             .iter()
-            .map(|(key, (cid, _))| (key.clone(), serde_json::json!({ "$link": cid.to_string() })))
+            .map(|(key, (cid, _))| {
+                (
+                    key.as_str().to_string(),
+                    serde_json::json!({ "$link": cid.to_string() }),
+                )
+            })
             .collect(),
     );
     let index_block =
@@ -298,8 +369,31 @@ mod tests {
         );
     }
 
+    /// Byte offset of a key's encoded text-string form inside the index block.
+    ///
+    /// Reading the index back through `serde_json` would sort the keys again
+    /// and prove nothing about the bytes on the wire. A key appears exactly
+    /// once in the encoded map, so its offset orders the entries as a consumer
+    /// streaming the block would see them.
+    fn key_offset(index_bytes: &[u8], key: &str) -> usize {
+        let needle = key.as_bytes();
+        index_bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap_or_else(|| panic!("{key} does not appear in the encoded index"))
+    }
+
+    /// Record blocks follow in canonical DAG-CBOR key order — shortest key
+    /// first, then bytewise — which is the order the index is encoded in.
+    ///
+    /// The dataset is chosen so the two candidate orders disagree.
+    /// `c.d.a/middle` is 12 bytes and sorts *first* lexicographically but
+    /// *last* canonically, so a writer draining a `BTreeMap<String, _>`
+    /// emits blocks in an order its own index contradicts. That is a
+    /// wire-format violation a consumer can detect and this test could not,
+    /// because it used to assert the lexicographic order it was measuring.
     #[tokio::test]
-    async fn record_blocks_follow_in_lexicographic_key_order() {
+    async fn record_blocks_follow_in_canonical_key_order() {
         // Records are handed in unsorted; the CAR must not be.
         let commit = atproto_dasl::atproto_json::to_vec(&serde_json::json!({"rev": "r"})).unwrap();
         let rows = vec![
@@ -307,11 +401,18 @@ mod tests {
             row("c.d.e", "apple", serde_json::json!({"v": 1})),
             row("c.d.a", "middle", serde_json::json!({"v": 2})),
         ];
-        let expected: Vec<String> = {
-            let mut keys = vec!["c.d.e/zebra", "c.d.e/apple", "c.d.a/middle"];
-            keys.sort_unstable();
-            keys.into_iter().map(str::to_string).collect()
-        };
+        // Length first, then bytes. Plain lexicographic would put
+        // `c.d.a/middle` first.
+        let expected = ["c.d.e/apple", "c.d.e/zebra", "c.d.a/middle"];
+        assert_ne!(
+            expected,
+            {
+                let mut lexicographic = expected;
+                lexicographic.sort_unstable();
+                lexicographic
+            },
+            "the dataset must distinguish canonical order from lexicographic"
+        );
         let by_cid: BTreeMap<String, String> = rows
             .iter()
             .map(|r| (format!("{}/{}", r.collection, r.rkey), r.cid.clone()))
@@ -321,8 +422,75 @@ mod tests {
         let (_, blocks) = read_back(&car).await;
         // Skip the commit and index blocks.
         let record_cids: Vec<String> = blocks[2..].iter().map(|(c, _)| c.to_string()).collect();
-        let expected_cids: Vec<String> = expected.iter().map(|k| by_cid[k].clone()).collect();
+        let expected_cids: Vec<String> = expected.iter().map(|k| by_cid[*k].clone()).collect();
         assert_eq!(record_cids, expected_cids);
+    }
+
+    /// The blocks and the index agree, whatever order that turns out to be.
+    ///
+    /// The two are produced by different code — the block loop walks the map,
+    /// the index is sorted by the DRISL encoder as it writes — so agreement is
+    /// a claim about both, not a restatement of either. Comparing them
+    /// directly is what catches a change to one that does not reach the other.
+    #[tokio::test]
+    async fn the_blocks_arrive_in_the_order_the_index_lists_them() {
+        let commit = atproto_dasl::atproto_json::to_vec(&serde_json::json!({"rev": "r"})).unwrap();
+        // Mixed-length keys within one collection and across two, so the
+        // agreement is not an accident of every key being the same size.
+        let rows = vec![
+            row("c.d.e", "b", serde_json::json!({"v": 1})),
+            row("c.d.e", "ab", serde_json::json!({"v": 2})),
+            row("c.d.a", "middle", serde_json::json!({"v": 3})),
+            row("c.d.e", "zebra", serde_json::json!({"v": 4})),
+        ];
+        let cid_to_key: BTreeMap<String, String> = rows
+            .iter()
+            .map(|r| (r.cid.clone(), format!("{}/{}", r.collection, r.rkey)))
+            .collect();
+
+        let car = build_repo_car(&commit, rows).await.unwrap();
+        let (roots, blocks) = read_back(&car).await;
+        let index_bytes = blocks
+            .iter()
+            .find(|(c, _)| atproto_dasl::Cid::from(*c) == roots[1])
+            .map(|(_, d)| d.clone())
+            .expect("index block");
+
+        let block_keys: Vec<String> = blocks[2..]
+            .iter()
+            .map(|(c, _)| cid_to_key[&c.to_string()].clone())
+            .collect();
+        let index_keys: Vec<String> = {
+            let mut keys = block_keys.clone();
+            keys.sort_by_key(|k| key_offset(&index_bytes, k));
+            keys
+        };
+        assert_eq!(
+            block_keys, index_keys,
+            "record blocks must stream in the order the index lists them"
+        );
+        // And that shared order is the canonical one, not lexicographic.
+        assert_eq!(
+            block_keys,
+            vec!["c.d.e/b", "c.d.e/ab", "c.d.e/zebra", "c.d.a/middle"],
+        );
+    }
+
+    /// `RecordPath` orders by length before bytes, which is what makes the map
+    /// it keys emit blocks in the encoder's order.
+    #[test]
+    fn record_path_orders_shortest_key_first() {
+        let mut paths = [
+            RecordPath::new("c.d.a", "middle"),
+            RecordPath::new("c.d.e", "apple"),
+            RecordPath::new("c.d.e", "b"),
+        ];
+        paths.sort();
+        let ordered: Vec<&str> = paths.iter().map(RecordPath::as_str).collect();
+        assert_eq!(ordered, vec!["c.d.e/b", "c.d.e/apple", "c.d.a/middle"]);
+
+        // Equal lengths fall through to the bytewise comparison.
+        assert!(RecordPath::new("c.d.e", "apple") < RecordPath::new("c.d.e", "zebra"));
     }
 
     #[tokio::test]

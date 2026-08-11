@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `atproto-pds`: `com.atproto.space.getRepo` emits record blocks in canonical DAG-CBOR key order, so
+  they follow the index the same CAR declares. Per proposal 0016 as amended by
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), which
+  replaced "lexicographic" with the canonical rule the encoder was already applying to the index.
+
+  DAG-CBOR sorts map keys by their *encoded* bytes, and a text string encodes its length first, so
+  the effective order is **shortest key first, then bytewise** — not plain lexicographic. The index
+  block got this for free, because the DRISL encoder sorts every map it writes. The record blocks
+  did not: they were drained from a `BTreeMap<String, _>`, whose `Ord` is bytewise only.
+
+  The two agree while every key is the same length, which is why the existing tests missed it, and
+  they disagree as soon as one is longer — reachable inside a single collection, since rkey `b`
+  sorts before rkey `ab`. A repo with such a pair exported a CAR whose blocks contradicted its own
+  index: a violation a consumer validating the stream can detect, and one that would have surfaced
+  as an interop failure against a stricter implementation rather than as anything visible here.
+
+  The order now lives in a `RecordPath` key type rather than in a sort call at the write site, so
+  the block order is a property of the collection the records are held in and cannot drift from the
+  index the encoder canonicalises independently.
+
+
 - `atproto-pds`: `createSpace` and `updateSpace` read the `policy` and `appAccess` open unions the
   simplespace lexicons define, and refuse variants this host does not implement with the
   `UnsupportedPolicy` / `UnsupportedAppAccess` errors those lexicons declare — per proposal 0016 as

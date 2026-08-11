@@ -1672,7 +1672,8 @@ pub async fn get_repo(
     let reader = space_reader(&state)?;
     // Pages fold into the sorted set as they arrive rather than piling up in a
     // second `Vec` first. This does not change what an export costs -- the
-    // format declares an index root and requires lexicographic block order, so
+    // format declares an index root and requires the record blocks to follow
+    // in the same canonical order as their index entries, so
     // every record has to be in hand before the header can be written -- but
     // it stops the same records being held twice on the way there.
     let mut records = crate::space::export_car::SortedRecords::default();
