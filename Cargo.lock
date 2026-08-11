@@ -203,7 +203,7 @@ dependencies = [
  "atproto-dasl",
  "atproto-identity",
  "atproto-record",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "cid",
  "clap",
@@ -249,7 +249,7 @@ version = "0.15.0-rc.3"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "cid",
@@ -293,7 +293,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atproto-dasl",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "data-encoding",
@@ -350,7 +350,7 @@ dependencies = [
  "atproto-client",
  "atproto-dasl",
  "atproto-identity",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bitflags",
  "chrono",
  "clap",
@@ -375,7 +375,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atproto-identity",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "ecdsa",
@@ -445,7 +445,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "cid",
  "clap",
@@ -480,7 +480,7 @@ dependencies = [
  "tokio-util",
  "tokio-websockets",
  "tower",
- "tower-http",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -495,7 +495,7 @@ dependencies = [
  "async-trait",
  "atproto-dasl",
  "atproto-identity",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "cid",
  "clap",
@@ -538,7 +538,7 @@ dependencies = [
  "atproto-dasl",
  "atproto-identity",
  "atproto-record",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "hkdf 0.13.0",
@@ -560,7 +560,7 @@ version = "0.15.0-rc.3"
 dependencies = [
  "atproto-client",
  "atproto-identity",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "compact_str",
  "futures",
@@ -586,7 +586,7 @@ dependencies = [
  "atproto-identity",
  "atproto-oauth",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "elliptic-curve",
  "hickory-resolver",
@@ -1520,17 +1520,16 @@ dependencies = [
 
 [[package]]
 name = "compact_str"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
 dependencies = [
  "castaway",
  "cfg-if",
  "itoa",
- "rustversion",
- "ryu",
  "serde",
  "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -3966,9 +3965,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus-client"
-version = "0.23.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf41c1a7c32ed72abe5082fb19505b969095c12da9f5732a4bc9878757fd087c"
+checksum = "ba70bf887030e45213b4a95c9b08d5a450b157f87c1d63661ed0847a12fa2aad"
 dependencies = [
  "dtoa",
  "itoa",
@@ -3978,9 +3977,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus-client-derive-encode"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "440f724eba9f6996b75d63681b0a92b06947f1457076d503a4d2e2c8f56442b8"
+checksum = "9adf1691c04c0a5ff46ff8f262b58beb07b0dbb61f96f9f54f6cbd82106ed87f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4418,7 +4417,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tower",
- "tower-http",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5644,14 +5643,31 @@ dependencies = [
  "futures-util",
  "http 1.5.0",
  "http-body 1.1.0",
- "http-body-util",
  "pin-project-lite",
- "tokio",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "futures-util",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "percent-encoding",
+ "pin-project-lite",
+ "tokio",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -5782,11 +5798,11 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ulid"
-version = "1.2.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+checksum = "947dde63b6d514cc5e044edad4e0ca7261afd1099d16c83d942cb2b2f348689c"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.2",
  "web-time",
 ]
 

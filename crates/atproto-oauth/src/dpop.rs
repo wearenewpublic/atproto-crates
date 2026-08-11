@@ -417,7 +417,7 @@ fn build_dpop(
         http_method: Some(http_method.to_string()),
         http_uri: Some(htu_of(http_uri).to_string()),
         issued_at,
-        json_web_token_id: Some(Ulid::new().to_string()),
+        json_web_token_id: Some(Ulid::generate().to_string()),
         nonce: nonce.map(str::to_string),
         ..Default::default()
     });
@@ -1354,7 +1354,7 @@ mod tests {
         };
 
         let claims = Claims::new(JoseClaims {
-            json_web_token_id: Some(Ulid::new().to_string()),
+            json_web_token_id: Some(Ulid::generate().to_string()),
             http_method: Some("POST".to_string()),
             http_uri: Some("https://example.com/token".to_string()),
             issued_at: Some(old_time),
