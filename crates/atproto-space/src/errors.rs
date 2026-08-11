@@ -132,6 +132,14 @@ pub enum SpaceError {
         field: String,
     },
 
+    /// error-atproto-space-credential-8: DPoP key thumbprint is not a
+    /// base64url-encoded SHA-256 digest (RFC 7638).
+    #[error("error-atproto-space-credential-8 invalid DPoP key thumbprint: {reason}")]
+    InvalidDpopJkt {
+        /// Why the thumbprint was refused.
+        reason: String,
+    },
+
     /// error-atproto-space-repo-1: attempt to add a record that already exists.
     #[error("error-atproto-space-repo-1 record already exists: {collection}/{rkey}")]
     RecordAlreadyExists {

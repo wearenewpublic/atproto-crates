@@ -517,6 +517,11 @@ pub(crate) async fn taken_down_rkeys(
 mod tests {
     use super::*;
 
+    /// A well-formed RFC 7638 thumbprint to bind minted credentials to. These
+    /// tests exercise the read path, which does not check the binding, so any
+    /// syntactically valid thumbprint does.
+    const TEST_JKT: &str = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I";
+
     /// `OwnPds` must own its DID.
     ///
     /// This is the F-SPACE-30 regression guard, and it is a *compile-time*
@@ -740,6 +745,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &uri,
+            TEST_JKT,
             Some("https://app.example/client-metadata.json"),
             &signing_key,
             SPACE_CREDENTIAL_TTL_SECS,
@@ -786,6 +792,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &other,
+            TEST_JKT,
             None,
             &signing_key,
             SPACE_CREDENTIAL_TTL_SECS,
@@ -823,6 +830,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &uri,
+            TEST_JKT,
             None,
             &signing_key,
             SPACE_CREDENTIAL_TTL_SECS,

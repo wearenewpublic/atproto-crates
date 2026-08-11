@@ -256,19 +256,31 @@ async fn create_space(app: &axum::Router, owner_token: &str, skey: &str) -> Stri
     body["uri"].as_str().unwrap().to_string()
 }
 
+/// The DPoP key thumbprint these tests bind minted credentials to.
+///
+/// A syntactically valid RFC 7638 thumbprint (43 unpadded base64url
+/// characters) that corresponds to no key anyone here holds. That is enough
+/// for every test in this file, because the read endpoints do not yet demand a
+/// proof — they verify the authority's signature and stop. When presentation
+/// lands, the tests that read with a credential need a thumbprint they can
+/// actually sign for, and this constant gets replaced by a generated keypair
+/// threaded out of [`mint_space_credential`].
+const TEST_DPOP_JKT: &str = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I";
+
 /// Exchange a delegation token for a space credential at
 /// `com.atproto.space.getSpaceCredential`.
 ///
 /// Per the 0016 spec (lines 200-251) the delegation token is presented in the
-/// `Authorization: Bearer` header and the body carries the target `space` plus
-/// an optional `clientAttestation`. The response is `{credential}`.
+/// `Authorization: Bearer` header and the body carries the target `space`, the
+/// `dpopJkt` to bind the credential to, plus an optional `clientAttestation`.
+/// The response is `{credential}`.
 async fn exchange_credential(
     app: &axum::Router,
     delegation_token: &str,
     space: &str,
     client_attestation: Option<&str>,
 ) -> (StatusCode, Value) {
-    let mut body = json!({ "space": space });
+    let mut body = json!({ "space": space, "dpopJkt": TEST_DPOP_JKT });
     if let Some(att) = client_attestation {
         body["clientAttestation"] = json!(att);
     }
@@ -1021,7 +1033,8 @@ async fn delegation_token_then_space_credential_member_allowed() {
     // Space-credential shape (spec lines 206-225): typ
     // atproto-space-credential+jwt, kid #atproto_space, iss == the authority,
     // sub == the space URI, NO aud. No attestation was presented, so client_id
-    // is omitted (spec lines 221, 228).
+    // is omitted (spec lines 221, 228). `cnf.jkt` carries the thumbprint the
+    // request asked for, verbatim.
     let (sc_header, sc_payload) = decode_jwt(credential);
     assert_eq!(sc_header["typ"], "atproto-space-credential+jwt");
     assert_eq!(sc_header["kid"], "#atproto_space");
@@ -1031,7 +1044,66 @@ async fn delegation_token_then_space_credential_member_allowed() {
         sc_payload.get("aud").is_none(),
         "space credential has no aud"
     );
+    assert_eq!(sc_payload["cnf"]["jkt"], TEST_DPOP_JKT);
     assert!(sc_payload.get("client_id").is_none());
+}
+
+/// `dpopJkt` is required, and a credential is never minted unbound.
+///
+/// The failure this guards is silent: before the field existed, a client
+/// sending `dpopJkt` got HTTP 200 and a credential that ignored it — the
+/// caller believed it held a key-bound capability and actually held a bearer
+/// token, with nothing in the response to say so. Whichever way the mismatch
+/// runs, it has to be an error the caller can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_space_credential_requires_a_well_formed_dpop_jkt() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // A fresh delegation token per attempt: they are single-use, so a reused
+    // one would fail on replay and prove nothing about `dpopJkt`.
+    let delegation = || async {
+        let oauth = mint_oauth_access("did:plc:owner", &read_scope());
+        let (status, body) = get_json(
+            app.clone(),
+            &format!(
+                "/xrpc/com.atproto.space.getDelegationToken?space={}",
+                urlencode(&uri)
+            ),
+            Some(&oauth),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
+        body["token"].as_str().unwrap().to_string()
+    };
+
+    // Omitted entirely: the body no longer decodes.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.getSpaceCredential",
+        json!({ "space": uri }),
+        Some(&delegation().await),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "InvalidRequest");
+
+    // Present but not a thumbprint. Accepting one would mint a credential no
+    // proof could ever match, and the caller would not learn that until every
+    // host refused it.
+    for bad in ["", "not-a-thumbprint"] {
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.getSpaceCredential",
+            json!({ "space": uri, "dpopJkt": bad }),
+            Some(&delegation().await),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} body: {body}");
+        assert_eq!(body["error"], "InvalidRequest", "{bad:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

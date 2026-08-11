@@ -1923,11 +1923,22 @@ pub async fn get_delegation_token(
 
 /// Inputs for `getSpaceCredential`. The delegation token is presented in the
 /// `Authorization: Bearer` header (not the body); the body carries the target
-/// space and an optional client attestation.
+/// space, the key to bind the credential to, and an optional client
+/// attestation.
 #[derive(Debug, Deserialize)]
 pub struct GetSpaceCredentialInput {
     /// The space being requested, an `at://…/space/…` URI.
     pub space: String,
+    /// RFC 7638 thumbprint of the key to bind the credential to, copied into
+    /// the credential's `cnf.jkt`. Matches the lexicon `dpopJkt` field.
+    ///
+    /// Required, as the lexicon declares it. A credential minted without one
+    /// would be a bearer token, so treating a caller who omits it as asking
+    /// for an unbound credential would hand out exactly what the binding
+    /// exists to prevent — and silently, since the caller would get a 200.
+    /// Omitting it is a 400 instead.
+    #[serde(rename = "dpopJkt")]
+    pub dpop_jkt: String,
     /// Optional client attestation (compact JWT) establishing the app's
     /// identity. Required only when the space gates on app identity
     /// (`appAccess` is `#allowList`). Matches the lexicon
@@ -1941,7 +1952,12 @@ pub struct GetSpaceCredentialInput {
 /// from the `Authorization: Bearer` header, verifies it against the member's
 /// `#atproto` signing key, enforces single-use via its `jti`, then mints a
 /// [`SpaceCredential`](atproto_space::credential::SpaceCredential) signed by
-/// the authority's `#atproto_space` signing key.
+/// the authority's `#atproto_space` signing key and bound to the `dpopJkt`
+/// the caller asked for.
+///
+/// The delegation token stays a bearer token: `dpopJkt` names the key to bind
+/// the *minted credential* to, and says nothing about how this request is
+/// authenticated.
 pub async fn get_space_credential(
     State(state): State<HttpState>,
     parts: Parts,
@@ -1953,6 +1969,12 @@ pub async fn get_space_credential(
     let grant_jwt = bearer_token(&parts)?;
 
     let space = parse_space_uri(&input.space)?;
+
+    // Reject a malformed thumbprint before doing any of the work below: it
+    // can only ever produce a credential no proof can match, and the caller
+    // is the one who has to fix it.
+    atproto_space::credential::validate_dpop_jkt(&input.dpop_jkt)
+        .map_err(|e| XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()))?;
 
     // Peek the delegation token to learn its issuer (the member) so we know
     // which key to resolve, and confirm it targets this space.
@@ -2101,11 +2123,13 @@ pub async fn get_space_credential(
         .map_err(mint_denial_to_xrpc)?;
 
     // The credential's `client_id` is the attested application identity, or
-    // omitted entirely when the request carried no attestation.
+    // omitted entirely when the request carried no attestation. `cnf.jkt` is
+    // the thumbprint the caller asked for, validated above.
     let credential_ttl = state.space_credential_ttl_secs;
     let token = create_space_credential(
         &space.space_did,
         &space,
+        &input.dpop_jkt,
         attested_client_id.as_deref(),
         &owner_signing,
         credential_ttl,

@@ -12,14 +12,25 @@
 //!    `iat`, `exp=iat+60`, `jti`. It carries no `lxm` claim and says nothing
 //!    about the app. Single-use, default 60-second TTL.
 //! 2. The app presents that delegation token (in the `Authorization: Bearer`
-//!    header) plus an optional client attestation to the space authority at
+//!    header), the `dpopJkt` thumbprint of a key it holds, and an optional
+//!    client attestation to the space authority at
 //!    [`com.atproto.space.getSpaceCredential`]. The authority verifies it and
 //!    mints a **space credential** (spec "Space credential", lines 200-230): a
 //!    JWT with header `typ=atproto-space-credential+jwt`,
 //!    `kid="#atproto_space"`, signed by the authority's space signing key.
 //!    Claims: `iss` (authority DID), `sub` (the space `at://` URI),
-//!    `client_id` (the attested app, omitted when no attestation), `iat`,
-//!    `exp=iat+7200`, `jti`. It has no `aud`. Default 2-hour TTL.
+//!    `cnf.jkt` (the requested thumbprint), `client_id` (the attested app,
+//!    omitted when no attestation), `iat`, `exp=iat+7200`, `jti`. It has no
+//!    `aud`. Default 2-hour TTL.
+//!
+//! A credential reads *every* repo in its space and is presented to each of
+//! their hosts in turn, so as a bearer token it would be a shared secret: any
+//! host handed one to serve its own repo could replay it against the others.
+//! Every credential is therefore **DPoP-bound** at issuance to a key the
+//! requesting app holds — the `cnf.jkt` claim (RFC 9449 §6.1) names that key
+//! by its RFC 7638 thumbprint, and a holder proves possession per request.
+//! Minting one without a thumbprint is not expressible: [`Cnf`] is not
+//! optional, and [`create_space_credential`] takes the thumbprint by value.
 //!
 //! Both JWTs use the same compact-form encoding:
 //! `b64url(header).b64url(payload).b64url(sig)`, signed with ECDSA over an
@@ -62,9 +73,10 @@ pub const SPACE_CREDENTIAL_TTL_MIN_SECS: u64 = 60;
 
 /// Longest SpaceCredential TTL a host may configure, in seconds (24 hours).
 ///
-/// A SpaceCredential is a bearer token with no revocation path — removing a
-/// member does not invalidate one already minted. The ceiling bounds how long
-/// a revoked member keeps access.
+/// A SpaceCredential has no revocation path — removing a member does not
+/// invalidate one already minted. The ceiling bounds how long a revoked member
+/// keeps access. DPoP binding narrows *who* can present a leaked credential,
+/// not how long it lives, so the ceiling is unaffected by it.
 pub const SPACE_CREDENTIAL_TTL_MAX_SECS: u64 = 86_400;
 
 // The default must sit inside the configurable range, or the host's own
@@ -104,6 +116,55 @@ pub struct DelegationToken {
     pub jti: String,
 }
 
+/// Length of an RFC 7638 thumbprint: SHA-256 (32 bytes) in unpadded base64url.
+const JKT_LEN: usize = 43;
+
+/// Check that `jkt` has the shape of an RFC 7638 JWK thumbprint.
+///
+/// RFC 9449 §6.1 fixes the `cnf.jkt` hash at SHA-256, so a well-formed
+/// thumbprint is always 43 unpadded base64url characters. Anything else — a
+/// whole JWK, a hex digest, a padded encoding — cannot match the thumbprint a
+/// host computes from a presented proof, so accepting it would mint a
+/// credential that nothing can ever present. Refusing it here turns that into
+/// an error the requesting app can read.
+///
+/// # Errors
+///
+/// Returns [`SpaceError::InvalidDpopJkt`] describing which check failed.
+pub fn validate_dpop_jkt(jkt: &str) -> SpaceResult<()> {
+    if jkt.is_empty() {
+        return Err(SpaceError::InvalidDpopJkt {
+            reason: "empty".to_string(),
+        });
+    }
+    if jkt.len() != JKT_LEN {
+        return Err(SpaceError::InvalidDpopJkt {
+            reason: format!(
+                "expected {JKT_LEN} base64url characters (unpadded SHA-256), got {}",
+                jkt.len()
+            ),
+        });
+    }
+    if let Some(bad) = jkt
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Err(SpaceError::InvalidDpopJkt {
+            reason: format!("contains {bad:?}, which is not a base64url character"),
+        });
+    }
+    Ok(())
+}
+
+/// `cnf` claim of a SpaceCredential: the key the credential is bound to
+/// (RFC 9449 §6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cnf {
+    /// RFC 7638 JWK thumbprint of the public key the holder proves possession
+    /// of on every request.
+    pub jkt: String,
+}
+
 /// Decoded SpaceCredential payload (spec lines 218-225).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceCredential {
@@ -111,6 +172,13 @@ pub struct SpaceCredential {
     pub iss: String,
     /// Subject — the space the credential reads, an `at://…/space/…` URI.
     pub sub: String,
+    /// Confirmation claim binding this credential to the holder's DPoP key.
+    ///
+    /// Not optional: a credential is a whole-space capability presented to
+    /// hosts that do not trust each other, so one that named no key would be a
+    /// bearer token any of them could replay. A credential decoding without
+    /// `cnf` is refused rather than treated as unbound.
+    pub cnf: Cnf,
     /// Attested application identity (the verified client attestation's
     /// `iss`). Omitted on the wire when the request carried no attestation
     /// (spec lines 221, 228).
@@ -375,6 +443,11 @@ pub fn verify_delegation_token(
 /// Mint a space credential signed by the space authority's `#atproto_space`
 /// signing key.
 ///
+/// `dpop_jkt` is the RFC 7638 thumbprint the requesting app sent as the
+/// `dpopJkt` parameter; it is copied verbatim into `cnf.jkt`, binding the
+/// credential to that key. The authority never sees the key itself and nothing
+/// is registered — the thumbprint is the whole binding.
+///
 /// `client_id` is the attested application identity (the verified client
 /// attestation's `iss`); pass `None` when the request carried no attestation,
 /// in which case the claim is omitted (spec lines 221, 228). The header
@@ -382,19 +455,26 @@ pub fn verify_delegation_token(
 ///
 /// # Errors
 ///
-/// Returns [`SpaceError::JwtEncoding`] / [`SpaceError::Signature`] on failure.
+/// Returns [`SpaceError::InvalidDpopJkt`] when `dpop_jkt` is not a
+/// well-formed thumbprint, or [`SpaceError::JwtEncoding`] /
+/// [`SpaceError::Signature`] on failure.
 pub fn create_space_credential(
     authority_did: &str,
     space: &SpaceUri,
+    dpop_jkt: &str,
     client_id: Option<&str>,
     authority_signing_key: &KeyData,
     ttl_secs: u64,
 ) -> SpaceResult<String> {
+    validate_dpop_jkt(dpop_jkt)?;
     let iat = now_secs();
     let exp = iat + ttl_secs;
     let payload = SpaceCredential {
         iss: authority_did.to_string(),
         sub: space.to_string(),
+        cnf: Cnf {
+            jkt: dpop_jkt.to_string(),
+        },
         client_id: client_id.map(str::to_string),
         iat,
         exp,
@@ -412,7 +492,13 @@ pub fn create_space_credential(
 /// expected claims.
 ///
 /// Checks: signature, header `typ`/`kid`/`alg`, `iss` (the authority DID),
-/// `sub` (the space URI), and `exp`.
+/// `sub` (the space URI), and `exp`. A credential carrying no `cnf` fails to
+/// decode, so an unbound one cannot pass here.
+///
+/// This establishes that the authority issued the credential and which key it
+/// was bound to. It does **not** check that the presenter holds that key: the
+/// caller compares `cnf.jkt` against the thumbprint of a verified DPoP proof,
+/// since only the caller sees the request the proof is bound to.
 ///
 /// # Errors
 ///
@@ -605,6 +691,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A syntactically valid RFC 7638 thumbprint: 43 unpadded base64url
+    /// characters, the shape of a base64url-encoded SHA-256 digest.
+    const TEST_JKT: &str = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I";
+
     #[test]
     fn space_credential_round_trip_with_client_id() {
         let (owner_priv, owner_pub) = keypair();
@@ -612,6 +702,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &space,
+            TEST_JKT,
             Some("https://app.example/client-metadata.json"),
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,
@@ -620,6 +711,7 @@ mod tests {
         let payload = verify_space_credential(&token, "did:plc:owner", &space, &owner_pub).unwrap();
         assert_eq!(payload.iss, "did:plc:owner");
         assert_eq!(payload.sub, space.to_string());
+        assert_eq!(payload.cnf.jkt, TEST_JKT);
         assert_eq!(
             payload.client_id.as_deref(),
             Some("https://app.example/client-metadata.json")
@@ -633,6 +725,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &space,
+            TEST_JKT,
             None,
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,
@@ -645,6 +738,90 @@ mod tests {
         assert_eq!(header["kid"], "#atproto_space");
     }
 
+    /// The wire shape of the binding, asserted on the encoded payload rather
+    /// than the round-tripped struct: a verifier on another host reads
+    /// `cnf.jkt` out of the JSON, so a rename or a flattening that still
+    /// round-trips through our own type would break it.
+    #[test]
+    fn space_credential_carries_the_requested_thumbprint_as_cnf_jkt() {
+        let (owner_priv, _) = keypair();
+        let space = test_space();
+        let token = create_space_credential(
+            "did:plc:owner",
+            &space,
+            TEST_JKT,
+            None,
+            &owner_priv,
+            SPACE_CREDENTIAL_TTL_SECS,
+        )
+        .unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(payload_b64).unwrap()).unwrap();
+        assert_eq!(payload["cnf"]["jkt"], TEST_JKT);
+        assert!(payload.get("jkt").is_none(), "jkt must be nested under cnf");
+    }
+
+    /// A credential minted before the binding existed names no key, so nothing
+    /// can prove possession of one — it is a bearer token, which is what the
+    /// binding removes. Decoding must refuse it rather than read it as
+    /// unbound.
+    #[test]
+    fn a_credential_without_cnf_is_refused() {
+        let (owner_priv, owner_pub) = keypair();
+        let space = test_space();
+        let unbound = serde_json::json!({
+            "iss": "did:plc:owner",
+            "sub": space.to_string(),
+            "iat": now_secs(),
+            "exp": now_secs() + SPACE_CREDENTIAL_TTL_SECS,
+            "jti": "f47ac10b58cc4372a5670e02b2c3d479",
+        });
+        let token = mint_jwt(
+            TYP_SPACE_CREDENTIAL,
+            KID_SPACE_CREDENTIAL,
+            &unbound,
+            &owner_priv,
+        )
+        .unwrap();
+
+        let result = verify_space_credential(&token, "did:plc:owner", &space, &owner_pub);
+        assert!(
+            matches!(result, Err(SpaceError::JwtDecoding { .. })),
+            "expected a decode refusal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_thumbprint_that_is_not_a_thumbprint_is_refused_at_mint() {
+        let (owner_priv, _) = keypair();
+        let space = test_space();
+        for bad in [
+            "",
+            "short",
+            // Padded base64, as `base64::encode` would produce.
+            "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I=",
+            // A hex digest: right entropy, wrong encoding.
+            "9f8e7d6c5b4a3210fedcba98765432109f8e7d6c5b4a3210fedcba9876543210",
+            // Correct length, but `+/` rather than `-_`.
+            "0ZcOCORZNYy+DWpqq30jZyJGHTN0d2HglBV3uiguA4I",
+        ] {
+            let result = create_space_credential(
+                "did:plc:owner",
+                &space,
+                bad,
+                None,
+                &owner_priv,
+                SPACE_CREDENTIAL_TTL_SECS,
+            );
+            assert!(
+                matches!(result, Err(SpaceError::InvalidDpopJkt { .. })),
+                "{bad:?} should not mint a credential, got {result:?}"
+            );
+        }
+        assert!(validate_dpop_jkt(TEST_JKT).is_ok());
+    }
+
     #[test]
     fn space_credential_omits_client_id_when_absent() {
         let (owner_priv, _) = keypair();
@@ -652,6 +829,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &space,
+            TEST_JKT,
             None,
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,
@@ -673,6 +851,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &space,
+            TEST_JKT,
             Some("https://app.example/cm"),
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,
@@ -697,6 +876,7 @@ mod tests {
         let token = create_space_credential(
             "did:plc:owner",
             &space,
+            TEST_JKT,
             None,
             &owner_priv,
             SPACE_CREDENTIAL_TTL_SECS,

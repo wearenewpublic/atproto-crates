@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `atproto-space` / `atproto-pds`: space credentials are DPoP-bound at issuance.
+  `com.atproto.space.getSpaceCredential` takes a **required** `dpopJkt` — the RFC 7638 thumbprint of
+  a key the requesting app holds — and copies it into the minted credential's `cnf.jkt` claim
+  (RFC 9449 §6.1), per proposal 0016 as amended by
+  [bluesky-social/proposals#99](https://github.com/bluesky-social/proposals/pull/99).
+
+  A credential reads *every* repo in its space and is presented to each of their hosts in turn. As a
+  bearer token it is therefore a shared secret: a host handed one so it can serve its own repo can
+  replay it against every other host in the space, and read repos it was never authorised for. The
+  thumbprint is the whole binding — nothing is registered, the authority never sees the key, and the
+  key may be ephemeral, since losing it costs one more `getSpaceCredential` call.
+
+  **`dpopJkt` is required, and malformed values are refused.** A caller that omits it gets 400
+  `InvalidRequest` rather than an unbound credential; one that sends something which is not a
+  thumbprint (padded base64, a hex digest, a whole JWK) gets the same. Both refusals exist because
+  the alternative is silent: an app that believed it held a key-bound capability and actually held a
+  bearer token would find out only when a host it does not control replayed it, and a credential
+  bound to a malformed thumbprint is one no proof can ever match — a failure that would otherwise
+  surface as every host refusing a credential that looks fine.
+
+  `Cnf` is not optional on `SpaceCredential`, so an unbound credential is not expressible: one
+  decodes or it does not. **A credential minted before this change no longer verifies** — it names
+  no key, which is the property being removed. Their TTL is two hours by default, so a deploy
+  invalidates at most that much of a window.
+
+  This is the issuing half. Hosts do not yet demand a proof on presentation — that lands with the
+  verification side, and until it does, `cnf.jkt` is carried and signed but not enforced.
 - `atproto-pds`: `include:` scopes expand the `rpc` permissions in a permission set, when the
   `include:` names an audience. The PDS has always *enforced* `rpc:` scopes on the proxy path
   (`assert_rpc`) while never being able to *grant* one, so a client asking for
