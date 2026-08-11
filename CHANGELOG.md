@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security
+- Dependency updates closing two RUSTSEC advisories, from a `cargo audit` sweep prompted by the
+  hickory pin.
+
+  **`hickory-resolver` / `hickory-proto` 0.25.2 → 0.26.1** fixes
+  [RUSTSEC-2026-0119](https://rustsec.org/advisories/RUSTSEC-2026-0119): CPU exhaustion during DNS
+  message encoding, from O(n²) name compression. It is reachable here — handle resolution encodes
+  `_atproto.<handle>` from a caller-supplied handle, which is exactly the adversarially-shaped input
+  the bug wants. The companion advisory RUSTSEC-2026-0118 (unbounded loop in NSEC3 validation, no
+  fixed version at any release) never applied: no DNSSEC feature is compiled in.
+
+  The 0.26 API moved under this. `NameServerConfigGroup::from_ips_clear` became one
+  `NameServerConfig` per address, the connection provider is now `TokioRuntimeProvider`,
+  `ResolverBuilder::build()` became fallible, and the resolver's error type folded into
+  `hickory-net` as `NetError`.
+
+  One change was silent rather than a compile error, and is the reason `txt_values` now exists as a
+  separate tested function. 0.25's `txt_lookup` returned a `TxtLookup` whose `iter()` yielded TXT
+  rdata; 0.26 returns a generic `Lookup` whose answers are `Record`s. Mapping `to_string()` over
+  them still compiles and still returns a `Vec<String>` of the right length — of whole records,
+  `_atproto.alice.example. 300 IN TXT "did=…"`, where the caller matches a leading `did=`. Every
+  DNS-based handle would have stopped resolving with nothing to see at the type level.
+
+  **`lru` 0.16 → 0.18** clears both unsoundness warnings against 0.16.4
+  (RUSTSEC-2026-0253 use-after-free in `LruCache::pop()`, RUSTSEC-2026-0002 `IterMut` violating
+  Stacked Borrows). No API changes were needed.
+
+  Six advisories remain and none is fixable by a version bump. `rsa` (RUSTSEC-2023-0071, Marvin
+  timing attack) and `rustls-pemfile` (unmaintained) have no fixed release. The other four are
+  reachable only through optional features that are off by default: `rustls-webpki 0.101.7` (three
+  advisories) and `lru 0.12.5` come in under `s3`, and `quick-xml 0.37.5` (two) under `panproto`.
+
+  The `s3` chain is structural rather than stale: `aws-sdk-s3/rustls` maps to
+  `aws-smithy-runtime/tls-rustls`, which is *defined* as `aws-smithy-http-client/legacy-rustls-ring`
+  — hyper 0.14 and rustls 0.21.8. Updating the SDK does not escape it; `aws-sdk-s3 1.141.0` still
+  resolves the same legacy stack, and additionally requires Rust 1.94.1 against this workspace's
+  1.90 pin. Escaping it means changing which TLS stack the S3 backend asks for, which is a
+  functional change to that backend rather than a dependency update.
+
 
 ## [0.15.0-rc.3] - 2026-08-11
 ### Fixed

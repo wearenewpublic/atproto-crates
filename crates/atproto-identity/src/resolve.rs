@@ -16,8 +16,9 @@ use anyhow::Result;
 #[cfg(feature = "hickory-dns")]
 use hickory_resolver::{
     Resolver, TokioResolver,
-    config::{NameServerConfigGroup, ResolverConfig},
-    name_server::TokioConnectionProvider,
+    config::{NameServerConfig, ResolverConfig},
+    net::runtime::TokioRuntimeProvider,
+    proto::rr::RData,
 };
 use reqwest::Client;
 use std::collections::HashSet;
@@ -57,16 +58,54 @@ impl HickoryDnsResolver {
         // Initialize the DNS resolver with custom nameservers if configured
         let tokio_resolver = if !nameservers.is_empty() {
             tracing::debug!("Using custom DNS nameservers: {:?}", nameservers);
-            let nameserver_group = NameServerConfigGroup::from_ips_clear(nameservers, 53, true);
-            let resolver_config = ResolverConfig::from_parts(None, vec![], nameserver_group);
-            Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default())
+            // 0.26 replaced `NameServerConfigGroup::from_ips_clear(ips, 53, true)`
+            // with one config per address. `udp_and_tcp` is the same thing the
+            // old call meant: unencrypted UDP and TCP on the default port 53,
+            // with negative responses trusted.
+            let name_servers: Vec<NameServerConfig> = nameservers
+                .iter()
+                .copied()
+                .map(NameServerConfig::udp_and_tcp)
+                .collect();
+            let resolver_config = ResolverConfig::from_parts(None, vec![], name_servers);
+            // `build()` became fallible in 0.26. This constructor is infallible
+            // by signature and the system-nameserver arm below already panicked
+            // on a failed builder, so both arms keep that contract rather than
+            // changing a public signature under a dependency bump.
+            Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
                 .build()
+                .expect("DNS resolver could not be built from the configured nameservers")
         } else {
             tracing::debug!("Using system default DNS nameservers");
-            Resolver::builder_tokio().unwrap().build()
+            Resolver::builder_tokio()
+                .expect("system DNS configuration could not be read")
+                .build()
+                .expect("DNS resolver could not be built from the system configuration")
         };
         Self::new(tokio_resolver)
     }
+}
+
+/// The TXT payloads of a lookup's answers, dropping anything that is not TXT.
+///
+/// Split out so it can be tested without a resolver, because getting it wrong
+/// is silent. 0.26 returns a generic `Lookup` rather than a `TxtLookup`, so the
+/// answers are `Record`s and not TXT rdata — and `Record`'s `Display` renders
+/// the whole record: name, TTL, class, type, quoted rdata. Mapping
+/// `to_string()` over the answers still yields a `Vec<String>` and still
+/// compiles, and every handle stops resolving, because the caller looks for a
+/// value beginning `did=` and
+/// `_atproto.alice.example. 300 IN TXT "did=…"` does not begin with it.
+#[cfg(feature = "hickory-dns")]
+fn txt_values(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
+    lookup
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::TXT(txt) => Some(txt.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(feature = "hickory-dns")]
@@ -80,7 +119,7 @@ impl DnsResolver for HickoryDnsResolver {
             .await
             .map_err(|error| ResolveError::DNSResolutionFailed { error })?;
 
-        Ok(lookup.iter().map(|record| record.to_string()).collect())
+        Ok(txt_values(&lookup))
     }
 }
 
@@ -221,6 +260,50 @@ pub fn parse_input(input: &str) -> Result<InputType, ResolveError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A TXT answer yields its payload, not the whole record.
+    ///
+    /// This is the hickory 0.26 migration's one silent hazard. 0.25 returned a
+    /// `TxtLookup` whose `iter()` gave TXT rdata; 0.26 returns a generic
+    /// `Lookup` whose answers are `Record`s. Mapping `to_string()` over them
+    /// compiles, type-checks, and returns a `Vec<String>` of the right length
+    /// — and every handle stops resolving, because the caller matches a `did=`
+    /// prefix that `_atproto.alice.example. 300 IN TXT "did=…"` does not have.
+    #[cfg(feature = "hickory-dns")]
+    #[test]
+    fn a_txt_answer_yields_its_payload_not_the_whole_record() {
+        use hickory_resolver::lookup::Lookup;
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::rdata::TXT;
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        use std::str::FromStr;
+
+        let name = Name::from_str("_atproto.alice.example.").unwrap();
+        let query = Query::query(name.clone(), RecordType::TXT);
+        let did = "did=did:plc:iu5fzdrrfrc6kk7vmmatvin2";
+        let answers = vec![
+            Record::from_rdata(
+                name.clone(),
+                300,
+                RData::TXT(TXT::new(vec![did.to_string()])),
+            ),
+            // A non-TXT answer in the same response is dropped rather than
+            // stringified into the result.
+            Record::from_rdata(
+                name,
+                300,
+                RData::A(hickory_resolver::proto::rr::rdata::A::new(127, 0, 0, 1)),
+            ),
+        ];
+
+        let values = txt_values(&Lookup::new_with_max_ttl(query, answers));
+        assert_eq!(values, vec![did.to_string()]);
+        assert!(
+            values[0].starts_with("did="),
+            "the caller matches this prefix; got {:?}",
+            values[0]
+        );
+    }
     use super::*;
     use crate::key::{
         IdentityDocumentKeyResolver, KeyResolver, KeyType, generate_key, identify_key, to_public,

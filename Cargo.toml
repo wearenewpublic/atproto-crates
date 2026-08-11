@@ -69,14 +69,14 @@ ecdsa = { version = "0.16", features = ["std"] }
 ed25519-dalek = { version = "2.1", features = ["std", "rand_core"] }
 elliptic-curve = { version = "0.13", features = ["jwk", "serde"] }
 futures = "0.3"
-hickory-resolver = { version = "0.25" }
+hickory-resolver = { version = "0.26" }
 idna = "1.0"
 http = "1.4"
 indexmap = { version = "2", features = ["serde"] }
 itoa = "1.0"
 k256 = "0.13"
 fjall = "3"
-lru = "0.16"
+lru = "0.18"
 multibase = "0.9"
 multihash = "0.19"
 p256 = "0.13"

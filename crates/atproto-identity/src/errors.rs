@@ -242,7 +242,9 @@ pub enum ResolveError {
     #[error("error-atproto-identity-resolve-4 DNS resolution failed: {error:?}")]
     DNSResolutionFailed {
         /// The underlying DNS resolution error
-        error: hickory_resolver::ResolveError,
+        // 0.26 folded the resolver's own error type into `hickory-net`:
+        // `txt_lookup` now returns `Result<Lookup, NetError>`.
+        error: hickory_resolver::net::NetError,
     },
 
     /// Occurs when DNS TXT record lookup fails (generic version for when hickory-dns is not enabled)
