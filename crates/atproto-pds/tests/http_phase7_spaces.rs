@@ -1761,6 +1761,132 @@ async fn register_notify_accepts_an_ordinary_https_endpoint() {
     assert_eq!(status, StatusCode::OK, "registerNotify: {body}");
 }
 
+/// A registration can be withdrawn, and withdrawal is idempotent.
+///
+/// Until this method existed a subscription could only be left to lapse, and
+/// the ones `getSpaceCredential` creates for every credential consumer carry
+/// no expiry at all — so a service that stopped syncing a space stayed on the
+/// authority's delivery list permanently, and the authority kept signing
+/// tokens addressed to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_notify_withdraws_the_registration() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": uri, "endpoint": "https://consumer.example"}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "registerNotify: {body}");
+
+    let recipients = async || -> Vec<String> {
+        let store =
+            atproto_pds::actor_store::sql::SqlActorStore::open(manager.data_dir(), "did:plc:owner")
+                .await
+                .unwrap();
+        sqlx::query_scalar("SELECT service_did FROM space_credential_recipient WHERE space = ?")
+            .bind(&uri)
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+    };
+    assert!(
+        !recipients().await.is_empty(),
+        "registerNotify should have stored a recipient"
+    );
+
+    // No `service`: withdraw the caller's own registration, which is the row
+    // its own registerNotify created.
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.unregisterNotify",
+        json!({"space": uri}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "unregisterNotify: {body}");
+    assert!(
+        recipients().await.is_empty(),
+        "the registration should be gone: {:?}",
+        recipients().await
+    );
+
+    // Idempotent: withdrawing again is the same request with the same intent,
+    // and a caller retrying after a timeout must not get an error for it.
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.unregisterNotify",
+        json!({"space": uri}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second unregisterNotify: {body}");
+}
+
+/// `unregisterNotify` is gated exactly as `registerNotify` is: a space
+/// credential, presented with its proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_notify_requires_a_space_credential() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // No credentials at all.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.unregisterNotify",
+        json!({"space": uri}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // An OAuth session is not a space credential, however well it authorizes
+    // the caller for the space.
+    let (status, _) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.unregisterNotify",
+        json!({"space": uri}),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A credential is bound to one space, and that is checked before this host
+/// says whether any other space exists.
+///
+/// Ordering, not politeness: the existence of a space is only disclosed to a
+/// caller already authorized for the space it asked about, so a credential for
+/// a space that exists cannot be used to enumerate ones that might not.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_notify_reports_an_unknown_space() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let real = create_space(&app, &owner_token, "default").await;
+    let credential = mint_space_credential(&app, "did:plc:owner", &real).await;
+
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.unregisterNotify",
+        json!({"space": "at://did:plc:owner/space/app.bsky.group/never-created"}),
+        &credential,
+    )
+    .await;
+    // The credential is bound to `real`, so it does not authorize a different
+    // space URI — and the refusal names the credential, not the space.
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "InvalidToken", "{body}");
+}
+
 // ---------------------------------------------------------------------------
 //  Inbound notify endpoints (service auth required)
 // ---------------------------------------------------------------------------

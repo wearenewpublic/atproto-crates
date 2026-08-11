@@ -459,6 +459,10 @@ fn build_router_inner(
             "/xrpc/com.atproto.space.registerNotify",
             post(space_handlers::register_notify),
         )
+        .route(
+            "/xrpc/com.atproto.space.unregisterNotify",
+            post(space_handlers::unregister_notify),
+        )
         // Inbound notifyWrite (service auth; contentless { space, repo, rev }).
         .route(
             "/xrpc/com.atproto.space.notifyWrite",

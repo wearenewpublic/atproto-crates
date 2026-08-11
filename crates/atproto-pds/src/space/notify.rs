@@ -144,6 +144,38 @@ pub async fn upsert_recipient(
     .await
 }
 
+/// Remove a write-notification registration.
+///
+/// Returns how many rows were removed, which is 0 when no registration
+/// matched. That is not an error: the lexicon makes withdrawal idempotent, and
+/// a caller retrying after a timeout, or withdrawing a registration that has
+/// already lapsed, wants the same answer as one that removed a live row —
+/// "this service is not subscribed".
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] on a query failure.
+pub async fn delete_subscription(
+    owner_actor_pool: &SqlitePool,
+    space: &SpaceUri,
+    repo: Option<&str>,
+    service_did: &str,
+) -> PdsResult<u64> {
+    let result = sqlx::query(
+        "DELETE FROM space_credential_recipient
+         WHERE space = ? AND repo = ? AND service_did = ?",
+    )
+    .bind(space.to_string())
+    .bind(repo.unwrap_or(""))
+    .bind(service_did)
+    .execute(owner_actor_pool)
+    .await
+    .map_err(|e| PdsError::Storage {
+        reason: format!("delete_subscription: {e}"),
+    })?;
+    Ok(result.rows_affected())
+}
+
 /// INSERT-OR-REPLACE a subscription, keyed `(space, repo-or-empty,
 /// service_did)`. `repo = None` is the whole-space sentinel; `expires_at` is
 /// the optional RFC 3339 registration lifetime. Used by both the

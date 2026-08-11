@@ -39,7 +39,7 @@ const ROLES: [&str; 1] = ["pds"];
 ///
 /// Held to the router by `the_described_methods_match_the_router`. Add a route
 /// without adding it here and the tests fail, which is the point.
-const METHODS: [&str; 98] = [
+const METHODS: [&str; 99] = [
     "app.bsky.actor.getPreferences",
     "app.bsky.actor.putPreferences",
     "com.atproto.admin.deleteAccount",
@@ -127,6 +127,7 @@ const METHODS: [&str; 98] = [
     "com.atproto.space.notifyWrite",
     "com.atproto.space.putRecord",
     "com.atproto.space.registerNotify",
+    "com.atproto.space.unregisterNotify",
     "com.atproto.sync.getBlob",
     "com.atproto.sync.getBlocks",
     "com.atproto.sync.getLatestCommit",

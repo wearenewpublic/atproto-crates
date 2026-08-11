@@ -3257,6 +3257,137 @@ pub async fn register_notify(
 }
 
 // ---------------------------------------------------------------------------
+//  unregisterNotify — withdraw a write-notification registration.
+// ---------------------------------------------------------------------------
+
+/// Inputs for `com.atproto.space.unregisterNotify`.
+#[derive(Debug, Deserialize)]
+pub struct UnregisterNotifyInput {
+    /// Space URI.
+    pub space: String,
+    /// The per-repo registration to withdraw. Omit for a whole-space one.
+    ///
+    /// Mirrors `registerNotify`, which accepts the same parameter: a
+    /// registration made for one repo has to be withdrawable, and a request
+    /// naming no repo would otherwise silently target the whole-space row
+    /// instead. The draft lexicon omits `repo` on both methods while the
+    /// amended README keeps per-repo registrations — an inconsistency raised
+    /// upstream; this server follows the README, on both sides.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Service identifier of the subscriber to remove, as passed to
+    /// `registerNotify`.
+    ///
+    /// Optional here, where the lexicon requires it. Registrations are
+    /// currently keyed on an identity derived from the presenting credential
+    /// rather than on a caller-supplied name, so a service does not
+    /// necessarily know the string its own registration was stored under.
+    /// Omitting it withdraws the caller's own registration, derived exactly as
+    /// `registerNotify` derived it. Naming one explicitly does what the
+    /// lexicon says.
+    #[serde(default)]
+    pub service: Option<String>,
+}
+
+/// `POST /xrpc/com.atproto.space.unregisterNotify`.
+///
+/// Authenticated with a space credential, like `registerNotify`. Idempotent:
+/// succeeds whether or not a matching registration existed, because a caller
+/// retrying after a timeout, or withdrawing one that already lapsed, is asking
+/// for the same end state as one that removed a live row.
+pub async fn unregister_notify(
+    State(state): State<HttpState>,
+    parts: Parts,
+    Json(input): Json<UnregisterNotifyInput>,
+) -> Result<StatusCode, XrpcError> {
+    let space = parse_space_uri(&input.space)?;
+    let manager = account_manager(&state)?;
+    let _ = space_service(&state)?; // gate on Spaces being enabled
+
+    let (scheme, token) = authorization_token(&parts)?;
+    if classify(token) != Some(SpaceTokenKind::SpaceCredential) {
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "unregisterNotify requires a space credential",
+        ));
+    }
+    require_scheme(
+        scheme,
+        AuthScheme::Dpop,
+        "a space credential is bound to a key",
+    )?;
+    crate::http::space_auth::require_credential_dpop_proof(&parts, &state, token).await?;
+
+    // Verify the credential before looking the space up. The credential's
+    // `sub` binds it to one space, so checking it first means a credential for
+    // a space that exists cannot be used to ask whether some *other* space
+    // does: the existence answer is only given to a caller already authorized
+    // for the space it is asking about.
+    let credential = space_reader(&state)?
+        .verify_space_credential_for(&space, token)
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "InvalidToken",
+                format!("SpaceCredential verification: {e}"),
+            )
+        })?;
+
+    // SpaceNotFound when the authority's space row is absent: a withdrawal
+    // against a space this host does not answer for is a different failure
+    // from a withdrawal that found no registration.
+    let owner_store = SqlActorStore::open(manager.data_dir(), &space.space_did)
+        .await
+        .map_err(XrpcError::from)?;
+    let space_exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM space WHERE uri = ? LIMIT 1")
+        .bind(space.to_string())
+        .fetch_optional(owner_store.pool())
+        .await
+        .map_err(|e| {
+            XrpcError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                format!("unregisterNotify space lookup: {e}"),
+            )
+        })?;
+    if space_exists.is_none() {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "SpaceNotFound",
+            format!("space not found: {space}"),
+        ));
+    }
+
+    // Same derivation `registerNotify` uses, so an omitted `service` names the
+    // row this caller's own registration created.
+    let service_did = input.service.clone().unwrap_or_else(|| {
+        credential
+            .client_id
+            .clone()
+            .unwrap_or_else(|| credential.iss.clone())
+    });
+
+    let removed = crate::space::notify::delete_subscription(
+        owner_store.pool(),
+        &space,
+        input.repo.as_deref(),
+        &service_did,
+    )
+    .await
+    .map_err(XrpcError::from)?;
+    tracing::debug!(
+        space = %space,
+        service = %service_did,
+        removed,
+        "unregisterNotify"
+    );
+
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
 //  notifySpaceDeleted — space-deletion lifecycle notification.
 // ---------------------------------------------------------------------------
 

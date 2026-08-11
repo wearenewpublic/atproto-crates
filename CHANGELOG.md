@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `atproto-pds`: `com.atproto.space.unregisterNotify` withdraws a write-notification registration —
+  the method proposal 0016 gained in
+  [bluesky-social/proposals#100](https://github.com/bluesky-social/proposals/pull/100), and the only
+  way to stop being notified other than waiting for a registration to lapse.
+
+  Some registrations never lapse. `getSpaceCredential` registers every credential consumer as a
+  whole-space recipient with no expiry at all, so a service that stopped syncing a space stayed on
+  the authority's delivery list permanently — and the authority kept minting service-auth tokens
+  addressed to it and POSTing to its endpoint, on every write, forever.
+
+  Authenticated with a space credential exactly as `registerNotify` is, and idempotent: withdrawing
+  a registration that is not there returns success, because a caller retrying after a timeout, or
+  withdrawing one that already lapsed, is asking for the same end state as one that removed a live
+  row.
+
+  Two deliberate departures from the draft lexicon, both because it is stricter than this server's
+  `registerNotify` can support. `service` is optional — registrations are currently keyed on an
+  identity derived from the presenting credential rather than a caller-supplied name, so a service
+  does not necessarily know the string its own registration was stored under; omitting it withdraws
+  the caller's own, derived exactly as `registerNotify` derived it. And `repo` is accepted, so a
+  per-repo registration can be withdrawn at all; the draft omits it from both methods while the
+  amended README keeps per-repo registrations, an inconsistency raised upstream.
+
+  The credential is verified *before* the space is looked up, so a caller holding a credential for
+  one space cannot use it to ask whether another exists. `registerNotify` still checks in the other
+  order; that is pre-existing and untouched here.
+
 ### Changed
 - `atproto-pds`: `getSpace` moved to `com.atproto.simplespace.getSpace` and answers
   `{uri, policy, appAccess}` with both config fields as top-level open unions — per proposal 0016 as
