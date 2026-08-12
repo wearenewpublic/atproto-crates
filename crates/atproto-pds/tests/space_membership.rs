@@ -562,3 +562,62 @@ async fn a_remote_authority_is_deferred_to_rather_than_refused() {
          non-member, which this server cannot know: {body}"
     );
 }
+
+/// The read side of the same rule, in both directions.
+///
+/// A member reading their **own** repo in a cross-PDS space is the production
+/// case: the authority's member list is on another host, and refusing what this
+/// server cannot verify refused every such read — a member could not see their
+/// own records.
+///
+/// Reading **someone else's** repo is not the same question. The target check is
+/// what stops one account being handed another account's permissioned records,
+/// and there "I could not verify it" is a reason to refuse, not to answer. A
+/// space credential is how a cross-host reader gets those records: it carries
+/// the authority's own signature, which is evidence this server can check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_authority_lets_a_member_read_only_their_own_repo() {
+    let (app, manager, _tmp) = build_app().await;
+    let space = "at://did:plc:authorityonanotherpds000000/space/app.bsky.group/default";
+    let rkey = "3kaaaaaaaaaa5";
+
+    let outsider = app_password_session(&app, &manager, OUTSIDER_DID, OUTSIDER_HANDLE).await;
+    let (status, body) = post_json(
+        &app,
+        "/xrpc/com.atproto.space.putRecord",
+        json!({
+            "repo": OUTSIDER_DID,
+            "space": space,
+            "collection": COLLECTION,
+            "rkey": rkey,
+            "record": {"$type": COLLECTION, "text": "cross-host"},
+        }),
+        Some(&outsider),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fixture write failed: {body}");
+
+    let path = format!(
+        "/xrpc/com.atproto.space.getRecord?space={}&collection={COLLECTION}&rkey={rkey}&repo={OUTSIDER_DID}",
+        urlencoding(space)
+    );
+
+    // Their own records, in a space this server holds no member list for.
+    let (status, body) = get_json(&app, &path, Some(&outsider)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a member could not read their own record in a cross-PDS space: {body}"
+    );
+
+    // Another local account naming that repo gets nothing: there is no list
+    // here that puts them in the same space, and a session is not a claim.
+    let other = app_password_session(&app, &manager, OWNER_DID, OWNER_HANDLE).await;
+    let (status, body) = get_json(&app, &path, Some(&other)).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "one account read another's permissioned record out of a space this \
+         server cannot vouch for: {body}"
+    );
+}

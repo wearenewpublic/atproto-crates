@@ -1297,13 +1297,30 @@ struct ResolvedRecordAuth<'a> {
 /// given space contains a given account's records is itself the confidential
 /// fact, and a caller who is not a member should not be able to probe it.
 ///
-/// Only [`Membership::NotMember`] refuses. The member list belongs to the space
-/// authority, so for a space hosted elsewhere there is nothing here to check
-/// against, and reading that absence as "not a member" refused every read in
-/// every cross-PDS space — including a member reading their own repo, and
-/// including a SpaceCredential minted by the very authority that holds the list.
-/// Same call as [`require_space_member`] makes on the write side: local
-/// authority, enforce; remote authority, defer to the side that owns the list.
+/// # When the member list is not on this server
+///
+/// The list belongs to the space authority, so for a space hosted elsewhere
+/// there is nothing here to check against, and reading that absence as "not a
+/// member" refused every read in every cross-PDS space — including a member
+/// reading their own repo, and including a SpaceCredential minted by the very
+/// authority that holds the list. But it cannot simply be waved through
+/// either: the *target* check is what stops one account being handed another
+/// account's permissioned records, and "I could not verify it" is not a reason
+/// to answer with someone else's data.
+///
+/// So the two questions part company on
+/// [`Membership::AuthorityElsewhere`]:
+///
+/// - **The caller**, and a target that *is* the caller, defer to the authority
+///   that owns the list — the caller is authenticated as themselves and is
+///   reading their own records either way.
+/// - **A target that is not the caller** needs positive local evidence, and an
+///   unverifiable claim is refused. A session-authenticated account does not
+///   get another account's records out of a space this server cannot vouch for.
+/// - **A SpaceCredential** (`caller: None`) defers, because the credential is
+///   the authority's own signed statement about its space and
+///   [`SpaceReader::verify_auth`] has checked that signature. That is the
+///   cross-host read path, and the authority is exactly who should answer.
 async fn assert_space_membership(
     state: &HttpState,
     uri: &SpaceUri,
@@ -1330,15 +1347,28 @@ async fn assert_space_membership(
     }
     // When the caller reads its own repo, the caller check above already
     // established membership.
-    if caller != Some(target)
-        && service
+    if caller != Some(target) {
+        let target_membership = service
             .membership(uri, target)
             .await
-            .map_err(XrpcError::from)?
-            == Membership::NotMember
-    {
-        tracing::debug!(space = %uri, target = %target, "space read refused: target is not a member");
-        return Err(deny());
+            .map_err(XrpcError::from)?;
+        let vouched = match caller {
+            // Session or OAuth: only a local member list can put another
+            // account's records in front of this caller.
+            Some(_) => target_membership == Membership::Member,
+            // SpaceCredential: the authority signed for this space, so its
+            // absence from this server is not evidence against the target.
+            None => target_membership != Membership::NotMember,
+        };
+        if !vouched {
+            tracing::debug!(
+                space = %uri,
+                target = %target,
+                membership = ?target_membership,
+                "space read refused: target is not a member this server can vouch for"
+            );
+            return Err(deny());
+        }
     }
     Ok(())
 }

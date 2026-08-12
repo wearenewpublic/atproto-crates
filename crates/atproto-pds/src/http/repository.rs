@@ -1153,10 +1153,19 @@ fn decode_record(bytes: &[u8]) -> Result<serde_json::Value, XrpcError> {
 /// one that does not exist. The records would be real, would be theirs, and
 /// would sync nowhere. Membership is the check that belongs here.
 ///
-/// Only a local member list can refuse: for a space whose authority is hosted
-/// elsewhere this server holds no list, and treating that as a negative would
-/// lock a member out of their own space through the portal while the XRPC path
-/// let the same write through. See [`crate::space::Membership`].
+/// Positive local evidence, deliberately: only [`crate::space::Membership::Member`]
+/// passes here, so a space whose authority this server does not host is refused
+/// along with one the caller simply is not in.
+///
+/// That is stricter than the XRPC guard, which defers to a remote authority
+/// rather than lock out cross-PDS members. The difference is what the caller
+/// brought. An XRPC client presents a credential the authority signed, or is
+/// syncing a space it can name for a reason; a browser session presents a
+/// guessable URL and nothing else, and the space DID in that URL is a path
+/// segment the user typed. With no list to check it against there is nothing
+/// between "a space I am in on another host" and "a DID I made up", so the
+/// portal declines to guess — a cross-PDS member reaches the space over XRPC
+/// instead of through this UI.
 async fn require_member(state: &HttpState, space: &SpaceUri, did: &str) -> Result<(), XrpcError> {
     let service = state.space_service.as_deref().ok_or_else(|| {
         XrpcError::new(
@@ -1169,7 +1178,7 @@ async fn require_member(state: &HttpState, space: &SpaceUri, did: &str) -> Resul
         .membership(space, did)
         .await
         .map_err(XrpcError::from)?
-        != crate::space::Membership::NotMember
+        == crate::space::Membership::Member
     {
         return Ok(());
     }
