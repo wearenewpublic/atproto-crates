@@ -102,6 +102,100 @@ fn thumbprint_kid(jwk: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    /// Byte-exact JWK output for three fixed keys, one per supported curve.
+    ///
+    /// The other tests here generate a random key, so they can only assert
+    /// shape — that `crv` says `P-256`, that `d` is absent, that `kid` is
+    /// longer than ten characters. None of them would notice if the encoding
+    /// of `x` changed, and that is the part consumers depend on: `kid` is a
+    /// thumbprint over `crv`/`kty`/`x`/`y`, so any change to how a coordinate
+    /// is serialised silently republishes every key under a new `kid`, and a
+    /// consumer pinning the old one stops verifying our signatures.
+    ///
+    /// These values were captured from this code, so they assert continuity
+    /// rather than correctness against an external authority — a deliberate
+    /// tripwire for a JWK implementation swapped in underneath. Changing one
+    /// is a decision about the wire format, not a test fix.
+    ///
+    /// Compared as parsed JSON, not as text. Field order here is not ours to
+    /// pin: `atproto-attestation` enables `serde_json/preserve_order`, so
+    /// whether a `Map` is an `IndexMap` or a `BTreeMap` depends on feature
+    /// unification, and this object serialises in insertion order when the
+    /// whole workspace builds and alphabetically when this crate builds
+    /// alone. Neither matters — JSON object order carries no meaning, and
+    /// `kid` is computed over a canonical object built field by field below,
+    /// so it comes out identical either way. Asserting on the text would have
+    /// pinned an artefact of the build graph.
+    #[test]
+    fn jwk_publication_is_byte_stable_across_curves() {
+        use atproto_identity::key::identify_key;
+
+        // Fixed private keys. `key_to_jwk_value` publishes the public half.
+        const CASES: &[(&str, &str, &str)] = &[
+            (
+                "P-256",
+                "did:key:z42tnbHmmnhF11nwSnp5kQJbcZQw2Vbw5WF3ABDSxPtDgU2o",
+                r#"{"alg":"ES256","crv":"P-256","kid":"AdbV1IYmdPHVnFFHV14jWlzgZaQErfd2IgTM0IdU-os","kty":"EC","use":"sig","x":"axDH7SohQqaxQH009D3qxF5VXmNoVQ8e_naICf0bwhU","y":"mJdQpagD5VImZJSJZCCYAM7wEgv4tMbFEI923RSr0TY"}"#,
+            ),
+            (
+                "secp256k1",
+                "did:key:z3vLY4nbXy2rV4Qr65gUtfnSF3A8Be7gmYzUiCX6eo2PR1Rt",
+                r#"{"alg":"ES256K","crv":"secp256k1","kid":"-DJpwrHF5YfkUEgq62OuQdgfYohyG8ocVOXJX-_xrVg","kty":"EC","use":"sig","x":"F3U6z00iOii8rUJDfYmLVk-shOvzBIvbSQpPoUm6Qps","y":"_MplUy_ZPGLCTE5YexuzNbz43w5-zBUWUlifYC3I1MQ"}"#,
+            ),
+            (
+                "P-384",
+                "did:key:zEanKnNAasQo4KSsY1qvS4hjB35sZ9DNxszP2urnkoEbb716dbDr2mtbTktSJYKbLNxvP",
+                r#"{"alg":"ES384","crv":"P-384","kid":"cZY4m1sY7DgqyomUfOt91QJRXawYG_meUI9uCrr3tIo","kty":"EC","use":"sig","x":"hbDIFhBNCQEKJjJriBW04DluKh9S93_rFPzEmrgzy8X4Fu23DHmqMwwrXZgdLB7s","y":"QLpTdgr3E2NfuAaPPtDoMUaTuk9GwQwOSm_BPvDfEvWnpXEAFlH0whDn_fcOEyEm"}"#,
+            ),
+        ];
+
+        for (curve, did_key, expected) in CASES {
+            let key = identify_key(did_key).expect("fixture key parses");
+            let value = key_to_jwk_value(&key).expect("fixture key converts to a JWK");
+            let expected: serde_json::Value =
+                serde_json::from_str(expected).expect("golden value is valid JSON");
+            assert_eq!(
+                value, expected,
+                "{curve}: published JWK changed. If this is intended, the `kid` changed with it \
+                 and every consumer pinning the old one must be considered."
+            );
+            // `d` would publish the private scalar.
+            assert!(
+                value.get("d").is_none(),
+                "{curve}: JWK must never carry the private component"
+            );
+        }
+    }
+
+    /// The `kid` is a thumbprint of the key material, so two different keys
+    /// must not collide, and the same key must produce the same `kid` on
+    /// every call. `jwks_handler` deduplicates published keys by `kid`, so a
+    /// collision would silently drop a rotated signer from the JWKS.
+    #[test]
+    fn kid_is_distinct_per_key_and_stable_per_call() {
+        use atproto_identity::key::identify_key;
+
+        let dids = [
+            "did:key:z42tnbHmmnhF11nwSnp5kQJbcZQw2Vbw5WF3ABDSxPtDgU2o",
+            "did:key:z3vLY4nbXy2rV4Qr65gUtfnSF3A8Be7gmYzUiCX6eo2PR1Rt",
+            "did:key:zEanKnNAasQo4KSsY1qvS4hjB35sZ9DNxszP2urnkoEbb716dbDr2mtbTktSJYKbLNxvP",
+        ];
+        let mut kids = Vec::new();
+        for did in dids {
+            let key = identify_key(did).expect("fixture key parses");
+            let first = key_to_jwk_value(&key).expect("converts");
+            let again = key_to_jwk_value(&key).expect("converts");
+            assert_eq!(first["kid"], again["kid"], "kid must be stable per key");
+            kids.push(first["kid"].as_str().expect("kid is a string").to_string());
+        }
+        let unique: std::collections::HashSet<&String> = kids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            kids.len(),
+            "kid collision across keys: {kids:?}"
+        );
+    }
+
     #[test]
     fn key_to_jwk_value_for_p256() {
         use atproto_identity::key::{KeyType, generate_key};
