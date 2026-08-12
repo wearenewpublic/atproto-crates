@@ -46,7 +46,8 @@ use crate::space::reader::SpaceReadAuth;
 use crate::space::writer::{SpaceCommitResult, SpaceWriteAction, SpaceWriteOp};
 use crate::space::{Membership, SpaceReader, SpaceService, SpaceSync, SpaceWriter};
 use atproto_space::credential::{
-    DELEGATION_TOKEN_TTL_SECS, create_delegation_token, create_space_credential,
+    DELEGATION_TOKEN_TTL_SECS, TYP_SPACE_CREDENTIAL, create_delegation_token,
+    create_space_credential,
 };
 use atproto_space::storage::OplogCursor;
 use atproto_space::types::SpaceUri;
@@ -1427,7 +1428,37 @@ async fn resolve_record_auth<'a>(
             "InvalidToken",
             "delegation token cannot be used to read records; exchange it at getSpaceCredential first",
         )),
-        _ => {
+        other => {
+            // A token signed with somebody's key is not one of the two HMAC
+            // shapes below, and saying so here is the difference between a
+            // usable refusal and a misleading one. Falling through, the HMAC
+            // verifier reported the first thing it noticed -- "bearer token
+            // rejected: unsupported alg ES256K" -- which reads as this server
+            // lacking ES256K support. It does not: the algorithm is fine and
+            // the token is simply not one of the kinds this endpoint takes,
+            // which is what a caller needs to be told.
+            if let Some(alg) = crate::http::space_auth::token_alg(raw)
+                && crate::http::space_auth::is_asymmetric_jws(&alg)
+            {
+                let typ = match &other {
+                    Some(SpaceTokenKind::Other(typ)) => typ.clone(),
+                    _ => "none".to_string(),
+                };
+                tracing::debug!(
+                    alg = %alg,
+                    typ = %typ,
+                    "space read refused: token is signed with a key but is not a space token"
+                );
+                return Err(XrpcError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "AuthenticationRequired",
+                    format!(
+                        "this endpoint accepts a session token, an OAuth access token, or a \
+                         SpaceCredential (typ={TYP_SPACE_CREDENTIAL}); the presented token is \
+                         signed with {alg} and declares typ={typ}"
+                    ),
+                ));
+            }
             // Treat as a session-style or OAuth access token. The unified
             // helper transparently accepts both shapes and enforces DPoP
             // when an OAuth token carries a `cnf.jkt` thumbprint.

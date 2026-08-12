@@ -4891,3 +4891,61 @@ async fn a_cross_collection_listing_that_fits_reports_no_cursor() {
         "a page that fits must not offer a cursor: {body}"
     );
 }
+
+/// A key-signed token that is not a space token is refused with a reason a
+/// caller can act on.
+///
+/// The two verifiers this path falls back to check HMAC tokens this server
+/// minted for itself, so the first thing they noticed about an ES256K token was
+/// its algorithm: `bearer token rejected: unsupported alg ES256K`. That reads as
+/// "this server does not support ES256K" and cost a client author a debugging
+/// session against a server whose algorithm support was never the problem — the
+/// token simply was not one of the kinds the endpoint takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_signed_token_is_told_what_this_endpoint_accepts() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+
+    // A service-auth-shaped token: signed with a real K256 key, so `alg` is
+    // ES256K and nothing about it is malformed.
+    let key = generate_key(KeyType::K256Private).unwrap();
+    let header = B64URL.encode(
+        serde_json::to_vec(&json!({"alg": "ES256K", "typ": "JWT", "kid": "#atproto"})).unwrap(),
+    );
+    let claims = B64URL.encode(
+        serde_json::to_vec(&json!({
+            "iss": "did:plc:someappview00000000000000",
+            "aud": "did:web:test.example",
+            "lxm": "com.atproto.space.getRecord",
+            "iat": 1_760_000_000u64,
+            "exp": 9_999_999_999u64,
+        }))
+        .unwrap(),
+    );
+    let signing_input = format!("{header}.{claims}");
+    let sig = atproto_identity::key::sign(&key, signing_input.as_bytes()).unwrap();
+    let token = format!("{signing_input}.{}", B64URL.encode(sig));
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&collection=c.d.e&rkey=r1&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&token),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("SpaceCredential"),
+        "the refusal should name the token kinds this endpoint accepts: {message}"
+    );
+    assert!(
+        !message.contains("unsupported alg"),
+        "the refusal still blames the algorithm: {message}"
+    );
+}

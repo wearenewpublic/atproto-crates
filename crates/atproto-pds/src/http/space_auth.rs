@@ -37,6 +37,40 @@ struct JwtTypHeader {
     typ: String,
 }
 
+/// JWT `alg` inspection, for telling a token this server could have issued from
+/// one signed by somebody's key.
+#[derive(Debug, Deserialize)]
+struct JwtAlgHeader {
+    alg: String,
+}
+
+/// The JWS algorithm named in a token's header, or `None` when the token is
+/// malformed or names no algorithm.
+#[must_use]
+pub fn token_alg(token: &str) -> Option<String> {
+    let header_b64 = token.split('.').next()?;
+    let header_bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(header_b64.as_bytes())
+        .ok()?;
+    let header: JwtAlgHeader = serde_json::from_slice(&header_bytes).ok()?;
+    Some(header.alg)
+}
+
+/// Whether `alg` signs with a key rather than a shared secret.
+///
+/// Session and OAuth access tokens are HMAC tokens this server minted for
+/// itself. Anything asymmetric was signed by somebody's private key, so it
+/// arrived from outside and is either a space token or a token for a different
+/// audience entirely — not something the HMAC verifiers can say anything useful
+/// about.
+#[must_use]
+pub fn is_asymmetric_jws(alg: &str) -> bool {
+    matches!(
+        alg,
+        "ES256" | "ES256K" | "ES384" | "ES512" | "EdDSA" | "RS256" | "PS256"
+    )
+}
+
 /// Identify which kind of token this is by parsing the JWT header `typ`.
 /// Returns the literal `typ` value or `None` if the token is malformed /
 /// missing a `typ` claim.
