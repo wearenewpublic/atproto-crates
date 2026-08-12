@@ -24,7 +24,7 @@ atproto-client.workspace = true
 atproto-dasl.workspace = true
 atproto-extras = { workspace = true, features = ["hickory-dns"] }
 atproto-identity = { workspace = true, features = ["hickory-dns"] }
-atproto-lexicon = { workspace = true, features = ["panproto"] }
+atproto-lexicon = { workspace = true }
 atproto-record.workspace = true
 
 dirs.workspace = true

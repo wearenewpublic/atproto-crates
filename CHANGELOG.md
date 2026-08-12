@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Removed
+- **`atproto-lexicon`'s `transmogrify` and `compatibility` modules, the `panproto` feature, and the
+  `panproto-core` dependency**, along with `atpmcp`'s `transmogrify_record` tool. This clears
+  RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both 7.5 high, in `quick-xml`) by removing the code that
+  reached them, so they are gone from the graph rather than accepted in `.cargo/audit.toml` — which
+  is down to four entries, all now tracing to the single `s3` TLS cause. 27 crates leave the
+  lockfile; `atproto-lexicon`'s own tree drops from 742 to 614 edges.
+
+  The trigger was measuring what the `panproto` path actually bought, which turned out to be
+  negative. Transforming `{handle, bio}` into `{handle, bio, avatarUrl}` with the record
+  `{"handle": "alice.test", "bio": "hi"}`, the categorical strategy across repeated runs on
+  *identical input* returned `{"handle": "alice.test"}`, `{"bio": "alice.test"}` and
+  `{"avatarUrl": "alice.test"}` — three different mappings, each dropping `bio` despite its exact
+  name and type match in the destination, two of them writing the handle into an unrelated field.
+  It reported quality 0.77 for those, against 0.67 for the correct answer, so the confidence signal
+  pointed the wrong way too. The JSON strategy returned the same correct record on all six runs.
+
+  Nothing caught this because the comparison that would have rejected the worse result was
+  conditioned on `resolved_refs.is_some()`, and the public `transmogrify` entry point passes `None`
+  — so the categorical answer was returned unchecked. The quality assertions in the tests were
+  `> 0.0` and `== 1.0`, which both answers satisfy.
+
+  `compatibility` had no caller anywhere in the workspace, and the only known external consumer of
+  the feature reimplements both against `panproto-core` directly rather than through this crate, so
+  it is unaffected.
+
+  This removes public API: `atproto_lexicon::transmogrify`, `atproto_lexicon::compatibility`, and
+  the `TransmogrifyError` / `CompatibilityError` types.
+
 ### Added
 - **`cargo audit` is now a CI step**, and the accepted advisories are written down in
   `.cargo/audit.toml` with the reason for each.

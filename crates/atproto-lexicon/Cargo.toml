@@ -26,7 +26,6 @@ default = ["hickory-dns"]
 zeroize = ["dep:zeroize"]
 hickory-dns = ["dep:hickory-resolver"]
 clap = ["dep:clap"]
-panproto = ["dep:panproto-core"]
 
 [dependencies]
 atproto-dasl.workspace = true
@@ -49,7 +48,6 @@ tracing.workspace = true
 unicode-segmentation.workspace = true
 zeroize = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
-panproto-core = { workspace = true, optional = true }
 
 [lints]
 workspace = true

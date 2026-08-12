@@ -23,20 +23,10 @@
 
 [advisories]
 ignore = [
-    # --- quick-xml 0.37.5, via panproto-io -> panproto-core -------------------
-    # Memory-exhaustion DoS in `NsReader` namespace handling, and quadratic
-    # time checking start tags for duplicate attributes. Both 7.5 high, both
-    # fixed in quick-xml 0.41.
-    #
-    # Reachable only under `atproto-lexicon/panproto`, which only `atpmcp`
-    # enables — a developer tool, not the server. Cannot be fixed here:
-    # panproto-io pins the 0.37 line, so `cargo update -p quick-xml --precise
-    # 0.41.0` is refused by the resolver, and panproto-core 0.70 (the current
-    # release) still depends on the same quick-xml. Upstream's to fix.
-    #
-    # Revisit when panproto-io moves to quick-xml >= 0.41.
-    "RUSTSEC-2026-0195",
-    "RUSTSEC-2026-0194",
+    # RUSTSEC-2026-0195 and RUSTSEC-2026-0194 (quick-xml) were here. They came
+    # in under `atproto-lexicon/panproto`, which has been removed, so quick-xml
+    # is no longer in the graph at all and the entries are gone rather than
+    # accepted.
 
     # --- rustls-webpki 0.101.7, via the `s3` feature --------------------------
     # Reachable panic parsing CRLs, plus two name-constraint checking flaws.

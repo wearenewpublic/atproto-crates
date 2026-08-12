@@ -81,7 +81,6 @@ multibase = "0.9"
 multihash = "0.19"
 p256 = "0.13"
 p384 = "0.13"
-panproto-core = "0.26"
 rand = "0.10"
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "system-proxy", "json", "rustls-tls"] }
