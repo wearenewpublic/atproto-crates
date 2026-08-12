@@ -72,11 +72,12 @@ XRPC endpoints (default features):
   (`createSpace`, `updateSpace`, `deleteSpace`, `addMember`, `removeMember`,
   `listMembers`) and the permissioned realm under `com.atproto.space.*`
   (`getSpace`, `listSpaces`, `applyWrites`, `createRecord`, `putRecord`,
-  `deleteRecord`, `getRecord`, `listRecords` (keys-only), `getBlob`,
+  `deleteRecord`, `getRecord`, `listRecords` (values inlined by default,
+  `excludeValues` for keys only), `getBlob`,
   `listRepos`, `getRepoState`, `listRepoOps`, `getDelegationToken` →
   `getSpaceCredential` (the two-step delegation-token/credential exchange,
   replay-protected via the in-memory JTI guard with optional Valkey/Redis
-  backing), `registerNotify`, and the contentless
+  backing), `registerNotify`/`unregisterNotify`, and the contentless
   `notifyWrite`/`notifySpaceDeleted` inbound hooks). Aligned to the published
   0016 Permissioned Data spec.
 - **Admin** (`com.atproto.admin.*`) — `getAccountInfo`, `getAccountInfos`,
@@ -86,7 +87,7 @@ XRPC endpoints (default features):
   `updateAccountHandle`, `updateAccountPassword`, `sendEmail`,
   `takedownSpaceRecord`, `revokeServiceAuth`, `forceRepoSync`. HTML
   operator dashboard at `GET /admin`.
-- **Federation** — Inbound `notifyWrite` / `notifyMembership` receipts,
+- **Federation** — Inbound `notifyWrite` / `notifySpaceDeleted` receipts,
   outbound `requestCrawl` announcements, default-pin `Atproto-Proxy`
   routing for `app.bsky.*` plus per-request override via header.
 
