@@ -29,7 +29,7 @@
 //! for the consoles already using it, and a negotiated subprotocol wins.
 
 use crate::http::state::HttpState;
-use crate::sequencer::frame::{Encoding, encode_error, encode_event};
+use crate::sequencer::frame::{Encoding, encode_error, encode_event, encode_info};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -210,6 +210,60 @@ async fn run_subscriber(
     // receive. The reference leaves its outbox cursor unset in this case and
     // streams live events only (subscribeRepos.ts:23-24).
     let mut cursor = params.cursor.or(head);
+
+    // A cursor *below* the retained window is the other end of the same
+    // question, and it is not an error. Retention drops events past its
+    // window, so a consumer that was down longer than that asks to resume from
+    // a point this server no longer holds. The spec's answer is an `#info`
+    // message named `OutdatedCursor`: the subscription continues, from the
+    // oldest event still held, and the consumer knows there is a gap and that
+    // it has to reconcile by other means rather than trusting the stream to be
+    // continuous.
+    //
+    // Silence would be the harmful option. Without the notice the subscriber
+    // is served the oldest retained event as though it were the next one after
+    // its cursor, and a relay would carry a repository forward across a hole it
+    // has no way to detect -- the same silent, permanent gap the firehose
+    // publish race used to produce, arriving by a different route.
+    //
+    // Sent only when events are genuinely missing: `read_after` returns rows
+    // *after* the cursor, so a cursor of exactly `earliest - 1` is still
+    // contiguous and gets no notice.
+    if let Some(requested) = params.cursor {
+        match sequencer.earliest_seq().await {
+            Ok(Some(earliest)) if requested + 1 < earliest => {
+                let (bytes, is_text) = encode_info(
+                    encoding,
+                    "OutdatedCursor",
+                    "the requested cursor is older than this server's firehose retention; \
+                     resuming from the oldest event still held",
+                );
+                // A consumer that cannot take the notice cannot be told about
+                // the gap, and streaming on regardless is exactly the silent
+                // hole this exists to prevent.
+                if send_frame(&mut socket, bytes, is_text, send_timeout).await != SendOutcome::Sent
+                {
+                    return;
+                }
+                tracing::info!(
+                    requested,
+                    earliest,
+                    missed = earliest - requested - 1,
+                    "subscribeRepos: cursor predates retention; sent OutdatedCursor"
+                );
+                // Resume from the floor rather than the cursor, so the first
+                // event delivered is the oldest one still held.
+                cursor = Some(earliest - 1);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Not fatal: without the floor the worst case is that the
+                // subscriber is served whatever remains with no notice, which
+                // is the behaviour before this check existed.
+                tracing::warn!(error = %e, "subscribeRepos: could not read the retention floor");
+            }
+        }
+    }
 
     // The poll is a backstop, not the delivery path: the broadcast wakes a
     // subscriber the moment the stream moves, and this exists only to catch

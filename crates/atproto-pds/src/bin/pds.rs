@@ -349,6 +349,29 @@ struct Args {
     )]
     blob_grace_hours: i64,
 
+    /// How long the firehose log keeps an event, in hours. Default 72. `0`
+    /// disables the sweep, which means the log grows without bound.
+    ///
+    /// Every event is a second copy of a record, as a DAG-CBOR CAR, in the
+    /// shared accounts database -- so this is not one account's storage that
+    /// fills but the database sessions, OAuth and the sequencer all live in.
+    ///
+    /// The window exists so a relay or AppView that falls over can reconnect
+    /// and resume rather than backfilling from `getRepo`. Three days covers a
+    /// weekend outage. A consumer that lags further gets `OutdatedCursor` and
+    /// re-syncs, which is the documented path and not a failure.
+    ///
+    /// The newest event is never deleted regardless of age: it is what
+    /// `subscribeRepos` compares a resume cursor against, and an empty log
+    /// would make every valid cursor read as `FutureCursor`.
+    #[arg(
+        long,
+        env = "PDS_STREAM_EVENT_RETENTION_HOURS",
+        default_value_t = 72,
+        value_parser = clap::value_parser!(i64).range(0..=8760),
+    )]
+    stream_event_retention_hours: i64,
+
     /// How long to wait for in-flight requests and background workers after a
     /// SIGTERM before exiting anyway. Default 25 seconds.
     ///
@@ -1306,6 +1329,7 @@ async fn main() -> anyhow::Result<()> {
         GcRetention {
             space_oplog_days: args.space_oplog_retention_days,
             blob_grace_hours: args.blob_grace_hours,
+            stream_event_hours: args.stream_event_retention_hours,
         },
         unified_gc_interval,
         token.clone(),
@@ -1456,6 +1480,8 @@ struct GcRetention {
     space_oplog_days: i64,
     /// Hours an unreferenced blob is kept. `0` disables that sweep.
     blob_grace_hours: i64,
+    /// Hours of firehose log kept. `0` disables that sweep.
+    stream_event_hours: i64,
 }
 
 /// Unified daily GC loop. Calls `gc::tick_with`
@@ -1481,11 +1507,28 @@ async fn unified_gc_loop(
     interval: Duration,
     token: tokio_util::sync::CancellationToken,
 ) {
+    // First tick fires immediately; skip it so we don't pile work on the
+    // accounts pool right at boot -- but do not then wait a whole interval.
+    //
+    // With a daily interval that meant a process restarted once a day never
+    // swept at all: every restart put the next tick 24 hours out and the
+    // process rarely lived that long. The sweep that never runs is
+    // indistinguishable from the sweep that does not exist, which is how the
+    // firehose log grew unbounded while a GC loop was ostensibly running.
+    //
+    // A minute is enough to be clear of boot -- migrations, key loading, the
+    // listener coming up -- and short enough that the first sweep is
+    // observable while an operator is still watching the deploy.
+    const FIRST_TICK_DELAY: Duration = Duration::from_secs(60);
+    tokio::select! {
+        _ = token.cancelled() => {
+            info!("unified GC worker exiting before its first tick");
+            return;
+        }
+        _ = tokio::time::sleep(FIRST_TICK_DELAY) => {}
+    }
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // First tick fires immediately; skip it so we don't pile work on the
-    // accounts pool right at boot.
-    ticker.tick().await;
     loop {
         tokio::select! {
             _ = token.cancelled() => {
@@ -1497,6 +1540,7 @@ async fn unified_gc_loop(
                     data_dir: Some(&data_dir),
                     space_oplog_retention_days: retention.space_oplog_days,
                     blob_grace_hours: retention.blob_grace_hours,
+                    stream_event_retention_hours: retention.stream_event_hours,
                 };
                 let report = atproto_pds::gc::tick_with(&pool, &jti_guard, &rate_limiter, &opts).await;
                 tracing::info!(
@@ -1509,6 +1553,7 @@ async fn unified_gc_loop(
                     rate_limit_window = report.rate_limit_window,
                     space_oplog = report.space_oplog,
                     orphan_blobs = report.orphan_blobs,
+                    stream_event = report.stream_event,
                     "unified GC tick complete"
                 );
             }

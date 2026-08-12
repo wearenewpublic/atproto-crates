@@ -254,6 +254,44 @@ impl Sequencer {
             .collect())
     }
 
+    /// Lowest `seq` still in the log, or `None` when it is empty.
+    ///
+    /// The floor of what a resuming subscriber can still be served. Retention
+    /// moves it forward, so a cursor below it names events this server no
+    /// longer holds — which is `OutdatedCursor`, not an error: the subscription
+    /// continues from what is left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if the read fails.
+    pub async fn earliest_seq(&self) -> PdsResult<Option<i64>> {
+        let row: Option<(Option<i64>,)> = match self.pool.kind() {
+            #[cfg(feature = "sqlite")]
+            AccountPoolKind::Sqlite => {
+                sqlx::query_as("SELECT MIN(seq) FROM stream_event")
+                    .fetch_optional(self.pool.as_sqlite())
+                    .await
+            }
+            #[cfg(feature = "postgres")]
+            AccountPoolKind::Postgres => {
+                sqlx::query_as("SELECT MIN(seq) FROM stream_event")
+                    .fetch_optional(self.pool.as_postgres())
+                    .await
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(PdsError::Storage {
+                    reason: "stream earliest_seq: no accounts backend compiled in".to_string(),
+                });
+            }
+        }
+        .map_err(|e| PdsError::Storage {
+            reason: format!("stream earliest_seq: {e}"),
+        })?;
+        // MIN over an empty table is a row holding NULL, not an absent row.
+        Ok(row.and_then(|(seq,)| seq))
+    }
+
     /// Highest `seq` the stream has issued, or `None` when it is empty.
     ///
     /// This is the high-water mark a cursor is compared against.

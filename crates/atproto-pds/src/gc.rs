@@ -50,6 +50,22 @@ pub const DEFAULT_SPACE_OPLOG_RETENTION_DAYS: i64 = 30;
 /// video is not billed for a month.
 pub const DEFAULT_BLOB_GRACE_HOURS: i64 = 24;
 
+/// How long the firehose log keeps an event, in hours.
+///
+/// `stream_event` had no retention at all: every record ever written was
+/// stored a second time, as a DAG-CBOR CAR, in the *shared* accounts database.
+/// At 20 writes/s and a 20 KB average payload that is roughly 35 GB a month,
+/// and when that volume fills it is not one actor that stops writing — it is
+/// sessions, OAuth, and the sequencer itself.
+///
+/// Seventy-two hours is chosen against what the window is *for*: a relay or
+/// AppView that falls over should be able to reconnect and resume without
+/// backfilling from `getRepo`. Three days covers a weekend outage, which is
+/// the realistic worst case for an operator who is not on call. A consumer
+/// that stays down longer gets `OutdatedCursor` and re-syncs, which is the
+/// documented path rather than a failure.
+pub const DEFAULT_STREAM_EVENT_RETENTION_HOURS: i64 = 72;
+
 /// Per-table prune counts. `Ok(rows_pruned)` per table; `None` indicates the
 /// helper failed and the caller logged.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -80,6 +96,8 @@ pub struct GcReport {
     /// Lapsed `space_credential_recipient` rows deleted, summed across all
     /// accounts.
     pub expired_notify_registrations: u64,
+    /// Firehose log rows dropped past [`DEFAULT_STREAM_EVENT_RETENTION_HOURS`].
+    pub stream_event: u64,
 }
 
 /// Optional knobs the unified GC tick honors.
@@ -96,6 +114,11 @@ pub struct TickOptions<'a> {
     /// hours. Defaults to [`DEFAULT_BLOB_GRACE_HOURS`] (24). When `0`, the
     /// blob sweep is skipped (operator-disabled).
     pub blob_grace_hours: i64,
+    /// How long a firehose event is kept, in hours. Defaults to
+    /// [`DEFAULT_STREAM_EVENT_RETENTION_HOURS`] (72). When `0`, the sweep is
+    /// skipped and the log grows without bound, which is what this server did
+    /// before the sweep existed.
+    pub stream_event_retention_hours: i64,
 }
 
 impl Default for TickOptions<'_> {
@@ -104,6 +127,7 @@ impl Default for TickOptions<'_> {
             data_dir: None,
             space_oplog_retention_days: DEFAULT_SPACE_OPLOG_RETENTION_DAYS,
             blob_grace_hours: DEFAULT_BLOB_GRACE_HOURS,
+            stream_event_retention_hours: DEFAULT_STREAM_EVENT_RETENTION_HOURS,
         }
     }
 }
@@ -172,6 +196,11 @@ pub async fn tick_with(
     )
     .await;
     report.oauth_state = run_or_log("oauth_par+oauth_code", prune_oauth(pool, &now_iso)).await;
+    if opts.stream_event_retention_hours > 0 {
+        let cutoff =
+            (now - chrono::Duration::hours(opts.stream_event_retention_hours)).to_rfc3339();
+        report.stream_event = run_or_log("stream_event", prune_stream_event(pool, &cutoff)).await;
+    }
     report.jti_replay = run_or_log("jti_replay", jti_guard.gc()).await;
     report.rate_limit_window = run_or_log("rate_limit_window", rate_limiter.gc()).await;
 
@@ -412,6 +441,41 @@ async fn prune_orphan_blobs(
     Ok(result.rows_affected())
 }
 
+/// Drop firehose events older than `cutoff`, always leaving the head in place.
+///
+/// # Why the head is never deleted
+///
+/// `latest_seq()` is `MAX(seq) FROM stream_event`, and `subscribeRepos`
+/// compares a resume cursor against it: a cursor above the head is
+/// `FutureCursor` and ends the subscription. An empty table makes that head
+/// `None`, which the handler reads as zero — so on a server quiet enough for
+/// every row to age out, *every* legitimate resume cursor would suddenly be
+/// "ahead of the stream head" and every consumer would be disconnected with an
+/// error naming its own cursor as the fault.
+///
+/// Keeping the newest row costs one event and removes that failure entirely.
+/// It also keeps the log self-describing: `MIN(seq)` and `MAX(seq)` continue
+/// to bound what a subscriber can still be served, which is what the
+/// `OutdatedCursor` check reads.
+///
+/// SQLite's `AUTOINCREMENT` keeps its high-water mark in `sqlite_sequence`
+/// rather than deriving it from the table, so allocation stays monotonic
+/// across a prune either way — a resumed cursor value is never reissued.
+async fn prune_stream_event(pool: &SqlitePool, cutoff: &str) -> PdsResult<u64> {
+    let res = sqlx::query(
+        "DELETE FROM stream_event \
+         WHERE created_at < ? \
+           AND seq < (SELECT MAX(seq) FROM stream_event)",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .map_err(|e| crate::errors::PdsError::Storage {
+        reason: format!("gc stream_event: {e}"),
+    })?;
+    Ok(res.rows_affected())
+}
+
 async fn prune_oauth(pool: &SqlitePool, now_iso: &str) -> PdsResult<u64> {
     let par = sqlx::query("DELETE FROM oauth_par WHERE expires_at < ?")
         .bind(now_iso)
@@ -442,6 +506,104 @@ mod tests {
             .unwrap()
             .pool()
             .clone()
+    }
+
+    /// Seed `n` firehose events, `old_count` of them past the window.
+    async fn seed_stream(pool: &SqlitePool, old_count: usize, fresh_count: usize) {
+        for i in 0..old_count {
+            sqlx::query(
+                "INSERT INTO stream_event (did, event_type, payload, created_at)
+                 VALUES ('did:plc:alice', '#commit', X'01', ?)",
+            )
+            .bind(format!("2020-01-0{}T00:00:00Z", (i % 9) + 1))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        for _ in 0..fresh_count {
+            sqlx::query(
+                "INSERT INTO stream_event (did, event_type, payload, created_at)
+                 VALUES ('did:plc:alice', '#commit', X'01', ?)",
+            )
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn stream_seqs(pool: &SqlitePool) -> Vec<i64> {
+        sqlx::query_scalar::<_, i64>("SELECT seq FROM stream_event ORDER BY seq")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The firehose log had no retention at all: every record ever written was
+    /// kept a second time in the shared accounts database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_prunes_the_firehose_log_past_its_window() {
+        let pool = fresh_pool().await;
+        seed_stream(&pool, 5, 2).await;
+        assert_eq!(stream_seqs(&pool).await.len(), 7);
+
+        let jti_guard = JtiReplayGuard::new_sql(pool.clone());
+        let limiter = SlidingWindowLimiter::new_sql(pool.clone(), 100, Duration::from_secs(60));
+        let report = tick(&pool, &jti_guard, &limiter).await;
+
+        assert_eq!(report.stream_event, 5, "the five aged rows go");
+        assert_eq!(
+            stream_seqs(&pool).await,
+            vec![6, 7],
+            "the two fresh rows stay, and seq is not renumbered"
+        );
+    }
+
+    /// The head is never deleted, however old it is.
+    ///
+    /// `subscribeRepos` compares a resume cursor against `MAX(seq)`, and an
+    /// empty log makes that `None` — which the handler reads as zero, so every
+    /// legitimate cursor would come back `FutureCursor` and every consumer
+    /// would be disconnected. On a server quiet enough for every row to age
+    /// out, that is the whole subscriber population.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_firehose_head_survives_retention() {
+        let pool = fresh_pool().await;
+        seed_stream(&pool, 4, 0).await;
+
+        let jti_guard = JtiReplayGuard::new_sql(pool.clone());
+        let limiter = SlidingWindowLimiter::new_sql(pool.clone(), 100, Duration::from_secs(60));
+        let report = tick(&pool, &jti_guard, &limiter).await;
+
+        assert_eq!(report.stream_event, 3, "everything but the head");
+        assert_eq!(
+            stream_seqs(&pool).await,
+            vec![4],
+            "the newest row is kept even though it is well past the window"
+        );
+
+        // And a subsequent insert continues the sequence rather than reusing a
+        // value a subscriber may still hold as its cursor.
+        seed_stream(&pool, 0, 1).await;
+        assert_eq!(stream_seqs(&pool).await, vec![4, 5]);
+    }
+
+    /// `0` is the operator's off switch, and it must mean off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_window_disables_the_firehose_sweep() {
+        let pool = fresh_pool().await;
+        seed_stream(&pool, 4, 0).await;
+
+        let jti_guard = JtiReplayGuard::new_sql(pool.clone());
+        let limiter = SlidingWindowLimiter::new_sql(pool.clone(), 100, Duration::from_secs(60));
+        let opts = TickOptions {
+            stream_event_retention_hours: 0,
+            ..TickOptions::default()
+        };
+        let report = tick_with(&pool, &jti_guard, &limiter, &opts).await;
+
+        assert_eq!(report.stream_event, 0);
+        assert_eq!(stream_seqs(&pool).await.len(), 4, "nothing was swept");
     }
 
     /// On an empty DB, the GC tick is a no-op and produces a zero report.

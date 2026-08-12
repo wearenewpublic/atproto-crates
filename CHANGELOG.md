@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- **The firehose log now has a retention window**, swept by the unified GC. `stream_event` had none
+  at all — zero `DELETE` statements existed anywhere in the crate — so every record ever written was
+  stored a second time, as a DAG-CBOR CAR, in the *shared* accounts database. At 20 writes/s and a
+  20 KB average payload that is roughly 35 GB a month, and when that volume fills it is not one
+  actor that stops writing: it is sessions, OAuth, and the sequencer itself.
+
+  Default 72 hours, via `--stream-event-retention-hours` / `PDS_STREAM_EVENT_RETENTION_HOURS`; `0`
+  restores the old unbounded behaviour. Three days is sized against what the window is for — a relay
+  or AppView that falls over reconnects and resumes rather than backfilling from `getRepo`, and a
+  weekend outage is the realistic worst case.
+
+  **The newest event is never deleted, whatever its age.** `subscribeRepos` compares a resume cursor
+  against `MAX(seq)`, and an empty log makes that `None`, which the handler reads as zero — so on a
+  server quiet enough for every row to age out, every legitimate cursor would come back
+  `FutureCursor` and every consumer would be disconnected with an error naming its own cursor as the
+  fault. Keeping one row costs nothing and removes that failure. SQLite's `AUTOINCREMENT` high-water
+  mark lives in `sqlite_sequence`, so a pruned `seq` is never reissued to a later event.
+
+- **`OutdatedCursor` is emitted** when a subscriber resumes from a cursor below the retained floor.
+  The subscription continues from the oldest event still held, per the lexicon — this is an `#info`
+  message, not an error.
+
+  It is what makes retention safe to turn on. Without it the subscriber is handed the oldest
+  retained event as though it were the next one after its cursor, so a relay carries a repository
+  forward across a hole it has no way to detect: the same silent, permanent gap the firehose publish
+  race used to produce, arriving by a different route. The `encode_info` encoder already existed and
+  had no production caller.
+
+  Sent only when events are genuinely missing — `read_after` returns rows strictly after the cursor,
+  so a cursor of exactly `earliest - 1` is contiguous and gets no notice.
+
+### Changed
+- **The unified GC now runs its first tick 60 seconds after boot** rather than one full interval
+  later. With the default daily interval, a process restarted about once a day never swept at all:
+  every restart pushed the next tick 24 hours out and the process rarely lived that long. A sweep
+  that never runs is indistinguishable from one that does not exist, which is how the firehose log
+  grew unbounded while a GC loop was ostensibly running.
+
+### Added
 - **`describe_scope` covers `repo:`, `blob:` and `rpc:`.** All three fell through to "request access
   to scope `…`", which is the string the consent page exists not to show. An `rpc` grant reads as
   "call *methods* at *service* on your behalf" — the last three words being the point, since the PDS
