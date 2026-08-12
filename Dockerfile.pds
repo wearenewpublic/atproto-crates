@@ -10,7 +10,15 @@
 # database, each actor's own SQLite store, blobs, and the key store -- lives
 # under `PDS_DATA_DIRECTORY`, so a single mount is the whole persistent state.
 
-FROM rust:1.90-slim-bookworm AS builder
+# Keep in step with `channel` in rust-toolchain.toml, `rust-version` in the
+# workspace Cargo.toml, and the builder stages in `Dockerfile` and
+# `crates/atproto-pds/Dockerfile`. The CI "toolchain pins" step fails on drift,
+# because this one silently did not fail: `COPY . .` brings `rust-toolchain.toml`
+# with it, so rustup inside the image downloads the pinned toolchain and builds
+# with it regardless of what this line says. A stale pin here costs a second
+# toolchain download per build and misreports what the image is built with --
+# it does not break the build, which is why it survived the last MSRV raise.
+FROM rust:1.97-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev \

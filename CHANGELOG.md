@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Fixed
+- **Every Dockerfile now names the toolchain the workspace pins.** The raise to 1.97 updated
+  `rust-toolchain.toml`, `rust-version` in the workspace `Cargo.toml` and the builder stage in
+  `Dockerfile`, and left `Dockerfile.pds` on 1.90 and `crates/atproto-pds/Dockerfile` on 1.85 —
+  where it had sat since the MSRV *was* 1.85. `Dockerfile.pds` is the image `railway.toml` deploys,
+  so the stale pin was on the one that ships.
+
+  Neither had broken a build, which is why both survived: every image does `COPY . .`, which brings
+  `rust-toolchain.toml` with it, so rustup inside the container installs the pinned toolchain and
+  compiles with that. The `FROM` line stops being the version the image is built with and becomes a
+  comment that disagrees with the build, while costing a second toolchain download on every run.
+
+- **CI fails on toolchain-pin drift.** A new step reads the version out of `rust-toolchain.toml` and
+  requires the other four declarations to name it, rather than hardcoding a sixth copy. Verified red
+  when any one of the four is perturbed on its own.
+
 ## [0.15.0-rc.4] - 2026-08-12
 ### Added
 - **`cargo audit` is now a CI step**, and the accepted advisories are written down in

@@ -27,7 +27,10 @@
 #     -v $PWD/.pds-data:/var/lib/pds \
 #     atproto-pds:dev
 
-ARG RUST_VERSION=1.85
+# Keep in step with `channel` in rust-toolchain.toml, `rust-version` in the
+# workspace Cargo.toml, and the builder stages in `Dockerfile` and
+# `Dockerfile.pds`. The CI "toolchain pins" step fails on drift.
+ARG RUST_VERSION=1.97
 ARG DEBIAN_VERSION=bookworm
 
 # ---------------------------------------------------------------------------

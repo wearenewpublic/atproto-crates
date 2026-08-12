@@ -27,6 +27,19 @@ steps:
   - name: "toolchain"
     command: rustup show active-toolchain && cargo clippy --version
 
+  # The compiler version is declared in five places that have to agree, and
+  # nothing tied them together: `rust-toolchain.toml`, `rust-version` in the
+  # workspace Cargo.toml, and the builder stage of each of the three
+  # Dockerfiles. The raise to 1.97 updated the first three and left
+  # `Dockerfile.pds` -- the image `railway.toml` actually deploys -- on 1.90,
+  # and `crates/atproto-pds/Dockerfile` on 1.85, where it had been since the
+  # MSRV was 1.85. Neither failed: every image copies `rust-toolchain.toml` in,
+  # so rustup downloads the pinned toolchain and the `FROM` line becomes a
+  # comment that lies. This step reads the version from `rust-toolchain.toml`
+  # and requires the other four to name it.
+  - name: "toolchain pins"
+    command: V=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml) && echo "toolchain $V" && grep -q "^rust-version = \"$V\"$" Cargo.toml && grep -q "^FROM rust:$V-" Dockerfile && grep -q "^FROM rust:$V-" Dockerfile.pds && grep -q "^ARG RUST_VERSION=$V$" crates/atproto-pds/Dockerfile
+
   # The `dasl-testing` submodule carries the DASL CBOR compliance fixtures.
   # Without it `cargo test` fails 13 cases in `atproto-dasl` on a missing
   # fixture file, so the checkout has to be recursive for the suite to mean

@@ -1,8 +1,9 @@
 # Multi-stage build for atproto-identity-rs workspace
 # Builds and installs all 15 binaries from the workspace
 
-# Build stage. Keep in step with `rust-version` in Cargo.toml and
-# `channel` in rust-toolchain.toml.
+# Build stage. Keep in step with `rust-version` in Cargo.toml, `channel` in
+# rust-toolchain.toml, and the builder stages in `Dockerfile.pds` and
+# `crates/atproto-pds/Dockerfile`. The CI "toolchain pins" step fails on drift.
 FROM rust:1.97-slim-bookworm AS builder
 
 # Install system dependencies needed for building
