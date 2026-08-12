@@ -1066,4 +1066,159 @@ mod tests {
             "a live registration and one with no expiry both survive"
         );
     }
+
+    /// **No maintenance path deletes a member's space records.** Records are the
+    /// account's own data; the oplog beside them is a replication aid with a
+    /// retention window, and only the oplog ages out.
+    ///
+    /// Asserted rather than assumed because the failure is invisible from here.
+    /// A permissioned record is not broadcast on the firehose, so an app-view
+    /// indexing one has no confirmation signal to wait for and no way to tell a
+    /// record that was never written from one the host dropped. An app-view has
+    /// already deleted real data on that reasoning ("The Fifteen-Minute Reaper",
+    /// 2026-08-12) — its reconciler read the absence as a write that never
+    /// landed and reaped the rows it had indexed. The bug was the consumer's,
+    /// and the host being right about this is what bounded it to one store.
+    /// Should a sweep here start collecting records, the same symptom would
+    /// return with no local evidence and nothing the consumer could do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sweep_never_collects_member_space_records() {
+        use crate::actor_store::sql::SqlActorStore;
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref)
+             VALUES ('did:plc:member', 'member.example', 'x', '2026-01-01T00:00:00Z', 'active', 'k')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = SqlActorStore::open(tmp.path(), "did:plc:member")
+            .await
+            .unwrap();
+        // A space this account is a member of, authority elsewhere: the shape a
+        // permissioned record actually arrives in.
+        let space = "at://did:plc:authority/space/app.bsky.group/default";
+        sqlx::query("INSERT INTO space (uri, is_owner, is_member, created_at) VALUES (?, 0, 1, ?)")
+            .bind(space)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // `rev` is a TID, so "3j" sorts far below the cutoff below and "9z" far
+        // above it: one oplog entry to collect, one to keep.
+        for (rev, rkey) in [("3jzzzzzzzzzzz", "ancient"), ("9zzzzzzzzzzzz", "recent")] {
+            sqlx::query(
+                "INSERT INTO space_record (space, collection, rkey, cid, value, repo_rev, indexed_at)
+                 VALUES (?, 'app.bulleted.node', ?, 'bafyrei', X'a0', ?, '2020-01-01T00:00:00Z')",
+            )
+            .bind(space)
+            .bind(rkey)
+            .bind(rev)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO space_record_oplog (space, rev, idx, action, collection, rkey, cid)
+                 VALUES (?, ?, 0, 'create', 'app.bulleted.node', ?, 'bafyrei')",
+            )
+            .bind(space)
+            .bind(rev)
+            .bind(rkey)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        let (oplog, _, _) = prune_per_actor(
+            &pool,
+            tmp.path(),
+            Some("4aaaaaaaaaaaa"),
+            Some("2099-01-01T00:00:00Z"),
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .unwrap();
+
+        // The sweep did run and did prune -- otherwise the assertion below
+        // would pass on a tick that touched nothing at all.
+        assert_eq!(oplog, 1, "the aged oplog entry is collected");
+        let records: Vec<String> =
+            sqlx::query_scalar("SELECT rkey FROM space_record ORDER BY rkey ASC")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            records,
+            vec!["ancient".to_string(), "recent".to_string()],
+            "both records survive: pruning an oplog entry must not take the \
+             record it describes, however old the record is"
+        );
+    }
+
+    /// `deleteSpace` erases the authority's own repo in the space and nothing
+    /// else. A member's records are their data, held in their store, and they
+    /// simply stop being reachable through credentials the authority no longer
+    /// issues — the same invariant as
+    /// [`the_sweep_never_collects_member_space_records`], on the path where an
+    /// operator did ask for a deletion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_space_leaves_member_records_alone() {
+        use crate::actor_store::sql::SqlActorStore;
+        use crate::space::SpaceService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = SpaceService::new(tmp.path().to_path_buf());
+        let info = svc
+            .create_space(
+                "did:plc:authority",
+                "app.bsky.group",
+                "default",
+                crate::space::SpaceConfig::default(),
+            )
+            .await
+            .unwrap();
+        let uri: atproto_space::types::SpaceUri = info.uri.parse().unwrap();
+
+        // One record in the authority's own store, one in a member's.
+        for did in ["did:plc:authority", "did:plc:member"] {
+            let store = SqlActorStore::open(tmp.path(), did).await.unwrap();
+            sqlx::query(
+                "INSERT OR IGNORE INTO space (uri, is_owner, is_member, created_at)
+                 VALUES (?, 0, 1, '2026-01-01T00:00:00Z')",
+            )
+            .bind(info.uri.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO space_record (space, collection, rkey, cid, value, repo_rev, indexed_at)
+                 VALUES (?, 'app.bulleted.node', 'n1', 'bafyrei', X'a0', '3jzzzzzzzzzzz', '2026-01-01T00:00:00Z')",
+            )
+            .bind(info.uri.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        svc.delete_space("did:plc:authority", &uri).await.unwrap();
+
+        async fn record_count(dir: &std::path::Path, did: &str) -> i64 {
+            let store = SqlActorStore::open(dir, did).await.unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM space_record")
+                .fetch_one(store.pool())
+                .await
+                .unwrap()
+        }
+        assert_eq!(
+            record_count(tmp.path(), "did:plc:authority").await,
+            0,
+            "the authority's own"
+        );
+        assert_eq!(
+            record_count(tmp.path(), "did:plc:member").await,
+            1,
+            "the member's, untouched"
+        );
+    }
 }
