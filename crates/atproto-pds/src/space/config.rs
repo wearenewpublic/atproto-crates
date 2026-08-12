@@ -14,7 +14,7 @@
 //!   `com.atproto.space.getSpace`, with `$type` discriminators referencing
 //!   `com.atproto.simplespace.defs#spaceConfig` / `#open` / `#allowList`.
 
-use crate::actor_store::sql::{SqlActorStore, actor_db_path};
+use crate::actor_store::sql::SqlActorStore;
 use crate::errors::PdsError;
 use atproto_space::types::SpaceUri;
 use serde::{Deserialize, Serialize};
@@ -450,11 +450,12 @@ pub async fn ensure_not_deleted(pool: &SqlitePool, uri: &SpaceUri) -> Result<(),
 /// Returns [`PdsError::SpaceNotFound`] when the authority's row is tombstoned,
 /// or [`PdsError::Storage`] on a query failure.
 pub async fn ensure_space_live(data_dir: &Path, space: &SpaceUri) -> Result<(), PdsError> {
-    // Skip when the authority's store does not exist locally.
-    if !actor_db_path(data_dir, &space.space_did).exists() {
+    // Skip when the authority's store does not exist locally -- and open it
+    // without creating one, so asking the question does not manufacture the
+    // store that the answer is read from.
+    let Some(store) = SqlActorStore::open_if_exists(data_dir, &space.space_did).await? else {
         return Ok(());
-    }
-    let store = SqlActorStore::open(data_dir, &space.space_did).await?;
+    };
     ensure_not_deleted(store.pool(), space).await
 }
 

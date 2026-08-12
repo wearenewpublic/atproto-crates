@@ -44,7 +44,7 @@ use crate::http::state::HttpState;
 use crate::space::notify::upsert_recipient;
 use crate::space::reader::SpaceReadAuth;
 use crate::space::writer::{SpaceCommitResult, SpaceWriteAction, SpaceWriteOp};
-use crate::space::{SpaceReader, SpaceService, SpaceSync, SpaceWriter};
+use crate::space::{Membership, SpaceReader, SpaceService, SpaceSync, SpaceWriter};
 use atproto_space::credential::{
     DELEGATION_TOKEN_TTL_SECS, create_delegation_token, create_space_credential,
 };
@@ -1296,6 +1296,14 @@ struct ResolvedRecordAuth<'a> {
 /// Refusals report `SpaceNotFound` rather than a distinct error: whether a
 /// given space contains a given account's records is itself the confidential
 /// fact, and a caller who is not a member should not be able to probe it.
+///
+/// Only [`Membership::NotMember`] refuses. The member list belongs to the space
+/// authority, so for a space hosted elsewhere there is nothing here to check
+/// against, and reading that absence as "not a member" refused every read in
+/// every cross-PDS space — including a member reading their own repo, and
+/// including a SpaceCredential minted by the very authority that holds the list.
+/// Same call as [`require_space_member`] makes on the write side: local
+/// authority, enforce; remote authority, defer to the side that owns the list.
 async fn assert_space_membership(
     state: &HttpState,
     uri: &SpaceUri,
@@ -1311,10 +1319,11 @@ async fn assert_space_membership(
         )
     };
     if let Some(caller) = caller
-        && !service
-            .is_member(uri, caller)
+        && service
+            .membership(uri, caller)
             .await
             .map_err(XrpcError::from)?
+            == Membership::NotMember
     {
         tracing::debug!(space = %uri, caller = %caller, "space read refused: caller is not a member");
         return Err(deny());
@@ -1322,10 +1331,11 @@ async fn assert_space_membership(
     // When the caller reads its own repo, the caller check above already
     // established membership.
     if caller != Some(target)
-        && !service
-            .is_member(uri, target)
+        && service
+            .membership(uri, target)
             .await
             .map_err(XrpcError::from)?
+            == Membership::NotMember
     {
         tracing::debug!(space = %uri, target = %target, "space read refused: target is not a member");
         return Err(deny());
@@ -2441,20 +2451,18 @@ async fn require_space_member(
 ) -> Result<(), XrpcError> {
     // Only when this server can answer the question. Membership lives in the
     // *authority's* per-actor store, and for a cross-PDS space that store is
-    // not here -- `is_member` would open an empty database, find no row, and
-    // report every legitimate remote member as a stranger, breaking cross-host
-    // spaces outright.
+    // not here, so reading its absence as a negative would report every
+    // legitimate remote member as a stranger and break cross-host spaces
+    // outright.
     //
     // Same shape as `ensure_space_live`: local authority, enforce; remote
     // authority, defer to the side that owns the member list. A space
     // credential minted by that authority is what carries the claim there.
-    if !crate::actor_store::sql::actor_db_path(state.reader.data_dir(), &uri.space_did).exists() {
-        return Ok(());
-    }
     if space_service(state)?
-        .is_member(uri, did)
+        .membership(uri, did)
         .await
         .map_err(XrpcError::from)?
+        != Membership::NotMember
     {
         return Ok(());
     }
@@ -2763,10 +2771,16 @@ pub async fn notify_write(
             .map_err(XrpcError::from)?
             .is_some();
     if owner_is_local {
+        // `owner_is_local` came from the account directory, so this branch has
+        // already established that the member list is ours to hold. Not finding
+        // one is a space that does not exist here, which is a refusal like any
+        // other non-member: unlike the read and write guards, there is no remote
+        // authority to defer to.
         let is_member = space_service(&state)?
-            .is_member(&space, &payload.repo)
+            .membership(&space, &payload.repo)
             .await
-            .map_err(XrpcError::from)?;
+            .map_err(XrpcError::from)?
+            == Membership::Member;
         if !is_member {
             return Err(XrpcError::new(
                 StatusCode::FORBIDDEN,

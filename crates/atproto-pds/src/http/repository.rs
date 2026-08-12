@@ -1152,6 +1152,11 @@ fn decode_record(bytes: &[u8]) -> Result<serde_json::Value, XrpcError> {
 /// into the caller's own store scoped to a space they do not belong to, or to
 /// one that does not exist. The records would be real, would be theirs, and
 /// would sync nowhere. Membership is the check that belongs here.
+///
+/// Only a local member list can refuse: for a space whose authority is hosted
+/// elsewhere this server holds no list, and treating that as a negative would
+/// lock a member out of their own space through the portal while the XRPC path
+/// let the same write through. See [`crate::space::Membership`].
 async fn require_member(state: &HttpState, space: &SpaceUri, did: &str) -> Result<(), XrpcError> {
     let service = state.space_service.as_deref().ok_or_else(|| {
         XrpcError::new(
@@ -1161,9 +1166,10 @@ async fn require_member(state: &HttpState, space: &SpaceUri, did: &str) -> Resul
         )
     })?;
     if service
-        .is_member(space, did)
+        .membership(space, did)
         .await
         .map_err(XrpcError::from)?
+        != crate::space::Membership::NotMember
     {
         return Ok(());
     }

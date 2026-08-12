@@ -271,6 +271,33 @@ impl SqlActorStore {
         })
     }
 
+    /// Open the per-actor DB for `did` only if it already exists, for a caller
+    /// asking a question *about* an account rather than acting as one.
+    ///
+    /// [`Self::open`] creates the database, which is right for a request that
+    /// is about to write and wrong for a lookup: a question about an account
+    /// this server does not host would answer "nothing there" while leaving an
+    /// empty database behind, and every later `exists()` test on that path then
+    /// reports a store that only the lookup created. Membership checks are the
+    /// case that matters -- see [`crate::space::service::SpaceService::membership`].
+    ///
+    /// Unlike [`Self::open_for_sweep`] this is a request-path open: on a miss it
+    /// builds the ordinary cached pool and runs migrations, because the caller
+    /// is one request about one actor rather than a walk over all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if the file exists but cannot be opened.
+    pub async fn open_if_exists(data_dir: &Path, did: &str) -> PdsResult<Option<Self>> {
+        if !tokio::fs::try_exists(actor_db_path(data_dir, did))
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        Self::open(data_dir, did).await.map(Some)
+    }
+
     /// Open an in-memory store for testing — no file is created.
     ///
     /// # Errors

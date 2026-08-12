@@ -4,7 +4,7 @@
 //! `listMembers`. Operates against the per-actor SQLite store.
 
 use crate::account::AccountManager;
-use crate::actor_store::sql::{SqlActorStore, SqlSpaceMembersStorage, actor_db_path};
+use crate::actor_store::sql::{SqlActorStore, SqlSpaceMembersStorage};
 use crate::errors::{PdsError, PdsResult};
 use crate::realm::PdsSetHash;
 use crate::space::config::{SpaceConfig, SpaceConfigPatch, ensure_not_deleted};
@@ -19,6 +19,22 @@ use std::sync::Arc;
 /// Space-management orchestrator.
 pub struct SpaceService {
     data_dir: PathBuf,
+}
+
+/// What this server can say about one account's membership of one space.
+///
+/// Returned by [`SpaceService::membership`]. The third variant is the point:
+/// membership is a fact held by the space authority, so a server that does not
+/// host that authority has no answer rather than a negative one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// The account is in the space's member list, or is the authority itself.
+    Member,
+    /// The authority's member list is here and does not contain the account.
+    NotMember,
+    /// The authority is hosted elsewhere, so the member list is not here to
+    /// consult. Not a refusal — an absence of local evidence.
+    AuthorityElsewhere,
 }
 
 impl SpaceService {
@@ -388,14 +404,43 @@ impl SpaceService {
     /// Whether `did` is a member of `space` (reference `store.space.isMember`).
     ///
     /// Membership is the `space_member` table; the space owner is implicitly a
-    /// member (owner-as-member). Used by the owner-side `notifyWrite` fan-out to
-    /// reject notifications from non-members. A missing or tombstoned space
-    /// yields `false`.
-    pub async fn is_member(&self, uri: &SpaceUri, did: &str) -> PdsResult<bool> {
+    /// member (owner-as-member). A missing or tombstoned space yields
+    /// [`Membership::NotMember`].
+    ///
+    /// # Why this is not a `bool`
+    ///
+    /// The member list lives in the *authority's* per-actor store, and for a
+    /// space whose authority is hosted elsewhere that store is not on this
+    /// server. A two-valued answer had to call that case something, and it
+    /// called it "not a member": every legitimate member of every cross-PDS
+    /// space read as a stranger. Callers cannot correct for it either, because
+    /// `false` gave them no way to tell "the list says no" from "there is no
+    /// list here to ask".
+    ///
+    /// [`Membership::AuthorityElsewhere`] is that third answer. What to do with
+    /// it belongs to the caller: an endpoint enforcing local policy defers to
+    /// the authority that owns the list (a credential minted by that authority
+    /// is what carries the claim), while one that has already established the
+    /// authority is local treats it as a missing space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdsError::Storage`] if the authority's store cannot be opened
+    /// or queried.
+    pub async fn membership(&self, uri: &SpaceUri, did: &str) -> PdsResult<Membership> {
         if uri.space_did == did {
-            return Ok(true);
+            return Ok(Membership::Member);
         }
-        let store = SqlActorStore::open(&self.data_dir, &uri.space_did).await?;
+        // Deliberately a non-creating open. Opening this store the ordinary way
+        // would materialise an empty database for the remote authority, and the
+        // `actor_db_path(..).exists()` locality tests elsewhere -- the write-side
+        // member check, `ensure_space_live` -- would then see a store that this
+        // lookup, and only this lookup, had created. One refused read would
+        // start refusing writes.
+        let Some(store) = SqlActorStore::open_if_exists(&self.data_dir, &uri.space_did).await?
+        else {
+            return Ok(Membership::AuthorityElsewhere);
+        };
         let row: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM space_member WHERE space = ? AND did = ? LIMIT 1")
                 .bind(uri.to_string())
@@ -403,9 +448,13 @@ impl SpaceService {
                 .fetch_optional(store.pool())
                 .await
                 .map_err(|e| PdsError::Storage {
-                    reason: format!("is_member: {e}"),
+                    reason: format!("membership: {e}"),
                 })?;
-        Ok(row.is_some())
+        Ok(if row.is_some() {
+            Membership::Member
+        } else {
+            Membership::NotMember
+        })
     }
 
     /// `listSpaces` — paginated listing for a viewer DID.
@@ -555,12 +604,12 @@ impl SpaceService {
         // read, and `SqlActorStore::open` would create an empty store and
         // report a space with no members rather than a space this host does
         // not answer for.
-        if !actor_db_path(&self.data_dir, &uri.space_did).exists() {
+        let Some(store) = SqlActorStore::open_if_exists(&self.data_dir, &uri.space_did).await?
+        else {
             return Err(PdsError::SpaceNotFound {
                 uri: uri.to_string(),
             });
-        }
-        let store = SqlActorStore::open(&self.data_dir, &uri.space_did).await?;
+        };
         ensure_not_deleted(store.pool(), uri).await?;
         let storage = SqlSpaceMembersStorage::new(store.pool().clone());
         let members: SpaceMembers<SqlSpaceMembersStorage, PdsSetHash> =
@@ -948,6 +997,86 @@ mod tests {
             svc.delete_space("did:plc:owner", &uri).await,
             Err(PdsError::SpaceNotFound { .. })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn membership_answers_from_a_local_member_list() {
+        let (svc, _tmp) = fresh_service().await;
+        let info = svc
+            .create_space(
+                "did:plc:owner",
+                "app.bsky.group",
+                "default",
+                SpaceConfig::default(),
+            )
+            .await
+            .unwrap();
+        let uri = info.uri.parse::<SpaceUri>().unwrap();
+        svc.add_member("did:plc:owner", &uri, "did:plc:alice")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            svc.membership(&uri, "did:plc:alice").await.unwrap(),
+            Membership::Member
+        );
+        // Owner-as-member, without consulting the list.
+        assert_eq!(
+            svc.membership(&uri, "did:plc:owner").await.unwrap(),
+            Membership::Member
+        );
+        // The list is here and does not name them, which is the one answer that
+        // may refuse a caller.
+        assert_eq!(
+            svc.membership(&uri, "did:plc:stranger").await.unwrap(),
+            Membership::NotMember
+        );
+    }
+
+    /// A space hosted by another PDS has no member list here, and saying
+    /// "not a member" about it locked every cross-PDS member out of their own
+    /// space: reads were refused as `SpaceNotFound` and the portal refused
+    /// writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn membership_of_a_remotely_hosted_space_is_not_a_refusal() {
+        let (svc, _tmp) = fresh_service().await;
+        let uri: SpaceUri = "at://did:plc:elsewhere/space/app.bsky.group/default"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            svc.membership(&uri, "did:plc:alice").await.unwrap(),
+            Membership::AuthorityElsewhere
+        );
+    }
+
+    /// Asking the question must not manufacture the store the answer is read
+    /// from. `SqlActorStore::open` creates the database, so a membership check
+    /// against a remote authority used to leave an empty one behind — and the
+    /// write-side guard reads exactly that file's existence to decide whether
+    /// the member list is local. One refused read then refused every
+    /// subsequent write to the same space, permanently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn asking_about_a_remote_authority_creates_no_store() {
+        let (svc, tmp) = fresh_service().await;
+        let uri: SpaceUri = "at://did:plc:elsewhere/space/app.bsky.group/default"
+            .parse()
+            .unwrap();
+
+        svc.membership(&uri, "did:plc:alice").await.unwrap();
+
+        let authority_db = crate::actor_store::sql::actor_db_path(tmp.path(), "did:plc:elsewhere");
+        assert!(
+            !authority_db.exists(),
+            "membership check created {}",
+            authority_db.display()
+        );
+        // Still the same answer on the second call, which the created store
+        // would have turned into `NotMember`.
+        assert_eq!(
+            svc.membership(&uri, "did:plc:alice").await.unwrap(),
+            Membership::AuthorityElsewhere
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

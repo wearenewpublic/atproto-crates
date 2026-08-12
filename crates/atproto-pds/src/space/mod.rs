@@ -36,6 +36,6 @@ pub use declaration::{
     NetworkSpaceDeclarationResolver, SpaceDeclaration, SpaceDeclarationResolver,
 };
 pub use reader::SpaceReader;
-pub use service::{GetSpaceOutput, SpaceInfo, SpaceService};
+pub use service::{GetSpaceOutput, Membership, SpaceInfo, SpaceService};
 pub use sync::SpaceSync;
 pub use writer::{SpaceWriteAction, SpaceWriteOp, SpaceWriter};

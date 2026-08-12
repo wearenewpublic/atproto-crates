@@ -504,9 +504,12 @@ impl SpaceWriter {
             self.data_dir.clone(),
             self.accounts.clone(),
         );
-        match svc.is_member(space, writer_did).await {
-            Ok(true) => {}
-            Ok(false) => {
+        // Reached only under `authority_is_local`, so -- as in the inbound
+        // handler -- an absent member list is a space that does not exist here
+        // rather than one to defer on.
+        match svc.membership(space, writer_did).await {
+            Ok(crate::space::Membership::Member) => {}
+            Ok(_) => {
                 tracing::warn!(
                     space = %space,
                     writer = %writer_did,
