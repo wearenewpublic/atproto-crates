@@ -103,6 +103,18 @@ pub enum PdsError {
         value: String,
     },
 
+    /// error-atproto-pds-space-6: a notify subscription named an endpoint the
+    /// service-endpoint policy refuses, so no write notification could ever be
+    /// delivered to it. Refused at the write rather than stored, because a row
+    /// the notifier must skip is a subscription in name only.
+    #[error("error-atproto-pds-space-6 not a permitted notify endpoint: {endpoint} ({reason})")]
+    UndeliverableNotifyEndpoint {
+        /// The endpoint as supplied.
+        endpoint: String,
+        /// Why the endpoint policy refused it.
+        reason: String,
+    },
+
     /// error-atproto-pds-account-1: account state transition rejected.
     #[error("error-atproto-pds-account-1 invalid account state transition: {from} -> {to}")]
     InvalidAccountTransition {

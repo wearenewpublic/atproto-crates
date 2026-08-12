@@ -166,6 +166,18 @@ impl From<PdsError> for XrpcError {
                 "UnsupportedAppAccess",
                 format!("this host does not implement the appAccess variant {value}"),
             ),
+            // `registerNotify` declares no error for this, so it reports as
+            // `InvalidRequest`: the endpoint came from the caller and is the
+            // caller's to correct. Named in the message rather than silently
+            // accepted, because the alternative was a registration that
+            // succeeded and then never delivered anything.
+            PdsError::UndeliverableNotifyEndpoint { endpoint, reason } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!(
+                    "{endpoint} is not an endpoint notifications can be delivered to: {reason}"
+                ),
+            ),
             // The lexicons name one error per state and a caller acts on
             // which it got: a deactivated repo may come back, a taken-down one
             // is a moderation decision. `Deleted` reports as not-found rather

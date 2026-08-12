@@ -1839,9 +1839,9 @@ async fn a_write_to_a_locally_hosted_space_fans_out_without_a_network_hop() {
     let uri = create_space(&app, &owner_token, "default").await;
 
     // A registered subscriber with a deliverable endpoint, so the fan-out has
-    // somewhere to go. (Minting a credential also registers its consumer, but
-    // without a client attestation that registration falls back to a stub
-    // endpoint the delivery path correctly refuses to sign a token for.)
+    // somewhere to go. (Minting a credential registers its consumer too, but
+    // only when the request attests a client_id there is an endpoint to derive
+    // from; without one, nothing is registered.)
     let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
     let (status, body) = post_json_cred(
         &app,
@@ -1902,8 +1902,21 @@ async fn a_write_to_a_locally_hosted_space_fans_out_without_a_network_hop() {
     );
 }
 
+/// A credential minted with no client attestation registers no recipient.
+///
+/// There is no consumer URL in that request, and the member's own DID is not
+/// somewhere a notification can be sent. This used to register the DID as the
+/// endpoint: `listRecipients` returned a subscriber, delivery refused the
+/// endpoint on every write to the space, and the fan-out log carried a warning
+/// per write for a subscription that had never been reachable
+/// (`endpoint=did:plc:… Endpoint scheme must be https`, seen in production).
+///
+/// Repeated because the row this replaces was also the upsert-idempotence
+/// fixture: two issuances left one row. That property is now covered where the
+/// upsert lives, in `space::notify::tests::upsert_recipient_is_idempotent`, and
+/// what matters end-to-end is that neither issuance registers anything.
 #[tokio::test(flavor = "multi_thread")]
-async fn space_credential_registers_recipient_idempotently() {
+async fn a_credential_without_an_attestation_registers_no_recipient() {
     // build_app hides the data dir, so this test constructs the app inline
     // with a TempDir it can inspect afterwards.
     let tmp = TempDir::new().unwrap();
@@ -1973,13 +1986,17 @@ async fn space_credential_registers_recipient_idempotently() {
         atproto_pds::actor_store::sql::SqlActorStore::open(&data_dir, "did:plc:owner")
             .await
             .unwrap();
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT space, service_did FROM space_credential_recipient")
-            .fetch_all(owner_store.pool())
-            .await
-            .unwrap();
-    assert_eq!(rows.len(), 1, "expected one recipient row, got: {rows:?}");
-    assert_eq!(rows[0].0, uri);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT space, service_did, service_endpoint FROM space_credential_recipient",
+    )
+    .fetch_all(owner_store.pool())
+    .await
+    .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a credential with no attested client registered a subscriber that \
+         nothing could ever be delivered to: {rows:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

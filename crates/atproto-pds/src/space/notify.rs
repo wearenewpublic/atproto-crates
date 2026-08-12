@@ -184,6 +184,18 @@ pub async fn delete_subscription(
 /// the optional RFC 3339 registration lifetime. Used by both the
 /// `getSpaceCredential` self-register path ([`upsert_recipient`]) and
 /// `registerNotify`.
+///
+/// # Errors
+///
+/// [`PdsError::UndeliverableNotifyEndpoint`] when `service_endpoint` is not one
+/// the endpoint policy permits, and [`PdsError::Storage`] on a query failure.
+///
+/// The endpoint is checked here, at the one statement that writes the column,
+/// rather than only in the callers. Delivery already refuses an endpoint this
+/// policy rejects, so a row holding one is not a subscription: it is a
+/// registration that reports success, delivers nothing, and logs a warning on
+/// every write to the space for as long as it exists. A caller that cannot
+/// produce a real endpoint needs to hear that when it registers.
 pub async fn upsert_subscription(
     owner_actor_pool: &SqlitePool,
     space: &SpaceUri,
@@ -192,6 +204,12 @@ pub async fn upsert_subscription(
     service_endpoint: &str,
     expires_at: Option<&str>,
 ) -> PdsResult<()> {
+    if let Err(err) = atproto_identity::validation::validate_service_endpoint(service_endpoint) {
+        return Err(PdsError::UndeliverableNotifyEndpoint {
+            endpoint: service_endpoint.to_string(),
+            reason: err.to_string(),
+        });
+    }
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO space_credential_recipient
@@ -421,6 +439,76 @@ mod tests {
         assert_eq!(recipients[0].service_did, "did:web:appview.example");
     }
 
+    /// The endpoint column cannot hold something notifications cannot be sent
+    /// to, whichever path writes it.
+    ///
+    /// A DID reached this column in production, from the stub the
+    /// no-attestation `getSpaceCredential` path built out of the member's own
+    /// DID. Delivery refused it — correctly — on every write to the space, so
+    /// the subscriber was registered and permanently unreachable, and the only
+    /// sign was a warning in the fan-out log. Refusing the write is what makes
+    /// that state unreachable rather than merely detected later.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscription_cannot_hold_an_undeliverable_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let owner_store = SqlActorStore::open(tmp.path(), "did:plc:owner")
+            .await
+            .unwrap();
+        let uri = test_space();
+        ensure_space_row(owner_store.pool(), &uri).await;
+
+        for endpoint in [
+            // What production actually stored.
+            "did:plc:iu5fzdrrfrc6kk7vmmatvin2",
+            "",
+            "http://appview.example",
+            "notaurl",
+            // The endpoint policy's own refusals, which the notifier applies on
+            // delivery and so must be refused here as well.
+            "https://169.254.169.254",
+            "https://box.localhost",
+        ] {
+            let err = upsert_recipient(
+                owner_store.pool(),
+                &uri,
+                "did:web:appview.example",
+                endpoint,
+            )
+            .await
+            .expect_err(&format!("{endpoint:?} was accepted as an endpoint"));
+            assert!(
+                matches!(err, PdsError::UndeliverableNotifyEndpoint { .. }),
+                "{endpoint:?} was refused, but not as an undeliverable endpoint: {err}"
+            );
+        }
+
+        // Nothing was written by any of those attempts.
+        assert!(
+            list_recipients(owner_store.pool(), &uri, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused registration still left a row behind"
+        );
+
+        // And a real endpoint still registers.
+        upsert_recipient(
+            owner_store.pool(),
+            &uri,
+            "did:web:appview.example",
+            "https://appview.example",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            list_recipients(owner_store.pool(), &uri, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn enqueue_writes_with_no_recipients_is_zero() {
         let tmp = TempDir::new().unwrap();
@@ -511,7 +599,11 @@ mod tests {
         let uri = test_space();
         ensure_space_row(owner_store.pool(), &uri).await;
 
-        // Written straight to the table, as a row predating the guard would be.
+        // Written straight to the table rather than through
+        // `upsert_recipient`, which now refuses these on the way in. That is
+        // the point of this test: the rows it seeds are the ones a database
+        // written before that refusal existed still holds, and no INSERT this
+        // binary performs can produce them any more.
         for (did, endpoint) in [
             ("did:web:good.example", "https://good.example"),
             // The SSRF shapes: cleartext, an address literal reaching inside
@@ -521,9 +613,18 @@ mod tests {
             ("did:web:metadata.example", "https://169.254.169.254"),
             ("did:web:port.example", "https://port.example:8080"),
         ] {
-            upsert_recipient(owner_store.pool(), &uri, did, endpoint)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO space_credential_recipient
+                   (space, repo, service_did, service_endpoint, last_issued_at, expires_at)
+                 VALUES (?, '', ?, ?, ?, NULL)",
+            )
+            .bind(uri.to_string())
+            .bind(did)
+            .bind(endpoint)
+            .bind(Utc::now().to_rfc3339())
+            .execute(owner_store.pool())
+            .await
+            .unwrap();
         }
 
         let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))

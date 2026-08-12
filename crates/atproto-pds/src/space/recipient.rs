@@ -33,8 +33,10 @@ use atproto_identity::validation::validate_service_endpoint;
 pub struct ResolvedRecipient {
     /// Consumer service DID (e.g. `did:web:appview.example`).
     pub service_did: String,
-    /// HTTPS endpoint base (e.g. `https://appview.example`).
-    pub service_endpoint: String,
+    /// HTTPS endpoint base (e.g. `https://appview.example`), or `None` when
+    /// resolution produced no endpoint to deliver to. Never a DID or any other
+    /// non-URL: a value here is something the notifier can POST to.
+    pub service_endpoint: Option<String>,
     /// `true` when the resolution went through the full
     /// well-known-DID + DID-document path. `false` when it fell back to
     /// the `(grant.iss, client_id-origin)` stub.
@@ -114,7 +116,7 @@ pub async fn resolve_recipient(
 
     Ok(ResolvedRecipient {
         service_did: did,
-        service_endpoint: endpoint,
+        service_endpoint: Some(endpoint),
         fully_resolved: true,
     })
 }
@@ -192,12 +194,22 @@ pub async fn resolve_service_endpoint(
 
 /// Build the fallback recipient — used both as the result on failure
 /// paths and as the documented behavior for unparseable client_id URLs.
+///
+/// `service_endpoint` is `None` when `client_id` carries no origin to fall back
+/// to. It used to be the `client_id` string verbatim, which meant a `client_id`
+/// that was not a URL at all — the member's own DID, on the no-attestation path
+/// — was stored as the endpoint. Nothing rejected it at registration, and the
+/// notifier then refused that endpoint on every single write to the space:
+/// `endpoint=did:plc:… Endpoint scheme must be https`. The subscriber was
+/// registered and could never be delivered to.
+///
+/// A stub with no endpoint is the honest result. Whether that is worth a refusal
+/// or a skip belongs to the caller, which knows what it was asked to register.
 #[must_use]
 pub fn stub_recipient(grant_iss: &str, client_id: &str) -> ResolvedRecipient {
-    let endpoint = client_id_origin(client_id).unwrap_or_else(|| client_id.to_string());
     ResolvedRecipient {
         service_did: grant_iss.to_string(),
-        service_endpoint: endpoint,
+        service_endpoint: client_id_origin(client_id),
         fully_resolved: false,
     }
 }
@@ -266,8 +278,27 @@ mod tests {
     fn stub_recipient_uses_iss_and_origin() {
         let stub = stub_recipient("did:plc:alice", "https://app.example/cm.json");
         assert_eq!(stub.service_did, "did:plc:alice");
-        assert_eq!(stub.service_endpoint, "https://app.example");
+        assert_eq!(
+            stub.service_endpoint.as_deref(),
+            Some("https://app.example")
+        );
         assert!(!stub.fully_resolved);
+    }
+
+    /// A `client_id` that is not a URL yields no endpoint rather than itself.
+    ///
+    /// The no-attestation path passed the member's DID here, and the DID came
+    /// back as the endpoint. It was stored, and the notifier then refused it on
+    /// every write to the space — a subscriber registered and unreachable.
+    #[test]
+    fn a_client_id_that_is_not_a_url_yields_no_endpoint() {
+        for not_a_url in ["did:plc:alice", "", "notaurl", "://noscheme"] {
+            let stub = stub_recipient("did:plc:alice", not_a_url);
+            assert_eq!(
+                stub.service_endpoint, None,
+                "{not_a_url} was turned into an endpoint"
+            );
+        }
     }
 
     /// Resolve against a hostname that has no `.well-known/atproto-did`

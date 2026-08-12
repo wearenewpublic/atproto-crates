@@ -2244,59 +2244,92 @@ pub async fn get_space_credential(
         .build()
         .unwrap_or_default();
     let resolved = match attested_client_id.as_deref() {
-        Some(client_id) => match crate::space::recipient::resolve_recipient(
-            &recipient_http,
-            &payload.iss,
-            client_id,
-            plc_dir,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    client_id = %client_id,
-                    "recipient resolution failed; falling back to stub"
-                );
-                crate::space::recipient::stub_recipient(&payload.iss, client_id)
-            }
-        },
-        None => crate::space::recipient::stub_recipient(&payload.iss, &payload.iss),
-    };
-    if !resolved.fully_resolved {
-        tracing::warn!(
-            member = %payload.iss,
-            stub_did = %resolved.service_did,
-            stub_endpoint = %resolved.service_endpoint,
-            "recipient resolved via stub; consumer DID document was unreachable or missing a PDS service entry"
-        );
-    }
-
-    match SqlActorStore::open(manager.data_dir(), &space.space_did).await {
-        Ok(owner_store) => {
-            if let Err(e) = upsert_recipient(
-                owner_store.pool(),
-                &space,
-                &resolved.service_did,
-                &resolved.service_endpoint,
+        Some(client_id) => {
+            let resolved = match crate::space::recipient::resolve_recipient(
+                &recipient_http,
+                &payload.iss,
+                client_id,
+                plc_dir,
             )
             .await
             {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        client_id = %client_id,
+                        "recipient resolution failed; falling back to stub"
+                    );
+                    crate::space::recipient::stub_recipient(&payload.iss, client_id)
+                }
+            };
+            if !resolved.fully_resolved {
                 tracing::warn!(
-                    error = ?e,
-                    space = %space,
                     member = %payload.iss,
-                    "register space_credential_recipient failed; this consumer will not receive notifyWrite"
+                    client_id = %client_id,
+                    stub_did = %resolved.service_did,
+                    stub_endpoint = ?resolved.service_endpoint,
+                    "recipient resolved via stub; the consumer's DID document was unreachable or had no PDS service entry"
                 );
             }
+            Some(resolved)
         }
-        Err(e) => {
-            tracing::warn!(
-                error = ?e,
+        // No attestation means no consumer URL, and the member's own DID is not
+        // somewhere a notification can be sent. This used to register it as the
+        // endpoint anyway: the row looked like a subscription, delivery refused
+        // the endpoint on every write to the space, and the warning above
+        // blamed a DID-document lookup that had never been attempted.
+        //
+        // Registering nothing costs the operator a record that this member took
+        // a credential, and buys back a fan-out log that only mentions
+        // subscribers that can actually be reached.
+        None => {
+            tracing::debug!(
+                member = %payload.iss,
                 space = %space,
-                "failed to open owner per-actor store while registering recipient"
+                "credential issued without a client attestation; no notify recipient to register"
             );
+            None
+        }
+    };
+
+    if let Some(resolved) = resolved {
+        match resolved.service_endpoint.as_deref() {
+            Some(endpoint) => match SqlActorStore::open(manager.data_dir(), &space.space_did).await
+            {
+                Ok(owner_store) => {
+                    if let Err(e) = upsert_recipient(
+                        owner_store.pool(),
+                        &space,
+                        &resolved.service_did,
+                        endpoint,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = ?e,
+                            space = %space,
+                            member = %payload.iss,
+                            "register space_credential_recipient failed; this consumer will not receive notifyWrite"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        space = %space,
+                        "failed to open owner per-actor store while registering recipient"
+                    );
+                }
+            },
+            None => {
+                tracing::warn!(
+                    space = %space,
+                    member = %payload.iss,
+                    service_did = %resolved.service_did,
+                    "no endpoint could be derived for this consumer; not registering it, so it will not receive notifyWrite"
+                );
+            }
         }
     }
 
