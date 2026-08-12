@@ -169,7 +169,11 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
                 repo_rev: value.repo_rev,
                 indexed_at: value.indexed_at,
             });
-            if !reverse && records.len() >= limit {
+            // One past the page: the extra row is what distinguishes a full
+            // final page from a full page with more behind it, and only the
+            // latter should hand back a cursor. See
+            // `SqlSpaceMembersStorage::list_members`.
+            if !reverse && records.len() > limit {
                 break;
             }
         }
@@ -179,9 +183,13 @@ impl SpaceRepoStorage for FjallSpaceRepoStorage {
             // `limit` ascending rows, which is the wrong end — collect the
             // whole prefix and take from the tail instead.
             records.reverse();
-            records.truncate(limit);
         }
-        let cursor = records.last().map(|r| r.rkey.clone());
+        let cursor = if records.len() > limit {
+            records.truncate(limit);
+            records.last().map(|r| r.rkey.clone())
+        } else {
+            None
+        };
         Ok(RecordPage { records, cursor })
     }
 

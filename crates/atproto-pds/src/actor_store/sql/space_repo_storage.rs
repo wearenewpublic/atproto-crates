@@ -100,7 +100,10 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
         // Direction flips both the ordering and the cursor comparison; getting
         // one without the other returns the first page forever.
         let (order, cmp) = if reverse { ("DESC", "<") } else { ("ASC", ">") };
-        let rows: Vec<(String, String, Vec<u8>, String, String)> = match cursor {
+        // One row past the page so the cursor promises a next page only when
+        // there is one; see `SqlSpaceMembersStorage::list_members`.
+        let probe = i64::from(limit) + 1;
+        let mut rows: Vec<(String, String, Vec<u8>, String, String)> = match cursor {
             Some(cur) => {
                 sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT rkey, cid, value, repo_rev, indexed_at FROM space_record
@@ -110,7 +113,7 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
                 .bind(space.to_string())
                 .bind(collection)
                 .bind(cur)
-                .bind(limit as i64)
+                .bind(probe)
                 .fetch_all(&self.pool)
                 .await
             }
@@ -122,13 +125,18 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
                 )))
                 .bind(space.to_string())
                 .bind(collection)
-                .bind(limit as i64)
+                .bind(probe)
                 .fetch_all(&self.pool)
                 .await
             }
         }
         .map_err(|e| sql_err(format!("list_records: {e}")))?;
-        let cursor = rows.last().map(|(rkey, _, _, _, _)| rkey.clone());
+        let cursor = if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            rows.last().map(|(rkey, _, _, _, _)| rkey.clone())
+        } else {
+            None
+        };
         let records = rows
             .into_iter()
             .map(|(rkey, cid, value, repo_rev, indexed_at)| RecordRow {

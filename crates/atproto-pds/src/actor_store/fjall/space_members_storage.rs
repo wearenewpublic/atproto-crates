@@ -117,11 +117,20 @@ impl SpaceMembersStorage for FjallSpaceMembersStorage {
                 member_rev: value.member_rev,
                 added_at: value.added_at,
             });
-            if members.len() >= limit {
+            // One past the page: a cursor promises a further page, and stopping
+            // at `limit` leaves no way to tell a full final page from a full
+            // page with more behind it. See the SQL storage for the client-side
+            // symptom that produced.
+            if members.len() > limit {
                 break;
             }
         }
-        let cursor = members.last().map(|m| m.did.clone());
+        let cursor = if members.len() > limit {
+            members.truncate(limit);
+            members.last().map(|m| m.did.clone())
+        } else {
+            None
+        };
         Ok(MemberPage { members, cursor })
     }
 
@@ -248,5 +257,44 @@ mod tests {
         assert_eq!(page.members.len(), 2);
         assert_eq!(page.members[0].did, "did:plc:a");
         assert_eq!(page.cursor.as_deref(), Some("did:plc:b"));
+    }
+
+    /// The last page carries no cursor — same contract as the SQL storage, and
+    /// the same reason: a cursor promises a page that a client will otherwise
+    /// go and ask for, or report to its user as more data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_final_page_carries_no_cursor() {
+        let (storage, _tmp) = fresh();
+        let space = test_space();
+        let m: TestMembers = SpaceMembers::new(space.clone(), storage);
+        for did in ["did:plc:a", "did:plc:b", "did:plc:c"] {
+            m.apply_commit(
+                m.format_commit(&[MemberOp {
+                    action: MemberOpAction::Add,
+                    did: did.to_string(),
+                }])
+                .await
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let page = m.list_members(None, 10).await.unwrap();
+        assert_eq!(page.members.len(), 3);
+        assert_eq!(page.cursor, None, "a short page is the last page");
+
+        let page = m.list_members(None, 3).await.unwrap();
+        assert_eq!(page.members.len(), 3);
+        assert_eq!(
+            page.cursor, None,
+            "a page that exactly consumes the members is still the last page"
+        );
+
+        let first = m.list_members(None, 2).await.unwrap();
+        let cursor = first.cursor.expect("a further page exists");
+        let second = m.list_members(Some(&cursor), 2).await.unwrap();
+        assert_eq!(second.members.len(), 1);
+        assert_eq!(second.cursor, None, "the walk terminates");
     }
 }

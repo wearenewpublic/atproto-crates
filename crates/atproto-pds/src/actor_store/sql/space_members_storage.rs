@@ -77,7 +77,19 @@ impl SpaceMembersStorage for SqlSpaceMembersStorage {
         limit: u32,
     ) -> SpaceResult<MemberPage> {
         let limit = limit.clamp(1, 100);
-        let rows: Vec<(String, String, String)> = match cursor {
+        // One row past the page, never returned to the caller. A cursor is a
+        // statement that a further page exists, and a `LIMIT limit` query cannot
+        // tell a full last page from a full page with more behind it -- so the
+        // cursor was emitted for every non-empty page, including the final one.
+        // A client reading "cursor present" as "more members exist" then tells
+        // its user there are more members after showing all of them.
+        //
+        // Over-fetching one row answers the question the page cannot, and makes
+        // this agree exactly with the in-memory storage in
+        // `atproto_space::space_members`, which sees the whole set and so has
+        // always reported the last page correctly.
+        let probe = i64::from(limit) + 1;
+        let mut rows: Vec<(String, String, String)> = match cursor {
             Some(cur) => {
                 sqlx::query_as(
                     "SELECT did, member_rev, added_at FROM space_member
@@ -85,7 +97,7 @@ impl SpaceMembersStorage for SqlSpaceMembersStorage {
                 )
                 .bind(space.to_string())
                 .bind(cur)
-                .bind(limit as i64)
+                .bind(probe)
                 .fetch_all(&self.pool)
                 .await
             }
@@ -95,13 +107,18 @@ impl SpaceMembersStorage for SqlSpaceMembersStorage {
                  WHERE space = ? ORDER BY did ASC LIMIT ?",
                 )
                 .bind(space.to_string())
-                .bind(limit as i64)
+                .bind(probe)
                 .fetch_all(&self.pool)
                 .await
             }
         }
         .map_err(|e| sql_err(format!("list_members: {e}")))?;
-        let cursor = rows.last().map(|(did, _, _)| did.clone());
+        let cursor = if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            rows.last().map(|(did, _, _)| did.clone())
+        } else {
+            None
+        };
         let members = rows
             .into_iter()
             .map(|(did, member_rev, added_at)| MemberRow {
@@ -256,5 +273,54 @@ mod tests {
         assert_eq!(page.members.len(), 2);
         assert_eq!(page.members[0].did, "did:plc:a");
         assert_eq!(page.cursor.as_deref(), Some("did:plc:b"));
+    }
+
+    /// A cursor is a promise that a further page exists, so the last page must
+    /// not carry one.
+    ///
+    /// Every non-empty page used to, because `LIMIT limit` cannot distinguish a
+    /// full final page from a full page with more behind it and the cursor was
+    /// taken from the last row either way. A client that reads "cursor present"
+    /// as "more members exist" then reports more members while displaying all of
+    /// them — which is what a membership dialog did against a live server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_final_page_carries_no_cursor() {
+        let space = test_space();
+        let m: TestMembers = SpaceMembers::new(space.clone(), fresh_storage().await);
+        for did in ["did:plc:a", "did:plc:b", "did:plc:c"] {
+            m.apply_commit(
+                m.format_commit(&[MemberOp {
+                    action: MemberOpAction::Add,
+                    did: did.to_string(),
+                }])
+                .await
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Room to spare: everyone fits, so there is nothing to page to.
+        let page = m.list_members(None, 10).await.unwrap();
+        assert_eq!(page.members.len(), 3);
+        assert_eq!(page.cursor, None, "a short page is the last page");
+
+        // Exactly full, and still the last page. This is the case a
+        // `rows.len() == limit` test cannot tell apart, and where this storage
+        // has to agree with the in-memory one in `atproto_space`.
+        let page = m.list_members(None, 3).await.unwrap();
+        assert_eq!(page.members.len(), 3);
+        assert_eq!(
+            page.cursor, None,
+            "a page that exactly consumes the members is still the last page"
+        );
+
+        // Walking with a cursor ends without one, and the final request is not
+        // an empty page.
+        let first = m.list_members(None, 2).await.unwrap();
+        let cursor = first.cursor.expect("a further page exists");
+        let second = m.list_members(Some(&cursor), 2).await.unwrap();
+        assert_eq!(second.members.len(), 1);
+        assert_eq!(second.cursor, None, "the walk terminates");
     }
 }
