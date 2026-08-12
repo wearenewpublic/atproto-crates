@@ -20,7 +20,11 @@
 
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
-use atproto_oauth::scopes::{Scope, SpaceCollection, SpaceDid, SpacePermission, SpaceType};
+use crate::oauth::permission_set;
+use atproto_oauth::scopes::{
+    BlobScope, MimePattern, RepoAction, RepoCollection, RepoScope, RpcAudience, RpcLexicon,
+    RpcScope, Scope, SpaceCollection, SpaceDid, SpacePermission, SpaceType,
+};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
@@ -151,7 +155,8 @@ pub async fn consent_page(
     // Best-effort: resolve the space-type NSIDs named in any `space:` scope to
     // their declaration `name` (the spec's "Consent" section). Failures fall back to the NSID.
     let type_names = resolve_space_type_names(&state, &request.scope).await;
-    let permission_sets = resolve_permission_sets(&state, &request.scope).await;
+    let permission_sets =
+        resolve_permission_sets(&state, &request.scope, &handles, &type_names).await;
 
     let html = render_consent(
         &q.request_uri,
@@ -220,7 +225,12 @@ async fn resolve_space_owner_handles(state: &HttpState, scope: &str) -> BTreeMap
 /// Sets that do not resolve are omitted, and the caller falls back to naming
 /// the NSID. Showing the raw scope is poor; inventing a description for a
 /// record this server could not read would be worse.
-async fn resolve_permission_sets(state: &HttpState, scope: &str) -> BTreeMap<String, String> {
+async fn resolve_permission_sets(
+    state: &HttpState,
+    scope: &str,
+    handles: &BTreeMap<String, String>,
+    type_names: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Some(resolver) = state.lexicon_resolver.as_ref() else {
         return out;
@@ -249,10 +259,23 @@ async fn resolve_permission_sets(state: &HttpState, scope: &str) -> BTreeMap<Str
         // The permissions themselves, not only the summary. The description is
         // the client's own words; this is what it actually gets, and the two
         // are not obliged to agree.
-        let grants = summarise_permissions(main);
+        //
+        // The audience travels on the `include:`, and whether an `rpc`
+        // permission is granted at all depends on it, so the description is
+        // per-request rather than per-set.
+        let (grants, refused) =
+            summarise_permissions(&doc, &inc.nsid, inc.aud.as_deref(), handles, type_names);
         if !grants.is_empty() {
             described.push_str(" Grants: ");
             described.push_str(&grants.join("; "));
+            described.push('.');
+        }
+        // Said out loud, because a set that asks for more than it gets is the
+        // case the holder most needs to understand: the client will behave as
+        // though it has these, and the failure lands later, somewhere else.
+        if !refused.is_empty() {
+            described.push_str(" Asks for, and is not granted: ");
+            described.push_str(&refused.join("; "));
             described.push('.');
         }
         out.insert(inc.nsid.clone(), described);
@@ -260,55 +283,52 @@ async fn resolve_permission_sets(state: &HttpState, scope: &str) -> BTreeMap<Str
     out
 }
 
-/// One readable line per permission a set declares.
-fn summarise_permissions(main: &serde_json::Value) -> Vec<String> {
-    let Some(permissions) = main["permissions"].as_array() else {
-        return Vec::new();
+/// What a permission set grants, and what it asks for and does not get.
+///
+/// Both halves come from [`permission_set::scopes_for_permission`] — the same
+/// call the token exchange makes — so the screen cannot describe a grant the
+/// token will not carry, or deny one it will.
+///
+/// It used to describe the permissions directly, with its own arms for `repo`
+/// and `blob` and a fall-through naming everything else "not granted by this
+/// server". That was true when it was written. Then `rpc` expansion landed, and
+/// `space` after it, and the screen went on saying the opposite of what the
+/// token did — telling the holder a set's proxy permissions were refused while
+/// issuing them. Describing the grant by expanding it is what keeps the two in
+/// step.
+///
+/// `include_aud` is the audience on the `include:` scope, which decides whether
+/// an `rpc` permission expands at all.
+fn summarise_permissions(
+    doc: &serde_json::Value,
+    nsid: &str,
+    include_aud: Option<&str>,
+    handles: &BTreeMap<String, String>,
+    type_names: &BTreeMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let Some(permissions) = doc["defs"]["main"]["permissions"].as_array() else {
+        return (Vec::new(), Vec::new());
     };
-    permissions
-        .iter()
-        .filter_map(|perm| {
-            let list = |k: &str| -> Vec<String> {
-                match &perm[k] {
-                    serde_json::Value::String(v) => vec![v.clone()],
-                    serde_json::Value::Array(a) => a
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect(),
-                    _ => Vec::new(),
-                }
-            };
-            match perm["resource"].as_str()? {
-                "repo" => {
-                    let mut actions = list("action");
-                    if actions.is_empty() {
-                        actions = vec!["create".into(), "update".into(), "delete".into()];
-                    }
-                    let collections = list("collection");
-                    if collections.is_empty() {
-                        return None;
-                    }
-                    Some(format!(
-                        "{} on {}",
-                        actions.join(", "),
-                        collections.join(", ")
-                    ))
-                }
-                "blob" => {
-                    let accept = list("accept");
-                    Some(if accept.is_empty() {
-                        "upload files of any type".to_string()
-                    } else {
-                        format!("upload {}", accept.join(", "))
-                    })
-                }
-                // Named rather than described: this server does not grant it,
-                // so claiming it does on the consent screen would be a lie in
-                // the one place that must not contain one.
-                other => Some(format!("{other} (not granted by this server)")),
+    let mut granted = Vec::new();
+    let mut refused = Vec::new();
+    for perm in permissions {
+        match permission_set::scopes_for_permission(perm, nsid, include_aud) {
+            // An expanded scope is never an `include:`, so the permission-set
+            // map a top-level scope needs is not consulted here.
+            Ok(scopes) => granted.extend(
+                scopes
+                    .iter()
+                    .map(|s| describe_scope(s, handles, type_names, &BTreeMap::new())),
+            ),
+            // The reason, not just the refusal: "not granted" and "add `?aud=`
+            // to get this" call for different things from the person reading.
+            Err(reason) => {
+                let resource = perm["resource"].as_str().unwrap_or("(unnamed)");
+                refused.push(format!("`{resource}` — {reason}"));
             }
-        })
-        .collect()
+        }
+    }
+    (granted, refused)
 }
 
 async fn resolve_space_type_names(state: &HttpState, scope: &str) -> BTreeMap<String, String> {
@@ -685,7 +705,108 @@ pub fn describe_scope(
             _ => format!("malformed Spaces scope `{scope}`"),
         };
     }
+    // `repo:`, `blob:` and `rpc:` reached the fall-through below until the
+    // consent screen started describing what a permission set expands into,
+    // which is mostly these three. A grant that lets an application call
+    // methods at another service on the holder's behalf, in particular, should
+    // say so in words before they approve it -- it was reading as "request
+    // access to scope `rpc:app.bsky.video.uploadVideo?aud=did:web:api.bsky.app`".
+    if scope == "repo" || scope.starts_with("repo:") || scope.starts_with("repo?") {
+        return match Scope::parse(scope) {
+            Ok(Scope::Repo(perm)) => describe_repo_scope(&perm),
+            _ => format!("malformed repository scope `{scope}`"),
+        };
+    }
+    if scope == "blob" || scope.starts_with("blob:") || scope.starts_with("blob?") {
+        return match Scope::parse(scope) {
+            Ok(Scope::Blob(perm)) => describe_blob_scope(&perm),
+            _ => format!("malformed blob scope `{scope}`"),
+        };
+    }
+    if scope == "rpc" || scope.starts_with("rpc:") || scope.starts_with("rpc?") {
+        return match Scope::parse(scope) {
+            Ok(Scope::Rpc(perm)) => describe_rpc_scope(&perm, handles),
+            _ => format!("malformed rpc scope `{scope}`"),
+        };
+    }
     format!("request access to scope `{scope}`")
+}
+
+/// `create, update records in app.bsky.feed.post`.
+fn describe_repo_scope(perm: &RepoScope) -> String {
+    let actions: Vec<&str> = perm.actions.iter().map(RepoAction::as_str).collect();
+    let actions_label = if actions.is_empty() {
+        "no access to".to_string()
+    } else {
+        actions.join(", ")
+    };
+    let collections: Vec<String> = perm
+        .collections
+        .iter()
+        .map(|c| match c {
+            RepoCollection::All => "any collection".to_string(),
+            RepoCollection::Nsid(nsid) => nsid.clone(),
+        })
+        .collect();
+    if collections.is_empty() {
+        return format!("{actions_label} records in no collection");
+    }
+    format!("{actions_label} records in {}", collections.join(", "))
+}
+
+/// `upload image/png, image/jpeg files`.
+fn describe_blob_scope(perm: &BlobScope) -> String {
+    let types: Vec<String> = perm
+        .accept
+        .iter()
+        .map(|m| match m {
+            MimePattern::All => "any type".to_string(),
+            MimePattern::TypeWildcard(t) => format!("{t}/*"),
+            MimePattern::Exact(t) => t.clone(),
+        })
+        .collect();
+    if types.is_empty() {
+        return "upload no files".to_string();
+    }
+    format!("upload {} files", types.join(", "))
+}
+
+/// `call app.bsky.video.uploadVideo at @api.bsky.app on your behalf`.
+///
+/// "On your behalf" is the part worth spelling out: the PDS signs a proxied
+/// call with the account's own key, so the service on the other end sees the
+/// holder, not the application.
+fn describe_rpc_scope(perm: &RpcScope, handles: &BTreeMap<String, String>) -> String {
+    let methods: Vec<String> = perm
+        .lxm
+        .iter()
+        .map(|l| match l {
+            RpcLexicon::All => "any method".to_string(),
+            RpcLexicon::Nsid(nsid) => nsid.clone(),
+        })
+        .collect();
+    let methods_label = if methods.is_empty() {
+        "no method".to_string()
+    } else {
+        methods.join(", ")
+    };
+    let audiences: Vec<String> = perm
+        .aud
+        .iter()
+        .map(|a| match a {
+            RpcAudience::All => "any service".to_string(),
+            RpcAudience::Did(did) => handles
+                .get(did)
+                .map(|h| format!("@{h}"))
+                .unwrap_or_else(|| did.clone()),
+        })
+        .collect();
+    let audiences_label = if audiences.is_empty() {
+        "no service".to_string()
+    } else {
+        audiences.join(", ")
+    };
+    format!("call {methods_label} at {audiences_label} on your behalf")
 }
 
 /// Build a human-readable description of a parsed `space:` permission, using
@@ -909,10 +1030,15 @@ mod tests {
         );
     }
 
+    /// Wrap a `main` def in the document shape `summarise_permissions` reads.
+    fn set_doc(main: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "defs": { "main": main } })
+    }
+
     /// The permission lines name collections and actions, not counts.
     #[test]
     fn permissions_are_summarised_in_full() {
-        let main = serde_json::json!({
+        let doc = set_doc(serde_json::json!({
             "type": "permission-set",
             "permissions": [
                 {"resource": "repo", "action": ["create", "update"],
@@ -920,38 +1046,158 @@ mod tests {
                 {"resource": "blob", "accept": ["image/png"]},
                 {"resource": "something-new"},
             ],
-        });
+        }));
 
-        let lines = summarise_permissions(&main);
+        let (granted, refused) =
+            summarise_permissions(&doc, "app.example.set", None, &no_handles(), &no_names());
 
         assert!(
-            lines.iter().any(|l| l.contains("app.x.one, app.x.two")),
-            "{lines:?}"
+            granted.iter().any(|l| l.contains("app.x.one")),
+            "{granted:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("create, update")),
-            "{lines:?}"
+            granted.iter().any(|l| l.contains("app.x.two")),
+            "{granted:?}"
         );
-        assert!(lines.iter().any(|l| l.contains("image/png")), "{lines:?}");
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("not granted by this server")),
-            "a resource this server ignores must not read as granted: {lines:?}"
+            granted.iter().any(|l| l.contains("create, update")),
+            "{granted:?}"
+        );
+        assert!(
+            granted.iter().any(|l| l.contains("image/png")),
+            "{granted:?}"
+        );
+        assert!(
+            refused.iter().any(|l| l.contains("something-new")),
+            "a resource this server ignores must not read as granted: {refused:?}"
         );
     }
 
     /// An omitted action list is every action, and the page must say all three.
     #[test]
     fn an_omitted_action_list_is_shown_as_all_three() {
-        let main = serde_json::json!({
+        let doc = set_doc(serde_json::json!({
             "type": "permission-set",
             "permissions": [{"resource": "repo", "collection": ["app.x.one"]}],
-        });
+        }));
 
-        let lines = summarise_permissions(&main);
+        let (granted, _) =
+            summarise_permissions(&doc, "app.example.set", None, &no_handles(), &no_names());
 
-        assert!(lines[0].contains("create, update, delete"), "{lines:?}");
+        assert!(granted[0].contains("create, update, delete"), "{granted:?}");
+    }
+
+    /// The defect this rewrite exists for. `app.bsky.authCreatePosts` is the
+    /// real bundled set: an `inheritAud` rpc permission covering the three
+    /// video methods, plus the three post collections. With an audience on the
+    /// `include:`, the token carries the rpc grants -- so the screen has to
+    /// describe them, and for a while it said the opposite.
+    #[test]
+    fn an_inherited_rpc_permission_is_described_as_granted() {
+        let doc = set_doc(serde_json::json!({
+            "type": "permission-set",
+            "permissions": [
+                {"resource": "rpc", "inheritAud": true,
+                 "lxm": ["app.bsky.video.uploadVideo"]},
+            ],
+        }));
+
+        let (granted, refused) = summarise_permissions(
+            &doc,
+            "app.bsky.authCreatePosts",
+            Some("did:web:api.bsky.app"),
+            &no_handles(),
+            &no_names(),
+        );
+
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(granted.len(), 1, "{granted:?}");
+        assert!(
+            granted[0].contains("app.bsky.video.uploadVideo"),
+            "the method has to be named: {granted:?}"
+        );
+        assert!(
+            granted[0].contains("did:web:api.bsky.app"),
+            "and so does the service it may be called at: {granted:?}"
+        );
+        assert!(
+            granted[0].contains("on your behalf"),
+            "a proxied call is signed with the holder's key, which is the part \
+             worth saying: {granted:?}"
+        );
+        assert!(
+            !granted[0].contains("not granted"),
+            "this is granted: {granted:?}"
+        );
+    }
+
+    /// The same set without `?aud=` on the `include:` grants nothing for that
+    /// permission -- and the screen says why, because adding an audience is
+    /// something the client can act on.
+    #[test]
+    fn an_rpc_permission_with_no_audience_says_why_it_is_refused() {
+        let doc = set_doc(serde_json::json!({
+            "type": "permission-set",
+            "permissions": [
+                {"resource": "rpc", "inheritAud": true,
+                 "lxm": ["app.bsky.video.uploadVideo"]},
+            ],
+        }));
+
+        let (granted, refused) = summarise_permissions(
+            &doc,
+            "app.bsky.authCreatePosts",
+            None,
+            &no_handles(),
+            &no_names(),
+        );
+
+        assert!(granted.is_empty(), "{granted:?}");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("aud="), "{refused:?}");
+        assert!(
+            refused[0].contains("app.bsky.authCreatePosts"),
+            "the reason names the include: to add it to: {refused:?}"
+        );
+    }
+
+    /// A verified handle is friendlier than a DID, and the rpc audience gets
+    /// the same treatment `space:` owners already had.
+    #[test]
+    fn an_rpc_audience_renders_a_known_handle() {
+        let mut handles = BTreeMap::new();
+        handles.insert(
+            "did:web:api.bsky.app".to_string(),
+            "api.bsky.app".to_string(),
+        );
+
+        let d = describe_scope(
+            "rpc:app.bsky.video.uploadVideo?aud=did:web:api.bsky.app",
+            &handles,
+            &no_names(),
+            &no_names(),
+        );
+
+        assert!(d.contains("@api.bsky.app"), "{d}");
+    }
+
+    /// `repo:` and `blob:` were falling through to "request access to scope
+    /// `…`" as well, which is the string this page exists not to show.
+    #[test]
+    fn describe_scope_covers_repo_and_blob() {
+        let repo = describe_scope(
+            "repo:app.bsky.feed.post?action=create",
+            &no_handles(),
+            &no_names(),
+            &no_names(),
+        );
+        assert!(repo.contains("create"), "{repo}");
+        assert!(repo.contains("app.bsky.feed.post"), "{repo}");
+        assert!(!repo.contains("request access to scope"), "{repo}");
+
+        let blob = describe_scope("blob:image/png", &no_handles(), &no_names(), &no_names());
+        assert!(blob.contains("image/png"), "{blob}");
+        assert!(!blob.contains("request access to scope"), "{blob}");
     }
 
     #[test]

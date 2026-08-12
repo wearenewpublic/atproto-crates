@@ -25,10 +25,24 @@
 //!
 //! # What is covered
 //!
-//! `repo` and `blob` permissions. A permission naming any other resource is
-//! dropped with a warning rather than guessed at: the failure from too few
-//! scopes is a clear `InsufficientScope`, and the failure from inventing one
-//! is a grant nobody approved.
+//! `repo`, `blob`, `rpc` and `space` permissions. A permission naming any other
+//! resource is dropped with a warning rather than guessed at: the failure from
+//! too few scopes is a clear `InsufficientScope`, and the failure from inventing
+//! one is a grant nobody approved.
+//!
+//! # The consent screen expands through here too
+//!
+//! [`scopes_for_permission`] is the single decision about what one declared
+//! permission becomes, and both callers go through it: this module, to build the
+//! grant, and `oauth::consent`, to describe it. They used to be separate — the
+//! screen had its own summary that predated `rpc` and `space` expansion and went
+//! on calling both "not granted by this server" after the token started carrying
+//! them. Describing the grant by expanding it is what stops the two drifting
+//! again: a resource arm added below is described above without being told.
+//!
+//! A permission that expands to nothing returns why, rather than an empty list,
+//! because the screen has to say which of "you are not getting this" and "add
+//! `?aud=` to get this" is true.
 
 use crate::repo::lexicon::LexiconResolver;
 use atproto_oauth::scopes::Scope;
@@ -66,28 +80,6 @@ pub async fn expand(resolver: Option<&Arc<dyn LexiconResolver>>, granted: &str) 
             continue;
         };
         let expanded = permissions_from(&doc, &nsid, include_aud.as_deref());
-        // Every string these scopes are built from is chosen by the client. The
-        // record lives in the client's own repository, so `lxm`, `collection`,
-        // `action` and `accept` are all its text, and the audience arrives on
-        // the `include:` scope the client wrote. A grant is space-delimited, so
-        // a value carrying a space is not a value -- it is a second scope, and
-        // one that never appeared on the consent screen because the screen
-        // splits on whitespace too and saw a single token.
-        //
-        // Checking here rather than in each builder is deliberate: this is the
-        // one place every expanded scope passes through, and a new resource
-        // arm added later inherits the check instead of having to remember it.
-        let (expanded, rejected): (Vec<String>, Vec<String>) = expanded
-            .into_iter()
-            .partition(|scope| atproto_oauth::scopes::is_scope_token(scope));
-        for scope in rejected {
-            tracing::warn!(
-                nsid = %nsid,
-                scope = %scope,
-                "dropping an expanded permission that is not a single scope token; a permission \
-                 set may not decide how many scopes it becomes"
-            );
-        }
         if expanded.is_empty() {
             tracing::warn!(nsid = %nsid, "permission set declared nothing this server understands");
         } else {
@@ -142,22 +134,67 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str, include_aud: Option<&st
 
     let mut out = Vec::new();
     for perm in permissions {
-        match perm["resource"].as_str() {
-            Some("repo") => out.extend(repo_scopes(perm)),
-            Some("blob") => out.extend(blob_scopes(perm)),
-            Some("rpc") => out.extend(rpc_scopes(perm, nsid, include_aud)),
-            Some("space") => out.extend(space_scopes(perm, nsid)),
-            other => {
-                // Deliberately not guessed at. See the module note.
-                tracing::warn!(
-                    nsid = %nsid,
-                    resource = ?other,
-                    "skipping a permission for a resource this server does not expand"
-                );
-            }
+        match scopes_for_permission(perm, nsid, include_aud) {
+            Ok(scopes) => out.extend(scopes),
+            Err(reason) => tracing::warn!(
+                nsid = %nsid,
+                resource = ?perm["resource"].as_str(),
+                reason = %reason,
+                "skipping a permission this server will not grant"
+            ),
         }
     }
     out
+}
+
+/// The scopes one declared permission expands into, or why it expands into
+/// nothing.
+///
+/// This is the whole decision about what a permission becomes, and it is
+/// deliberately the only copy: `oauth::consent` calls it to describe a set on
+/// the consent screen, so the words the account holder reads are generated from
+/// the same code that builds the grant they are approving. See the module note.
+///
+/// The error is a sentence for a person, not a code — it reaches the consent
+/// screen verbatim.
+pub(crate) fn scopes_for_permission(
+    perm: &serde_json::Value,
+    nsid: &str,
+    include_aud: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let scopes = match perm["resource"].as_str() {
+        Some("repo") => repo_scopes(perm)?,
+        Some("blob") => blob_scopes(perm),
+        Some("rpc") => rpc_scopes(perm, nsid, include_aud)?,
+        Some("space") => space_scopes(perm)?,
+        // Deliberately not guessed at. See the module note.
+        Some(other) => {
+            return Err(format!("`{other}` is not a resource this server grants"));
+        }
+        None => return Err("the permission names no resource".to_string()),
+    };
+
+    // Every string these scopes are built from is chosen by the client. The
+    // record lives in the client's own repository, so `lxm`, `collection`,
+    // `action` and `accept` are all its text, and the audience arrives on the
+    // `include:` scope the client wrote. A grant is space-delimited, so a value
+    // carrying a space is not a value -- it is a second scope, and one that
+    // never appeared on the consent screen because the screen splits on
+    // whitespace too and saw a single token.
+    //
+    // Checking here rather than in each builder is deliberate: this is the one
+    // place every expanded scope passes through, and a new resource arm added
+    // later inherits the check instead of having to remember it.
+    if let Some(bad) = scopes
+        .iter()
+        .find(|scope| !atproto_oauth::scopes::is_scope_token(scope))
+    {
+        return Err(format!(
+            "`{bad}` is not a single scope token; a permission set may not decide how many scopes \
+             it becomes"
+        ));
+    }
+    Ok(scopes)
 }
 
 /// `space:<spaceType>[?authority=…][&skey=…][&collection=…][&action=…]` for a
@@ -181,20 +218,20 @@ fn permissions_from(doc: &serde_json::Value, nsid: &str, include_aud: Option<&st
 /// the declaration as it changes; enumerating the collections here would
 /// freeze them at the moment of expansion. The spec says an app that wants
 /// them frozen should list them explicitly, which a permission set can do.
-fn space_scopes(perm: &serde_json::Value, nsid: &str) -> Vec<String> {
+fn space_scopes(perm: &serde_json::Value) -> Result<Vec<String>, String> {
     let Some(space_type) = perm["spaceType"].as_str().filter(|t| !t.is_empty()) else {
-        tracing::warn!(
-            nsid = %nsid,
-            "skipping a space permission with no spaceType; a set permission must name a concrete space type"
+        return Err(
+            "the space permission names no spaceType, and a set permission must name a concrete \
+             space type"
+                .to_string(),
         );
-        return Vec::new();
     };
     if space_type == "*" {
-        tracing::warn!(
-            nsid = %nsid,
-            "skipping a space permission with spaceType=*; a cross-type grant is only expressible as a scope requested directly"
+        return Err(
+            "the space permission asks for every space type, which is only expressible as a scope \
+             requested directly"
+                .to_string(),
         );
-        return Vec::new();
     }
 
     let mut params: Vec<String> = Vec::new();
@@ -232,11 +269,11 @@ fn space_scopes(perm: &serde_json::Value, nsid: &str) -> Vec<String> {
         params.push(format!("action={action}"));
     }
 
-    vec![if params.is_empty() {
+    Ok(vec![if params.is_empty() {
         format!("space:{space_type}")
     } else {
         format!("space:{space_type}?{}", params.join("&"))
-    }]
+    }])
 }
 
 /// `rpc:<lxm>?aud=<audience>` for each method the permission names.
@@ -264,39 +301,37 @@ fn space_scopes(perm: &serde_json::Value, nsid: &str) -> Vec<String> {
 /// outright, matching the reference (`oauth-scopes`, `include-scope.ts`): a set
 /// is published once and reused by every client, so an audience baked into it
 /// would be the publisher choosing who a holder's tokens may talk to.
-fn rpc_scopes(perm: &serde_json::Value, nsid: &str, include_aud: Option<&str>) -> Vec<String> {
+fn rpc_scopes(
+    perm: &serde_json::Value,
+    nsid: &str,
+    include_aud: Option<&str>,
+) -> Result<Vec<String>, String> {
     // `aud: "*"` is the one self-named audience that is not a claim about a
     // particular service, and the reference lets it through to be treated like
     // an absent one. It still needs an inherited audience to expand.
     let own_aud = perm["aud"].as_str().filter(|a| *a != "*");
     if let Some(own) = own_aud {
-        tracing::warn!(
-            nsid = %nsid,
-            aud = %own,
-            "skipping an rpc permission that names its own audience; a permission set may not choose \
+        return Err(format!(
+            "the permission names its own audience (`{own}`), and a permission set may not choose \
              which service a holder's token may call"
-        );
-        return Vec::new();
+        ));
     }
 
     let inherits = perm["inheritAud"].as_bool().unwrap_or(false);
     let aud = match (inherits, include_aud.filter(|a| !a.is_empty())) {
         (true, Some(aud)) => aud,
         (true, None) => {
-            tracing::warn!(
-                nsid = %nsid,
-                "skipping an rpc permission: it inherits its audience and the include: scope named \
-                 none. Add `?aud=<did>` to the include: scope to grant it"
-            );
-            return Vec::new();
+            return Err(format!(
+                "the permission takes its audience from the request, which named none — ask for \
+                 `include:{nsid}?aud=<did>` to grant it"
+            ));
         }
         (false, _) => {
-            tracing::warn!(
-                nsid = %nsid,
-                "skipping an rpc permission with no audience: granting it would mean every service, \
-                 which is wider than this set describes"
+            return Err(
+                "the permission names no audience, and granting it would mean every service, which \
+                 is wider than this set describes"
+                    .to_string(),
             );
-            return Vec::new();
         }
     };
 
@@ -304,23 +339,25 @@ fn rpc_scopes(perm: &serde_json::Value, nsid: &str, include_aud: Option<&str>) -
     if methods.is_empty() {
         // No `lxm` means every method, which with a concrete audience is still
         // "anything at that one service" -- broader than any set here declares.
-        tracing::warn!(
-            nsid = %nsid,
-            "skipping an rpc permission that names no methods; it would grant every method at its audience"
+        return Err(
+            "the permission names no methods, so it would grant every method at its audience"
+                .to_string(),
         );
-        return Vec::new();
     }
 
-    methods
+    Ok(methods
         .into_iter()
         .map(|lxm| format!("rpc:{lxm}?aud={aud}"))
-        .collect()
+        .collect())
 }
 
 /// `repo:<collection>?action=…` for each collection the permission names.
-fn repo_scopes(perm: &serde_json::Value) -> Vec<String> {
+fn repo_scopes(perm: &serde_json::Value) -> Result<Vec<String>, String> {
     let actions = string_list(&perm["action"]);
     let collections = string_list(&perm["collection"]);
+    if collections.is_empty() {
+        return Err("the permission names no collections".to_string());
+    }
     let mut out = Vec::new();
     for collection in collections {
         // An omitted `action` means every action, matching how a bare `repo:`
@@ -342,7 +379,7 @@ fn repo_scopes(perm: &serde_json::Value) -> Vec<String> {
             .join("&");
         out.push(format!("repo:{collection}?{query}"));
     }
-    out
+    Ok(out)
 }
 
 /// `blob:<mime>` for each accepted type.
@@ -1074,6 +1111,54 @@ mod tests {
         assert!(
             expanded.contains("repo:app.bsky.feed.post?action=create"),
             "{expanded}"
+        );
+    }
+
+    /// Every resource the bundled corpus declares is one this server expands.
+    ///
+    /// The underlying defect is structural: two lists -- what enforcement
+    /// asserts and what expansion emits -- that have to agree, written in
+    /// different files with nothing tying them together. It has now produced
+    /// the same bug three times (space declarations, rpc, and
+    /// `repo?collection=` on the parse side), and each time the only signal was
+    /// a WARN in a log nobody was reading.
+    ///
+    /// This turns that warning into a build failure for the sets we ship. It
+    /// deliberately checks only the *unknown resource* refusal: an rpc
+    /// permission skipped for want of an audience is a decision, made in
+    /// `rpc_scopes` and visible on the consent screen, not a gap. A new
+    /// resource appearing in a vendored lexicon is the gap.
+    #[test]
+    fn every_bundled_permission_set_expands_completely() {
+        let mut checked = 0;
+        for (nsid, raw) in crate::repo::lexicon::BUNDLED_LEXICONS {
+            let doc: serde_json::Value =
+                serde_json::from_str(raw).expect("a bundled lexicon parses");
+            let main = &doc["defs"]["main"];
+            if main["type"].as_str() != Some("permission-set") {
+                continue;
+            }
+            let Some(permissions) = main["permissions"].as_array() else {
+                continue;
+            };
+            for perm in permissions {
+                checked += 1;
+                // A concrete audience, so an `inheritAud` permission is judged
+                // on whether this server understands it rather than on whether
+                // the caller supplied one.
+                let outcome = scopes_for_permission(perm, nsid, Some("did:web:api.bsky.app"));
+                if let Err(reason) = &outcome {
+                    assert!(
+                        !reason.contains("is not a resource this server grants"),
+                        "{nsid} declares a resource expansion does not handle, so a set the \
+                         holder approves grants less than the screen showed: {reason}"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "the corpus guard found no bundled permission sets, so it is asserting nothing"
         );
     }
 }
