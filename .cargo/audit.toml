@@ -1,0 +1,68 @@
+# `cargo audit` configuration — the accepted-advisory list for the CI gate.
+#
+# CI runs `cargo audit --deny warnings`, so an advisory not listed here fails
+# the build. That is the point: these six were found by an ad-hoc sweep months
+# after they were published, and the gate exists so the next one announces
+# itself instead of waiting to be noticed.
+#
+# An entry here is a decision, not a silence. Each records why the advisory is
+# accepted and what would reverse that. The bar for adding one:
+#
+#   1. the vulnerable code is not in the release image, which builds
+#      `-F clap,hickory-dns,zeroize,tokio,smtp` (see the Dockerfile and the
+#      `release build` step in .tangled/workflows/ci.yml), and
+#   2. no version bump fixes it, and
+#   3. the reason is written down below.
+#
+# Verify a claim in (1) with, for a given advisory crate:
+#
+#   cargo tree -p atproto-pds --features clap,hickory-dns,smtp -i <crate>
+#
+# An advisory that reaches the release feature set is not eligible for this
+# file. Fix it, or change what the release build contains.
+
+[advisories]
+ignore = [
+    # --- quick-xml 0.37.5, via panproto-io -> panproto-core -------------------
+    # Memory-exhaustion DoS in `NsReader` namespace handling, and quadratic
+    # time checking start tags for duplicate attributes. Both 7.5 high, both
+    # fixed in quick-xml 0.41.
+    #
+    # Reachable only under `atproto-lexicon/panproto`, which only `atpmcp`
+    # enables — a developer tool, not the server. Cannot be fixed here:
+    # panproto-io pins the 0.37 line, so `cargo update -p quick-xml --precise
+    # 0.41.0` is refused by the resolver, and panproto-core 0.70 (the current
+    # release) still depends on the same quick-xml. Upstream's to fix.
+    #
+    # Revisit when panproto-io moves to quick-xml >= 0.41.
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
+
+    # --- rustls-webpki 0.101.7, via the `s3` feature --------------------------
+    # Reachable panic parsing CRLs, plus two name-constraint checking flaws.
+    # Fixed in 0.103.12/0.103.13 — which the tree already carries for its own
+    # TLS. This is a second, older copy that only the AWS SDK uses.
+    #
+    # Structural rather than stale: `aws-smithy-runtime` *defines*
+    # `tls-rustls` as `aws-smithy-http-client/legacy-rustls-ring`, which is
+    # rustls 0.21, and `aws-sdk-s3` exposes no other rustls feature. Moving to
+    # the newest SDK does not escape it — verified at aws-sdk-s3 1.141.0.
+    #
+    # The escape is `aws-smithy-http-client`'s modern `rustls-ring` /
+    # `rustls-aws-lc` features, reached by constructing the HTTP client
+    # directly and passing it to the SDK config. That is a change to the blob
+    # backend's TLS stack, not a dependency bump, so it wants its own change
+    # with its own testing.
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+
+    # --- lru 0.16.4, via the `s3` feature -------------------------------------
+    # Unsound: `LruCache::pop()` is not panic-safe and can leave a
+    # use-after-free. The workspace's own `lru` is 0.18.2 and unaffected; this
+    # is aws-sdk-s3's copy, which we do not choose.
+    #
+    # Goes away with the same work that fixes the rustls-webpki entries above,
+    # or sooner if the SDK bumps it.
+    "RUSTSEC-2026-0253",
+]

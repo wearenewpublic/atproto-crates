@@ -17,6 +17,9 @@ dependencies:
     - openssl
     - cmake
     - gcc
+    # From nixpkgs rather than `cargo install cargo-audit`, which would build
+    # the tool from source on every run.
+    - cargo-audit
 
 steps:
   # Installs the toolchain named in rust-toolchain.toml and prints it, so the
@@ -54,3 +57,18 @@ steps:
   # that cannot build fails CI rather than the release.
   - name: "release build"
     command: cargo check --release --bins -F clap,hickory-dns,zeroize,tokio,smtp
+
+  # Advisories against the locked dependency graph. The accepted ones live in
+  # `.cargo/audit.toml`, each with the reason it is accepted; anything not on
+  # that list fails here.
+  #
+  # `--deny warnings` because the unmaintained and unsound classes are the ones
+  # that would otherwise accumulate silently -- `cargo audit` reports them but
+  # exits 0 by default, which is indistinguishable from having none.
+  #
+  # This runs last on purpose. It is the only step whose result can change
+  # without the tree changing, since it reads a database that moves on its own,
+  # and a red build here means "a new advisory was published", not "this commit
+  # broke something".
+  - name: "audit"
+    command: cargo audit --deny warnings

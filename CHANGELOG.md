@@ -6,7 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **`cargo audit` is now a CI step**, and the accepted advisories are written down in
+  `.cargo/audit.toml` with the reason for each.
+
+  These were found by an ad-hoc sweep months after publication. The gate exists so the next one
+  announces itself. It runs `--deny warnings`, because the unmaintained and unsound classes are
+  exactly the ones that accumulate silently — `cargo audit` reports them but exits 0 by default,
+  which is indistinguishable from having none. It runs last, since it is the only step whose result
+  can change without the tree changing, and a failure there means "a new advisory was published",
+  not "this commit broke something".
+
+  A bare `cargo audit` would have failed forever, so the ignore list is what makes the gate usable —
+  and each entry is a decision rather than a silence. The bar for adding one: the vulnerable code is
+  not in the release image, no version bump fixes it, and the reason is recorded. An advisory that
+  reaches the release feature set is not eligible.
+
+  Verified in both directions: the gate passes on this tree, and removing any single entry — a
+  vulnerability or the unsound warning — turns it red.
+
 ### Changed
+- **`sqlx` 0.8 → 0.9**, which also drops `rsa` and with it RUSTSEC-2023-0071 (Marvin timing attack),
+  an advisory that had no fixed release and so could not be cleared by upgrading anything.
+
+  `runtime-tokio-rustls` splits into a runtime and an explicit TLS choice. 0.8 defined it as
+  `tls-rustls-ring`, itself an alias for `tls-rustls-ring-webpki`, so naming that directly keeps the
+  same provider and the same bundled roots rather than adopting a new posture. Three API changes:
+  `SqliteArguments` lost its lifetime parameter (which is also why `fetch_one_or_none` appeared to
+  vanish — the extension trait's impl had stopped matching), and `sqlx::query` now takes `SqlStr`,
+  satisfied only by `&'static str`.
+
+  The rest is a new lint that refuses a runtime-built query string until it has been audited. It
+  flagged 24 sites; none interpolates caller data. Most splice a `const`, a table name iterating a
+  literal array, or an ordering chosen by a `bool`. The one genuinely dynamic construction is
+  `list_spaces`, which builds a `WHERE` clause — but every pushed clause is a literal and the
+  caller's space type, authority DID and cursor go to the bindings vector, where `like_escape`
+  already neutralises `LIKE` wildcards. Those sites are wrapped in `AssertSqlSafe` with the reason
+  recorded at each. `prune_simple` went the other way: its `sql` parameter is now `&'static str`, so
+  the compiler proves what an assertion would only claim.
+
+  Existing databases were the actual risk, since the suite only ever builds fresh ones. Verified by
+  creating the accounts and actor migration sets under 0.8 and reopening those same files under 0.9
+  — 19 and 10 migrations, neither re-run nor rejected — with a tampered checksum confirming the
+  check is not vacuous (`VersionMismatch`). The migrations table DDL is column-for-column identical
+  across both versions for sqlite and postgres, and the checksum is Sha384 over the migration text
+  in both.
+
 - **Minimum supported Rust version raised from 1.90 to 1.97**, in the three places that declare it:
   `rust-version` in the workspace Cargo.toml, `channel` in `rust-toolchain.toml`, and the
   `FROM rust:<version>` builder stage in the Dockerfile.
