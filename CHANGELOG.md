@@ -5,19 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-### Fixed
-- **`PDS_OAUTH_KEYS_JWK_SET` could not accept a published JWKS.** The JWK type it parsed with
-  deserialised exactly `kty`, `crv`, `x`, `y`, `d` and failed the whole document on anything else,
-  so a key set carrying `use`, `alg` or `kid` — which is to say any key set produced by a real
-  implementation, since `kid` is what lets a consumer pick a key at all — was refused at boot with
-  `unknown field 'alg'`. Only a JWK hand-stripped to the curve members worked. The sibling parser
-  for client keys in `oauth/par.rs` filtered the document to those members first, which is why this
-  affected only the operator-supplied set and went unnoticed.
+## [0.15.0-rc.4] - 2026-08-12
+### Added
+- **`cargo audit` is now a CI step**, and the accepted advisories are written down in
+  `.cargo/audit.toml` with the reason for each.
 
-  The parsing moved from `bin/pds.rs` into `oauth/jwks.rs` alongside publication. Its tests could
-  not otherwise run: the `pds` target sets `test = false`, so tests written beside it are compiled
-  by nothing that CI invokes.
+  These were found by an ad-hoc sweep months after publication. The gate exists so the next one
+  announces itself. It runs `--deny warnings`, because the unmaintained and unsound classes are
+  exactly the ones that accumulate silently — `cargo audit` reports them but exits 0 by default,
+  which is indistinguishable from having none. It runs last, since it is the only step whose result
+  can change without the tree changing, and a failure there means "a new advisory was published",
+  not "this commit broke something".
+
+  A bare `cargo audit` would have failed forever, so the ignore list is what makes the gate usable —
+  and each entry is a decision rather than a silence. The bar for adding one: the vulnerable code is
+  not in the release image, no version bump fixes it, and the reason is recorded. An advisory that
+  reaches the release feature set is not eligible.
+
+  Verified in both directions: the gate passes on this tree, and removing any single entry — a
+  vulnerability or the unsound warning — turns it red.
 
 ### Changed
 - **RustCrypto upgraded a major**: `elliptic-curve` 0.14, `p256`/`p384`/`k256` 0.14, `ecdsa` 0.17,
@@ -54,7 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `password-hash` shares. Moving to 3.0 removed it. Salts now come from the workspace `rand`
   directly rather than depending on another crate's feature choice.
 
-### Changed
 - **`reqwest` 0.12 → 0.13**, with `reqwest-middleware` 0.5 and `reqwest-chain` 2.0.
 
   0.13 gates builder methods that used to be unconditional, so `form` and `query` join the feature
@@ -88,93 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and does not apply. Verified live: requests to `https://plc.directory/` and
   `https://bsky.social/xrpc/_health` both complete.
 
-### Security
-- **The `s3` feature now selects the current TLS stack**, clearing RUSTSEC-2026-0104, -0098 and
-  -0099 (`rustls-webpki 0.101.7`: a reachable panic parsing CRLs, and two name-constraint checking
-  flaws). `cargo audit` now reports **zero vulnerabilities** across the whole graph, and
-  `.cargo/audit.toml` is down to one accepted entry.
-
-  Two feature names, no code:
-
-      aws-config = { ..., features = ["rt-tokio", "default-https-client"] }
-      aws-sdk-s3 = { ..., features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
-
-  `aws-sdk-s3`'s `rustls` feature is not "rustls", it is
-  `aws-smithy-runtime/tls-rustls`, which that crate *defines* as
-  `aws-smithy-http-client/legacy-rustls-ring` — rustls 0.21, hyper 0.14, and the old
-  `rustls-webpki`. `default-https-client` maps instead to `rustls-aws-lc`, giving rustls 0.23 and
-  `rustls-webpki 0.103.14`. Earlier entries in this file called that chain structural and concluded
-  escaping it meant rewriting the blob backend; those have been corrected in place. The mistake was
-  a search, not an inference — the feature list was grepped for names containing `tls`, and
-  `default-https-client` does not contain it.
-
-  What actually changes underneath: `rustls 0.21 -> 0.23`, `hyper 0.14 -> 1.x`, and the crypto
-  provider from `ring` to `aws-lc-rs`. The trust anchors do **not** change — both the legacy and the
-  current client load platform roots via `rustls-native-certs`, so which certificates the S3
-  endpoint is verified against is the same before and after.
-
-  The provider change is the part worth care. `ring` is still in the graph for `reqwest` and `sqlx`,
-  so rustls 0.23 now has both provider features enabled, and in that state it *panics* on first use
-  unless something names a provider explicitly. Nothing here relies on the ambiguous default:
-  `aws-smithy-http-client` builds with `aws_lc_rs::default_provider()`, `reqwest` with
-  `ring::default_provider()`, and `sqlx` with a cfg-selected one, each through
-  `builder_with_provider`. Verified rather than assumed — driving a real request through
-  `aws_sdk_s3::Client` against `s3.amazonaws.com` returns `InvalidAccessKeyId`, a service-level
-  response, so the handshake completed and no panic occurred.
-
-  One build-time note for operators enabling `s3`: `aws-lc-rs` compiles C and needs `cmake`. CI
-  already installs it. The Dockerfile does not, because the release image does not build this
-  feature — enabling it there means adding `cmake` alongside `-F s3`.
-
-### Removed
-- **`atproto-lexicon`'s `transmogrify` and `compatibility` modules, the `panproto` feature, and the
-  `panproto-core` dependency**, along with `atpmcp`'s `transmogrify_record` tool. This clears
-  RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both 7.5 high, in `quick-xml`) by removing the code that
-  reached them, so they are gone from the graph rather than accepted in `.cargo/audit.toml` — which
-  is down to four entries, all now tracing to the single `s3` TLS cause. 27 crates leave the
-  lockfile; `atproto-lexicon`'s own tree drops from 742 to 614 edges.
-
-  The trigger was measuring what the `panproto` path actually bought, which turned out to be
-  negative. Transforming `{handle, bio}` into `{handle, bio, avatarUrl}` with the record
-  `{"handle": "alice.test", "bio": "hi"}`, the categorical strategy across repeated runs on
-  *identical input* returned `{"handle": "alice.test"}`, `{"bio": "alice.test"}` and
-  `{"avatarUrl": "alice.test"}` — three different mappings, each dropping `bio` despite its exact
-  name and type match in the destination, two of them writing the handle into an unrelated field.
-  It reported quality 0.77 for those, against 0.67 for the correct answer, so the confidence signal
-  pointed the wrong way too. The JSON strategy returned the same correct record on all six runs.
-
-  Nothing caught this because the comparison that would have rejected the worse result was
-  conditioned on `resolved_refs.is_some()`, and the public `transmogrify` entry point passes `None`
-  — so the categorical answer was returned unchecked. The quality assertions in the tests were
-  `> 0.0` and `== 1.0`, which both answers satisfy.
-
-  `compatibility` had no caller anywhere in the workspace, and the only known external consumer of
-  the feature reimplements both against `panproto-core` directly rather than through this crate, so
-  it is unaffected.
-
-  This removes public API: `atproto_lexicon::transmogrify`, `atproto_lexicon::compatibility`, and
-  the `TransmogrifyError` / `CompatibilityError` types.
-
-### Added
-- **`cargo audit` is now a CI step**, and the accepted advisories are written down in
-  `.cargo/audit.toml` with the reason for each.
-
-  These were found by an ad-hoc sweep months after publication. The gate exists so the next one
-  announces itself. It runs `--deny warnings`, because the unmaintained and unsound classes are
-  exactly the ones that accumulate silently — `cargo audit` reports them but exits 0 by default,
-  which is indistinguishable from having none. It runs last, since it is the only step whose result
-  can change without the tree changing, and a failure there means "a new advisory was published",
-  not "this commit broke something".
-
-  A bare `cargo audit` would have failed forever, so the ignore list is what makes the gate usable —
-  and each entry is a decision rather than a silence. The bar for adding one: the vulnerable code is
-  not in the release image, no version bump fixes it, and the reason is recorded. An advisory that
-  reaches the release feature set is not eligible.
-
-  Verified in both directions: the gate passes on this tree, and removing any single entry — a
-  vulnerability or the unsound warning — turns it red.
-
-### Changed
 - **`sqlx` 0.8 → 0.9**, which also drops `rsa` and with it RUSTSEC-2023-0071 (Marvin timing attack),
   an advisory that had no fixed release and so could not be cleared by upgrading anything.
 
@@ -231,7 +149,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did not — 12 warnings across 8 files, all mechanical, all fixed here. That drift is precisely what
   `rust-toolchain.toml` exists to keep out of `main`.
 
+- Dependency upgrade sweep across the 68 declared workspace requirements; 20 were a major behind.
+
+  **Upgraded.** `base64` 0.22 → 0.23, `compact_str` 0.9 → 0.10, `prometheus-client` 0.23 → 0.25,
+  `tower-http` 0.6 → 0.7 and `ulid` 1.2 → 3.0 needed no source change beyond `Ulid::new()` becoming
+  `Ulid::generate()`. The `opentelemetry` trio 0.27 → 0.32 with `tracing-opentelemetry` 0.28 → 0.33
+  needed three: the batch span processor no longer takes a runtime handle (so the `rt-tokio` feature
+  comes off), `Resource::new` is private in favour of `builder_empty`, and
+  `global::shutdown_tracer_provider` is gone because it could not guarantee the exporter had
+  drained, so the provider is retained and flushed directly. `redis` 0.27 → 1.5 needed none, and
+  drops the unmaintained `rustls-pemfile`.
+
+  `redis` needing no source change is why `feature_valkey.rs` gained a live round-trip behind
+  `PDS_VALKEY_TEST_URL` (the `postgres-live-tests` opt-in shape). Both valkey guards read a reply
+  *shape* rather than a status code — the JTI guard separates `SET NX` returning `OK` from returning
+  nil, the limiter destructures a two-element pipeline reply — and both fail *open* on a client
+  error. A release that changed nil handling or pipeline typing would compile, pass every offline
+  test, and silently stop rejecting replays and enforcing rate limits. The existing coverage never
+  contacted a server, so it could not have seen that.
+
+  **Deferred, with reasons.** `sqlx` 0.9 requires rustc 1.94 against the 1.90 pin. `panproto-core`
+  0.70 is API-compatible and passes, but `panproto-io` still pins the same vulnerable `quick-xml
+  0.37.5`, so it fixes neither advisory while *adding* `bitmaps` (unmaintained + unsound) and `paste`
+  (unmaintained) and growing that feature's tree from 742 to 976 edges. The `quick-xml` requirement
+  cannot be forced past it; the fix is upstream's.
+
+  The RustCrypto stack (`ecdsa` 0.17, `elliptic-curve` 0.14, `k256`/`p256`/`p384` 0.14,
+  `ed25519-dalek` 3.0) and the `reqwest` stack (0.13 with `reqwest-middleware` 0.5,
+  `reqwest-chain` 2.0) each need their own branch. `elliptic-curve` 0.14 removes `JwkEcKey` and the
+  `jwk` feature outright with no in-crate successor, across 71 references in 8 files including the
+  JWKS endpoint, DPoP proof parsing and PAR client attestation — and JWK field serialization is what
+  RFC 7638 thumbprints are computed over, which is what `cnf.jkt` binds space credentials to, so a
+  hand-rolled replacement risks invalidating every credential already issued. `reqwest` 0.13 renames
+  `rustls-tls` to `rustls`, but that also swaps the `ring` provider for `aws-lc-rs` (whose build
+  tooling the builder image does not install) and removes bundled `webpki-roots` with no replacement
+  feature, moving the trust anchors for every outbound connection — PLC directory, PDS-to-PDS,
+  AppView — from the binary to the host trust store.
+
+### Removed
+- **`atproto-lexicon`'s `transmogrify` and `compatibility` modules, the `panproto` feature, and the
+  `panproto-core` dependency**, along with `atpmcp`'s `transmogrify_record` tool. This clears
+  RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both 7.5 high, in `quick-xml`) by removing the code that
+  reached them, so they are gone from the graph rather than accepted in `.cargo/audit.toml` — which
+  is down to four entries, all now tracing to the single `s3` TLS cause. 27 crates leave the
+  lockfile; `atproto-lexicon`'s own tree drops from 742 to 614 edges.
+
+  The trigger was measuring what the `panproto` path actually bought, which turned out to be
+  negative. Transforming `{handle, bio}` into `{handle, bio, avatarUrl}` with the record
+  `{"handle": "alice.test", "bio": "hi"}`, the categorical strategy across repeated runs on
+  *identical input* returned `{"handle": "alice.test"}`, `{"bio": "alice.test"}` and
+  `{"avatarUrl": "alice.test"}` — three different mappings, each dropping `bio` despite its exact
+  name and type match in the destination, two of them writing the handle into an unrelated field.
+  It reported quality 0.77 for those, against 0.67 for the correct answer, so the confidence signal
+  pointed the wrong way too. The JSON strategy returned the same correct record on all six runs.
+
+  Nothing caught this because the comparison that would have rejected the worse result was
+  conditioned on `resolved_refs.is_some()`, and the public `transmogrify` entry point passes `None`
+  — so the categorical answer was returned unchecked. The quality assertions in the tests were
+  `> 0.0` and `== 1.0`, which both answers satisfy.
+
+  `compatibility` had no caller anywhere in the workspace, and the only known external consumer of
+  the feature reimplements both against `panproto-core` directly rather than through this crate, so
+  it is unaffected.
+
+  This removes public API: `atproto_lexicon::transmogrify`, `atproto_lexicon::compatibility`, and
+  the `TransmogrifyError` / `CompatibilityError` types.
+
+### Fixed
+- **`PDS_OAUTH_KEYS_JWK_SET` could not accept a published JWKS.** The JWK type it parsed with
+  deserialised exactly `kty`, `crv`, `x`, `y`, `d` and failed the whole document on anything else,
+  so a key set carrying `use`, `alg` or `kid` — which is to say any key set produced by a real
+  implementation, since `kid` is what lets a consumer pick a key at all — was refused at boot with
+  `unknown field 'alg'`. Only a JWK hand-stripped to the curve members worked. The sibling parser
+  for client keys in `oauth/par.rs` filtered the document to those members first, which is why this
+  affected only the operator-supplied set and went unnoticed.
+
+  The parsing moved from `bin/pds.rs` into `oauth/jwks.rs` alongside publication. Its tests could
+  not otherwise run: the `pds` target sets `test = false`, so tests written beside it are compiled
+  by nothing that CI invokes.
+
+- **The `s3` feature did not compile.** Twelve `aws-smithy` / `aws-runtime` crates had drifted to
+  releases requiring rustc 1.94.1 against the 1.90 pin, so `cargo check -p atproto-pds --features s3`
+  failed in the resolver before reaching any code. Nothing built that path — CI
+  (`.tangled/workflows/ci.yml`) passes no `--features` to its clippy or test steps, its release-build
+  step uses only the Dockerfile's set (`-F clap,hickory-dns,zeroize,tokio,smtp`), and
+  `--all-features` dies on the same resolver error rather than attributing it to a feature — so the
+  blob backend selected by `PDS_BLOB_STORE_URL=s3://...` was unbuildable from this tree.
+  Regenerating the lockfile lets the MSRV-aware resolver pick 1.90-compatible releases; only `aws`
+  crates move, all downgrades. Every optional feature now compiles in a single invocation, which was
+  not previously true.
+
 ### Security
+- **The `s3` feature now selects the current TLS stack**, clearing RUSTSEC-2026-0104, -0098 and
+  -0099 (`rustls-webpki 0.101.7`: a reachable panic parsing CRLs, and two name-constraint checking
+  flaws). `cargo audit` now reports **zero vulnerabilities** across the whole graph, and
+  `.cargo/audit.toml` is down to one accepted entry.
+
+  Two feature names, no code:
+
+      aws-config = { ..., features = ["rt-tokio", "default-https-client"] }
+      aws-sdk-s3 = { ..., features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+
+  `aws-sdk-s3`'s `rustls` feature is not "rustls", it is
+  `aws-smithy-runtime/tls-rustls`, which that crate *defines* as
+  `aws-smithy-http-client/legacy-rustls-ring` — rustls 0.21, hyper 0.14, and the old
+  `rustls-webpki`. `default-https-client` maps instead to `rustls-aws-lc`, giving rustls 0.23 and
+  `rustls-webpki 0.103.14`. Earlier entries in this file called that chain structural and concluded
+  escaping it meant rewriting the blob backend; those have been corrected in place. The mistake was
+  a search, not an inference — the feature list was grepped for names containing `tls`, and
+  `default-https-client` does not contain it.
+
+  What actually changes underneath: `rustls 0.21 -> 0.23`, `hyper 0.14 -> 1.x`, and the crypto
+  provider from `ring` to `aws-lc-rs`. The trust anchors do **not** change — both the legacy and the
+  current client load platform roots via `rustls-native-certs`, so which certificates the S3
+  endpoint is verified against is the same before and after.
+
+  The provider change is the part worth care. `ring` is still in the graph for `reqwest` and `sqlx`,
+  so rustls 0.23 now has both provider features enabled, and in that state it *panics* on first use
+  unless something names a provider explicitly. Nothing here relies on the ambiguous default:
+  `aws-smithy-http-client` builds with `aws_lc_rs::default_provider()`, `reqwest` with
+  `ring::default_provider()`, and `sqlx` with a cfg-selected one, each through
+  `builder_with_provider`. Verified rather than assumed — driving a real request through
+  `aws_sdk_s3::Client` against `s3.amazonaws.com` returns `InvalidAccessKeyId`, a service-level
+  response, so the handshake completed and no panic occurred.
+
+  One build-time note for operators enabling `s3`: `aws-lc-rs` compiles C and needs `cmake`. CI
+  already installs it. The Dockerfile does not, because the release image does not build this
+  feature — enabling it there means adding `cmake` alongside `-F s3`.
+
 - Dependency updates closing two RUSTSEC advisories, from a `cargo audit` sweep prompted by the
   hickory pin.
 
@@ -271,57 +316,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required rewriting the blob backend. That was wrong, and a later entry corrects it: `aws-sdk-s3`
   also offers `default-https-client`, which selects the current rustls, and switching features is
   the whole fix.
-
-### Fixed
-- **The `s3` feature did not compile.** Twelve `aws-smithy` / `aws-runtime` crates had drifted to
-  releases requiring rustc 1.94.1 against the 1.90 pin, so `cargo check -p atproto-pds --features s3`
-  failed in the resolver before reaching any code. Nothing built that path — CI
-  (`.tangled/workflows/ci.yml`) passes no `--features` to its clippy or test steps, its release-build
-  step uses only the Dockerfile's set (`-F clap,hickory-dns,zeroize,tokio,smtp`), and
-  `--all-features` dies on the same resolver error rather than attributing it to a feature — so the
-  blob backend selected by `PDS_BLOB_STORE_URL=s3://...` was unbuildable from this tree.
-  Regenerating the lockfile lets the MSRV-aware resolver pick 1.90-compatible releases; only `aws`
-  crates move, all downgrades. Every optional feature now compiles in a single invocation, which was
-  not previously true.
-
-### Changed
-- Dependency upgrade sweep across the 68 declared workspace requirements; 20 were a major behind.
-
-  **Upgraded.** `base64` 0.22 → 0.23, `compact_str` 0.9 → 0.10, `prometheus-client` 0.23 → 0.25,
-  `tower-http` 0.6 → 0.7 and `ulid` 1.2 → 3.0 needed no source change beyond `Ulid::new()` becoming
-  `Ulid::generate()`. The `opentelemetry` trio 0.27 → 0.32 with `tracing-opentelemetry` 0.28 → 0.33
-  needed three: the batch span processor no longer takes a runtime handle (so the `rt-tokio` feature
-  comes off), `Resource::new` is private in favour of `builder_empty`, and
-  `global::shutdown_tracer_provider` is gone because it could not guarantee the exporter had
-  drained, so the provider is retained and flushed directly. `redis` 0.27 → 1.5 needed none, and
-  drops the unmaintained `rustls-pemfile`.
-
-  `redis` needing no source change is why `feature_valkey.rs` gained a live round-trip behind
-  `PDS_VALKEY_TEST_URL` (the `postgres-live-tests` opt-in shape). Both valkey guards read a reply
-  *shape* rather than a status code — the JTI guard separates `SET NX` returning `OK` from returning
-  nil, the limiter destructures a two-element pipeline reply — and both fail *open* on a client
-  error. A release that changed nil handling or pipeline typing would compile, pass every offline
-  test, and silently stop rejecting replays and enforcing rate limits. The existing coverage never
-  contacted a server, so it could not have seen that.
-
-  **Deferred, with reasons.** `sqlx` 0.9 requires rustc 1.94 against the 1.90 pin. `panproto-core`
-  0.70 is API-compatible and passes, but `panproto-io` still pins the same vulnerable `quick-xml
-  0.37.5`, so it fixes neither advisory while *adding* `bitmaps` (unmaintained + unsound) and `paste`
-  (unmaintained) and growing that feature's tree from 742 to 976 edges. The `quick-xml` requirement
-  cannot be forced past it; the fix is upstream's.
-
-  The RustCrypto stack (`ecdsa` 0.17, `elliptic-curve` 0.14, `k256`/`p256`/`p384` 0.14,
-  `ed25519-dalek` 3.0) and the `reqwest` stack (0.13 with `reqwest-middleware` 0.5,
-  `reqwest-chain` 2.0) each need their own branch. `elliptic-curve` 0.14 removes `JwkEcKey` and the
-  `jwk` feature outright with no in-crate successor, across 71 references in 8 files including the
-  JWKS endpoint, DPoP proof parsing and PAR client attestation — and JWK field serialization is what
-  RFC 7638 thumbprints are computed over, which is what `cnf.jkt` binds space credentials to, so a
-  hand-rolled replacement risks invalidating every credential already issued. `reqwest` 0.13 renames
-  `rustls-tls` to `rustls`, but that also swaps the `ring` provider for `aws-lc-rs` (whose build
-  tooling the builder image does not install) and removes bundled `webpki-roots` with no replacement
-  feature, moving the trust anchors for every outbound connection — PLC directory, PDS-to-PDS,
-  AppView — from the binary to the host trust store.
-
 
 ## [0.15.0-rc.3] - 2026-08-11
 ### Fixed
@@ -3183,6 +3177,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core DID document handling
 - Cryptographic key operations for P-256 curves
 
+[0.15.0-rc.4]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.4
 [0.15.0-rc.3]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.3
 [0.15.0-rc.2]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.2
 [0.15.0-rc.1]: https://tangled.org/ngerakines.me/atproto-crates/tree/v0.15.0-rc.1

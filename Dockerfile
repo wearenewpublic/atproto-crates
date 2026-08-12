@@ -75,7 +75,7 @@ LABEL org.opencontainers.image.title="atproto-identity-rs"
 LABEL org.opencontainers.image.description="AT Protocol identity management tools"
 LABEL org.opencontainers.image.authors="Nick Gerakines <nick.gerakines@gmail.com>"
 LABEL org.opencontainers.image.source="https://tangled.org/ngerakines.me/atproto-crates"
-LABEL org.opencontainers.image.version="0.15.0-rc.3"
+LABEL org.opencontainers.image.version="0.15.0-rc.4"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Document available binaries
