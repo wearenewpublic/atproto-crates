@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security
+- **The `s3` feature now selects the current TLS stack**, clearing RUSTSEC-2026-0104, -0098 and
+  -0099 (`rustls-webpki 0.101.7`: a reachable panic parsing CRLs, and two name-constraint checking
+  flaws). `cargo audit` now reports **zero vulnerabilities** across the whole graph, and
+  `.cargo/audit.toml` is down to one accepted entry.
+
+  Two feature names, no code:
+
+      aws-config = { ..., features = ["rt-tokio", "default-https-client"] }
+      aws-sdk-s3 = { ..., features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+
+  `aws-sdk-s3`'s `rustls` feature is not "rustls", it is
+  `aws-smithy-runtime/tls-rustls`, which that crate *defines* as
+  `aws-smithy-http-client/legacy-rustls-ring` — rustls 0.21, hyper 0.14, and the old
+  `rustls-webpki`. `default-https-client` maps instead to `rustls-aws-lc`, giving rustls 0.23 and
+  `rustls-webpki 0.103.14`. Earlier entries in this file called that chain structural and concluded
+  escaping it meant rewriting the blob backend; those have been corrected in place. The mistake was
+  a search, not an inference — the feature list was grepped for names containing `tls`, and
+  `default-https-client` does not contain it.
+
+  What actually changes underneath: `rustls 0.21 -> 0.23`, `hyper 0.14 -> 1.x`, and the crypto
+  provider from `ring` to `aws-lc-rs`. The trust anchors do **not** change — both the legacy and the
+  current client load platform roots via `rustls-native-certs`, so which certificates the S3
+  endpoint is verified against is the same before and after.
+
+  The provider change is the part worth care. `ring` is still in the graph for `reqwest` and `sqlx`,
+  so rustls 0.23 now has both provider features enabled, and in that state it *panics* on first use
+  unless something names a provider explicitly. Nothing here relies on the ambiguous default:
+  `aws-smithy-http-client` builds with `aws_lc_rs::default_provider()`, `reqwest` with
+  `ring::default_provider()`, and `sqlx` with a cfg-selected one, each through
+  `builder_with_provider`. Verified rather than assumed — driving a real request through
+  `aws_sdk_s3::Client` against `s3.amazonaws.com` returns `InvalidAccessKeyId`, a service-level
+  response, so the handshake completed and no panic occurred.
+
+  One build-time note for operators enabling `s3`: `aws-lc-rs` compiles C and needs `cmake`. CI
+  already installs it. The Dockerfile does not, because the release image does not build this
+  feature — enabling it there means adding `cmake` alongside `-F s3`.
+
 ### Removed
 - **`atproto-lexicon`'s `transmogrify` and `compatibility` modules, the `panproto` feature, and the
   `panproto-core` dependency**, along with `atpmcp`'s `transmogrify_record` tool. This clears
@@ -90,13 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had to walk *backwards* to stay inside 1.90 now move forward again (`aws-sdk-s3` 1.119 → 1.141,
   `aws-config` 1.8.13 → 1.10.1).
 
-  It buys no security. `cargo audit` reports the same six advisories before and after, and the four
-  under `s3` in particular are unreachable this way: at `aws-sdk-s3` 1.141.0 the vulnerable
-  `rustls-webpki 0.101.7` and `lru 0.12.5` are still in the tree, because `aws-smithy-runtime`
-  *defines* `tls-rustls` as `aws-smithy-http-client/legacy-rustls-ring` and `aws-sdk-s3` exposes no
-  other rustls door. Modern `rustls-ring` / `rustls-aws-lc` features do exist on
-  `aws-smithy-http-client`; reaching them means constructing the HTTP client directly and handing it
-  to the SDK config, which is a change to the blob backend and was never gated on the compiler.
+  It buys no security. `cargo audit` reports the same six advisories before and after: at
+  `aws-sdk-s3` 1.141.0 the vulnerable `rustls-webpki 0.101.7` and `lru` are still in the tree,
+  because `aws-smithy-runtime` defines `tls-rustls` as
+  `aws-smithy-http-client/legacy-rustls-ring`. (A later entry corrects the conclusion drawn from
+  that: the SDK does expose a modern alternative, `default-https-client`, and switching to it clears
+  the `rustls-webpki` advisories without touching any code. It was never gated on the compiler
+  either way.)
 
   `sqlx` 0.9 is now unblocked but not taken here: it splits `runtime-tokio-rustls` into separate
   runtime and TLS features, drops a lifetime parameter from `SqliteArguments`, renames
@@ -144,12 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachable only through optional features that are off by default: `rustls-webpki 0.101.7` (three
   advisories) and `lru 0.12.5` come in under `s3`, and `quick-xml 0.37.5` (two) under `panproto`.
 
-  The `s3` chain is structural rather than stale: `aws-sdk-s3/rustls` maps to
-  `aws-smithy-runtime/tls-rustls`, which is *defined* as `aws-smithy-http-client/legacy-rustls-ring`
-  — hyper 0.14 and rustls 0.21.8. Updating the SDK does not escape it; `aws-sdk-s3 1.141.0` still
-  resolves the same legacy stack, and additionally requires Rust 1.94.1 against this workspace's
-  1.90 pin. Escaping it means changing which TLS stack the S3 backend asks for, which is a
-  functional change to that backend rather than a dependency update.
+  The `s3` chain is not stale but *selected*: `aws-sdk-s3/rustls` maps to
+  `aws-smithy-runtime/tls-rustls`, which is defined as `aws-smithy-http-client/legacy-rustls-ring`
+  — hyper 0.14 and rustls 0.21.8. Bumping the SDK does not escape it; `aws-sdk-s3 1.141.0` resolves
+  the same legacy stack. This entry originally called that structural and concluded the escape
+  required rewriting the blob backend. That was wrong, and a later entry corrects it: `aws-sdk-s3`
+  also offers `default-https-client`, which selects the current rustls, and switching features is
+  the whole fix.
 
 ### Fixed
 - **The `s3` feature did not compile.** Twelve `aws-smithy` / `aws-runtime` crates had drifted to

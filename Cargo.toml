@@ -107,8 +107,8 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 tracing-opentelemetry = "0.33"
 prometheus-client = "0.25"
 redis = { version = "1.5", default-features = false, features = ["tokio-rustls-comp", "connection-manager"] }
-aws-config = { version = "1.5", default-features = false, features = ["rt-tokio", "rustls"] }
-aws-sdk-s3 = { version = "1.65", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-config = { version = "1.5", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "1.65", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-credential-types = "1.2"
 ulid = "3.0"
 unicode-segmentation = "1.13"

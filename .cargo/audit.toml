@@ -28,31 +28,19 @@ ignore = [
     # is no longer in the graph at all and the entries are gone rather than
     # accepted.
 
-    # --- rustls-webpki 0.101.7, via the `s3` feature --------------------------
-    # Reachable panic parsing CRLs, plus two name-constraint checking flaws.
-    # Fixed in 0.103.12/0.103.13 — which the tree already carries for its own
-    # TLS. This is a second, older copy that only the AWS SDK uses.
-    #
-    # Structural rather than stale: `aws-smithy-runtime` *defines*
-    # `tls-rustls` as `aws-smithy-http-client/legacy-rustls-ring`, which is
-    # rustls 0.21, and `aws-sdk-s3` exposes no other rustls feature. Moving to
-    # the newest SDK does not escape it — verified at aws-sdk-s3 1.141.0.
-    #
-    # The escape is `aws-smithy-http-client`'s modern `rustls-ring` /
-    # `rustls-aws-lc` features, reached by constructing the HTTP client
-    # directly and passing it to the SDK config. That is a change to the blob
-    # backend's TLS stack, not a dependency bump, so it wants its own change
-    # with its own testing.
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
+    # RUSTSEC-2026-0104, -0098 and -0099 (rustls-webpki 0.101.7) were here,
+    # described as structural. That was wrong. They came from the AWS SDK's
+    # `rustls` feature, which `aws-smithy-runtime` defines as
+    # `legacy-rustls-ring` — rustls 0.21 and hyper 0.14. The SDK also exposes
+    # `default-https-client`, which maps to `rustls-aws-lc` and the current
+    # rustls; switching to it drops the old copy entirely. No code changed.
 
     # --- lru 0.16.4, via the `s3` feature -------------------------------------
     # Unsound: `LruCache::pop()` is not panic-safe and can leave a
     # use-after-free. The workspace's own `lru` is 0.18.2 and unaffected; this
-    # is aws-sdk-s3's copy, which we do not choose.
+    # is aws-sdk-s3's copy, which we do not choose and cannot override — it is
+    # a direct dependency of the SDK crate, not something a feature selects.
     #
-    # Goes away with the same work that fixes the rustls-webpki entries above,
-    # or sooner if the SDK bumps it.
+    # Goes away when aws-sdk-s3 bumps it.
     "RUSTSEC-2026-0253",
 ]
