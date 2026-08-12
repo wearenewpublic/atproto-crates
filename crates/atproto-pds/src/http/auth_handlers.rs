@@ -487,6 +487,11 @@ pub async fn create_account(
         match invite::redeem(&manager.account_pool(), code, &row.did).await {
             Ok(true) => {}
             Ok(false) => {
+                // The code is named here and not in the arm below, because
+                // `false` *is* the report that it is exhausted: somebody else
+                // redeemed it between the peek and here. A spent code is not a
+                // credential, and the operator reconciling this orphan has no
+                // other handle on which code it was.
                 tracing::warn!(
                     did = %row.did,
                     code = %code,
@@ -494,9 +499,14 @@ pub async fn create_account(
                 );
             }
             Err(e) => {
+                // No code on this path. The redeem did not complete, so the
+                // code may well still be live -- and a live invite code in a
+                // log is a credential in a log, readable by anyone the logs
+                // reach and usable by them. The DID is enough to find the
+                // account; `invite_code.used_by` is where the pairing lives
+                // once storage is working again.
                 tracing::warn!(
                     did = %row.did,
-                    code = %code,
                     error = ?e,
                     "account_without_invite: invite redeem storage error — operator reconcile"
                 );
@@ -2419,7 +2429,15 @@ pub async fn request_password_reset(
         })? {
         Some(d) => d,
         None => {
-            tracing::info!(email = %input.email, "requestPasswordReset: no active account match (silent 200)");
+            // Deliberately without the address. This endpoint is
+            // unauthenticated and answers 200 to everything, so logging what
+            // was asked about turned it into a writable record: anyone could
+            // put an arbitrary address into this server's logs, and the ones
+            // that landed here are precisely the addresses that are *not*
+            // registered — the enumeration answer the silent 200 exists to
+            // withhold, recorded for whoever reads the logs. The line still
+            // counts, which is what makes probing visible in aggregate.
+            tracing::info!("requestPasswordReset: no active account match (silent 200)");
             return Ok(axum::http::StatusCode::OK);
         }
     };

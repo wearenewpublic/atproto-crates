@@ -124,6 +124,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message and several of them quote back something the caller sent, which made the error path an
   injection sink on the origin holding the portal session cookie. It uses `textContent` now.
 
+- **`requestPasswordReset` no longer logs the address it was asked about.** The endpoint answers 200
+  to everything on purpose — whether an address is registered is the enumeration answer it exists to
+  withhold — and then wrote that answer into the log, since the addresses reaching the miss branch
+  are exactly the ones that are *not* registered. It is also unauthenticated, so anyone with a curl
+  command could put arbitrary addresses into this server's logs. The line remains, without the
+  address: it is what makes probing visible in aggregate.
+
+- **A live invite code is no longer logged when its redemption fails on a storage error.** The
+  neighbouring race path still names the code, and deliberately: a `false` return *is* the report
+  that the code is spent, a spent code is not a credential, and the operator reconciling that orphan
+  has no other handle on it. The storage-error path is the one where the code may still be live, and
+  a live invite code in a log is a credential in a log. The DID is enough to find the account.
+
 ## [0.15.0-rc.4] - 2026-08-12
 ### Added
 - **`cargo audit` is now a CI step**, and the accepted advisories are written down in
