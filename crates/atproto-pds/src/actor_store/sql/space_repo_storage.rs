@@ -102,11 +102,11 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
         let (order, cmp) = if reverse { ("DESC", "<") } else { ("ASC", ">") };
         let rows: Vec<(String, String, Vec<u8>, String, String)> = match cursor {
             Some(cur) => {
-                sqlx::query_as(&format!(
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT rkey, cid, value, repo_rev, indexed_at FROM space_record
                  WHERE space = ? AND collection = ? AND rkey {cmp} ?
                  ORDER BY rkey {order} LIMIT ?"
-                ))
+                )))
                 .bind(space.to_string())
                 .bind(collection)
                 .bind(cur)
@@ -115,11 +115,11 @@ impl SpaceRepoStorage for SqlSpaceRepoStorage {
                 .await
             }
             None => {
-                sqlx::query_as(&format!(
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT rkey, cid, value, repo_rev, indexed_at FROM space_record
                  WHERE space = ? AND collection = ?
                  ORDER BY rkey {order} LIMIT ?"
-                ))
+                )))
                 .bind(space.to_string())
                 .bind(collection)
                 .bind(limit as i64)

@@ -371,13 +371,16 @@ impl SpaceService {
             "space_repo",
             "space_blob_ref",
         ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE space = ?"))
-                .bind(uri.to_string())
-                .execute(store.pool())
-                .await
-                .map_err(|e| PdsError::Storage {
-                    reason: format!("deleteSpace purge {table}: {e}"),
-                })?;
+            // `AssertSqlSafe`: `table` iterates the literal array above.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE space = ?"
+            )))
+            .bind(uri.to_string())
+            .execute(store.pool())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("deleteSpace purge {table}: {e}"),
+            })?;
         }
         Ok(())
     }
@@ -446,7 +449,7 @@ impl SpaceService {
             "SELECT uri, is_owner, is_member, created_at FROM space {where_clause}
              ORDER BY uri ASC LIMIT ?"
         );
-        let mut q = sqlx::query_as::<_, (String, i64, i64, String)>(&sql);
+        let mut q = sqlx::query_as::<_, (String, i64, i64, String)>(sqlx::AssertSqlSafe(sql));
         for b in &bindings {
             q = q.bind(b);
         }

@@ -243,7 +243,11 @@ async fn prune_notify(pool: &SqlitePool, state: &str, cutoff: &str) -> PdsResult
     Ok(result.rows_affected())
 }
 
-async fn prune_simple(pool: &SqlitePool, sql: &str, bind: &str) -> PdsResult<u64> {
+// `sql` is `&'static str` rather than `&str` so the query text can only ever
+// be a literal. sqlx 0.9 requires one or the other -- a borrowed `&str` has to
+// be wrapped in `AssertSqlSafe` -- and every caller already passes a literal,
+// so this is the version the compiler checks instead of the one we assert.
+async fn prune_simple(pool: &SqlitePool, sql: &'static str, bind: &str) -> PdsResult<u64> {
     let result = sqlx::query(sql)
         .bind(bind)
         .execute(pool)
@@ -319,8 +323,10 @@ async fn prune_per_actor(
 
             if let Some(cutoff_tid) = cutoff_tid {
                 for table in ["space_record_oplog", "space_member_oplog"] {
-                    let sql = format!("DELETE FROM {table} WHERE rev < ?");
-                    match sqlx::query(&sql)
+                    // `AssertSqlSafe`: `table` iterates the literal array on
+                    // the line above, so no caller value reaches the SQL text.
+                    let sql = sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE rev < ?"));
+                    match sqlx::query(sql)
                         .bind(cutoff_tid)
                         .execute(store.pool())
                         .await
@@ -798,9 +804,9 @@ mod tests {
             .unwrap();
 
         for table in ["space_record_oplog", "space_member_oplog"] {
-            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "EXPLAIN QUERY PLAN DELETE FROM {table} WHERE rev < ?"
-            ))
+            )))
             .bind("3zzzzzzzzzzzz")
             .fetch_all(store.pool())
             .await

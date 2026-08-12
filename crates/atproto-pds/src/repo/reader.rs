@@ -424,11 +424,11 @@ impl RepoReader {
 
         let rows: Vec<(String, String, String)> = match cursor {
             Some(cur) => {
-                sqlx::query_as(&format!(
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT uri, cid, rkey FROM repo_record
                  WHERE collection = ? AND rkey {comparator} ?
                  ORDER BY rkey {order_clause} LIMIT ?"
-                ))
+                )))
                 .bind(collection)
                 .bind(cur)
                 .bind(limit as i64)
@@ -436,11 +436,11 @@ impl RepoReader {
                 .await
             }
             None => {
-                sqlx::query_as(&format!(
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT uri, cid, rkey FROM repo_record
                  WHERE collection = ?
                  ORDER BY rkey {order_clause} LIMIT ?"
-                ))
+                )))
                 .bind(collection)
                 .bind(limit as i64)
                 .fetch_all(pool)
@@ -782,7 +782,7 @@ trait QueryAsExt<'a, R> {
 }
 
 impl<'a, R> QueryAsExt<'a, R>
-    for sqlx::query::QueryAs<'a, sqlx::Sqlite, R, sqlx::sqlite::SqliteArguments<'a>>
+    for sqlx::query::QueryAs<'a, sqlx::Sqlite, R, sqlx::sqlite::SqliteArguments>
 where
     R: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin,
 {

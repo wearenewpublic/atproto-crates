@@ -4127,14 +4127,15 @@ mod list_repos_plan_tests {
             .await
             .unwrap();
 
-        let plan: Vec<(i64, i64, i64, String)> =
-            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {LIST_REPOS_SQL}"))
-                .bind("at://did:plc:planowner/space/main")
-                .bind("")
-                .bind(100i64)
-                .fetch_all(store.pool())
-                .await
-                .expect("explain");
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {LIST_REPOS_SQL}"
+        )))
+        .bind("at://did:plc:planowner/space/main")
+        .bind("")
+        .bind(100i64)
+        .fetch_all(store.pool())
+        .await
+        .expect("explain");
         let plan: Vec<String> = plan.into_iter().map(|(_, _, _, detail)| detail).collect();
         let rendered = plan.join("\n");
 

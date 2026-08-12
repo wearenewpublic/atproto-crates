@@ -467,10 +467,11 @@ mod tests {
             "space_member_oplog",
             "space_credential_recipient",
         ] {
-            let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(store.pool())
-                .await
-                .unwrap_or_else(|e| panic!("table {table} missing: {e}"));
+            let row: (i64,) =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap_or_else(|e| panic!("table {table} missing: {e}"));
             assert_eq!(row.0, 0);
         }
     }

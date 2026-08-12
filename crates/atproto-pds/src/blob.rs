@@ -315,19 +315,21 @@ pub async fn list_all(
              JOIN repo_record c ON c.uri = r.record_uri
              WHERE r.blob_cid = b.cid
            )";
+    // `AssertSqlSafe`: the only interpolation is `PUBLIC`, a `const` defined
+    // directly above. The caller's cursor and limit are bound, not formatted.
     let rows: Vec<(String,)> =
         match cursor {
-            Some(c) => sqlx::query_as(&format!(
+            Some(c) => sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT b.cid FROM repo_blob b WHERE b.cid > ? {PUBLIC} ORDER BY b.cid ASC LIMIT ?"
-            ))
+            )))
             .bind(c)
             .bind(limit as i64)
             .fetch_all(store.pool())
             .await,
             None => {
-                sqlx::query_as(&format!(
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
                     "SELECT b.cid FROM repo_blob b WHERE 1 = 1 {PUBLIC} ORDER BY b.cid ASC LIMIT ?"
-                ))
+                )))
                 .bind(limit as i64)
                 .fetch_all(store.pool())
                 .await

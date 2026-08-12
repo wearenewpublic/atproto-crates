@@ -99,7 +99,7 @@ tokio = { version = "1.50", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tokio-websockets = { version = "0.13", features = ["client", "rustls-native-roots", "fastrand", "ring"] }
 tokio-util = "0.7"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "macros", "migrate", "chrono"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "macros", "migrate", "chrono"] }
 tracing = { version = "0.1", features = ["async-await"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.32"
