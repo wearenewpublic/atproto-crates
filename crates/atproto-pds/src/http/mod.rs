@@ -23,6 +23,7 @@ pub mod rate_limit;
 /// The Repository section of the portal -- a browser over this account's records.
 pub mod repository;
 pub mod router;
+pub mod security_headers;
 pub mod service_auth_handlers;
 pub mod service_describe;
 pub mod space_auth;

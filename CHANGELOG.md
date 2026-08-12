@@ -18,6 +18,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CI step for the sets we ship. It deliberately does not fail on an `rpc` permission skipped for want
   of an audience: that is a decision, and it is now visible on the screen.
 
+- **Security headers on every response**, applied as an outermost layer rather than per handler.
+
+  This server serves HTML from three places — the OAuth consent screen, the account portal and the
+  admin dashboard — and none of them sent a single security header. The consent screen is the one
+  that matters: it is where an account holder types their password, it shares an origin with the
+  portal session cookie, and it could be framed by any page on the internet.
+
+  `X-Content-Type-Options: nosniff` goes on everything. `text/html` responses additionally carry
+  `Content-Security-Policy`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. A handler
+  that sets its own value keeps it, so `getBlob`'s stricter `default-src 'none'; sandbox` is
+  untouched.
+
+  The policy is `default-src 'none'` with `style-src`/`script-src 'unsafe-inline'`, `connect-src
+  'self'`, `form-action 'self'`, `frame-ancestors 'none'` and `base-uri 'none'`. **`'unsafe-inline'`
+  is load-bearing and not a placeholder**: every page has an inline `<style>` block and the consent
+  page has an inline `<script>` plus an `onsubmit=` attribute. A nonce covers the script element but
+  not an inline event handler, so tightening this means moving that handler into the script block
+  and hashing the block — worth doing, and a change to the most security-sensitive form on the
+  server, so it is not folded in here. What the policy buys regardless: the consent screen is
+  unframeable, an injected `<form>` cannot post the holder's password to another origin, and a
+  `<base>` tag cannot re-point a relative form action.
+
+  A layer rather than three handlers because the alternative is the failure this codebase keeps
+  repeating — a correct thing invoked at some call sites and not others. Being outermost, it also
+  reaches responses no handler produced: the 503 from load shedding, the 408 from a deadline, the
+  500 from a caught panic.
+
 ### Changed
 - A permission whose expansion produces a non-token string now grants **nothing**, rather than
   granting the members that parsed. One malformed member is not evidence the rest are trustworthy,
@@ -92,6 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token exchange calls, so a resource arm added later is described without being told. A permission
   that grants nothing reports *why*: "you are not getting this" and "ask for
   `include:<nsid>?aud=<did>` and you will" are different things to read, and only one is actionable.
+
+- **The consent page built its error text with `insertAdjacentHTML`.** That string is a server error
+  message and several of them quote back something the caller sent, which made the error path an
+  injection sink on the origin holding the portal session cookie. It uses `textContent` now.
 
 ## [0.15.0-rc.4] - 2026-08-12
 ### Added

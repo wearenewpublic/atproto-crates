@@ -652,6 +652,12 @@ fn build_router_inner(
                 .concurrency_limit(MAX_CONCURRENT_REQUESTS),
         )
         .layer(cors_layer())
+        // Outermost, so it reaches responses no handler produced: the 503 from
+        // load shedding, the 408 from a request deadline, the 500 from a caught
+        // panic. Those are served from this origin like any other page.
+        .layer(axum::middleware::from_fn(
+            crate::http::security_headers::security_headers_middleware,
+        ))
         .with_state(state)
 }
 

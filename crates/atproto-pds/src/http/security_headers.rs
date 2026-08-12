@@ -1,0 +1,113 @@
+//! Response security headers, applied once for the whole server.
+//!
+//! This PDS serves HTML from three places -- the OAuth consent screen, the
+//! account portal, and the admin dashboard -- and none of them sent a single
+//! security header. The consent screen is the one that matters most: it is
+//! where an account holder types their password and approves an application's
+//! access, it lives on the PDS origin alongside the portal session cookie, and
+//! it could be framed by any page on the internet.
+//!
+//! # Why a layer and not three handlers
+//!
+//! Because the alternative is the failure this codebase keeps repeating: a
+//! correct thing invoked at some call sites and not others. `getBlob` already
+//! sets its own headers and got them right; the three HTML pages each would
+//! have had to remember, and a fourth page added later would have had to
+//! remember too. A layer means a route cannot be added without them.
+//!
+//! Handlers that set their own value keep it -- every header here is inserted
+//! only when absent, so `getBlob`'s stricter `default-src 'none'; sandbox`
+//! survives contact with this.
+//!
+//! # What is sent
+//!
+//! `X-Content-Type-Options: nosniff` on everything. A JSON error body that a
+//! browser decides to render as HTML is the whole of that class of bug, and it
+//! costs nothing to refuse.
+//!
+//! On `text/html` responses only:
+//!
+//! - `Content-Security-Policy` -- see [`HTML_CSP`].
+//! - `X-Frame-Options: DENY`, which `frame-ancestors` already covers for
+//!   anything current. It is here for browsers that predate it, since the cost
+//!   is a header and the thing it prevents is a password prompt in an invisible
+//!   frame.
+//! - `Referrer-Policy: no-referrer`. The consent URL carries a `request_uri`
+//!   that names a pending authorization, and the page links out to a client's
+//!   `client_id`; neither should travel in a `Referer`.
+
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::http::header::{
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+};
+use axum::middleware::Next;
+use axum::response::Response;
+
+/// The policy for this server's own HTML.
+///
+/// `default-src 'none'` and then only what the pages actually use. These are
+/// server-rendered pages with no assets: no images, no fonts, no stylesheets,
+/// no XHR except the consent form's own submit, which `connect-src 'self'`
+/// covers.
+///
+/// # `'unsafe-inline'` is doing real work here and is not a placeholder
+///
+/// Both `style-src` and `script-src` need it. Every page carries an inline
+/// `<style>` block, and the consent page carries an inline `<script>` plus an
+/// `onsubmit=` attribute that lifts its form POST into the JSON the authorize
+/// endpoint expects.
+///
+/// A nonce would cover the `<script>` element but not the `onsubmit` attribute
+/// -- inline event handlers need `'unsafe-hashes'` with a hash of each handler,
+/// or no attribute at all. Tightening this means moving that handler into the
+/// script block and hashing the block, which is worth doing and is a change to
+/// the most security-sensitive form on the server, so it is not folded in here.
+///
+/// What the policy still buys with `'unsafe-inline'` present is the part that
+/// does not depend on it: `frame-ancestors 'none'` makes the consent screen
+/// unframeable, `form-action 'self'` means an injected `<form>` cannot post the
+/// holder's password to another origin, and `base-uri 'none'` stops a `<base>`
+/// tag re-pointing the form's relative action.
+pub const HTML_CSP: &str = "default-src 'none'; \
+     style-src 'unsafe-inline'; \
+     script-src 'unsafe-inline'; \
+     connect-src 'self'; \
+     form-action 'self'; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
+
+/// Add the headers above to every response that does not already carry them.
+pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+
+    let is_html = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+        });
+
+    let headers = response.headers_mut();
+    headers
+        .entry(X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+
+    if is_html {
+        headers
+            .entry(CONTENT_SECURITY_POLICY)
+            .or_insert(HeaderValue::from_static(HTML_CSP));
+        headers
+            .entry(X_FRAME_OPTIONS)
+            .or_insert(HeaderValue::from_static("DENY"));
+        headers
+            .entry(REFERRER_POLICY)
+            .or_insert(HeaderValue::from_static("no-referrer"));
+    }
+
+    response
+}

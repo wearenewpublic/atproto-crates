@@ -613,8 +613,14 @@ fn render_consent(
       }}).then(function(pair) {{
         var resp = pair[0], body = pair[1];
         if (!resp.ok) {{
-          document.body.insertAdjacentHTML('beforeend',
-            '<p style="color:#b00">Error: ' + (body.message || resp.statusText) + '</p>');
+          // textContent, not insertAdjacentHTML. This string is a server error
+          // message, and several of them quote back something the caller sent,
+          // so parsing it as HTML made the error path an injection sink on the
+          // origin that holds the portal session cookie.
+          var err = document.createElement('p');
+          err.style.color = '#b00';
+          err.textContent = 'Error: ' + (body.message || resp.statusText);
+          document.body.appendChild(err);
           return;
         }}
         // On success, redirect with code + state + iss per RFC 9207.
