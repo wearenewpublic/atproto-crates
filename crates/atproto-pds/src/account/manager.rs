@@ -11,9 +11,7 @@ use crate::account::{AccountPool, AccountPoolKind, AccountRow, AccountState};
 use crate::actor_store::sql::SqlActorStore;
 use crate::errors::{PdsError, PdsResult};
 use crate::keys::{KeyStore, generate_account_signing_key};
-use argon2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core,
-};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use atproto_identity::key::KeyType;
 #[cfg(feature = "sqlite")]
@@ -1459,7 +1457,18 @@ impl<'a> CreateAccountParams<'a> {
 
 /// Hash a password with Argon2id default parameters.
 pub fn hash_password(password: &str) -> PdsResult<String> {
-    let salt = SaltString::generate(&mut rand_core::OsRng);
+    // Salt bytes come from the workspace RNG rather than
+    // `SaltString::generate`, which wants an `OsRng` from `password-hash`'s
+    // `rand_core` 0.6 -- and that item only exists when something enables
+    // `rand_core/getrandom`. Nothing declares it; it used to arrive because
+    // ed25519-dalek 2.x happened to pull the same `rand_core` with that
+    // feature on. Depending on another crate's feature choice for the salt of
+    // every password hash is not a dependency worth keeping.
+    let mut salt_bytes = [0u8; Salt::RECOMMENDED_LENGTH];
+    rand::fill(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| PdsError::Storage {
+        reason: format!("argon2 salt encode: {e}"),
+    })?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
     let hash = argon2
         .hash_password(password.as_bytes(), &salt)

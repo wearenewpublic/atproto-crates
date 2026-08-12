@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- **`PDS_OAUTH_KEYS_JWK_SET` could not accept a published JWKS.** The JWK type it parsed with
+  deserialised exactly `kty`, `crv`, `x`, `y`, `d` and failed the whole document on anything else,
+  so a key set carrying `use`, `alg` or `kid` — which is to say any key set produced by a real
+  implementation, since `kid` is what lets a consumer pick a key at all — was refused at boot with
+  `unknown field 'alg'`. Only a JWK hand-stripped to the curve members worked. The sibling parser
+  for client keys in `oauth/par.rs` filtered the document to those members first, which is why this
+  affected only the operator-supplied set and went unnoticed.
+
+  The parsing moved from `bin/pds.rs` into `oauth/jwks.rs` alongside publication. Its tests could
+  not otherwise run: the `pds` target sets `test = false`, so tests written beside it are compiled
+  by nothing that CI invokes.
+
+### Changed
+- **RustCrypto upgraded a major**: `elliptic-curve` 0.14, `p256`/`p384`/`k256` 0.14, `ecdsa` 0.17,
+  `ed25519-dalek` 3.0 — with a hand-written JWK replacing `elliptic_curve::JwkEcKey`, which 0.14
+  removes along with the `jwk` feature.
+
+  `jose-jwk`, RustCrypto's JWK crate, is not a way out: last published in 2023, it pins
+  `p256`/`p384` at 0.13 — the versions this upgrade exists to leave — and depends on `rsa` 0.9,
+  carrying RUSTSEC-2023-0071 with no fixed release, which `sqlx` 0.9 had just removed from the
+  graph. So `atproto_identity::jwk::Jwk` implements RFC 7518 §6.2.1 directly: affine coordinates,
+  base64url without padding, left-padded to the curve's width. The fixed width is the load-bearing
+  part — a coordinate that keeps its leading zeros verifies identically to one that drops them, but
+  thumbprints differently, and that thumbprint is the `kid` in the JWKS and the `jkt` a DPoP proof
+  is bound to.
+
+  Equivalence was established before the version bump rather than after: the new type was written
+  against `elliptic-curve` 0.13 and compared to `JwkEcKey` over the fixtures and 1800 generated
+  keys across all three curves, public and private, byte for byte. Random keys matter here because
+  fixtures cannot produce a coordinate with leading zero bytes. The golden JWKS tests added
+  previously then passed unchanged across the upgrade itself.
+
+  Conversion in both directions now lives in `atproto-identity` and everything routes through it —
+  the JWKS endpoint, PAR client attestation, the operator key set, and `atpdid` — so the four
+  entry points agree on what a JWK is and where a point is checked to be on its curve. `Zeroize`
+  wipes `d` only, matching what `JwkEcKey` did; `x` and `y` are published.
+
+  Elsewhere in the bump: `ToEncodedPoint` became `ToSec1Point` (20 call sites), `normalize_s`
+  returns the low-S signature directly instead of `Option`, `generic_array` became `hybrid-array`,
+  and key generation moved to `Generate::try_generate`, which reports RNG failure rather than
+  panicking. `ed25519-dalek` 3.0 needs `alloc` in place of `std`, plus `digest` for that trait.
+
+  One side effect worth recording: password salts were being generated with an `OsRng` that only
+  existed because `ed25519-dalek` 2.x happened to enable `rand_core/getrandom` on a version
+  `password-hash` shares. Moving to 3.0 removed it. Salts now come from the workspace `rand`
+  directly rather than depending on another crate's feature choice.
+
 ### Changed
 - **`reqwest` 0.12 → 0.13**, with `reqwest-middleware` 0.5 and `reqwest-chain` 2.0.
 

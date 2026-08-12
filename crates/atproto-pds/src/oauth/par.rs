@@ -685,15 +685,15 @@ impl std::error::Error for KeyResolveError {}
 /// `atproto-identity/src/bin/atpdid.rs` — bypasses `identify_key` because
 /// we already have the raw SEC1 bytes from the JWK.
 fn jwk_to_key_data(jwk: &serde_json::Value) -> Result<KeyData, String> {
-    use elliptic_curve::JwkEcKey;
-    use elliptic_curve::sec1::ToEncodedPoint;
+    use atproto_identity::jwk::{CRV_K256, CRV_P256, CRV_P384, Jwk};
+    use elliptic_curve::sec1::ToSec1Point;
 
-    // Only the curve members, because `JwkEcKey` rejects anything else and a
-    // real JWK is never only those. `alg`, `kid`, `use` and `key_ops` are all
-    // standard JWK members (RFC 7517 §4) and clients publish them as a matter
-    // of course -- `kid` is required to pick a key from a set at all. Handing
-    // the document straight to a deserialiser that refuses unknown fields
-    // meant this server could parse only the keys it generated itself.
+    // Only the curve members, because the JWK type refuses unknown fields and
+    // a real JWK is never only those. `alg`, `kid`, `use` and `key_ops` are
+    // all standard JWK members (RFC 7517 §4) and clients publish them as a
+    // matter of course -- `kid` is required to pick a key from a set at all.
+    // Handing the document straight to a deserialiser that refuses unknown
+    // fields meant this server could parse only the keys it generated itself.
     //
     // Dropping them is safe here because none of them change what the key
     // *is*: `alg` is checked against the JWS header before this, and `kid`
@@ -704,31 +704,36 @@ fn jwk_to_key_data(jwk: &serde_json::Value) -> Result<KeyData, String> {
             minimal.insert(member.to_string(), value.clone());
         }
     }
-    let parsed: JwkEcKey = serde_json::from_value(serde_json::Value::Object(minimal))
-        .map_err(|e| format!("parse JwkEcKey: {e}"))?;
+    let parsed: Jwk = serde_json::from_value(serde_json::Value::Object(minimal))
+        .map_err(|e| format!("parse JWK: {e}"))?;
+    let point = parsed
+        .to_sec1_uncompressed()
+        .map_err(|e| format!("jwk point: {e}"))?;
+    // Re-derive through the curve type rather than trusting the coordinates:
+    // this is where a point that is not actually on the curve is rejected.
     match parsed.crv() {
-        "P-256" => {
-            let pk: p256::PublicKey =
-                p256::PublicKey::from_jwk(&parsed).map_err(|e| format!("p256 from jwk: {e}"))?;
+        CRV_P256 => {
+            let pk = p256::PublicKey::from_sec1_bytes(&point)
+                .map_err(|e| format!("p256 from jwk: {e}"))?;
             Ok(KeyData::new(
                 KeyType::P256Public,
-                pk.to_encoded_point(true).as_bytes().to_vec(),
+                pk.to_sec1_point(true).as_bytes().to_vec(),
             ))
         }
-        "P-384" => {
-            let pk: p384::PublicKey =
-                p384::PublicKey::from_jwk(&parsed).map_err(|e| format!("p384 from jwk: {e}"))?;
+        CRV_P384 => {
+            let pk = p384::PublicKey::from_sec1_bytes(&point)
+                .map_err(|e| format!("p384 from jwk: {e}"))?;
             Ok(KeyData::new(
                 KeyType::P384Public,
-                pk.to_encoded_point(true).as_bytes().to_vec(),
+                pk.to_sec1_point(true).as_bytes().to_vec(),
             ))
         }
-        "secp256k1" => {
-            let pk: k256::PublicKey =
-                k256::PublicKey::from_jwk(&parsed).map_err(|e| format!("k256 from jwk: {e}"))?;
+        CRV_K256 => {
+            let pk = k256::PublicKey::from_sec1_bytes(&point)
+                .map_err(|e| format!("k256 from jwk: {e}"))?;
             Ok(KeyData::new(
                 KeyType::K256Public,
-                pk.to_encoded_point(true).as_bytes().to_vec(),
+                pk.to_sec1_point(true).as_bytes().to_vec(),
             ))
         }
         other => Err(format!("unsupported jwk crv {other}")),
@@ -935,11 +940,11 @@ mod tests {
         // Round-trip a freshly-generated P-256 key through the JWK encoder
         // → our jwk_to_key_data decoder, and verify the decoded public
         // bytes match the source key's public form.
+        use atproto_identity::jwk::Jwk;
         use atproto_identity::key::{KeyType, generate_key, to_public};
-        use elliptic_curve::JwkEcKey;
         let priv_key = generate_key(KeyType::P256Private).unwrap();
         let pub_key = to_public(&priv_key).unwrap();
-        let jwk: JwkEcKey = (&pub_key).try_into().unwrap();
+        let jwk: Jwk = (&pub_key).try_into().unwrap();
         let jwk_value = serde_json::to_value(&jwk).unwrap();
         let recovered = jwk_to_key_data(&jwk_value).unwrap();
         assert_eq!(recovered.bytes(), pub_key.bytes());
@@ -985,11 +990,11 @@ mod tests {
     /// "unknown field `alg`".
     #[test]
     fn a_jwk_with_standard_metadata_still_parses() {
+        use atproto_identity::jwk::Jwk;
         use atproto_identity::key::{KeyType, generate_key, to_public};
-        use elliptic_curve::JwkEcKey;
         let priv_key = generate_key(KeyType::P256Private).unwrap();
         let pub_key = to_public(&priv_key).unwrap();
-        let jwk: JwkEcKey = (&pub_key).try_into().unwrap();
+        let jwk: Jwk = (&pub_key).try_into().unwrap();
         let mut jwk_value = serde_json::to_value(&jwk).unwrap();
 
         // What a client actually publishes alongside the curve point.
@@ -1008,11 +1013,11 @@ mod tests {
 
     #[test]
     fn jwk_to_key_data_round_trip_k256() {
+        use atproto_identity::jwk::Jwk;
         use atproto_identity::key::{KeyType, generate_key, to_public};
-        use elliptic_curve::JwkEcKey;
         let priv_key = generate_key(KeyType::K256Private).unwrap();
         let pub_key = to_public(&priv_key).unwrap();
-        let jwk: JwkEcKey = (&pub_key).try_into().unwrap();
+        let jwk: Jwk = (&pub_key).try_into().unwrap();
         let jwk_value = serde_json::to_value(&jwk).unwrap();
         let recovered = jwk_to_key_data(&jwk_value).unwrap();
         assert_eq!(recovered.bytes(), pub_key.bytes());

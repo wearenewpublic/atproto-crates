@@ -18,7 +18,7 @@
 //!
 //! ```rust
 //! use atproto_identity::key::{identify_key, generate_key, to_public, validate, sign, KeyType, KeyData};
-//! use elliptic_curve::JwkEcKey;
+//! use atproto_identity::jwk::Jwk;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!   // Identify existing keys
@@ -41,16 +41,15 @@
 //!
 //!   // Convert to JWK format (P-256 and P-384 support JWK)
 //!   let p256_key_data = identify_key("did:key:zDnaeXduWbJ1b1Kgjf3uCdCpMDF1LEDizUiyxAxGwerou3Nh2")?;
-//!   let p256_jwk: JwkEcKey = (&p256_key_data).try_into()?;
-//!   let p384_jwk: JwkEcKey = (&p384_key).try_into()?;
+//!   let p256_jwk: Jwk = (&p256_key_data).try_into()?;
+//!   let p384_jwk: Jwk = (&p384_key).try_into()?;
 //!   Ok(())
 //! }
 //! ```
 
 use anyhow::{Context, Result, anyhow};
 use ecdsa::signature::Signer;
-use elliptic_curve::JwkEcKey;
-use elliptic_curve::sec1::ToEncodedPoint;
+use elliptic_curve::sec1::ToSec1Point;
 
 use crate::model::VerificationMethod;
 use crate::traits::IdentityResolver;
@@ -307,8 +306,7 @@ pub fn identify_key(key: &str) -> Result<KeyData, KeyError> {
 #[allow(deprecated)]
 fn reject_high_s<C>(signature: &ecdsa::Signature<C>) -> Result<(), KeyError>
 where
-    C: ecdsa::PrimeCurve + ecdsa::elliptic_curve::CurveArithmetic,
-    ecdsa::SignatureSize<C>: ecdsa::elliptic_curve::generic_array::ArrayLength<u8>,
+    C: ecdsa::EcdsaCurve + ecdsa::elliptic_curve::CurveArithmetic,
 {
     use ecdsa::elliptic_curve::scalar::IsHigh;
 
@@ -535,7 +533,7 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
             // does not normalize for us. Without this the crate emits the
             // high-S form roughly half the time, and a peer enforcing low-S
             // rejects exactly those.
-            Ok(signature.normalize_s().unwrap_or(signature).to_vec())
+            Ok(signature.normalize_s().to_vec())
         }
         KeyType::P384Private => {
             let secret_key: p384::SecretKey =
@@ -546,7 +544,7 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
                 .try_sign(content)
                 .map_err(|error| KeyError::ECDSAError { error })?;
             // As for P-256: `p384` does not normalize on signing either.
-            Ok(signature.normalize_s().unwrap_or(signature).to_vec())
+            Ok(signature.normalize_s().to_vec())
         }
         KeyType::K256Private => {
             let secret_key: k256::SecretKey =
@@ -559,7 +557,7 @@ pub fn sign(key_data: &KeyData, content: &[u8]) -> Result<Vec<u8>, KeyError> {
             // `k256` normalizes inside its own `SignPrimitive`, which is why
             // K-256 account keys were never affected. Stated rather than
             // relied on silently.
-            Ok(signature.normalize_s().unwrap_or(signature).to_vec())
+            Ok(signature.normalize_s().to_vec())
         }
         KeyType::Ed25519Private => {
             let key_bytes: &[u8; 32] =
@@ -692,49 +690,131 @@ impl KeyResolver for IdentityDocumentKeyResolver {
     }
 }
 
-impl TryInto<JwkEcKey> for &KeyData {
+/// Recover a key from its JWK form.
+///
+/// The coordinates are re-derived through the curve type rather than trusted:
+/// that is what rejects a point which is not actually on the curve, or a
+/// private scalar outside the field order. A JWK carrying `d` yields the
+/// private key type; otherwise the public one, stored compressed to match how
+/// `KeyData` holds public keys everywhere else.
+impl TryFrom<&crate::jwk::Jwk> for KeyData {
     type Error = KeyError;
 
-    fn try_into(self) -> Result<JwkEcKey, Self::Error> {
+    fn try_from(jwk: &crate::jwk::Jwk) -> Result<Self, Self::Error> {
+        use crate::jwk::{CRV_K256, CRV_P256, CRV_P384};
+        use elliptic_curve::sec1::ToSec1Point;
+
+        fn err(what: &str, e: impl std::fmt::Display) -> KeyError {
+            KeyError::JWKConversionFailed {
+                error: format!("{what}: {e}"),
+            }
+        }
+
+        let scalar = jwk.private_scalar()?;
+        let point = jwk.to_sec1_uncompressed()?;
+        match (jwk.crv(), scalar) {
+            (CRV_P256, Some(d)) => {
+                let sk = p256::SecretKey::from_slice(&d).map_err(|e| err("P-256 private", e))?;
+                Ok(KeyData::new(KeyType::P256Private, sk.to_bytes().to_vec()))
+            }
+            (CRV_P256, None) => {
+                let pk =
+                    p256::PublicKey::from_sec1_bytes(&point).map_err(|e| err("P-256 public", e))?;
+                Ok(KeyData::new(
+                    KeyType::P256Public,
+                    pk.to_sec1_point(true).as_bytes().to_vec(),
+                ))
+            }
+            (CRV_P384, Some(d)) => {
+                let sk = p384::SecretKey::from_slice(&d).map_err(|e| err("P-384 private", e))?;
+                Ok(KeyData::new(KeyType::P384Private, sk.to_bytes().to_vec()))
+            }
+            (CRV_P384, None) => {
+                let pk =
+                    p384::PublicKey::from_sec1_bytes(&point).map_err(|e| err("P-384 public", e))?;
+                Ok(KeyData::new(
+                    KeyType::P384Public,
+                    pk.to_sec1_point(true).as_bytes().to_vec(),
+                ))
+            }
+            (CRV_K256, Some(d)) => {
+                let sk =
+                    k256::SecretKey::from_slice(&d).map_err(|e| err("secp256k1 private", e))?;
+                Ok(KeyData::new(KeyType::K256Private, sk.to_bytes().to_vec()))
+            }
+            (CRV_K256, None) => {
+                let pk = k256::PublicKey::from_sec1_bytes(&point)
+                    .map_err(|e| err("secp256k1 public", e))?;
+                Ok(KeyData::new(
+                    KeyType::K256Public,
+                    pk.to_sec1_point(true).as_bytes().to_vec(),
+                ))
+            }
+            (other, _) => Err(KeyError::JWKConversionFailed {
+                error: format!("unsupported jwk crv {other}"),
+            }),
+        }
+    }
+}
+
+impl TryInto<crate::jwk::Jwk> for &KeyData {
+    type Error = KeyError;
+
+    fn try_into(self) -> Result<crate::jwk::Jwk, Self::Error> {
+        use crate::jwk::{CRV_K256, CRV_P256, CRV_P384, Jwk};
+        use elliptic_curve::sec1::ToSec1Point;
+
+        // `KeyData` holds the compressed SEC1 form for public keys, and a JWK
+        // needs both affine coordinates, so each arm parses the point and
+        // re-encodes it uncompressed rather than splitting the stored bytes.
+        fn err(curve: &str, e: impl std::fmt::Display) -> KeyError {
+            KeyError::JWKConversionFailed {
+                error: format!("Failed to parse {curve} key: {e}"),
+            }
+        }
+
         match *self.key_type() {
             KeyType::P256Public => {
-                let public_key = p256::PublicKey::from_sec1_bytes(self.bytes()).map_err(|e| {
-                    KeyError::JWKConversionFailed {
-                        error: format!("Failed to parse P256 public key: {}", e),
-                    }
-                })?;
-                Ok(public_key.to_jwk())
+                let pk = p256::PublicKey::from_sec1_bytes(self.bytes())
+                    .map_err(|e| err("P256 public", e))?;
+                Jwk::from_sec1_uncompressed(CRV_P256, pk.to_sec1_point(false).as_bytes())
             }
             KeyType::P256Private => {
-                let secret_key = p256::SecretKey::from_slice(self.bytes())
+                let sk = p256::SecretKey::from_slice(self.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
-                Ok(secret_key.to_jwk())
+                Jwk::from_sec1_uncompressed(
+                    CRV_P256,
+                    sk.public_key().to_sec1_point(false).as_bytes(),
+                )?
+                .with_private_scalar(&sk.to_bytes())
             }
             KeyType::P384Public => {
-                let public_key = p384::PublicKey::from_sec1_bytes(self.bytes()).map_err(|e| {
-                    KeyError::JWKConversionFailed {
-                        error: format!("Failed to parse P384 public key: {}", e),
-                    }
-                })?;
-                Ok(public_key.to_jwk())
+                let pk = p384::PublicKey::from_sec1_bytes(self.bytes())
+                    .map_err(|e| err("P384 public", e))?;
+                Jwk::from_sec1_uncompressed(CRV_P384, pk.to_sec1_point(false).as_bytes())
             }
             KeyType::P384Private => {
-                let secret_key = p384::SecretKey::from_slice(self.bytes())
+                let sk = p384::SecretKey::from_slice(self.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
-                Ok(secret_key.to_jwk())
+                Jwk::from_sec1_uncompressed(
+                    CRV_P384,
+                    sk.public_key().to_sec1_point(false).as_bytes(),
+                )?
+                .with_private_scalar(&sk.to_bytes())
             }
             KeyType::K256Public => {
-                let public_key = k256::PublicKey::from_sec1_bytes(self.bytes()).map_err(|e| {
-                    KeyError::JWKConversionFailed {
-                        error: format!("Failed to parse k256 public key: {}", e),
-                    }
-                })?;
-                Ok(public_key.to_jwk())
+                let pk = k256::PublicKey::from_sec1_bytes(self.bytes())
+                    .map_err(|e| err("k256 public", e))?;
+                Jwk::from_sec1_uncompressed(CRV_K256, pk.to_sec1_point(false).as_bytes())
             }
             KeyType::K256Private => {
-                let secret_key = k256::SecretKey::from_slice(self.bytes())
+                let sk = k256::SecretKey::from_slice(self.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
-                Ok(secret_key.to_jwk())
+                Jwk::from_sec1_uncompressed(
+                    CRV_K256,
+                    sk.public_key().to_sec1_point(false).as_bytes(),
+                )?
+                .with_private_scalar(&sk.to_bytes())
             }
             KeyType::Ed25519Public | KeyType::Ed25519Private => {
                 Err(KeyError::JWKConversionFailed {
@@ -742,6 +822,13 @@ impl TryInto<JwkEcKey> for &KeyData {
                 })
             }
         }
+    }
+}
+/// The OS RNG failing is not something a caller can act on differently from
+/// any other key-generation failure, so it folds into the existing variant.
+fn rng_failure(error: elliptic_curve::common::getrandom::Error) -> KeyError {
+    KeyError::JWKConversionFailed {
+        error: format!("system RNG unavailable for key generation: {error}"),
     }
 }
 
@@ -766,31 +853,32 @@ impl TryInto<JwkEcKey> for &KeyData {
 /// # Ok::<(), atproto_identity::errors::KeyError>(())
 /// ```
 pub fn generate_key(key_type: KeyType) -> Result<KeyData, KeyError> {
+    use elliptic_curve::common::Generate;
+
     match key_type {
         KeyType::P256Private => {
-            let secret_key = p256::SecretKey::random(&mut elliptic_curve::rand_core::OsRng);
+            let secret_key = p256::SecretKey::try_generate().map_err(rng_failure)?;
             Ok(KeyData::new(
                 KeyType::P256Private,
                 secret_key.to_bytes().to_vec(),
             ))
         }
         KeyType::P384Private => {
-            let secret_key = p384::SecretKey::random(&mut elliptic_curve::rand_core::OsRng);
+            let secret_key = p384::SecretKey::try_generate().map_err(rng_failure)?;
             Ok(KeyData::new(
                 KeyType::P384Private,
                 secret_key.to_bytes().to_vec(),
             ))
         }
         KeyType::K256Private => {
-            let secret_key = k256::SecretKey::random(&mut elliptic_curve::rand_core::OsRng);
+            let secret_key = k256::SecretKey::try_generate().map_err(rng_failure)?;
             Ok(KeyData::new(
                 KeyType::K256Private,
                 secret_key.to_bytes().to_vec(),
             ))
         }
         KeyType::Ed25519Private => {
-            let signing_key =
-                ed25519_dalek::SigningKey::generate(&mut elliptic_curve::rand_core::OsRng);
+            let signing_key = ed25519_dalek::SigningKey::try_generate().map_err(rng_failure)?;
             Ok(KeyData::new(
                 KeyType::Ed25519Private,
                 signing_key.to_bytes().to_vec(),
@@ -834,7 +922,7 @@ pub fn to_public(key_data: &KeyData) -> Result<KeyData, KeyError> {
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
             let public_key = secret_key.public_key();
-            let compressed = public_key.to_encoded_point(true);
+            let compressed = public_key.to_sec1_point(true);
             let public_key_bytes = compressed.to_bytes();
             Ok(KeyData::new(KeyType::P256Public, public_key_bytes.to_vec()))
         }
@@ -843,7 +931,7 @@ pub fn to_public(key_data: &KeyData) -> Result<KeyData, KeyError> {
                 ecdsa::elliptic_curve::SecretKey::from_slice(key_data.bytes())
                     .map_err(|error| KeyError::SecretKeyError { error })?;
             let public_key = secret_key.public_key();
-            let compressed = public_key.to_encoded_point(true);
+            let compressed = public_key.to_sec1_point(true);
             let public_key_bytes = compressed.to_bytes();
             Ok(KeyData::new(KeyType::P384Public, public_key_bytes.to_vec()))
         }
@@ -886,6 +974,7 @@ pub fn to_public(key_data: &KeyData) -> Result<KeyData, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jwk::Jwk;
 
     /// A signature in the high-S form must verify under
     /// [`SignaturePolicy::AnyS`] and be refused under
@@ -1051,11 +1140,11 @@ mod tests {
         assert_eq!(*public_key_data.key_type(), KeyType::P256Public);
 
         // Test private key to JWK conversion
-        let private_jwk: Result<elliptic_curve::JwkEcKey, _> = (&private_key_data).try_into();
+        let private_jwk: Result<crate::jwk::Jwk, _> = (&private_key_data).try_into();
         assert!(private_jwk.is_ok());
 
         // Test public key to JWK conversion
-        let public_jwk: Result<elliptic_curve::JwkEcKey, _> = (&public_key_data).try_into();
+        let public_jwk: Result<crate::jwk::Jwk, _> = (&public_key_data).try_into();
         assert!(public_jwk.is_ok());
 
         Ok(())
@@ -1077,12 +1166,12 @@ mod tests {
         assert_eq!(*public_key_data.key_type(), KeyType::K256Public);
 
         // Test that K256 keys successfully convert to JWK format
-        let private_jwk: Result<elliptic_curve::JwkEcKey, _> = (&private_key_data).try_into();
+        let private_jwk: Result<crate::jwk::Jwk, _> = (&private_key_data).try_into();
         assert!(private_jwk.is_ok());
         let private_jwk = private_jwk.unwrap();
         assert_eq!(private_jwk.crv(), "secp256k1");
 
-        let public_jwk: Result<elliptic_curve::JwkEcKey, _> = (&public_key_data).try_into();
+        let public_jwk: Result<crate::jwk::Jwk, _> = (&public_key_data).try_into();
         assert!(public_jwk.is_ok());
         let public_jwk = public_jwk.unwrap();
         assert_eq!(public_jwk.crv(), "secp256k1");
@@ -1106,10 +1195,10 @@ mod tests {
         assert_eq!(*public_key_data.key_type(), KeyType::P256Public);
 
         // Test TryInto with KeyData directly
-        let private_jwk: Result<JwkEcKey, KeyError> = (&private_key_data).try_into();
+        let private_jwk: Result<Jwk, KeyError> = (&private_key_data).try_into();
         assert!(private_jwk.is_ok());
 
-        let public_jwk: Result<JwkEcKey, KeyError> = (&public_key_data).try_into();
+        let public_jwk: Result<Jwk, KeyError> = (&public_key_data).try_into();
         assert!(public_jwk.is_ok());
 
         Ok(())
@@ -1777,11 +1866,11 @@ mod tests {
         let public_key = to_public(&private_key)?;
 
         // Test private key to JWK conversion
-        let private_jwk: Result<elliptic_curve::JwkEcKey, _> = (&private_key).try_into();
+        let private_jwk: Result<crate::jwk::Jwk, _> = (&private_key).try_into();
         assert!(private_jwk.is_ok());
 
         // Test public key to JWK conversion
-        let public_jwk: Result<elliptic_curve::JwkEcKey, _> = (&public_key).try_into();
+        let public_jwk: Result<crate::jwk::Jwk, _> = (&public_key).try_into();
         assert!(public_jwk.is_ok());
 
         Ok(())
@@ -1910,8 +1999,8 @@ mod tests {
 
         // Step 7: Test JWK conversion
         println!("7. Testing JWK conversion...");
-        let private_jwk: elliptic_curve::JwkEcKey = (&private_key).try_into()?;
-        let public_jwk: elliptic_curve::JwkEcKey = (&public_key).try_into()?;
+        let private_jwk: crate::jwk::Jwk = (&private_key).try_into()?;
+        let public_jwk: crate::jwk::Jwk = (&public_key).try_into()?;
 
         assert_eq!(private_jwk.crv(), "P-384");
         assert_eq!(public_jwk.crv(), "P-384");
@@ -2207,13 +2296,13 @@ mod tests {
         let private_key = generate_key(KeyType::Ed25519Private)?;
         let public_key = to_public(&private_key)?;
 
-        let private_jwk: Result<elliptic_curve::JwkEcKey, _> = (&private_key).try_into();
+        let private_jwk: Result<crate::jwk::Jwk, _> = (&private_key).try_into();
         assert!(matches!(
             private_jwk,
             Err(KeyError::JWKConversionFailed { .. })
         ));
 
-        let public_jwk: Result<elliptic_curve::JwkEcKey, _> = (&public_key).try_into();
+        let public_jwk: Result<crate::jwk::Jwk, _> = (&public_key).try_into();
         assert!(matches!(
             public_jwk,
             Err(KeyError::JWKConversionFailed { .. })

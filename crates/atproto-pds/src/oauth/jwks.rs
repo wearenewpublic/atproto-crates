@@ -17,10 +17,10 @@
 //! (RFC 7517 §5 permits this and OAuth metadata still validates).
 
 use crate::http::state::HttpState;
+use atproto_identity::jwk::Jwk;
 use atproto_identity::key::{KeyData, to_public};
 use axum::Json;
 use axum::extract::State;
-use elliptic_curve::JwkEcKey;
 use serde::Serialize;
 
 /// JWKS shape per RFC 7517.
@@ -71,7 +71,7 @@ pub async fn jwks_handler(State(state): State<HttpState>) -> Json<Jwks> {
 /// If the input is a private key, only the public component is published.
 fn key_to_jwk_value(key: &KeyData) -> Result<serde_json::Value, String> {
     let public = to_public(key).map_err(|e| format!("derive pub: {e}"))?;
-    let jwk: JwkEcKey = (&public).try_into().map_err(|e| format!("to jwk: {e}"))?;
+    let jwk: Jwk = (&public).try_into().map_err(|e| format!("to jwk: {e}"))?;
     let mut value: serde_json::Value =
         serde_json::to_value(&jwk).map_err(|e| format!("serialize jwk: {e}"))?;
 
@@ -98,9 +98,134 @@ fn thumbprint_kid(jwk: &serde_json::Value) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Parse `PDS_OAUTH_KEYS_JWK_SET` into a vec of
+/// `KeyData`. Format: standard JWKS `{"keys": [<jwk>, ...]}`. The first
+/// entry is the *current* signer; subsequent entries are historical
+/// rotations (kept in `/oauth/jwks` so consumers verifying older tokens
+/// still find the matching `kid`). EC curves only (P-256 / P-384 /
+/// secp256k1).
+pub fn parse_jwk_set_env(raw: &str) -> anyhow::Result<Vec<atproto_identity::key::KeyData>> {
+    use atproto_identity::jwk::{CRV_K256, CRV_P256, CRV_P384, Jwk};
+    use atproto_identity::key::{KeyData, KeyType};
+    use elliptic_curve::sec1::ToSec1Point;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("parse JWK set JSON: {e}"))?;
+    let keys = value
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("JWK set missing `keys` array"))?;
+    let mut out: Vec<KeyData> = Vec::with_capacity(keys.len());
+    for jwk in keys {
+        // Unknown members are ignored rather than refused. Every real JWKS
+        // carries `alg`, `use` and `kid` (RFC 7517 §4), and the previous type
+        // rejected the whole document on the first one -- so this variable
+        // only ever accepted keys hand-written down to the curve members.
+        let parsed: Jwk =
+            serde_json::from_value(jwk.clone()).map_err(|e| anyhow::anyhow!("parse JWK: {e}"))?;
+        let scalar = parsed
+            .private_scalar()
+            .map_err(|e| anyhow::anyhow!("jwk private scalar: {e}"))?;
+        let point = parsed
+            .to_sec1_uncompressed()
+            .map_err(|e| anyhow::anyhow!("jwk point: {e}"))?;
+        // Re-derive through the curve type: this is what rejects a point that
+        // is not on the curve, or a scalar outside the field order.
+        let kd = match (parsed.crv(), scalar) {
+            (CRV_P256, Some(d)) => {
+                let secret = p256::SecretKey::from_slice(&d)
+                    .map_err(|e| anyhow::anyhow!("P-256 priv from jwk: {e}"))?;
+                KeyData::new(KeyType::P256Private, secret.to_bytes().to_vec())
+            }
+            (CRV_P256, None) => {
+                let pk = p256::PublicKey::from_sec1_bytes(&point)
+                    .map_err(|e| anyhow::anyhow!("P-256 pub from jwk: {e}"))?;
+                KeyData::new(
+                    KeyType::P256Public,
+                    pk.to_sec1_point(true).as_bytes().to_vec(),
+                )
+            }
+            (CRV_P384, Some(d)) => {
+                let secret = p384::SecretKey::from_slice(&d)
+                    .map_err(|e| anyhow::anyhow!("P-384 priv from jwk: {e}"))?;
+                KeyData::new(KeyType::P384Private, secret.to_bytes().to_vec())
+            }
+            (CRV_P384, None) => {
+                let pk = p384::PublicKey::from_sec1_bytes(&point)
+                    .map_err(|e| anyhow::anyhow!("P-384 pub from jwk: {e}"))?;
+                KeyData::new(
+                    KeyType::P384Public,
+                    pk.to_sec1_point(true).as_bytes().to_vec(),
+                )
+            }
+            (CRV_K256, Some(d)) => {
+                let secret = k256::SecretKey::from_slice(&d)
+                    .map_err(|e| anyhow::anyhow!("K-256 priv from jwk: {e}"))?;
+                KeyData::new(KeyType::K256Private, secret.to_bytes().to_vec())
+            }
+            (CRV_K256, None) => {
+                let pk = k256::PublicKey::from_sec1_bytes(&point)
+                    .map_err(|e| anyhow::anyhow!("K-256 pub from jwk: {e}"))?;
+                KeyData::new(
+                    KeyType::K256Public,
+                    pk.to_sec1_point(true).as_bytes().to_vec(),
+                )
+            }
+            (other, _) => return Err(anyhow::anyhow!("unsupported JWK curve {other}")),
+        };
+        out.push(kd);
+    }
+    if out.is_empty() {
+        return Err(anyhow::anyhow!("JWK set is empty"));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PDS_OAUTH_KEYS_JWK_SET` must accept a JWKS as actually published,
+    /// meaning one carrying `use`, `alg` and `kid` alongside the curve members.
+    ///
+    /// It did not. The previous JWK type deserialised exactly `kty`, `crv`,
+    /// `x`, `y`, `d` and failed the whole document on anything else --
+    /// `unknown field 'alg'` -- so an operator pasting a real key set got a
+    /// boot failure, and only a JWK hand-stripped to the curve members worked.
+    /// The sibling parser in `oauth/par.rs` filtered the document first, which
+    /// is why client keys were unaffected and this went unnoticed.
+    #[test]
+    fn a_jwk_set_with_standard_metadata_is_accepted() {
+        let raw = r#"{"keys":[{
+            "kty":"EC","crv":"P-256",
+            "x":"axDH7SohQqaxQH009D3qxF5VXmNoVQ8e_naICf0bwhU",
+            "y":"mJdQpagD5VImZJSJZCCYAM7wEgv4tMbFEI923RSr0TY",
+            "use":"sig","alg":"ES256","kid":"AdbV1IYmdPHVnFFHV14jWlzgZaQErfd2IgTM0IdU-os"
+        }]}"#;
+        let keys = parse_jwk_set_env(raw).expect("a published JWKS must parse");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            *keys[0].key_type(),
+            atproto_identity::key::KeyType::P256Public
+        );
+    }
+
+    /// A JWK carrying `d` yields the private key type, so the PDS can sign
+    /// with a key set supplied by configuration rather than only verify.
+    #[test]
+    fn a_jwk_set_entry_with_d_parses_as_a_private_key() {
+        use atproto_identity::jwk::Jwk;
+        use atproto_identity::key::{KeyType, generate_key};
+
+        let key = generate_key(KeyType::P256Private).expect("generate");
+        let jwk: Jwk = (&key).try_into().expect("to jwk");
+        let raw = format!(
+            r#"{{"keys":[{}]}}"#,
+            serde_json::to_string(&jwk).expect("serialise")
+        );
+        let keys = parse_jwk_set_env(&raw).expect("private JWKS parses");
+        assert_eq!(*keys[0].key_type(), KeyType::P256Private);
+        assert_eq!(keys[0].bytes(), key.bytes(), "round trip must be lossless");
+    }
 
     /// Byte-exact JWK output for three fixed keys, one per supported curve.
     ///

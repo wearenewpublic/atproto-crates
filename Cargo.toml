@@ -65,22 +65,22 @@ criterion = { version = "0.8", features = ["html_reports"] }
 compact_str = { version = "0.10", features = ["serde"] }
 data-encoding = "2.10"
 dirs = "6"
-ecdsa = { version = "0.16", features = ["std"] }
-ed25519-dalek = { version = "2.1", features = ["std", "rand_core"] }
-elliptic-curve = { version = "0.13", features = ["jwk", "serde"] }
+ecdsa = { version = "0.17", features = ["std"] }
+ed25519-dalek = { version = "3.0", features = ["alloc", "rand_core", "digest"] }
+elliptic-curve = { version = "0.14", features = ["serde", "getrandom"] }
 futures = "0.3"
 hickory-resolver = { version = "0.26" }
 idna = "1.0"
 http = "1.4"
 indexmap = { version = "2", features = ["serde"] }
 itoa = "1.0"
-k256 = "0.13"
+k256 = "0.14"
 fjall = "3"
 lru = "0.18"
 multibase = "0.9"
 multihash = "0.19"
-p256 = "0.13"
-p384 = "0.13"
+p256 = "0.14"
+p384 = "0.14"
 rand = "0.10"
 regex = "1.12"
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "system-proxy", "json", "form", "query", "rustls"] }

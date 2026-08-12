@@ -5,9 +5,9 @@
 
 use crate::errors::{JWKError, JWTError};
 use anyhow::Result;
+use atproto_identity::jwk::Jwk;
 use atproto_identity::key::{KeyData, SignaturePolicy, to_public, validate_with_policy};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use elliptic_curve::JwkEcKey;
 use reqwest::header::HeaderValue;
 use reqwest_chain::Chainer;
 use ulid::Ulid;
@@ -394,7 +394,7 @@ fn build_dpop(
     let now = chrono::Utc::now();
 
     let public_key_data = to_public(key_data)?;
-    let dpop_jwk: JwkEcKey = (&public_key_data).try_into()?;
+    let dpop_jwk: Jwk = (&public_key_data).try_into()?;
 
     let header = Header {
         type_: Some("dpop+jwt".to_string()),
@@ -482,14 +482,14 @@ pub fn extract_jwk_thumbprint(dpop_jwt: &str) -> Result<String> {
             claim: "jwk".to_string(),
         })?;
 
-    // Filter the JWK to only include core fields that JwkEcKey expects
+    // Filter to the curve members: the rest is JWK metadata, not key material
     let jwk_object = jwk_value
         .as_object()
         .ok_or_else(|| JWKError::MissingField {
             field: "jwk object".to_string(),
         })?;
 
-    // Extract only the core JWK fields that JwkEcKey supports
+    // Extract only the curve members
     let mut filtered_jwk = serde_json::Map::new();
     for field in ["kty", "crv", "x", "y", "d"] {
         if let Some(value) = jwk_object.get(field) {
@@ -497,10 +497,12 @@ pub fn extract_jwk_thumbprint(dpop_jwt: &str) -> Result<String> {
         }
     }
 
-    // Convert the filtered JWK JSON to a JwkEcKey
-    let jwk_ec_key: JwkEcKey = serde_json::from_value(serde_json::Value::Object(filtered_jwk))
-        .map_err(|e| JWKError::SerializationError {
-            message: e.to_string(),
+    // Convert the filtered JWK JSON into a key
+    let jwk_ec_key: Jwk =
+        serde_json::from_value(serde_json::Value::Object(filtered_jwk)).map_err(|e| {
+            JWKError::SerializationError {
+                message: e.to_string(),
+            }
         })?;
 
     // Create a WrappedJsonWebKey to use with the thumbprint function
@@ -676,7 +678,7 @@ pub fn validate_dpop_jwt(dpop_jwt: &str, config: &DpopValidationConfig) -> Resul
             field: "jwk object".to_string(),
         })?;
 
-    // Filter the JWK to only include core fields that JwkEcKey expects
+    // Filter to the curve members: the rest is JWK metadata, not key material
     let mut filtered_jwk = serde_json::Map::new();
     for field in ["kty", "crv", "x", "y", "d"] {
         if let Some(value) = jwk_object.get(field) {
@@ -684,9 +686,11 @@ pub fn validate_dpop_jwt(dpop_jwt: &str, config: &DpopValidationConfig) -> Resul
         }
     }
 
-    let jwk_ec_key: JwkEcKey = serde_json::from_value(serde_json::Value::Object(filtered_jwk))
-        .map_err(|e| JWKError::SerializationError {
-            message: e.to_string(),
+    let jwk_ec_key: Jwk =
+        serde_json::from_value(serde_json::Value::Object(filtered_jwk)).map_err(|e| {
+            JWKError::SerializationError {
+                message: e.to_string(),
+            }
         })?;
 
     // Create WrappedJsonWebKey for further operations
@@ -1344,7 +1348,7 @@ mod tests {
         let old_time = chrono::Utc::now().timestamp().cast_unsigned() - 3600; // 1 hour ago
 
         let public_key_data = to_public(&key_data)?;
-        let dpop_jwk: JwkEcKey = (&public_key_data).try_into()?;
+        let dpop_jwk: Jwk = (&public_key_data).try_into()?;
 
         let header = Header {
             type_: Some("dpop+jwt".to_string()),

@@ -803,7 +803,7 @@ async fn main() -> anyhow::Result<()> {
     ) = match args.oauth_keys_jwk_set.as_deref() {
         None => (pds_signing_key, Vec::new()),
         Some(raw) => {
-            let mut parsed = parse_jwk_set_env(raw)?;
+            let mut parsed = atproto_pds::oauth::jwks::parse_jwk_set_env(raw)?;
             if parsed.is_empty() {
                 (pds_signing_key, Vec::new())
             } else {
@@ -1525,77 +1525,6 @@ fn service_endpoint_url(hostname: &Option<String>, service_did: &str) -> String 
         "https"
     };
     format!("{scheme}://{host}")
-}
-
-/// Parse `PDS_OAUTH_KEYS_JWK_SET` into a vec of
-/// `KeyData`. Format: standard JWKS `{"keys": [<jwk>, ...]}`. The first
-/// entry is the *current* signer; subsequent entries are historical
-/// rotations (kept in `/oauth/jwks` so consumers verifying older tokens
-/// still find the matching `kid`). EC curves only (P-256 / P-384 /
-/// secp256k1).
-fn parse_jwk_set_env(raw: &str) -> anyhow::Result<Vec<atproto_identity::key::KeyData>> {
-    use atproto_identity::key::{KeyData, KeyType};
-    use elliptic_curve::JwkEcKey;
-    use elliptic_curve::sec1::ToEncodedPoint;
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("parse JWK set JSON: {e}"))?;
-    let keys = value
-        .get("keys")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("JWK set missing `keys` array"))?;
-    let mut out: Vec<KeyData> = Vec::with_capacity(keys.len());
-    for jwk in keys {
-        let parsed: JwkEcKey = serde_json::from_value(jwk.clone())
-            .map_err(|e| anyhow::anyhow!("parse JwkEcKey: {e}"))?;
-        let has_private = jwk.get("d").is_some_and(|d| d.is_string());
-        let kd = match (parsed.crv(), has_private) {
-            ("P-256", true) => {
-                let secret = p256::SecretKey::from_jwk(&parsed)
-                    .map_err(|e| anyhow::anyhow!("P-256 priv from jwk: {e}"))?;
-                KeyData::new(KeyType::P256Private, secret.to_bytes().to_vec())
-            }
-            ("P-256", false) => {
-                let pk = p256::PublicKey::from_jwk(&parsed)
-                    .map_err(|e| anyhow::anyhow!("P-256 pub from jwk: {e}"))?;
-                KeyData::new(
-                    KeyType::P256Public,
-                    pk.to_encoded_point(true).as_bytes().to_vec(),
-                )
-            }
-            ("P-384", true) => {
-                let secret = p384::SecretKey::from_jwk(&parsed)
-                    .map_err(|e| anyhow::anyhow!("P-384 priv from jwk: {e}"))?;
-                KeyData::new(KeyType::P384Private, secret.to_bytes().to_vec())
-            }
-            ("P-384", false) => {
-                let pk = p384::PublicKey::from_jwk(&parsed)
-                    .map_err(|e| anyhow::anyhow!("P-384 pub from jwk: {e}"))?;
-                KeyData::new(
-                    KeyType::P384Public,
-                    pk.to_encoded_point(true).as_bytes().to_vec(),
-                )
-            }
-            ("secp256k1", true) => {
-                let secret = k256::SecretKey::from_jwk(&parsed)
-                    .map_err(|e| anyhow::anyhow!("K-256 priv from jwk: {e}"))?;
-                KeyData::new(KeyType::K256Private, secret.to_bytes().to_vec())
-            }
-            ("secp256k1", false) => {
-                let pk = k256::PublicKey::from_jwk(&parsed)
-                    .map_err(|e| anyhow::anyhow!("K-256 pub from jwk: {e}"))?;
-                KeyData::new(
-                    KeyType::K256Public,
-                    pk.to_encoded_point(true).as_bytes().to_vec(),
-                )
-            }
-            (other, _) => return Err(anyhow::anyhow!("unsupported JWK curve {other}")),
-        };
-        out.push(kd);
-    }
-    if out.is_empty() {
-        return Err(anyhow::anyhow!("JWK set is empty"));
-    }
-    Ok(out)
 }
 
 /// Parse the externally-supplied PLC rotation key

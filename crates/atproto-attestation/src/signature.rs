@@ -56,7 +56,7 @@ fn normalize_p256(signature: Vec<u8>) -> Result<Vec<u8>, AttestationError> {
         }
     })?;
 
-    let normalized = parsed.normalize_s().unwrap_or(parsed);
+    let normalized = parsed.normalize_s();
 
     Ok(normalized.to_vec())
 }
@@ -77,7 +77,7 @@ fn normalize_k256(signature: Vec<u8>) -> Result<Vec<u8>, AttestationError> {
         }
     })?;
 
-    let normalized = parsed.normalize_s().unwrap_or(parsed);
+    let normalized = parsed.normalize_s();
 
     Ok(normalized.to_vec())
 }

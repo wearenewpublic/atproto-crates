@@ -10,11 +10,11 @@
 //! [`crate::jwt::JwtValidationConfig::allow_missing_expiration`].
 
 use anyhow::Result;
+use atproto_identity::jwk::Jwk;
 use atproto_identity::key::{
     KeyData, KeyType, SignaturePolicy, sign, to_public, validate_with_policy,
 };
 use base64::{Engine as _, engine::general_purpose};
-use elliptic_curve::JwkEcKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,7 +43,7 @@ pub struct Header {
 
     /// Embedded JSON Web Key.
     #[serde(rename = "jwk", skip_serializing_if = "Option::is_none")]
-    pub json_web_key: Option<JwkEcKey>,
+    pub json_web_key: Option<Jwk>,
 }
 
 impl TryFrom<KeyData> for Header {

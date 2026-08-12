@@ -4,9 +4,9 @@
 //! for P-256 (ES256), P-384 (ES384), and K-256 (ES256K) curves.
 
 use anyhow::Result;
+use atproto_identity::jwk::Jwk;
 use atproto_identity::key::{KeyData, KeyType, to_public};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use elliptic_curve::{JwkEcKey, sec1::ToEncodedPoint};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -37,7 +37,7 @@ pub struct WrappedJsonWebKey {
 
     /// The underlying elliptic curve JWK.
     #[serde(flatten)]
-    pub jwk: JwkEcKey,
+    pub jwk: Jwk,
 }
 
 /// A set of JSON Web Keys.
@@ -73,68 +73,11 @@ pub fn generate(key_data: &KeyData) -> Result<WrappedJsonWebKey> {
 
 /// Convert a WrappedJsonWebKey to KeyData.
 pub fn to_key_data(wrapped_jwk: &WrappedJsonWebKey) -> Result<KeyData, JWKError> {
-    // Determine the curve from the JWK
-    let curve = wrapped_jwk.jwk.crv();
-
-    match curve {
-        "P-256" => {
-            // Try to convert to private key first
-            if let Ok(secret_key) = p256::SecretKey::try_from(&wrapped_jwk.jwk) {
-                Ok(KeyData::new(
-                    KeyType::P256Private,
-                    secret_key.to_bytes().to_vec(),
-                ))
-            } else if let Ok(public_key) = p256::PublicKey::try_from(&wrapped_jwk.jwk) {
-                // Convert to compressed format for consistency with KeyData
-                let compressed = public_key.to_encoded_point(true);
-                Ok(KeyData::new(
-                    KeyType::P256Public,
-                    compressed.as_bytes().to_vec(),
-                ))
-            } else {
-                Err(JWKError::P256ConversionFailed)
-            }
-        }
-        "P-384" => {
-            // Try to convert to private key first
-            if let Ok(secret_key) = p384::SecretKey::try_from(&wrapped_jwk.jwk) {
-                Ok(KeyData::new(
-                    KeyType::P384Private,
-                    secret_key.to_bytes().to_vec(),
-                ))
-            } else if let Ok(public_key) = p384::PublicKey::try_from(&wrapped_jwk.jwk) {
-                // Convert to compressed format for consistency with KeyData
-                let compressed = public_key.to_encoded_point(true);
-                Ok(KeyData::new(
-                    KeyType::P384Public,
-                    compressed.as_bytes().to_vec(),
-                ))
-            } else {
-                Err(JWKError::P384ConversionFailed)
-            }
-        }
-        "secp256k1" => {
-            // Try to convert to private key first
-            if let Ok(secret_key) = k256::SecretKey::try_from(&wrapped_jwk.jwk) {
-                Ok(KeyData::new(
-                    KeyType::K256Private,
-                    secret_key.to_bytes().to_vec(),
-                ))
-            } else if let Ok(public_key) = k256::PublicKey::try_from(&wrapped_jwk.jwk) {
-                // K-256 public keys in KeyData use compressed SEC1 format
-                let compressed = public_key.to_encoded_point(true);
-                Ok(KeyData::new(
-                    KeyType::K256Public,
-                    compressed.as_bytes().to_vec(),
-                ))
-            } else {
-                Err(JWKError::K256ConversionFailed)
-            }
-        }
-        _ => Err(JWKError::UnsupportedCurve {
-            curve: curve.to_string(),
-        }),
-    }
+    // Curve dispatch and on-curve validation both live in the conversion in
+    // `atproto-identity`, so every JWK entry point agrees on what it accepts.
+    KeyData::try_from(&wrapped_jwk.jwk).map_err(|e| JWKError::SerializationError {
+        message: e.to_string(),
+    })
 }
 
 /// Calculate the JWK thumbprint according to RFC 7638.
@@ -629,7 +572,7 @@ mod tests {
         });
 
         // This should fail during JWK parsing, not our conversion
-        let _jwk_result: Result<elliptic_curve::JwkEcKey, _> =
+        let _jwk_result: Result<atproto_identity::jwk::Jwk, _> =
             serde_json::from_value(invalid_jwk_json);
         // The elliptic_curve crate may be more lenient than expected, so we don't assert here
 

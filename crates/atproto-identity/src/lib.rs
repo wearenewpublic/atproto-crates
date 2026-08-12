@@ -16,6 +16,7 @@
 pub mod config;
 pub mod errors;
 pub mod host;
+pub mod jwk;
 pub mod key;
 pub mod model;
 pub mod plc;

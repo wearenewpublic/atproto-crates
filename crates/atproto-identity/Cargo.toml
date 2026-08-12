@@ -75,11 +75,11 @@ ed25519-dalek.workspace = true
 elliptic-curve.workspace = true
 hickory-resolver = { workspace = true, optional = true }
 idna.workspace = true
-k256 = { workspace = true, features = ["jwk"] }
+k256 = { workspace = true, features = [] }
 lru = { workspace = true, optional = true }
 multibase.workspace = true
-p256 = { workspace = true, features = ["jwk"] }
-p384 = { workspace = true, features = ["jwk"] }
+p256 = { workspace = true, features = [] }
+p384 = { workspace = true, features = [] }
 atproto-dasl.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

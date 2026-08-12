@@ -293,7 +293,7 @@ fn handle_key(command: KeyCommands) -> Result<()> {
             let public_key = key::to_public(&private_key)?;
 
             if jwk {
-                let jwk_result: Result<elliptic_curve::JwkEcKey, _> = (&private_key).try_into();
+                let jwk_result: Result<atproto_identity::jwk::Jwk, _> = (&private_key).try_into();
                 match jwk_result {
                     Ok(jwk_key) => {
                         println!("{}", serde_json::to_string_pretty(&jwk_key)?);
@@ -330,7 +330,7 @@ fn handle_key(command: KeyCommands) -> Result<()> {
             }
 
             if jwk {
-                let jwk_result: Result<elliptic_curve::JwkEcKey, _> = (&key_data).try_into();
+                let jwk_result: Result<atproto_identity::jwk::Jwk, _> = (&key_data).try_into();
                 match jwk_result {
                     Ok(jwk_key) => {
                         println!("JWK: {}", serde_json::to_string_pretty(&jwk_key)?);
@@ -871,67 +871,12 @@ fn build_http_context() -> Result<(reqwest::Client, HickoryDnsResolver, String)>
 /// Supports P-256, P-384, and K-256 EC keys. Detects private vs public
 /// based on the presence of the `d` parameter.
 fn parse_jwk_to_key_data(jwk_json: &str) -> Result<KeyData> {
-    use elliptic_curve::sec1::ToEncodedPoint;
-
-    let jwk: elliptic_curve::JwkEcKey =
+    let jwk: atproto_identity::jwk::Jwk =
         serde_json::from_str(jwk_json).map_err(|e| anyhow::anyhow!("invalid JWK: {}", e))?;
-
-    let crv = jwk.crv();
-    let has_private = serde_json::to_value(&jwk)?
-        .get("d")
-        .is_some_and(|d| d.is_string());
-
-    match (crv, has_private) {
-        ("P-256", true) => {
-            let secret = p256::SecretKey::from_jwk(&jwk)
-                .map_err(|e| anyhow::anyhow!("invalid P-256 private JWK: {}", e))?;
-            Ok(KeyData::new(
-                KeyType::P256Private,
-                secret.to_bytes().to_vec(),
-            ))
-        }
-        ("P-256", false) => {
-            let public = p256::PublicKey::from_jwk(&jwk)
-                .map_err(|e| anyhow::anyhow!("invalid P-256 public JWK: {}", e))?;
-            Ok(KeyData::new(
-                KeyType::P256Public,
-                public.to_encoded_point(true).as_bytes().to_vec(),
-            ))
-        }
-        ("P-384", true) => {
-            let secret = p384::SecretKey::from_jwk(&jwk)
-                .map_err(|e| anyhow::anyhow!("invalid P-384 private JWK: {}", e))?;
-            Ok(KeyData::new(
-                KeyType::P384Private,
-                secret.to_bytes().to_vec(),
-            ))
-        }
-        ("P-384", false) => {
-            let public = p384::PublicKey::from_jwk(&jwk)
-                .map_err(|e| anyhow::anyhow!("invalid P-384 public JWK: {}", e))?;
-            Ok(KeyData::new(
-                KeyType::P384Public,
-                public.to_encoded_point(true).as_bytes().to_vec(),
-            ))
-        }
-        ("secp256k1", true) => {
-            let secret = k256::SecretKey::from_jwk(&jwk)
-                .map_err(|e| anyhow::anyhow!("invalid K-256 private JWK: {}", e))?;
-            Ok(KeyData::new(
-                KeyType::K256Private,
-                secret.to_bytes().to_vec(),
-            ))
-        }
-        ("secp256k1", false) => {
-            let public = k256::PublicKey::from_jwk(&jwk)
-                .map_err(|e| anyhow::anyhow!("invalid K-256 public JWK: {}", e))?;
-            Ok(KeyData::new(
-                KeyType::K256Public,
-                public.to_encoded_point(true).as_bytes().to_vec(),
-            ))
-        }
-        (crv, _) => Err(anyhow::anyhow!("unsupported JWK curve: {}", crv)),
-    }
+    // Curve dispatch, `d`-presence and on-curve validation all live in the
+    // conversion in the library, so this tool accepts exactly what the server
+    // does.
+    KeyData::try_from(&jwk).map_err(|e| anyhow::anyhow!("invalid JWK: {}", e))
 }
 
 /// Parse a `name=value` pair from a CLI argument.
