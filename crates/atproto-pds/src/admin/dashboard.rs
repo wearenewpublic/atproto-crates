@@ -11,87 +11,19 @@
 //! Bigger UIs (record-level moderation, takedown bulk-ops) are an
 //! operational-tooling concern, kept outside the PDS binary.
 
-use crate::admin::handlers::DEFAULT_ADMIN_PASSWORD;
+// The dashboard guards the same verbs behind the same secret as the XRPC admin
+// surface, so it cannot be the softer of the two doors. It used to say that in
+// a comment above a second copy of the gate -- parsing the same header, taking
+// the same bucket, making the same comparison. A copy that has to stay in step
+// is the shape every defect in this codebase has taken, and this one had
+// already drifted in its error strings. There is one gate now.
+use crate::admin::handlers::require_admin;
 use crate::http::errors::XrpcError;
 use crate::http::state::HttpState;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::{Html, IntoResponse, Response};
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64STD};
-
-async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
-    let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
-        XrpcError::new(
-            StatusCode::UNAUTHORIZED,
-            "AdminAuthenticationRequired",
-            "no Authorization header",
-        )
-    })?;
-    let raw = header.to_str().map_err(|_| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "Authorization header is not valid UTF-8",
-        )
-    })?;
-    let encoded = raw.strip_prefix("Basic ").ok_or_else(|| {
-        XrpcError::new(
-            StatusCode::UNAUTHORIZED,
-            "AdminAuthenticationRequired",
-            "expected Basic scheme",
-        )
-    })?;
-    let decoded = B64STD.decode(encoded).map_err(|_| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "Authorization header is not base64",
-        )
-    })?;
-    let s = String::from_utf8(decoded).map_err(|_| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "Authorization header is not UTF-8",
-        )
-    })?;
-    let (_, password) = s.split_once(':').ok_or_else(|| {
-        XrpcError::new(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "expected user:pass",
-        )
-    })?;
-    // Same bound and same comparison as the XRPC admin surface: the dashboard
-    // guards the same verbs behind the same secret, so it cannot be the softer
-    // of the two doors.
-    state
-        .rate_limiter
-        .try_acquire("admin-auth")
-        .await
-        .map_err(|e| {
-            XrpcError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "RateLimited",
-                format!("admin authentication rate-limit hit: {e}"),
-            )
-        })?;
-
-    let expected = state
-        .admin_password
-        .as_deref()
-        .unwrap_or(DEFAULT_ADMIN_PASSWORD);
-    if !crate::security::secret_eq(password, expected) {
-        return Err(XrpcError::new(
-            StatusCode::UNAUTHORIZED,
-            "AdminAuthenticationFailed",
-            "invalid admin password",
-        ));
-    }
-    Ok(())
-}
 
 /// Render the admin status dashboard.
 ///

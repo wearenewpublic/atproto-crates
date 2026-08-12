@@ -30,21 +30,35 @@ use axum::http::request::Parts;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64STD};
 use serde::{Deserialize, Serialize};
 
-/// Default admin password for unconfigured deployments. **Never** ship a
-/// PDS without overriding `PDS_ADMIN_PASSWORD`.
-pub const DEFAULT_ADMIN_PASSWORD: &str = "admin-default-CHANGE-ME";
-
 /// Verify the admin Basic-auth header.
 ///
 /// Rate-limited and constant-time. One shared secret guards every admin verb,
 /// so a `!=` gave a timing oracle against it and an unbounded endpoint gave an
 /// online guessing oracle — the second being the larger of the two.
 ///
+/// # No password means no admin surface
+///
+/// There used to be a `DEFAULT_ADMIN_PASSWORD` constant here, published in this
+/// repository, that an unset `admin_password` fell back to. The `pds` binary
+/// closes that through `validate_production_safety`, so a server started the
+/// documented way was never exposed — but this is a library, and anything
+/// building an `HttpState` without `with_admin_password` served
+/// `updateAccountPassword`, `deleteAccount` and `updateAccountEmail` behind a
+/// string anyone could read here.
+///
+/// An absent password now refuses every admin request rather than standing in
+/// for one. A credential that has to be configured before it works cannot be
+/// left at its default by accident, which is the only property that survives
+/// somebody not reading the documentation.
+///
+/// An empty password counts as absent, for the same reason.
+///
 /// # Errors
 ///
 /// `AdminAuthenticationRequired` when the header is absent or malformed,
-/// `AdminAuthenticationFailed` when the password does not match, and
-/// `RateLimited` when the shared attempt budget is exhausted.
+/// `AdminAuthenticationFailed` when the password does not match or none is
+/// configured, and `RateLimited` when the attempt budget for the caller's
+/// address is exhausted.
 pub(crate) async fn require_admin(parts: &Parts, state: &HttpState) -> Result<(), XrpcError> {
     let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
         XrpcError::new(
@@ -90,9 +104,18 @@ pub(crate) async fn require_admin(parts: &Parts, state: &HttpState) -> Result<()
     })?;
     // Bounded before comparing: an attacker who can guess without limit does
     // not need a timing side-channel.
+    //
+    // Keyed per address. It was one constant key for the whole server, which
+    // bounds the guessing but hands anyone a lockout: 3000 bad requests from
+    // anywhere exhaust the operator's budget too, and the moment an operator
+    // most needs the admin surface is during the incident that is generating
+    // them. A caller with no resolvable address -- an in-process call or a test
+    // harness -- falls back to the shared key, so the bound never disappears.
+    let ip = crate::http::rate_limit::client_ip_from_parts(parts, state.trusted_proxy_hops);
+    let limiter_key = ip.map_or_else(|| "admin-auth".to_string(), |ip| format!("admin-auth:{ip}"));
     state
         .rate_limiter
-        .try_acquire("admin-auth")
+        .try_acquire(&limiter_key)
         .await
         .map_err(|e| {
             XrpcError::new(
@@ -102,7 +125,31 @@ pub(crate) async fn require_admin(parts: &Parts, state: &HttpState) -> Result<()
             )
         })?;
 
-    if !crate::security::secret_eq(password, admin_password(state)) {
+    // Fail closed. See the note above.
+    let Some(expected) = state.admin_password.as_deref().filter(|p| !p.is_empty()) else {
+        // ERROR rather than WARN: every admin request will fail until someone
+        // configures one, and the caller is told only that authentication
+        // failed, so this log line is the sole place the actual cause appears.
+        tracing::error!(
+            "refused an admin request because no admin password is configured; set one with \
+             HttpState::with_admin_password (PDS_ADMIN_PASSWORD for the pds binary)"
+        );
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AdminAuthenticationFailed",
+            "invalid admin password",
+        ));
+    };
+
+    if !crate::security::secret_eq(password, expected) {
+        // There was no log line at all on a failed admin attempt, so a campaign
+        // against the one secret that guards every admin verb left no trace.
+        // The address and nothing else: the submitted password is the secret
+        // being guessed, and a log is not where it should end up.
+        tracing::warn!(
+            client_ip = ?ip,
+            "admin authentication failed"
+        );
         return Err(XrpcError::new(
             StatusCode::UNAUTHORIZED,
             "AdminAuthenticationFailed",
@@ -132,13 +179,6 @@ async fn resolve_at_identifier(state: &HttpState, identifier: &str) -> Result<St
             format!("account {identifier} not found"),
         )
     })
-}
-
-fn admin_password(state: &HttpState) -> &str {
-    state
-        .admin_password
-        .as_deref()
-        .unwrap_or(DEFAULT_ADMIN_PASSWORD)
 }
 
 /// Query params for `getAccountInfo`.
@@ -1375,4 +1415,131 @@ pub async fn disable_invite_codes(
     }
     tracing::info!(count = input.codes.len(), "admin: invite codes disabled");
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::SlidingWindowLimiter;
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    async fn test_state() -> HttpState {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let accounts = crate::account::AccountDirectory::open_memory()
+            .await
+            .expect("accounts");
+        let reader = std::sync::Arc::new(crate::repo::RepoReader::new(
+            accounts,
+            tmp.path().to_path_buf(),
+        ));
+        // The tempdir is dropped here; nothing in these tests touches the data
+        // directory, only the admin gate.
+        HttpState::new(reader)
+    }
+
+    /// `Parts` carrying a Basic credential, optionally from a named address.
+    fn parts_with(password: &str, peer: Option<&str>) -> Parts {
+        let encoded = B64STD.encode(format!("admin:{password}"));
+        let mut builder = axum::http::Request::builder()
+            .uri("/xrpc/com.atproto.admin.getAccountInfo")
+            .header(AUTHORIZATION, format!("Basic {encoded}"));
+        if let Some(peer) = peer {
+            let addr: SocketAddr = peer.parse().expect("socket addr");
+            builder = builder.extension(ConnectInfo(addr));
+        }
+        builder.body(()).expect("request").into_parts().0
+    }
+
+    /// The published constant this used to fall back to. Named here so the test
+    /// fails loudly if anything reintroduces it.
+    const FORMER_DEFAULT: &str = "admin-default-CHANGE-ME";
+
+    /// The defect: an `HttpState` built without `with_admin_password` served
+    /// every admin verb behind a string published in this repository.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_configured_password_refuses_the_former_default() {
+        let state = test_state().await;
+        assert!(state.admin_password.is_none(), "the case under test");
+
+        let err = require_admin(&parts_with(FORMER_DEFAULT, None), &state)
+            .await
+            .expect_err("an unconfigured admin surface must refuse");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// And refuses everything else too, rather than only that one string.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_configured_password_refuses_any_password() {
+        let state = test_state().await;
+        for attempt in ["", "hunter2", FORMER_DEFAULT] {
+            assert!(
+                require_admin(&parts_with(attempt, None), &state)
+                    .await
+                    .is_err(),
+                "unconfigured admin surface accepted {attempt:?}"
+            );
+        }
+    }
+
+    /// An empty configured password is not a password.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_configured_password_is_treated_as_absent() {
+        let mut state = test_state().await;
+        state.admin_password = Some(String::new());
+
+        assert!(
+            require_admin(&parts_with("", None), &state).await.is_err(),
+            "an empty password must not authenticate against itself"
+        );
+    }
+
+    /// The ordinary path still works.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_password_authenticates() {
+        let mut state = test_state().await;
+        state.admin_password = Some("correct horse".to_string());
+
+        require_admin(&parts_with("correct horse", None), &state)
+            .await
+            .expect("the configured password authenticates");
+        assert!(
+            require_admin(&parts_with("wrong horse", None), &state)
+                .await
+                .is_err()
+        );
+    }
+
+    /// The budget was one constant key for the whole server, so anyone could
+    /// exhaust it and lock the operator out during the incident that was
+    /// generating the attempts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_attempt_budget_is_per_address() {
+        let mut state = test_state().await;
+        state.admin_password = Some("correct horse".to_string());
+        state.rate_limiter = SlidingWindowLimiter::new(2, Duration::from_secs(60), 1_000);
+
+        // Burn the attacker's whole budget.
+        for _ in 0..2 {
+            assert!(
+                require_admin(&parts_with("guess", Some("203.0.113.9:5000")), &state)
+                    .await
+                    .is_err(),
+                "a wrong password is refused"
+            );
+        }
+        let exhausted = require_admin(&parts_with("guess", Some("203.0.113.9:5001")), &state)
+            .await
+            .expect_err("the attacker's third attempt is over budget");
+        assert_eq!(exhausted.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The operator, on a different address, is unaffected.
+        require_admin(
+            &parts_with("correct horse", Some("198.51.100.4:6000")),
+            &state,
+        )
+        .await
+        .expect("the operator keeps their own budget");
+    }
 }

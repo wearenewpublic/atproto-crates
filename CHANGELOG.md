@@ -25,6 +25,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   screen can describe. A `repo` permission naming no collections is likewise now refused with a
   reason instead of silently expanding to nothing.
 
+- **Admin authentication is rate-limited per client address**, not on one shared key.
+
+  The budget was a single `"admin-auth"` bucket for the whole server, so 3000 bad requests from
+  anywhere exhausted the operator's attempts as well — locking them out of the admin surface during
+  exactly the incident that would be generating those requests. A caller with no resolvable address
+  (an in-process call, a test harness) still falls back to the shared key, so the bound never
+  disappears.
+
+- **A failed admin attempt is now logged** at WARN with the client address, and an admin request
+  refused for want of any configured password is logged at ERROR. There was previously no log line
+  at all on a failed admin authentication, so a campaign against the one secret guarding every admin
+  verb left no trace. The submitted password is not logged: it is the secret being guessed.
+
+- The admin HTML dashboard and the XRPC admin surface now share one gate. The dashboard had a second
+  copy that parsed the same header, took the same bucket and made the same comparison, under a
+  comment saying it must not be the softer of the two doors; the copies had already drifted in their
+  error strings.
+
+- The `pds` binary's `--jwt-secret` and `--admin-password` defaults are now named from
+  `atproto_pds::config::DEV_SENTINEL_*` rather than repeating the literals. The production-safety
+  gate matches on those constants, so a second copy of each string is a gate that silently stops
+  working when somebody edits one of them.
+
+### Removed
+- **`atproto_pds::admin::handlers::DEFAULT_ADMIN_PASSWORD` is gone, and an unconfigured admin
+  password now refuses every admin request** instead of falling back to it.
+
+  The constant was `"admin-default-CHANGE-ME"`, published in this repository. The `pds` binary was
+  never exposed by it — `validate_production_safety` refuses that exact string as a dev sentinel —
+  but this is a library, and anything constructing an `HttpState` without `with_admin_password`
+  served `updateAccountPassword`, `deleteAccount` and `updateAccountEmail` behind a value anyone
+  could read here. A credential that has to be configured before it works cannot be left at its
+  default by accident, which is the only property that survives somebody not reading the
+  documentation. An empty password counts as absent for the same reason.
+
+  **Breaking for embedders** that relied on the fallback: call `HttpState::with_admin_password`.
+  There is no behaviour change for the `pds` binary, whose `--admin-password` default is the dev
+  sentinel and is unchanged.
+
 ### Fixed
 - **Every Dockerfile now names the toolchain the workspace pins.** The raise to 1.97 updated
   `rust-toolchain.toml`, `rust-version` in the workspace `Cargo.toml` and the builder stage in

@@ -70,18 +70,25 @@ struct Args {
     hostname: Option<String>,
 
     /// HMAC secret for app-password sessions and OAuth tokens (>=32 bytes).
+    ///
+    /// The default is the dev sentinel `validate_production_safety` refuses, so
+    /// it is named from `config` rather than written out a second time: two
+    /// copies of the same literal, one the gate matches on, is a gate that stops
+    /// working the moment somebody edits the other.
     #[arg(
         long,
         env = "PDS_JWT_SECRET",
-        default_value = "dev-only-jwt-secret-32-bytes-min!"
+        default_value = atproto_pds::config::DEV_SENTINEL_JWT_SECRET
     )]
     jwt_secret: String,
 
     /// Admin password for `com.atproto.admin.*` Basic-auth.
+    ///
+    /// Also the dev sentinel; see `jwt_secret`.
     #[arg(
         long,
         env = "PDS_ADMIN_PASSWORD",
-        default_value = "admin-default-CHANGE-ME"
+        default_value = atproto_pds::config::DEV_SENTINEL_ADMIN_PASSWORD
     )]
     admin_password: String,
 
