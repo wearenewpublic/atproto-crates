@@ -592,6 +592,8 @@ async fn main() -> anyhow::Result<()> {
         "atproto-pds starting"
     );
 
+    report_tls_trust_anchors();
+
     // Backends that are configured but cannot be used. These flags used to
     // parse and be ignored, so an operator who set one believed they had it and
     // got neither.
@@ -1744,6 +1746,40 @@ fn build_rate_limit_policy(
         args.trusted_proxy_hops,
         bypass,
     ))
+}
+
+/// Log how many TLS trust anchors the platform offers, and warn when there are
+/// none.
+///
+/// `reqwest` used to compile the Mozilla root set into the binary. It no longer
+/// ships one — 0.13 removed the bundled-roots feature entirely — so every
+/// outbound HTTPS call now verifies against the host's trust store: the PLC
+/// directory, PDS-to-PDS traffic, AppView proxying, crawler notifications.
+///
+/// On a container that is missing `/etc/ssl/certs/ca-certificates.crt` that
+/// failure looks like every remote call failing certificate verification at
+/// once, with nothing at boot to say why. This reads the same store the TLS
+/// stack will (`rustls-native-certs`, which is what `rustls-platform-verifier`
+/// uses on Linux), so the count cannot drift from what verification actually
+/// sees.
+///
+/// Reporting only. An empty store is fatal to outbound TLS but not to serving
+/// requests, and refusing to boot would take down a PDS that is still able to
+/// answer its own clients.
+fn report_tls_trust_anchors() {
+    let result = rustls_native_certs::load_native_certs();
+    let count = result.certs.len();
+    if count == 0 {
+        tracing::warn!(
+            errors = ?result.errors,
+            "no TLS trust anchors found; outbound HTTPS will fail certificate \
+             verification. On a container image this usually means the runtime \
+             stage has no ca-certificates package. SSL_CERT_FILE or SSL_CERT_DIR \
+             override the search."
+        );
+    } else {
+        tracing::debug!(count, "TLS trust anchors loaded from the platform store");
+    }
 }
 
 fn init_tracing(filter: &str, otel_endpoint: Option<&str>) {

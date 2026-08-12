@@ -66,6 +66,9 @@ url.workspace = true
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+# Reads the same trust store the TLS stack verifies against, so the boot-time
+# anchor count cannot drift from what `rustls-platform-verifier` actually sees.
+rustls-native-certs = "0.8"
 hex = "0.4"
 sha2.workspace = true
 tracing.workspace = true

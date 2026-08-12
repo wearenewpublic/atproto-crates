@@ -83,9 +83,9 @@ p256 = "0.13"
 p384 = "0.13"
 rand = "0.10"
 regex = "1.12"
-reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "system-proxy", "json", "rustls-tls"] }
-reqwest-chain = "1.0"
-reqwest-middleware = { version = "0.4", features = ["json", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "system-proxy", "json", "form", "query", "rustls"] }
+reqwest-chain = "2.0"
+reqwest-middleware = { version = "0.5", features = ["json", "multipart", "form", "query"] }
 rpassword = "7.3"
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }

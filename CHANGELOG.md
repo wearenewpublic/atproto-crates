@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- **`reqwest` 0.12 → 0.13**, with `reqwest-middleware` 0.5 and `reqwest-chain` 2.0.
+
+  0.13 gates builder methods that used to be unconditional, so `form` and `query` join the feature
+  list on both `reqwest` and `reqwest-middleware` — without them `.form()` and `.query()` simply do
+  not exist. `rustls-tls` is renamed `rustls`. No source changes.
+
+  The consequential part is trust anchors. 0.13 removes the bundled-roots feature outright — there
+  is no `webpki-roots` option left, and both `rustls` and `rustls-no-provider` pull
+  `rustls-platform-verifier`, which on Linux reads the host store via `rustls-native-certs`. Until
+  now the binary carried the Mozilla root set inside it and the runtime image's CA store went
+  unused; from here every `reqwest` call verifies against the host: PLC directory, PDS-to-PDS,
+  AppView proxying, crawler notifications. This is scoped to `reqwest` — `lettre` (SMTP) and `sqlx`
+  (Postgres TLS) still use bundled `webpki-roots`.
+
+  The release image was checked rather than assumed: pulling the published
+  `gcr.io/distroless/cc-debian12` manifest and unpacking its layers shows
+  `/etc/ssl/certs/ca-certificates.crt` present with 150 certificates — which is exactly the path
+  `openssl-probe` looks for on behalf of `rustls-native-certs`.
+
+  That check is a snapshot, so `pds` now reports the anchor count at boot, warning when it is zero.
+  It reads the same store the TLS stack verifies against, so the number cannot drift from what
+  verification sees. Without it, a base image that stopped shipping `ca-certificates` would surface
+  as every remote call failing certificate verification at once with nothing at boot to explain it.
+  Reporting only: an empty store breaks outbound TLS but not serving, and refusing to boot would
+  take down a PDS that can still answer its own clients.
+
+  On the crypto provider: 0.13's `rustls` feature selects `aws-lc-rs`, so `ring` and `aws-lc-rs` are
+  now both compiled in, a state where rustls panics on first use if nothing names a provider.
+  `reqwest` prefers an installed process default and otherwise falls back to
+  `aws_lc_rs::default_provider()` explicitly, so the panic branch belongs to `rustls-no-provider`
+  and does not apply. Verified live: requests to `https://plc.directory/` and
+  `https://bsky.social/xrpc/_health` both complete.
+
 ### Security
 - **The `s3` feature now selects the current TLS stack**, clearing RUSTSEC-2026-0104, -0098 and
   -0099 (`rustls-webpki 0.101.7`: a reachable panic parsing CRLs, and two name-constraint checking
