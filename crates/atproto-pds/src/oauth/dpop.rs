@@ -215,6 +215,51 @@ pub async fn verify_token_endpoint_dpop(
     Ok(jkt)
 }
 
+/// Verify the DPoP proof presented at space-credential issuance and return
+/// its JWK thumbprint.
+///
+/// The XRPC-flavored sibling of [`verify_token_endpoint_dpop`], for
+/// `com.atproto.space.getSpaceCredential`: the same construction (no bound
+/// thumbprint to compare against — the thumbprint is the *output*, written
+/// into the minted credential's `cnf.jkt`; no `ath`, because the delegation
+/// token is an authorization grant rather than an access token; single-use
+/// `jti`), but errors carry the XRPC-style names the space endpoints speak,
+/// and there is no nonce machinery — space issuance does not challenge with
+/// nonces.
+///
+/// # Errors
+///
+/// Returns a 401 `InvalidDpopProof` when the header is missing, malformed,
+/// fails validation, or replays a previously seen `jti`.
+pub async fn verify_issuance_dpop_proof(
+    headers: &HeaderMap,
+    htm: &str,
+    htu: &str,
+    jti_guard: &JtiReplayGuard,
+) -> Result<String, XrpcError> {
+    let invalid =
+        |message: String| XrpcError::new(StatusCode::UNAUTHORIZED, "InvalidDpopProof", message);
+
+    let proof = headers
+        .get(DPOP_HEADER)
+        .ok_or_else(|| invalid("missing DPoP header".to_string()))?
+        .to_str()
+        .map_err(|_| invalid("DPoP header is not valid UTF-8".to_string()))?;
+
+    let mut config = DpopValidationConfig::for_authorization(htm, htu);
+    config.max_age_seconds = DPOP_MAX_AGE_SECS;
+    let jkt = validate_dpop_jwt(proof, &config)
+        .map_err(|e| invalid(format!("DPoP proof invalid: {e}")))?;
+
+    let jti = extract_jti(proof).ok_or_else(|| invalid("DPoP proof missing jti".to_string()))?;
+    jti_guard
+        .check_and_insert(&jti, Duration::from_secs(DPOP_MAX_AGE_SECS * 2))
+        .await
+        .map_err(|e| invalid(format!("DPoP proof replay: {e}")))?;
+
+    Ok(jkt)
+}
+
 /// Thumbprint of a DPoP proof presented on a PAR request, if one was sent.
 ///
 /// Returns `Ok(None)` when there is no DPoP header — RFC 9449 §10.1 makes the

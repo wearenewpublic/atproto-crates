@@ -13,8 +13,9 @@
 //! - `getRepoState` / `listRepoOps` — signed-commit (`{commit:#signedCommit}`)
 //!   sync surface (sig over `ctx` + `mac`-bound `hash`, spec lines 285-316).
 //! - `getDelegationToken` (GET -> `{token}`; spec lines 147-176) exchanged at
-//!   `getSpaceCredential` (delegation token in the `Authorization` header +
-//!   body `{space, clientAttestation?}` -> `{credential}`; spec lines 200-251)
+//!   `getSpaceCredential` (delegation token in the `Authorization` header, a
+//!   `DPoP` proof naming the key to bind the credential to, and body
+//!   `{space, clientAttestation?}` -> `{credential}`; spec lines 200-251)
 //!   with mint authorization (member-list allow, non-member deny, `#allowList`
 //!   app deny).
 //! - `getBlob` permissioned gating, `listRepos` (`{did, rev}`),
@@ -27,7 +28,7 @@
 //! HS256 OAuth access token directly (mirroring `tests/dpop_enforcement.rs`).
 
 use atproto_identity::key::{KeyData, KeyType, generate_key};
-use atproto_oauth::dpop::{extract_jwk_thumbprint, request_dpop};
+use atproto_oauth::dpop::{auth_dpop, extract_jwk_thumbprint, request_dpop};
 use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
@@ -162,10 +163,10 @@ impl SpaceCred {
     }
 }
 
-/// RFC 7638 thumbprint of a key, as `dpopJkt` wants it.
+/// RFC 7638 thumbprint of a key, as a credential's `cnf.jkt` carries it.
 ///
 /// Taken from a throwaway proof rather than computed directly, so the value
-/// sent as `dpopJkt` is by construction the one the server derives from a real
+/// asserted against is by construction the one the server derives from a real
 /// proof's `jwk` header.
 fn jkt_of(key: &KeyData) -> String {
     let (proof, _, _) = request_dpop(key, "POST", "http://test.example/", "t").unwrap();
@@ -194,7 +195,7 @@ async fn mint_space_credential(app: &axum::Router, member_did: &str, space_uri: 
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
     let key = generate_key(KeyType::P256Private).unwrap();
-    let (status, body) = exchange_credential(app, &grant, space_uri, &jkt_of(&key), None).await;
+    let (status, body) = exchange_credential(app, &grant, space_uri, &key, None).await;
     assert_eq!(status, StatusCode::OK, "getSpaceCredential: {body}");
     SpaceCred {
         jwt: body["credential"].as_str().unwrap().to_string(),
@@ -348,38 +349,61 @@ async fn create_space(app: &axum::Router, owner_token: &str, skey: &str) -> Stri
     body["uri"].as_str().unwrap().to_string()
 }
 
-/// A fixed, well-formed RFC 7638 thumbprint for tests that assert what the
-/// mint does with the value rather than presenting the credential afterwards.
+/// The issuance endpoint, as both the exchange helper and the server's `htu`
+/// computation see it.
+const GET_SPACE_CREDENTIAL_PATH: &str = "/xrpc/com.atproto.space.getSpaceCredential";
+
+/// A DPoP proof for the `getSpaceCredential` request itself, signed by the key
+/// the credential should bind to. No `ath`: the delegation token is an
+/// authorization grant, not an access token (spec, "DPoP binding").
+fn issuance_proof(key: &KeyData) -> String {
+    let (proof, _, _) = auth_dpop(
+        key,
+        "POST",
+        &format!("http://test.example{GET_SPACE_CREDENTIAL_PATH}"),
+    )
+    .expect("mint issuance DPoP proof");
+    proof
+}
+
+/// A throwaway key for exchanges that only assert on the mint's answer and
+/// never present the credential afterwards.
 ///
-/// Tests that actually *use* a credential get a generated key from
+/// Tests that actually *use* a credential get theirs from
 /// [`mint_space_credential`] instead — they have to sign proofs with it.
-const TEST_DPOP_JKT: &str = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I";
+fn throwaway_key() -> KeyData {
+    generate_key(KeyType::P256Private).unwrap()
+}
 
 /// Exchange a delegation token for a space credential at
 /// `com.atproto.space.getSpaceCredential`.
 ///
-/// Per the 0016 spec (lines 200-251) the delegation token is presented in the
-/// `Authorization: Bearer` header and the body carries the target `space`, the
-/// `dpopJkt` to bind the credential to, plus an optional `clientAttestation`.
-/// The response is `{credential}`.
+/// Per the 0016 spec (lines 200-251 and "DPoP binding") the delegation token
+/// is presented in the `Authorization: Bearer` header, a `DPoP` proof signed
+/// by `key` names the key to bind the credential to, and the body carries the
+/// target `space` plus an optional `clientAttestation`. The response is
+/// `{credential}`.
 async fn exchange_credential(
     app: &axum::Router,
     delegation_token: &str,
     space: &str,
-    dpop_jkt: &str,
+    key: &KeyData,
     client_attestation: Option<&str>,
 ) -> (StatusCode, Value) {
-    let mut body = json!({ "space": space, "dpopJkt": dpop_jkt });
+    let mut body = json!({ "space": space });
     if let Some(att) = client_attestation {
         body["clientAttestation"] = json!(att);
     }
-    post_json(
-        app.clone(),
-        "/xrpc/com.atproto.space.getSpaceCredential",
-        body,
-        Some(delegation_token),
-    )
-    .await
+    let request = Request::builder()
+        .uri(GET_SPACE_CREDENTIAL_PATH)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("host", "test.example")
+        .header("authorization", format!("Bearer {delegation_token}"))
+        .header("DPoP", issuance_proof(key))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    read_response(app.clone().oneshot(request).await.unwrap()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +557,7 @@ async fn a_deleted_space_answers_space_deleted_at_renewal() {
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
 
-    let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    let (status, body) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
     assert_eq!(
         body["error"], "SpaceDeleted",
         "renewal against a deleted space must say so by name: {body}"
@@ -560,7 +584,7 @@ async fn a_deleted_space_answers_space_deleted_at_renewal() {
             &app,
             grant,
             "at://did:plc:owner/space/app.bsky.group/never-existed",
-            TEST_DPOP_JKT,
+            &throwaway_key(),
             None,
         )
         .await;
@@ -1483,9 +1507,11 @@ async fn delegation_token_then_space_credential_member_allowed() {
     assert_eq!(dt_exp, dt_iat + 60, "delegation token exp is iat + 60");
 
     // Exchange the grant for a space credential (member-list + #open => allow).
-    // The delegation token rides in the Authorization header; the body carries
-    // only the target space. The response is {credential} (spec lines 200-251).
-    let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    // The delegation token rides in the Authorization header, the key to bind
+    // to rides as a DPoP proof, and the body carries only the target space.
+    // The response is {credential} (spec lines 200-251).
+    let key = throwaway_key();
+    let (status, body) = exchange_credential(&app, &grant, &uri, &key, None).await;
     assert_eq!(status, StatusCode::OK, "getSpaceCredential: {body}");
     let credential = body["credential"].as_str().unwrap();
     // No legacy {token, expiresAt} shape.
@@ -1495,8 +1521,8 @@ async fn delegation_token_then_space_credential_member_allowed() {
     // Space-credential shape (spec lines 206-225): typ
     // atproto-space-credential+jwt, kid #atproto_space, iss == the authority,
     // sub == the space URI, NO aud. No attestation was presented, so client_id
-    // is omitted (spec lines 221, 228). `cnf.jkt` carries the thumbprint the
-    // request asked for, verbatim.
+    // is omitted (spec lines 221, 228). `cnf.jkt` carries the thumbprint of
+    // the key the request's DPoP proof was signed by.
     let (sc_header, sc_payload) = decode_jwt(credential);
     assert_eq!(sc_header["typ"], "atproto-space-credential+jwt");
     assert_eq!(sc_header["kid"], "#atproto_space");
@@ -1506,7 +1532,7 @@ async fn delegation_token_then_space_credential_member_allowed() {
         sc_payload.get("aud").is_none(),
         "space credential has no aud"
     );
-    assert_eq!(sc_payload["cnf"]["jkt"], TEST_DPOP_JKT);
+    assert_eq!(sc_payload["cnf"]["jkt"], jkt_of(&key));
     assert!(sc_payload.get("client_id").is_none());
 }
 
@@ -1639,13 +1665,13 @@ async fn a_failed_delegation_token_is_named_as_one() {
     let uri = create_space(&app, &owner_token, "default").await;
 
     // Structurally broken.
-    let (status, body) = exchange_credential(&app, "not-a-jwt", &uri, TEST_DPOP_JKT, None).await;
+    let (status, body) = exchange_credential(&app, "not-a-jwt", &uri, &throwaway_key(), None).await;
     assert_eq!(body["error"], "InvalidDelegationToken", "{body}");
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // Well-formed and not signed by anyone who could have issued it.
     let forged = forge_space_credential("did:plc:owner", &uri);
-    let (_, body) = exchange_credential(&app, &forged.jwt, &uri, TEST_DPOP_JKT, None).await;
+    let (_, body) = exchange_credential(&app, &forged.jwt, &uri, &throwaway_key(), None).await;
     assert_eq!(body["error"], "InvalidDelegationToken", "{body}");
 
     // Single-use: the second presentation of a real one is refused under the
@@ -1661,28 +1687,29 @@ async fn a_failed_delegation_token_is_named_as_one() {
     )
     .await;
     let grant = body["token"].as_str().unwrap().to_string();
-    let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    let (status, body) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
     assert_eq!(status, StatusCode::OK, "first use: {body}");
-    let (_, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    let (_, body) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
     assert_eq!(body["error"], "InvalidDelegationToken", "replay: {body}");
 }
 
-/// `dpopJkt` is required, and a credential is never minted unbound.
+/// A credential is minted only against a DPoP proof, and binds to the proof's
+/// key — never to anything the request body asserts.
 ///
-/// The failure this guards is silent: before the field existed, a client
-/// sending `dpopJkt` got HTTP 200 and a credential that ignored it — the
-/// caller believed it held a key-bound capability and actually held a bearer
-/// token, with nothing in the response to say so. Whichever way the mismatch
-/// runs, it has to be an error the caller can see.
+/// The failure this guards is silent the other way around: a mint that took
+/// the thumbprint from a body field would hand a key-bound-looking credential
+/// to anyone holding a delegation token, bound to whatever key they *named* —
+/// including one they don't control, or one they'll happily prove nothing
+/// about. The proof is what makes `cnf.jkt` mean "the caller holds this key".
 #[tokio::test(flavor = "multi_thread")]
-async fn get_space_credential_requires_a_well_formed_dpop_jkt() {
+async fn get_space_credential_requires_a_dpop_proof() {
     let (app, manager, _tmp) = build_app().await;
     let owner_token =
         create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner_token, "default").await;
 
     // A fresh delegation token per attempt: they are single-use, so a reused
-    // one would fail on replay and prove nothing about `dpopJkt`.
+    // one would fail on replay and prove nothing about the proof handling.
     let delegation = || async {
         let oauth = mint_oauth_access("did:plc:owner", &read_scope());
         let (status, body) = get_json(
@@ -1698,31 +1725,78 @@ async fn get_space_credential_requires_a_well_formed_dpop_jkt() {
         body["token"].as_str().unwrap().to_string()
     };
 
-    // Omitted entirely: the body no longer decodes.
-    let (status, body) = post_json(
-        app.clone(),
-        "/xrpc/com.atproto.space.getSpaceCredential",
+    let send = |grant: String, proof: Option<String>, body: Value| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder()
+                .uri(GET_SPACE_CREDENTIAL_PATH)
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("host", "test.example")
+                .header("authorization", format!("Bearer {grant}"));
+            if let Some(p) = proof {
+                req = req.header("DPoP", p);
+            }
+            let request = req
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            read_response(app.oneshot(request).await.unwrap()).await
+        }
+    };
+
+    // No proof at all: refused before the delegation token is even consumed.
+    let (status, body) = send(delegation().await, None, json!({ "space": uri })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "InvalidDpopProof");
+
+    // Not a proof.
+    let (status, body) = send(
+        delegation().await,
+        Some("not-a-jwt".to_string()),
         json!({ "space": uri }),
-        Some(&delegation().await),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_eq!(body["error"], "InvalidRequest");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "InvalidDpopProof");
 
-    // Present but not a thumbprint. Accepting one would mint a credential no
-    // proof could ever match, and the caller would not learn that until every
-    // host refused it.
-    for bad in ["", "not-a-thumbprint"] {
-        let (status, body) = post_json(
-            app.clone(),
-            "/xrpc/com.atproto.space.getSpaceCredential",
-            json!({ "space": uri, "dpopJkt": bad }),
-            Some(&delegation().await),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} body: {body}");
-        assert_eq!(body["error"], "InvalidRequest", "{bad:?}");
-    }
+    // A proof addressed to another URL: `htu` must match this endpoint.
+    let key = throwaway_key();
+    let (elsewhere, _, _) =
+        auth_dpop(&key, "POST", "http://test.example/xrpc/other.method").expect("mint proof");
+    let (status, body) = send(delegation().await, Some(elsewhere), json!({ "space": uri })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["error"], "InvalidDpopProof");
+
+    // Single-use: replaying a proof that already minted is refused, even with
+    // a fresh delegation token.
+    let proof = issuance_proof(&key);
+    let (status, body) = send(
+        delegation().await,
+        Some(proof.clone()),
+        json!({ "space": uri }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first use: {body}");
+    let (status, body) = send(delegation().await, Some(proof), json!({ "space": uri })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "replay: {body}");
+    assert_eq!(body["error"], "InvalidDpopProof");
+
+    // A legacy `dpopJkt` body field is ignored: the credential binds to the
+    // proof's key, not the asserted one.
+    let key = throwaway_key();
+    let (status, body) = send(
+        delegation().await,
+        Some(issuance_proof(&key)),
+        json!({ "space": uri, "dpopJkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (_, sc_payload) = decode_jwt(body["credential"].as_str().unwrap());
+    assert_eq!(
+        sc_payload["cnf"]["jkt"],
+        jkt_of(&key),
+        "cnf.jkt must come from the proof, not the body"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1767,7 +1841,7 @@ async fn space_credential_non_member_denied() {
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
 
-    let (status, _) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    let (status, _) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-member must be denied");
 }
 
@@ -1814,7 +1888,7 @@ async fn space_credential_app_allowlist_denies_unattested() {
 
     // No client attestation -> the #allowList app axis denies (spec lines
     // 533-535: only the apps named in `allowed` may access the space).
-    let (status, _) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+    let (status, _) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -1978,7 +2052,7 @@ async fn a_credential_without_an_attestation_registers_no_recipient() {
         )
         .await;
         let grant = body["token"].as_str().unwrap().to_string();
-        let (status, body) = exchange_credential(&app, &grant, &uri, TEST_DPOP_JKT, None).await;
+        let (status, body) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
         assert_eq!(status, StatusCode::OK, "getSpaceCredential: {body}");
     }
 
@@ -4623,7 +4697,7 @@ async fn space_not_found_uses_one_status_everywhere() {
     .await;
     assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
     let grant = body["token"].as_str().unwrap().to_string();
-    let (status, body) = exchange_credential(&app, &grant, missing, TEST_DPOP_JKT, None).await;
+    let (status, body) = exchange_credential(&app, &grant, missing, &throwaway_key(), None).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
