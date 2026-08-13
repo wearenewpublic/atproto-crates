@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a cursor of exactly `earliest - 1` is contiguous and gets no notice.
 
 ### Changed
+- **The `registerNotify` registration window is configurable and now defaults to 60 days**, via
+  `--space-register-notify-ttl-seconds` / `PDS_SPACE_REGISTER_NOTIFY_TTL_SECONDS` (clamped to
+  60 seconds .. 365 days). It was a hard-coded 24 hours, which made re-registration a daily
+  obligation for every syncer: a subscriber renewing on a slower timer simply stopped hearing about
+  writes, and nothing said so — a lapsed registration is skipped at fan-out without an error, while
+  the row sits in the table still looking like a subscription.
+
+  0016 requires the host to report an expiry and lets it outlast the space credential that created
+  the registration, but names no duration, so this is host policy. There is still a ceiling because
+  expiry remains the backstop revocation: `unregisterNotify` is the subscriber's own call, and
+  neither removing a member nor deleting a space prunes their registrations, so the window bounds
+  how long a syncer that should no longer receive `notifyWrite` still does. What it keeps receiving
+  is metadata — `{space, repo, rev, hash}`, no record content, and reading records still needs a
+  live credential.
+
 - **The unified GC now runs its first tick 60 seconds after boot** rather than one full interval
   later. With the default daily interval, a process restarted about once a day never swept at all:
   every restart pushed the next tick 24 hours out and the process rarely lived that long. A sweep

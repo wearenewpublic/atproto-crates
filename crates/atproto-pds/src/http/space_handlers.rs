@@ -3326,9 +3326,6 @@ pub struct RegisterNotifyResponse {
     pub expires_at: String,
 }
 
-/// Registration window for `registerNotify` (24h).
-const REGISTER_NOTIFY_TTL_SECS: i64 = 24 * 60 * 60;
-
 /// `POST /xrpc/com.atproto.space.registerNotify`.
 ///
 /// Authenticated with a **space credential** (`typ = space_credential`): the
@@ -3488,8 +3485,12 @@ pub async fn register_notify(
         )
     })?;
 
-    let expires_at =
-        (chrono::Utc::now() + chrono::Duration::seconds(REGISTER_NOTIFY_TTL_SECS)).to_rfc3339();
+    // Host policy, not a protocol constant: 0016 requires an expiry to be
+    // reported and lets it outlast the space credential that created the
+    // registration, but names no duration.
+    let ttl = i64::try_from(state.space_register_notify_ttl_secs)
+        .unwrap_or(crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS as i64);
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(ttl)).to_rfc3339();
     crate::space::notify::upsert_subscription(
         owner_store.pool(),
         &space,

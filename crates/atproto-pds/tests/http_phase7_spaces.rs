@@ -4949,3 +4949,78 @@ async fn a_key_signed_token_is_told_what_this_endpoint_accepts() {
         "the refusal still blames the algorithm: {message}"
     );
 }
+
+/// The registration window is host policy, and the value an operator sets is
+/// the value subscribers are told.
+///
+/// It was a hard-coded day, which made renewal a daily obligation for every
+/// syncer and gave operators no way to say otherwise. 0016 requires the expiry
+/// to be reported and allows it to outlast the space credential that created
+/// the registration, but names no duration.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_registration_window_is_configurable_and_reported() {
+    use atproto_pds::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS;
+
+    // The default is 60 days, not a day.
+    assert_eq!(DEFAULT_REGISTER_NOTIFY_TTL_SECS, 60 * 24 * 60 * 60);
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, dir.clone()));
+    let svc = Arc::new(SpaceService::with_accounts(dir.clone(), manager.clone()));
+    let space_writer = Arc::new(SpaceWriter::new(manager.clone(), dir.clone()));
+    let space_reader = Arc::new(SpaceReader::new(manager.clone(), dir.clone()));
+    let space_sync = Arc::new(SpaceSync::new(dir.clone()));
+
+    // A week, so the assertion cannot pass against either the old constant or
+    // the new default.
+    const CONFIGURED: u64 = 7 * 24 * 60 * 60;
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        JWT_SECRET.to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_spaces(svc, space_writer, space_reader, space_sync)
+    .with_space_register_notify_ttl(CONFIGURED);
+    let app = build_router(state);
+
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+
+    let before = chrono::Utc::now();
+    let (status, body) = post_json_cred(
+        &app,
+        "/xrpc/com.atproto.space.registerNotify",
+        json!({"space": uri, "endpoint": "https://consumer.example"}),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "registerNotify: {body}");
+
+    let expires: chrono::DateTime<chrono::Utc> = body["expiresAt"]
+        .as_str()
+        .expect("expiresAt")
+        .parse()
+        .expect("rfc 3339");
+    let window = (expires - before).num_seconds();
+    assert!(
+        (CONFIGURED as i64 - 60..=CONFIGURED as i64 + 60).contains(&window),
+        "expiresAt should be the configured window, was {window}s"
+    );
+}

@@ -457,6 +457,30 @@ struct Args {
     )]
     space_credential_ttl_seconds: u64,
 
+    /// How long a `registerNotify` subscription lasts, in seconds. Default
+    /// 5184000 (60 days).
+    ///
+    /// A syncer renews by calling `registerNotify` again before this elapses;
+    /// the expiry is returned to it as `expiresAt`. Nothing reminds a
+    /// subscriber that has stopped renewing — a lapsed registration is skipped
+    /// at fan-out without an error — so this is the window a syncer that only
+    /// registers at startup keeps hearing about writes.
+    ///
+    /// It is also the backstop revocation for a subscription: `unregisterNotify`
+    /// is the subscriber's own call, and neither removing a member nor deleting
+    /// a space prunes their registrations, so a lower value bounds how long a
+    /// syncer that should no longer receive `notifyWrite` still does.
+    #[arg(
+        long,
+        env = "PDS_SPACE_REGISTER_NOTIFY_TTL_SECONDS",
+        default_value_t = atproto_pds::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS,
+        value_parser = clap::value_parser!(u64).range(
+            atproto_pds::space::notify::REGISTER_NOTIFY_TTL_MIN_SECS
+                ..=atproto_pds::space::notify::REGISTER_NOTIFY_TTL_MAX_SECS,
+        ),
+    )]
+    space_register_notify_ttl_seconds: u64,
+
     /// Comma-separated list of allowed handle suffix domains (REMAINING-
     /// WORK §11e). When set, `createAccount` rejects handles whose
     /// suffix isn't in the list. Empty (default) means any handle is
@@ -1009,6 +1033,7 @@ async fn main() -> anyhow::Result<()> {
     .with_rate_limiter(rate_limiter.clone())
     .with_public_realm_backend(public_realm_backend.clone())
     .with_space_credential_ttl(args.space_credential_ttl_seconds)
+    .with_space_register_notify_ttl(args.space_register_notify_ttl_seconds)
     .with_service_handle_domains(args.service_handle_domains.clone())
     .with_crawlers(args.crawlers.clone())
     .with_policy_documents(policy_documents)

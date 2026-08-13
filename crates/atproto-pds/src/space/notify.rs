@@ -45,6 +45,42 @@ pub const NOTIFY_WRITE_NSID: &str = "com.atproto.space.notifyWrite";
 /// Lexicon method notified when a space is deleted.
 pub const NOTIFY_SPACE_DELETED_NSID: &str = "com.atproto.space.notifySpaceDeleted";
 
+/// How long a `registerNotify` subscription lasts by default: 60 days.
+///
+/// The 0016 draft requires the host to report an expiry and says it may outlast
+/// the space credential that created the registration, but names no duration —
+/// this is host policy, and operators set it with
+/// `PDS_SPACE_REGISTER_NOTIFY_TTL_SECONDS`.
+///
+/// It was a day, which made re-registration a daily obligation for every
+/// syncer: a subscriber that renewed on a timer slower than that stopped
+/// hearing about writes, and the only sign was silence — delivery skips a
+/// lapsed row without an error, and the row itself is still sitting in the
+/// table looking like a subscription.
+pub const DEFAULT_REGISTER_NOTIFY_TTL_SECS: u64 = 60 * 24 * 60 * 60;
+
+/// Shortest registration window a host may configure.
+///
+/// A registration that expires inside the round trip that created it reads to a
+/// subscriber as an unreliable server rather than as a policy — the same floor,
+/// for the same reason, as [`atproto_space::credential::SPACE_CREDENTIAL_TTL_MIN_SECS`].
+pub const REGISTER_NOTIFY_TTL_MIN_SECS: u64 = 60;
+
+/// Longest registration window a host may configure: one year.
+///
+/// There is a ceiling at all because expiry is still the backstop revocation
+/// for a subscription: `unregisterNotify` is the subscriber's own call, and
+/// removing a member or deleting a space does not prune their registrations, so
+/// a syncer that should no longer hear about a space keeps hearing about it
+/// until its registration lapses. What leaks in the meantime is
+/// metadata — `notifyWrite` carries `{space, repo, rev, hash}` and no record
+/// content, and reading the records still needs a live credential — which is
+/// why a year is tolerable and unbounded is not.
+pub const REGISTER_NOTIFY_TTL_MAX_SECS: u64 = 365 * 24 * 60 * 60;
+
+const _: () = assert!(REGISTER_NOTIFY_TTL_MIN_SECS <= DEFAULT_REGISTER_NOTIFY_TTL_SECS);
+const _: () = assert!(DEFAULT_REGISTER_NOTIFY_TTL_SECS <= REGISTER_NOTIFY_TTL_MAX_SECS);
+
 /// Wire-shape of `com.atproto.space.notifyWrite` request body
 /// (`application/json`). Near-contentless: it announces that `repo` advanced to
 /// `rev` within `space`, and carries the resulting commit hash; consumers PULL

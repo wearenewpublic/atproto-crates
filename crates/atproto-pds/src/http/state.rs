@@ -239,6 +239,10 @@ pub struct HttpState {
     /// `atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS` (7200 / 2h);
     /// operators tighten/loosen via `PDS_SPACE_CREDENTIAL_TTL_SECONDS`.
     pub space_credential_ttl_secs: u64,
+    /// How long a `registerNotify` subscription lasts, in seconds. Default
+    /// `crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS` (60 days);
+    /// operators tighten/loosen via `PDS_SPACE_REGISTER_NOTIFY_TTL_SECONDS`.
+    pub space_register_notify_ttl_secs: u64,
     /// Allowed handle suffix domains. Empty means
     /// any handle is accepted (back-compat). Set via
     /// `PDS_SERVICE_HANDLE_DOMAINS`.
@@ -301,6 +305,7 @@ impl HttpState {
             oauth_refresh_ttl_secs: crate::oauth::state::DEFAULT_REFRESH_TTL_SECS,
             pds_extra_signing_keys: Vec::new(),
             space_credential_ttl_secs: atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
+            space_register_notify_ttl_secs: crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS,
             service_handle_domains: Vec::new(),
             crawlers: Vec::new(),
             bsky_app_view_did: None,
@@ -359,6 +364,7 @@ impl HttpState {
             oauth_refresh_ttl_secs: crate::oauth::state::DEFAULT_REFRESH_TTL_SECS,
             pds_extra_signing_keys: Vec::new(),
             space_credential_ttl_secs: atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
+            space_register_notify_ttl_secs: crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS,
             service_handle_domains: Vec::new(),
             crawlers: Vec::new(),
             bsky_app_view_did: None,
@@ -607,6 +613,32 @@ impl HttpState {
             );
         }
         self.space_credential_ttl_secs = clamped;
+        self
+    }
+
+    /// Set how long a `registerNotify` subscription lasts.
+    ///
+    /// Clamped to
+    /// [`REGISTER_NOTIFY_TTL_MIN_SECS`](crate::space::notify::REGISTER_NOTIFY_TTL_MIN_SECS)
+    /// ..=[`REGISTER_NOTIFY_TTL_MAX_SECS`](crate::space::notify::REGISTER_NOTIFY_TTL_MAX_SECS),
+    /// with the applied value logged when it differs from the requested one:
+    /// the number is reported to every subscriber as `expiresAt`, so an
+    /// operator who set one value and whose syncers are told another needs to
+    /// see that in the log rather than infer it from renewals.
+    #[must_use]
+    pub fn with_space_register_notify_ttl(mut self, ttl_secs: u64) -> Self {
+        let clamped = ttl_secs.clamp(
+            crate::space::notify::REGISTER_NOTIFY_TTL_MIN_SECS,
+            crate::space::notify::REGISTER_NOTIFY_TTL_MAX_SECS,
+        );
+        if clamped != ttl_secs {
+            tracing::warn!(
+                requested = ttl_secs,
+                applied = clamped,
+                "registerNotify ttl outside the permitted range; clamped"
+            );
+        }
+        self.space_register_notify_ttl_secs = clamped;
         self
     }
 
