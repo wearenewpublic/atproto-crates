@@ -5112,3 +5112,65 @@ async fn a_credential_read_is_recorded_against_the_repo_it_read() {
         "an unattested credential must not be given a name: {entries:?}"
     );
 }
+
+/// A blocked reader's credential stops working against that repo.
+///
+/// The access log answers "who read this"; the block is the only thing an
+/// account can do about the answer, since a credential the authority minted
+/// cannot be revoked. Asserted through the real read path, because a block the
+/// reader never notices is decoration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_reader_stops_being_served() {
+    let (app, manager, tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.putRecord",
+        json!({
+            "repo": "did:plc:owner",
+            "space": uri,
+            "collection": "c.d.e",
+            "rkey": "r1",
+            "record": {"v": 1},
+        }),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fixture write: {body}");
+
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let path = format!(
+        "/xrpc/com.atproto.space.getRecord?space={}&collection=c.d.e&rkey=r1&repo=did:plc:owner",
+        urlencode(&uri)
+    );
+    let (status, read) = get_json_cred(&app, &path, &credential).await;
+    assert_eq!(status, StatusCode::OK, "the read works first: {read}");
+
+    // Block whatever the log recorded — for an unattested credential that is
+    // the DPoP thumbprint, which is exactly what the portal would submit.
+    let space_uri: atproto_space::types::SpaceUri = uri.parse().unwrap();
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(tmp.path(), "did:plc:owner")
+        .await
+        .unwrap();
+    let entries = atproto_pds::space::access_log::list(store.pool(), &space_uri)
+        .await
+        .unwrap();
+    let identity = entries[0]
+        .client_id
+        .clone()
+        .unwrap_or_else(|| format!("jkt:{}", entries[0].jkt));
+    atproto_pds::space::access_log::block(store.pool(), &space_uri, &identity)
+        .await
+        .unwrap();
+
+    let (status, refused) = get_json_cred(&app, &path, &credential).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a blocked reader must stop being served: {refused}"
+    );
+    // Refused the same way a stranger is, so a block cannot be probed for.
+    assert_eq!(refused["error"], "SpaceNotFound", "{refused}");
+}

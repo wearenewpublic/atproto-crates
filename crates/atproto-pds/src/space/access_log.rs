@@ -136,6 +136,91 @@ pub async fn list(actor_pool: &SqlitePool, space: &SpaceUri) -> PdsResult<Vec<Ac
         .collect())
 }
 
+/// Refuse this identity's reads of the account's records in `space`.
+///
+/// Idempotent: blocking something already blocked is the same request twice.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the row cannot be written.
+pub async fn block(actor_pool: &SqlitePool, space: &SpaceUri, identity: &str) -> PdsResult<()> {
+    sqlx::query(
+        "INSERT INTO space_access_block (space, identity, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(space, identity) DO NOTHING",
+    )
+    .bind(space.to_string())
+    .bind(identity)
+    .bind(Utc::now().to_rfc3339())
+    .execute(actor_pool)
+    .await
+    .map_err(|e| PdsError::Storage {
+        reason: format!("space access block: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Lift a block. Returns whether one was there to lift.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the delete fails.
+pub async fn unblock(actor_pool: &SqlitePool, space: &SpaceUri, identity: &str) -> PdsResult<bool> {
+    let result = sqlx::query("DELETE FROM space_access_block WHERE space = ? AND identity = ?")
+        .bind(space.to_string())
+        .bind(identity)
+        .execute(actor_pool)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("space access unblock: {e}"),
+        })?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Whether this credential's presenter is refused.
+///
+/// Checked on the read path, so it is deliberately one indexed lookup on the
+/// primary key. Fails **closed** on a storage error: a block that cannot be
+/// read is not evidence that there is none, and the account asked for this
+/// reader to be refused.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the row cannot be read.
+pub async fn is_blocked(
+    actor_pool: &SqlitePool,
+    space: &SpaceUri,
+    credential: &SpaceCredential,
+) -> PdsResult<bool> {
+    let identity = identity_of(credential);
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM space_access_block WHERE space = ? AND identity = ? LIMIT 1",
+    )
+    .bind(space.to_string())
+    .bind(&identity)
+    .fetch_optional(actor_pool)
+    .await
+    .map_err(|e| PdsError::Storage {
+        reason: format!("space access block lookup: {e}"),
+    })?;
+    Ok(row.is_some())
+}
+
+/// Every identity currently refused in `space`.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the rows cannot be read.
+pub async fn list_blocked(actor_pool: &SqlitePool, space: &SpaceUri) -> PdsResult<Vec<String>> {
+    sqlx::query_scalar("SELECT identity FROM space_access_block WHERE space = ? ORDER BY identity")
+        .bind(space.to_string())
+        .fetch_all(actor_pool)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("space access block list: {e}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

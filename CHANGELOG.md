@@ -6,7 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Collection listings show each authority's favicon**, fetched and cached by this server and served from
+  its own origin at `/account/repository/icon/{nsid}`. Hot-linking would have needed `img-src` opened to
+  other origins, and on a signed-in page that tells every NSID authority in the repository when the holder
+  opens it. The policy is relaxed only to `img-src 'self' data:`.
+
+  The domain being fetched comes from a record in the account's own repository, so it is caller-chosen: the
+  same endpoint policy that guards every other caller-supplied host applies, plus HTTPS only, no redirects,
+  a four-second timeout, a 64 KiB cap, and a bitmap-only content-type list. SVG is refused even though
+  browsers would render it — its safety in an `<img>` rests on browser behaviour rather than on anything
+  checked here.
+
+  An authority with no usable favicon gets a monogram this server draws, cached like a hit, so the icon
+  column is total and a missing favicon costs one cache entry rather than a fetch per page view.
+
+- **An account can block an application from reading its permissioned records.** A space credential is
+  minted by the authority and cannot be revoked — nothing invalidates one already issued, and removing a
+  member only stops the next. Blocking is the one lever the account holding the records has: the read path
+  refuses that identity, immediately, and fails closed if the lookup errors.
+
+  The page states the bounds rather than implying more: a block covers this account's records on this
+  server, the same credential keeps working against every other member's repository wherever those are
+  hosted, and for a space you own, removing the member is the stronger step because it stops new
+  credentials being issued at all.
+
 ### Changed
+- **Grouped collection listings drop their row rules and line up.** Rows in a group sat a few pixels out
+  from the row that carried the mark: a `0.8em` badge beside a `1em` spacer resolves two different widths
+  from the same `em` value. Both arms now share every metric that decides where the text starts, and the
+  table draws no per-row borders — the groups are the structure, and a line under every row competed with
+  them.
+
+- **A space's access settings are spelled out.** Each option under both selectors now carries a sentence
+  saying what it does to the space, rather than the page naming the mechanism and leaving the consequence
+  to be inferred.
+
 - **A space's access controls now say what they do rather than what they are called.** The policy selector
   offered "Anyone" and "Whatever the managing app decides" — the schema's own vocabulary, in a dropdown
   where a mis-click publishes an outline to the network. Each option now names its consequence, and the

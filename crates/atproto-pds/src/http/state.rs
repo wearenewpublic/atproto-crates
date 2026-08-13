@@ -243,6 +243,11 @@ pub struct HttpState {
     /// `crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS` (60 days);
     /// operators tighten/loosen via `PDS_SPACE_REGISTER_NOTIFY_TTL_SECONDS`.
     pub space_register_notify_ttl_secs: u64,
+    /// Favicons for the NSID authorities a repository holds records from,
+    /// keyed by domain. Holds the drawn fallback as readily as a fetched icon,
+    /// so a domain without one costs a single cache entry rather than a fetch
+    /// on every page view.
+    pub icon_cache: Arc<crate::ttl_cache::TtlCache<crate::http::icons::Icon>>,
     /// Allowed handle suffix domains. Empty means
     /// any handle is accepted (back-compat). Set via
     /// `PDS_SERVICE_HANDLE_DOMAINS`.
@@ -306,6 +311,10 @@ impl HttpState {
             pds_extra_signing_keys: Vec::new(),
             space_credential_ttl_secs: atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
             space_register_notify_ttl_secs: crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS,
+            icon_cache: Arc::new(crate::ttl_cache::TtlCache::new(
+                crate::http::icons::ICON_TTL,
+                crate::http::icons::ICON_CAPACITY,
+            )),
             service_handle_domains: Vec::new(),
             crawlers: Vec::new(),
             bsky_app_view_did: None,
@@ -365,6 +374,10 @@ impl HttpState {
             pds_extra_signing_keys: Vec::new(),
             space_credential_ttl_secs: atproto_space::credential::SPACE_CREDENTIAL_TTL_SECS,
             space_register_notify_ttl_secs: crate::space::notify::DEFAULT_REGISTER_NOTIFY_TTL_SECS,
+            icon_cache: Arc::new(crate::ttl_cache::TtlCache::new(
+                crate::http::icons::ICON_TTL,
+                crate::http::icons::ICON_CAPACITY,
+            )),
             service_handle_domains: Vec::new(),
             crawlers: Vec::new(),
             bsky_app_view_did: None,

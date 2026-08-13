@@ -790,7 +790,7 @@ async fn collections_are_grouped_by_publishing_domain() {
 
     // One badge per publisher, not one per collection: the two app.bsky
     // collections share a group, so there are two badges for three rows.
-    let badges = body.matches(r#"<span class="badge" "#).count();
+    let badges = body.matches(r#"<span class="badge"><img"#).count();
     assert_eq!(badges, 2, "expected one badge per domain group: {body}");
     // Rows inside a group are indented under it rather than repeating it.
     assert!(
@@ -813,4 +813,71 @@ async fn collections_are_grouped_by_publishing_domain() {
             "{collection} should still be reachable: {body}"
         );
     }
+}
+
+/// The icon route serves an image for any NSID, and never a broken one.
+///
+/// An authority with no reachable favicon still gets a drawn stand-in, so the
+/// listing's icon column is total and the page shows no broken images. The
+/// fetch itself is not exercised here — there is no network in this test — which
+/// is the point: the fallback is what runs when a fetch cannot happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_icon_route_always_returns_an_image() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    let req = Request::builder()
+        .uri("/account/repository/icon/app.bsky.feed.post")
+        .header("sec-fetch-site", "same-origin")
+        .header("cookie", format!("atproto_pds_portal={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("image/"),
+        "an icon route must serve an image, got {content_type}"
+    );
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!body.is_empty(), "the icon should have bytes");
+}
+
+/// Icons are for the account, not the network: they say which authorities
+/// appear in someone's repository.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_icon_route_requires_a_session() {
+    let (app, _manager, _writer, _tmp) = build_app().await;
+    let req = Request::builder()
+        .uri("/account/repository/icon/app.bsky.feed.post")
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The listing points at this server for its icons, never at the authority.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listing_never_hot_links_an_authority() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+    let (_, body, _) = get(&app, &cookie, "/account/repository/public/").await;
+    assert!(
+        body.contains(r#"src="/account/repository/icon/"#),
+        "the icon should be proxied: {body}"
+    );
+    assert!(
+        !body.contains(r#"src="https://"#),
+        "no image on a signed-in page may be fetched from another origin: {body}"
+    );
 }

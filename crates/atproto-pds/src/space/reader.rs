@@ -179,6 +179,8 @@ impl SpaceReader {
         let credential = self.verify_auth(space, &auth).await?;
         self.ensure_space_live(space, &auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
+        self.refuse_if_blocked(store.pool(), space, credential.as_ref())
+            .await?;
         self.note_access(store.pool(), space, credential.as_ref())
             .await;
 
@@ -256,6 +258,8 @@ impl SpaceReader {
         let credential = self.verify_auth(space, &auth).await?;
         self.ensure_space_live(space, &auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
+        self.refuse_if_blocked(store.pool(), space, credential.as_ref())
+            .await?;
         self.note_access(store.pool(), space, credential.as_ref())
             .await;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
@@ -384,6 +388,39 @@ impl SpaceReader {
     /// Best effort by construction: a read is not failed because its
     /// bookkeeping was, so a storage error is logged and swallowed. The
     /// consequence is worth stating -- the log undercounts rather than blocks.
+    /// Refuse a reader the account has blocked.
+    ///
+    /// The only lever this server has over a credential the authority already
+    /// minted: nothing revokes one, so the choice is to serve it or not. The
+    /// refusal is `SpaceNotFound` rather than a distinct error, matching the
+    /// membership guard — a blocked reader should not be able to tell being
+    /// refused from the space not being here.
+    ///
+    /// Fails **closed**: a lookup that errors refuses the read. The account
+    /// asked for this reader to be turned away, and a storage fault is not
+    /// evidence that they changed their mind.
+    async fn refuse_if_blocked(
+        &self,
+        actor_pool: &sqlx::SqlitePool,
+        space: &SpaceUri,
+        credential: Option<&SpaceCredential>,
+    ) -> PdsResult<()> {
+        let Some(credential) = credential else {
+            return Ok(());
+        };
+        if crate::space::access_log::is_blocked(actor_pool, space, credential).await? {
+            tracing::info!(
+                space = %space,
+                client_id = ?credential.client_id,
+                "space read refused: the account blocked this reader"
+            );
+            return Err(PdsError::SpaceNotFound {
+                uri: space.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn note_access(
         &self,
         actor_pool: &sqlx::SqlitePool,

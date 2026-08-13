@@ -575,6 +575,12 @@ fn build_router_inner(
         // and `/account/repository/` are two different routes, and mounting only
         // one makes the other a 404 for no reason a reader could guess.
         .route("/account/repository", get(repository::index))
+        // Icons for the authorities a repository holds records from. Served
+        // from here rather than hot-linked; see `http::icons`.
+        .route(
+            "/account/repository/icon/{nsid}",
+            get(crate::http::icons::icon),
+        )
         .route("/account/repository/", get(repository::index))
         .route(
             "/account/repository/public/",
@@ -615,6 +621,14 @@ fn build_router_inner(
         .route(
             "/account/spaces/{host}/{space_type}/{space_key}/config",
             post(portal_spaces::save_config),
+        )
+        .route(
+            "/account/spaces/{host}/{space_type}/{space_key}/readers/block",
+            post(portal_spaces::block_reader),
+        )
+        .route(
+            "/account/spaces/{host}/{space_type}/{space_key}/readers/unblock",
+            post(portal_spaces::unblock_reader),
         )
         .route(
             "/account/spaces/{host}/{space_type}/{space_key}/members",

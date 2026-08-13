@@ -107,6 +107,12 @@ fn banner(msg: Option<&str>) -> String {
         Some("config-saved") => ("ok", "Space settings saved."),
         Some("member-added") => ("ok", "Member added."),
         Some("member-removed") => ("ok", "Member removed."),
+        Some("reader-blocked") => (
+            "ok",
+            "That application can no longer read your records here. The credential \
+             it holds still works against other members' repositories.",
+        ),
+        Some("reader-unblocked") => ("ok", "That application can read your records here again."),
         Some("err-not-owner") => ("err", "Only the space's authority can change this."),
         Some("err-unknown-space") => (
             "err",
@@ -252,25 +258,56 @@ async fn access_log_section(
     state: &HttpState,
     viewer_did: &str,
     uri: &SpaceUri,
+    base: &str,
 ) -> Result<String, XrpcError> {
     let store =
         crate::actor_store::sql::SqlActorStore::open_if_exists(state.reader.data_dir(), viewer_did)
             .await
             .map_err(XrpcError::from)?;
-    let entries = match &store {
-        Some(store) => crate::space::access_log::list(store.pool(), uri)
-            .await
-            .map_err(XrpcError::from)?,
-        None => Vec::new(),
+    let (entries, blocked) = match &store {
+        Some(store) => (
+            crate::space::access_log::list(store.pool(), uri)
+                .await
+                .map_err(XrpcError::from)?,
+            crate::space::access_log::list_blocked(store.pool(), uri)
+                .await
+                .map_err(XrpcError::from)?,
+        ),
+        None => (Vec::new(), Vec::new()),
     };
 
     let rows = if entries.is_empty() {
-        r#"<tr><td colspan="4" class="muted">Nothing has read your records in this space.</td></tr>"#
+        r#"<tr><td colspan="5" class="muted">Nothing has read your records in this space.</td></tr>"#
             .to_string()
     } else {
         entries
             .iter()
             .map(|e| {
+                let identity = e
+                    .client_id
+                    .clone()
+                    .unwrap_or_else(|| format!("jkt:{}", e.jkt));
+                let is_blocked = blocked.contains(&identity);
+                let control = if is_blocked {
+                    format!(
+                        r#"<form method="POST" action="{base}/readers/unblock" style="display:inline">
+  <input type="hidden" name="identity" value="{}">
+  <button class="quiet" type="submit">Unblock</button></form>"#,
+                        esc(&identity)
+                    )
+                } else {
+                    format!(
+                        r#"<form method="POST" action="{base}/readers/block" style="display:inline">
+  <input type="hidden" name="identity" value="{}">
+  <button class="quiet" type="submit">Block</button></form>"#,
+                        esc(&identity)
+                    )
+                };
+                let state = if is_blocked {
+                    r#"<span class="muted">blocked</span>"#
+                } else {
+                    ""
+                };
                 // An application that proved its identity is named. One that
                 // did not is called what it is: the only thing identifying it
                 // is a key the specification says to replace with each
@@ -281,8 +318,9 @@ async fn access_log_section(
                     None => r#"<span class="muted">Unidentified application</span>"#.to_string(),
                 };
                 format!(
-                    r#"<tr><td>{who}</td><td class="muted">{}</td><td class="muted">{}</td>
-<td class="muted" style="text-align:right">{}</td></tr>"#,
+                    r#"<tr><td>{who} {state}</td><td class="muted">{}</td><td class="muted">{}</td>
+<td class="muted" style="text-align:right">{}</td>
+<td style="text-align:right">{control}</td></tr>"#,
                     esc(&e.first_seen),
                     esc(&e.last_seen),
                     e.reads
@@ -308,7 +346,14 @@ each time its credential is renewed.</p>"#
 <p class="muted">Applications that presented a credential from this space's
 authority to read your records on this server. Reads of other members' records,
 on their own servers, are not visible here.</p>
-<table><thead><tr><th>Application</th><th>First seen</th><th>Last seen</th><th>Reads</th></tr></thead>
+<p class="muted"><b>Blocking</b> refuses that application's future reads of
+<em>your</em> records on this server, immediately. It cannot cancel the
+credential it holds — only the space's authority decides who is issued one, and
+nothing invalidates one already issued — so the same application keeps reading
+every other member's records wherever those are hosted. If this is your space,
+removing the account from the member list below is the stronger step: it stops
+new credentials being issued at all.</p>
+<table><thead><tr><th>Application</th><th>First seen</th><th>Last seen</th><th>Reads</th><th></th></tr></thead>
 <tbody>{rows}</tbody></table>
 {caveat}
 </section>"#
@@ -346,7 +391,7 @@ pub async fn detail(
         return Ok(redirect("/account/spaces?msg=err-unknown-space"));
     }
 
-    let readers = access_log_section(&state, &account.did, &uri).await?;
+    let readers = access_log_section(&state, &account.did, &uri, &base).await?;
 
     if !is_authority {
         // A member's view: the records are theirs, the space is not.
@@ -441,6 +486,11 @@ pub async fn detail(
 
 <section>
 <h2 style="margin-top:0">Access</h2>
+<p class="muted">Two questions decide who may read this space, and <b>both</b>
+must say yes: which <em>people</em> may be issued a credential, and which
+<em>applications</em> may use one. A credential is a key to the whole space —
+whoever holds one reads every member's records, not only their own — and issuing
+one neither adds anyone to the member list nor lets them write anything.</p>
 <form method="POST" action="{base}/config">
   <label for="policy">Who may be issued a credential</label>
   <select id="policy" name="policy">
@@ -448,13 +498,21 @@ pub async fn detail(
     <option value="public"{pu}>Any account that asks &mdash; readable network-wide</option>
     <option value="managing-app"{ma}>Ask a service I nominate, on every request</option>
   </select>
-  <p class="muted">A credential reads <b>every member's records</b> in this space,
-  not only the requester's own. Being issued one does not add anyone to the
-  member list and does not let them write. Choosing "any account that asks"
-  therefore publishes what the members here have written to anyone who asks for
-  it. Choosing "ask a service" hands that decision to the managing app below,
-  which is asked afresh for each request &mdash; and while it is unreachable, no
-  new credentials are issued at all.</p>
+  <dl class="explain">
+    <dt>Only the members listed below</dt>
+    <dd>The default. A credential is issued to an account on the member list and
+    to nobody else, so the list further down this page is the guest list.</dd>
+    <dt>Any account that asks &mdash; readable network-wide</dt>
+    <dd>Every account on the network can obtain a credential for this space just
+    by asking, and read what every member here has written. There is no approval
+    step and no notification. Choose this only for a space whose contents you
+    would be content to publish.</dd>
+    <dt>Ask a service I nominate, on every request</dt>
+    <dd>Each request is forwarded to the managing app named below, which answers
+    yes or no per account &mdash; for rules a fixed list cannot express, like
+    followers-only or paid access. While that service is unreachable, nobody new
+    is admitted; credentials already issued keep working until they expire.</dd>
+  </dl>
 
   <fieldset>
     <legend>Which applications may reach it</legend>
@@ -462,12 +520,17 @@ pub async fn detail(
     <label><input type="radio" name="app_access" value="allow-list"{list_checked}> Only the applications I name</label>
     <label for="allowed">Allowed client IDs, one per line</label>
     <textarea id="allowed" name="allowed" rows="4" placeholder="https://example.app/oauth-client-metadata.json">{allowed}</textarea>
-    <p class="muted">Both settings must pass: a request is refused unless the
-    policy above admits the person <em>and</em> this admits their application.
-    An allow list is matched against the client identity an application proves
-    when it asks for a credential, so it also excludes every app that cannot
-    identify itself &mdash; including any that does not present a client
-    attestation at all.</p>
+    <dl class="explain">
+      <dt>Any application</dt>
+      <dd>The default. Whoever the setting above admits may use whatever
+      software they like to read this space.</dd>
+      <dt>Only the applications I name</dt>
+      <dd>An application must prove which application it is before it is issued
+      a credential, and be on this list. Software that cannot prove an identity
+      is refused outright, so this also excludes every app that does not
+      identify itself &mdash; including, today, some that read spaces
+      perfectly well.</dd>
+    </dl>
   </fieldset>
 
   <label for="managing_app">Managing app</label>
@@ -607,6 +670,83 @@ pub async fn save_config(
             Ok(redirect(&format!("{base}?msg=err-save-failed")))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Blocking a reader
+// ---------------------------------------------------------------------------
+
+/// Submitted by the Block and Unblock controls.
+#[derive(Debug, Deserialize)]
+pub struct ReaderForm {
+    /// The identity as the access log keys it: an attested `client_id`, or
+    /// `jkt:<thumbprint>` for a reader that proved no identity.
+    pub identity: String,
+}
+
+/// Open the viewer's own per-actor store, where their access log and blocks
+/// live. Absent means the account has never written anything, and so has
+/// nothing to block anyone from.
+async fn viewer_store(
+    state: &HttpState,
+    did: &str,
+) -> Result<Option<crate::actor_store::sql::SqlActorStore>, XrpcError> {
+    crate::actor_store::sql::SqlActorStore::open_if_exists(state.reader.data_dir(), did)
+        .await
+        .map_err(XrpcError::from)
+}
+
+/// `POST /account/spaces/{…}/readers/block` — refuse this reader's future
+/// reads of the caller's own records in this space.
+pub async fn block_reader(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(path): Path<SpacePath>,
+    Form(form): Form<ReaderForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+    let uri = path.uri()?;
+    let base = path.base();
+    let identity = form.identity.trim();
+    if identity.is_empty() {
+        return Ok(redirect(&format!("{base}?msg=err-save-failed")));
+    }
+    let Some(store) = viewer_store(&state, &account.did).await? else {
+        return Ok(redirect(&format!("{base}?msg=err-save-failed")));
+    };
+    crate::space::access_log::block(store.pool(), &uri, identity)
+        .await
+        .map_err(XrpcError::from)?;
+    tracing::info!(did = %account.did, space = %uri, identity, "portal space reader blocked");
+    Ok(redirect(&format!("{base}?msg=reader-blocked")))
+}
+
+/// `POST /account/spaces/{…}/readers/unblock` — serve this reader again.
+pub async fn unblock_reader(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(path): Path<SpacePath>,
+    Form(form): Form<ReaderForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+    let uri = path.uri()?;
+    let base = path.base();
+    let Some(store) = viewer_store(&state, &account.did).await? else {
+        return Ok(redirect(&format!("{base}?msg=err-save-failed")));
+    };
+    crate::space::access_log::unblock(store.pool(), &uri, form.identity.trim())
+        .await
+        .map_err(XrpcError::from)?;
+    tracing::info!(did = %account.did, space = %uri, "portal space reader unblocked");
+    Ok(redirect(&format!("{base}?msg=reader-unblocked")))
 }
 
 // ---------------------------------------------------------------------------

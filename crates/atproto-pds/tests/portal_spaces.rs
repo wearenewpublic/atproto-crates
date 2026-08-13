@@ -487,9 +487,12 @@ async fn an_unattested_reader_is_shown_as_unidentified() {
         body.contains("Unidentified application"),
         "an unattested reader should be named as such: {body}"
     );
+    // The thumbprint appears in the Block control's form value, because that is
+    // what identifies the row to block. What it must never be is the reader's
+    // displayed name.
     assert!(
-        !body.contains("thumbprint-abc"),
-        "the DPoP thumbprint is not an identity and should not be shown: {body}"
+        !body.contains("<code>jkt:thumbprint-abc</code>"),
+        "the DPoP thumbprint must not be rendered as an identity: {body}"
     );
     assert!(
         body.contains("only appears by name"),
@@ -618,18 +621,133 @@ async fn the_access_controls_state_their_consequences() {
         // The public policy names its reach rather than saying "anyone".
         "readable network-wide",
         // A credential is not scoped to the requester's own records.
-        "every member's records",
+        "every member's records, not only their own",
         // Nor does it make anyone a member, or let them write.
-        "does not add anyone to the member list and does not let them write",
+        "neither adds anyone to the member list nor lets them write",
         // The managing app is asked per request, and its absence closes the
         // space rather than opening it.
-        "while it is unreachable, no new credentials are issued",
+        "While that service is unreachable, nobody new is admitted",
         // The two axes are ANDed, which decides whether an allow list helps.
-        "Both settings must pass",
+        "both</b> must say yes",
+        // An allow list excludes software that cannot identify itself, which
+        // is not obvious from the option's name.
+        "Software that cannot prove an identity is refused",
     ] {
         assert!(
             flat.contains(phrase),
             "the access section should say {phrase:?}: {flat}"
+        );
+    }
+}
+
+/// Blocking a reader refuses its next read, and unblocking restores it.
+///
+/// This is the only lever an account has over a credential the space authority
+/// already minted: nothing revokes one, so the choice is to serve it or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_reader_is_refused_and_can_be_restored() {
+    let f = fixture().await;
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(f.dir(), OWNER)
+        .await
+        .expect("owner store");
+    let credential = credential_for(&f.space, Some("https://reader.example/c.json"), "k1");
+    atproto_pds::space::access_log::record(store.pool(), &f.space, &credential)
+        .await
+        .expect("seed log");
+
+    assert!(
+        !atproto_pds::space::access_log::is_blocked(store.pool(), &f.space, &credential)
+            .await
+            .unwrap(),
+        "nothing is blocked to begin with"
+    );
+
+    let (status, location) = f
+        .post(
+            &format!("{}/readers/block", f.base()),
+            "identity=https%3A%2F%2Freader.example%2Fc.json",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("{}?msg=reader-blocked", f.base()).as_str())
+    );
+    assert!(
+        atproto_pds::space::access_log::is_blocked(store.pool(), &f.space, &credential)
+            .await
+            .unwrap(),
+        "the read path should now refuse this credential"
+    );
+
+    // The row shows its state and offers the way back.
+    let (_, body, _) = f.get(&f.base()).await;
+    assert!(body.contains("blocked"), "the row should say so: {body}");
+    assert!(
+        body.contains("readers/unblock"),
+        "a block must be liftable: {body}"
+    );
+
+    let (_, location) = f
+        .post(
+            &format!("{}/readers/unblock", f.base()),
+            "identity=https%3A%2F%2Freader.example%2Fc.json",
+        )
+        .await;
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("{}?msg=reader-unblocked", f.base()).as_str())
+    );
+    assert!(
+        !atproto_pds::space::access_log::is_blocked(store.pool(), &f.space, &credential)
+            .await
+            .unwrap()
+    );
+}
+
+/// A block is scoped to the identity that was blocked, not to the space.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_one_reader_leaves_the_others_served() {
+    let f = fixture().await;
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(f.dir(), OWNER)
+        .await
+        .expect("owner store");
+    let blocked = credential_for(&f.space, Some("https://one.example/c.json"), "k1");
+    let allowed = credential_for(&f.space, Some("https://two.example/c.json"), "k2");
+
+    atproto_pds::space::access_log::block(store.pool(), &f.space, "https://one.example/c.json")
+        .await
+        .expect("block");
+
+    assert!(
+        atproto_pds::space::access_log::is_blocked(store.pool(), &f.space, &blocked)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !atproto_pds::space::access_log::is_blocked(store.pool(), &f.space, &allowed)
+            .await
+            .unwrap(),
+        "another application must be unaffected"
+    );
+}
+
+/// The page says what a block does not do, since the obvious reading —
+/// "this application can no longer read my records" — is wrong everywhere
+/// except this server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_bounds_what_blocking_achieves() {
+    let f = fixture().await;
+    let (_, body, _) = f.get(&f.base()).await;
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in [
+        "It cannot cancel the credential it holds",
+        "keeps reading every other member's records wherever those are hosted",
+        "removing the account from the member list below is the stronger step",
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "the page should say {phrase:?}: {flat}"
         );
     }
 }

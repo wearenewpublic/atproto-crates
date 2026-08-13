@@ -324,7 +324,7 @@ async fn all_spaces(state: &HttpState, did: &str) -> Result<Vec<String>, XrpcErr
 /// published by one party and belong together in a list, which is what a person
 /// reading their own repository is looking for. An NSID with fewer than the two
 /// segments a domain needs is its own group, since there is nothing to derive.
-fn nsid_domain(nsid: &str) -> String {
+pub(crate) fn nsid_domain(nsid: &str) -> String {
     let mut parts = nsid.split('.');
     match (parts.next(), parts.next()) {
         (Some(tld), Some(name)) if !tld.is_empty() && !name.is_empty() => {
@@ -348,27 +348,17 @@ fn group_by_domain(collections: &[String]) -> Vec<(String, Vec<&String>)> {
     groups
 }
 
-/// A small square standing in for the domain's favicon.
+/// The group's icon: this server's cached copy of the authority's favicon.
 ///
-/// Drawn rather than fetched. The portal's `Content-Security-Policy` is
-/// `default-src 'none'`, so a remote `<img>` would not load without opening
-/// `img-src` to other origins — which on a signed-in page means every NSID
-/// authority in the account's repository learns when the holder opens it, and
-/// an injected image tag gains somewhere to phone home to. A letter and a hue
-/// derived from the domain distinguishes the groups without either cost.
-fn domain_badge(domain: &str) -> String {
-    let hash = domain.bytes().fold(0u32, |acc, b| {
-        acc.wrapping_mul(31).wrapping_add(u32::from(b))
-    });
-    let hue = hash % 360;
-    let initial = domain
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string());
+/// Same-origin by construction — see [`crate::http::icons`] for why the bytes
+/// are proxied rather than hot-linked, and what is served when an authority has
+/// no favicon to fetch. The `alt` is empty because the domain is written out on
+/// the row beside it, and announcing it twice is noise to a screen reader.
+fn domain_badge(nsid: &str, domain: &str) -> String {
     format!(
-        r#"<span class="badge" style="background:hsl({hue} 45% 88%);color:hsl({hue} 55% 28%)">{}</span>"#,
-        esc(&initial)
+        r#"<span class="badge"><img src="{ROOT}/icon/{}" alt="" loading="lazy" width="16" height="16" title="{}"></span>"#,
+        esc(&urlenc(nsid)),
+        esc(domain)
     )
 }
 
@@ -402,16 +392,17 @@ fn collections_view(
                     // The badge marks where a group starts; the rows under it
                     // are indented instead of repeating it.
                     let mark = if i == 0 {
-                        domain_badge(domain)
+                        domain_badge(c, domain)
                     } else {
                         r#"<span class="badge-gap"></span>"#.to_string()
                     };
+                    let row_class = if i == 0 { r#" class="group""# } else { "" };
                     // The authority is the same for every row in the group, so
                     // it is dimmed and the part that differs is left to read.
                     let prefix_len = c.len() - c.rsplit('.').next().unwrap_or(c).len();
                     let (prefix, tail) = c.split_at(prefix_len);
                     format!(
-                        r#"<tr><td>{mark}<a href="{child_base}{}"><span class="dim">{}</span>{}</a></td></tr>"#,
+                        r#"<tr{row_class}><td>{mark}<a href="{child_base}{}"><span class="dim">{}</span>{}</a></td></tr>"#,
                         esc(&urlenc(c)),
                         esc(prefix),
                         esc(tail)
@@ -441,7 +432,7 @@ fn collections_view(
         title,
         crumbs,
         &format!(
-            r#"{}<section><table>{rows}</table><p>{pager}</p></section>{create_form}"#,
+            r#"{}<section><table class="groups">{rows}</table><p>{pager}</p></section>{create_form}"#,
             banner(msg)
         ),
     )
@@ -1328,12 +1319,19 @@ mod tests {
         assert_eq!(groups[1].1.len(), 1);
     }
 
-    /// The badge is a pure function of the domain, so a publisher keeps the
-    /// same mark between page loads and between the two realms.
+    /// The mark points at this server's own icon route, never at the authority
+    /// it depicts — the whole reason the bytes are proxied.
     #[test]
-    fn a_domains_badge_is_stable_and_distinct() {
-        assert_eq!(domain_badge("bsky.app"), domain_badge("bsky.app"));
-        assert_ne!(domain_badge("bsky.app"), domain_badge("badge.blue"));
+    fn a_group_mark_is_served_from_this_origin() {
+        let mark = domain_badge("app.bsky.feed.post", "bsky.app");
+        assert!(
+            mark.contains(r#"src="/account/repository/icon/app.bsky.feed.post""#),
+            "{mark}"
+        );
+        assert!(
+            !mark.contains("https://"),
+            "the page must not reach out to the authority: {mark}"
+        );
     }
 
     /// A blob reference, as records actually carry one.

@@ -224,10 +224,23 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
             word-break: break-all; }}
   .muted {{ color: #777; font-size: 0.88em; }}
   .dim {{ color: #999; }}
-  .badge {{ display: inline-block; width: 1.35em; height: 1.35em; line-height: 1.35em;
-           text-align: center; border-radius: 4px; font-size: 0.8em; font-weight: 600;
-           margin-right: 0.55em; vertical-align: baseline; }}
-  .badge-gap {{ display: inline-block; width: 1.35em; margin-right: 0.55em; }}
+  dl.explain {{ margin: 0.5em 0 0.9em; font-size: 0.9em; }}
+  dl.explain dt {{ font-weight: 600; margin-top: 0.6em; }}
+  dl.explain dd {{ margin: 0.15em 0 0; color: #555; }}
+  /* One box, two appearances. Both arms must share every metric that decides
+     where the text after them starts -- including font-size, since a width in
+     `em` resolves against it and a 0.8em badge beside a 1em spacer put the
+     rows of one group a few pixels out from each other. */
+  .badge, .badge-gap {{ display: inline-block; width: 16px; height: 16px;
+           line-height: 16px; font-size: 11px; margin-right: 8px;
+           text-align: center; vertical-align: middle; }}
+  .badge {{ border-radius: 4px; font-weight: 600; }}
+  .badge img {{ width: 16px; height: 16px; display: block; border-radius: 3px; }}
+  /* Grouped listings draw no row rules: the groups are the structure, and a
+     line under every row competes with them. */
+  table.groups td {{ border-bottom: 0; padding: 0.2em 0.5em; }}
+  table.groups tr.group td {{ padding-top: 0.75em; }}
+  table.groups tr:first-child td {{ padding-top: 0; }}
   nav {{ margin-bottom: 1.5em; font-size: 0.9em; }}
   nav .sections {{ margin-top: 0.7em; padding-top: 0.6em; border-top: 1px solid #e2e2e2; }}
   nav .here {{ font-weight: 600; color: #1a1a1a; }}
@@ -248,6 +261,7 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
       background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
     code {{ background: #232326; }}
     .dim {{ color: #6b6b70; }}
+    dl.explain dd {{ color: #a8a8ad; }}
     button.quiet {{ background: #2e2e33; color: #e8e8e8; }}
   }}
 </style>

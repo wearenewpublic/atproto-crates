@@ -64,12 +64,23 @@ use axum::response::Response;
 /// script block and hashing the block, which is worth doing and is a change to
 /// the most security-sensitive form on the server, so it is not folded in here.
 ///
+/// # `img-src 'self' data:` and not a step further
+///
+/// The repository browser shows a small icon for each NSID authority. Those are
+/// served by this server from its own cache rather than hot-linked, so the
+/// browser never contacts a third party for them — which matters on a signed-in
+/// page, where a remote image tells its host when the account holder opened
+/// their own repository, and gives an injected `<img>` somewhere to report to.
+/// `data:` is here for the same reason a generated placeholder is: an icon this
+/// server draws needs no round trip at all.
+///
 /// What the policy still buys with `'unsafe-inline'` present is the part that
 /// does not depend on it: `frame-ancestors 'none'` makes the consent screen
 /// unframeable, `form-action 'self'` means an injected `<form>` cannot post the
 /// holder's password to another origin, and `base-uri 'none'` stops a `<base>`
 /// tag re-pointing the form's relative action.
 pub const HTML_CSP: &str = "default-src 'none'; \
+     img-src 'self' data:; \
      style-src 'unsafe-inline'; \
      script-src 'unsafe-inline'; \
      connect-src 'self'; \
