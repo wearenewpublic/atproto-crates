@@ -108,6 +108,10 @@ fn banner(msg: Option<&str>) -> String {
         Some("member-added") => ("ok", "Member added."),
         Some("member-removed") => ("ok", "Member removed."),
         Some("err-not-owner") => ("err", "Only the space's authority can change this."),
+        Some("err-unknown-space") => (
+            "err",
+            "You do not hold records in that space, and do not host it.",
+        ),
         Some("err-enter-a-did") => ("err", "Enter the DID of the account to add."),
         Some("err-already-a-member") => ("err", "That account is already a member."),
         Some("err-not-a-member") => ("err", "That account is not a member of this space."),
@@ -197,7 +201,7 @@ so there is nothing to administer here.</div>
     } else {
         joined
             .iter()
-            .map(|s| row(s, false))
+            .map(|s| row(s, true))
             .collect::<Vec<_>>()
             .join("")
     };
@@ -219,8 +223,8 @@ which applications may reach them.</p>
 <section>
 <h2 style="margin-top:0">Spaces you are in</h2>
 <p class="muted">Hosted by another account, which decides their membership and
-access. Your records in them are yours and live in your repository —
-<a href="/account/repository">browse them here</a>.</p>
+access. Your records in them are yours and live in your repository, and each one
+shows what has been reading them.</p>
 <table><thead><tr><th>Space</th><th>Joined</th></tr></thead>
 <tbody>{joined_rows}</tbody></table>
 </section>"#,
@@ -233,6 +237,78 @@ access. Your records in them are yours and live in your repository —
 // ---------------------------------------------------------------------------
 //  One space
 // ---------------------------------------------------------------------------
+
+/// The "who has read your records here" table.
+///
+/// Reads its rows from the viewer's own per-actor store, because that is where
+/// the reads happened: a space credential is minted by the authority, so this
+/// server only ever sees one arrive at a repo it hosts.
+async fn access_log_section(
+    state: &HttpState,
+    viewer_did: &str,
+    uri: &SpaceUri,
+) -> Result<String, XrpcError> {
+    let store =
+        crate::actor_store::sql::SqlActorStore::open_if_exists(state.reader.data_dir(), viewer_did)
+            .await
+            .map_err(XrpcError::from)?;
+    let entries = match &store {
+        Some(store) => crate::space::access_log::list(store.pool(), uri)
+            .await
+            .map_err(XrpcError::from)?,
+        None => Vec::new(),
+    };
+
+    let rows = if entries.is_empty() {
+        r#"<tr><td colspan="4" class="muted">Nothing has read your records in this space.</td></tr>"#
+            .to_string()
+    } else {
+        entries
+            .iter()
+            .map(|e| {
+                // An application that proved its identity is named. One that
+                // did not is called what it is: the only thing identifying it
+                // is a key the specification says to replace with each
+                // credential, so it is a stranger every couple of hours and
+                // naming it after that key would imply otherwise.
+                let who = match &e.client_id {
+                    Some(client_id) => format!("<code>{}</code>", esc(client_id)),
+                    None => r#"<span class="muted">Unidentified application</span>"#.to_string(),
+                };
+                format!(
+                    r#"<tr><td>{who}</td><td class="muted">{}</td><td class="muted">{}</td>
+<td class="muted" style="text-align:right">{}</td></tr>"#,
+                    esc(&e.first_seen),
+                    esc(&e.last_seen),
+                    e.reads
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let anonymous = entries.iter().any(|e| e.client_id.is_none());
+    let caveat = if anonymous {
+        r#"<p class="muted">An application only appears by name when it proved
+its identity to the space's authority. One that did not cannot be told apart
+from any other, or from itself an hour later, so it is listed as unidentified
+each time its credential is renewed.</p>"#
+    } else {
+        ""
+    };
+
+    Ok(format!(
+        r#"<section>
+<h2 style="margin-top:0">Who has read your records</h2>
+<p class="muted">Applications that presented a credential from this space's
+authority to read your records on this server. Reads of other members' records,
+on their own servers, are not visible here.</p>
+<table><thead><tr><th>Application</th><th>First seen</th><th>Last seen</th><th>Reads</th></tr></thead>
+<tbody>{rows}</tbody></table>
+{caveat}
+</section>"#
+    ))
+}
 
 /// `GET /account/spaces/{host}/{space_type}/{space_key}` — settings and members.
 pub async fn detail(
@@ -247,12 +323,44 @@ pub async fn detail(
     };
     let svc = service(&state)?;
     let uri = path.uri()?;
+    let base = path.base();
 
-    // This page administers a space, and only its authority can. A member
-    // looking at someone else's space is sent to the browser, which is the
-    // thing they can actually use.
-    if uri.space_did != account.did {
-        return Ok(redirect("/account/spaces?msg=err-not-owner"));
+    // Two different pages share this route, because two different questions
+    // are asked of a space and they belong to different people. The authority
+    // configures it; anyone holding records in it wants to know who has been
+    // reading them. A space the account has no relationship with is neither.
+    let holds_records = svc
+        .list_spaces(&account.did, None, None, None, 100)
+        .await
+        .map_err(XrpcError::from)?
+        .spaces
+        .into_iter()
+        .any(|s| s.uri == uri.to_string());
+    let is_authority = uri.space_did == account.did;
+    if !holds_records && !is_authority {
+        return Ok(redirect("/account/spaces?msg=err-unknown-space"));
+    }
+
+    let readers = access_log_section(&state, &account.did, &uri).await?;
+
+    if !is_authority {
+        // A member's view: the records are theirs, the space is not.
+        let body = format!(
+            r#"{nav}
+{banner}
+<h1>{uri_label}</h1>
+<p class="sub">Hosted by another account, which sets its membership and access.</p>
+{readers}
+<p class="muted"><a href="/account/repository/space/{host}/{stype}/{skey}">Browse your records in this space</a>
+&middot; <a href="/account/spaces">All spaces</a></p>"#,
+            nav = nav(Section::Spaces, &account, &esc(&uri.to_string())),
+            banner = banner(q.msg.as_deref()),
+            uri_label = esc(&uri.to_string()),
+            host = urlenc(&path.host),
+            stype = urlenc(&path.space_type),
+            skey = urlenc(&path.space_key),
+        );
+        return Ok(page("Space", &body).into_response());
     }
 
     let inputs = svc
@@ -260,7 +368,7 @@ pub async fn detail(
         .await
         .map_err(XrpcError::from)?;
     if !inputs.found || inputs.deleted {
-        return Ok(redirect("/account/spaces?msg=err-not-owner"));
+        return Ok(redirect("/account/spaces?msg=err-unknown-space"));
     }
     let config = inputs.config;
 
@@ -268,7 +376,6 @@ pub async fn detail(
         .list_members(&uri, q.cursor.as_deref(), MEMBER_PAGE)
         .await
         .map_err(XrpcError::from)?;
-    let base = path.base();
 
     let member_rows = if members.members.is_empty() {
         r#"<tr><td colspan="3" class="muted">No members.</td></tr>"#.to_string()
@@ -359,6 +466,8 @@ pub async fn detail(
 </form>
 </section>
 
+{readers}
+
 <section>
 <h2 style="margin-top:0">Members</h2>
 <p class="muted">Members hold their own records for this space, in their own
@@ -380,6 +489,7 @@ until it expires.</p>
         nav = nav(Section::Spaces, &account, &esc(&uri.to_string())),
         banner = banner(q.msg.as_deref()),
         uri_label = esc(&uri.to_string()),
+        readers = readers,
         base = base,
         ml = sel(MintPolicy::MemberList),
         pu = sel(MintPolicy::Public),

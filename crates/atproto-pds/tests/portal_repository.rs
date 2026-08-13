@@ -669,3 +669,86 @@ fn hrefs(body: &str) -> Vec<String> {
     }
     out
 }
+
+/// One application can be cut off without ending every other application's
+/// access.
+///
+/// Until this existed, the Access page listed OAuth grants and offered exactly
+/// one control over them: sign out everywhere. An account holder who wanted a
+/// single application gone had to end all of them and sign back in everywhere
+/// else.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_oauth_grant_can_be_revoked_without_touching_the_others() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+    let pool = manager.account_pool();
+
+    for client in [
+        "https://one.example/client-metadata.json",
+        "https://two.example/client-metadata.json",
+    ] {
+        sqlx::query(
+            "INSERT INTO oauth_refresh (jti, did, client_id, dpop_jkt, scope, issued_at)
+             VALUES (?, ?, ?, 'thumb', 'atproto', '2026-08-13T00:00:00Z')",
+        )
+        .bind(format!("jti-{client}"))
+        .bind(DID)
+        .bind(client)
+        .execute(pool.as_sqlite())
+        .await
+        .expect("seed grant");
+    }
+
+    let (_, listed, _) = get(&app, &cookie, "/account/sessions").await;
+    assert!(
+        listed.contains("https://one.example/client-metadata.json"),
+        "the grant should be listed before it is revoked: {listed}"
+    );
+
+    let location = post(
+        &app,
+        &cookie,
+        "/account/sessions/revoke",
+        "client_id=https%3A%2F%2Fone.example%2Fclient-metadata.json",
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some("/account/sessions?msg=grant-revoked")
+    );
+
+    let (_, after, _) = get(&app, &cookie, "/account/sessions").await;
+    assert!(
+        !after.contains("https://one.example/client-metadata.json"),
+        "the revoked grant should be gone: {after}"
+    );
+    assert!(
+        after.contains("https://two.example/client-metadata.json"),
+        "the other application should be untouched: {after}"
+    );
+    // The copy has to be honest about the 15-minute tail, since the access
+    // token already issued is a stateless JWT with no row to delete.
+    assert!(
+        after.contains("15 minutes"),
+        "the page should say when access actually ends: {after}"
+    );
+}
+
+/// Revoking something that is not there is the account holder's mistake to
+/// read, not a 500 — a double-clicked button lands here.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_grant_that_is_not_there_says_so() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+    let location = post(
+        &app,
+        &cookie,
+        "/account/sessions/revoke",
+        "client_id=https%3A%2F%2Fnobody.example%2Fc.json",
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some("/account/sessions?msg=err-nothing-to-revoke")
+    );
+}

@@ -35,6 +35,13 @@ struct Fixture {
     _tmp: TempDir,
 }
 
+impl Fixture {
+    /// The server's data directory, for tests that seed per-actor state.
+    fn dir(&self) -> &std::path::Path {
+        self._tmp.path()
+    }
+}
+
 /// An account that owns one space, with a portal session.
 async fn fixture() -> Fixture {
     let tmp = TempDir::new().unwrap();
@@ -350,9 +357,9 @@ async fn the_authority_row_offers_no_remove_control() {
     );
 }
 
-/// Administering someone else's space is not a page this section serves.
+/// A space the account neither hosts nor holds records in is not a page.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_space_hosted_elsewhere_is_not_administrable_here() {
+async fn a_space_with_no_relationship_is_not_served() {
     let f = fixture().await;
     let stranger = format!(
         "/account/spaces/{}/{}/{}",
@@ -364,7 +371,7 @@ async fn a_space_hosted_elsewhere_is_not_administrable_here() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location.as_deref(),
-        Some("/account/spaces?msg=err-not-owner")
+        Some("/account/spaces?msg=err-unknown-space")
     );
 }
 
@@ -424,5 +431,137 @@ async fn the_section_requires_a_session() {
             Some("/account/signin"),
             "{path} served something to a request with no session"
         );
+    }
+}
+
+/// An owner sees who has been reading their records, and an application that
+/// proved its identity is named.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_space_page_lists_what_has_read_your_records() {
+    let f = fixture().await;
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(f.dir(), OWNER)
+        .await
+        .expect("owner store");
+    atproto_pds::space::access_log::record(
+        store.pool(),
+        &f.space,
+        &credential_for(&f.space, Some("https://reader.example/c.json"), "k1"),
+    )
+    .await
+    .expect("seed log");
+
+    let (status, body, _) = f.get(&f.base()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Who has read your records"),
+        "the readers section should render: {body}"
+    );
+    assert!(
+        body.contains("https://reader.example/c.json"),
+        "an attested reader should be named: {body}"
+    );
+    assert!(
+        !body.contains("Unidentified application"),
+        "an attested reader is not anonymous: {body}"
+    );
+}
+
+/// A reader that did not attest is shown as unidentified, with the reason,
+/// rather than as a key thumbprint that looks like a name.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unattested_reader_is_shown_as_unidentified() {
+    let f = fixture().await;
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(f.dir(), OWNER)
+        .await
+        .expect("owner store");
+    atproto_pds::space::access_log::record(
+        store.pool(),
+        &f.space,
+        &credential_for(&f.space, None, "thumbprint-abc"),
+    )
+    .await
+    .expect("seed log");
+
+    let (_, body, _) = f.get(&f.base()).await;
+    assert!(
+        body.contains("Unidentified application"),
+        "an unattested reader should be named as such: {body}"
+    );
+    assert!(
+        !body.contains("thumbprint-abc"),
+        "the DPoP thumbprint is not an identity and should not be shown: {body}"
+    );
+    assert!(
+        body.contains("only appears by name"),
+        "the page should explain why it cannot say more: {body}"
+    );
+}
+
+/// A member of someone else's space gets the readers list for their own
+/// records — and none of the controls that belong to the authority.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_sees_readers_but_no_settings() {
+    let f = fixture().await;
+    // A space hosted elsewhere that this account holds records in: the space
+    // row in its own store is what `listSpaces` reports.
+    let remote: SpaceUri = "at://did:plc:elsewherehost0000000000000/space/app.bsky.group/shared"
+        .parse()
+        .unwrap();
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(f.dir(), OWNER)
+        .await
+        .expect("owner store");
+    sqlx::query(
+        "INSERT INTO space (uri, is_owner, is_member, created_at)
+         VALUES (?, 0, 1, '2026-08-13T00:00:00Z')",
+    )
+    .bind(remote.to_string())
+    .execute(store.pool())
+    .await
+    .expect("seed membership");
+    atproto_pds::space::access_log::record(
+        store.pool(),
+        &remote,
+        &credential_for(&remote, Some("https://reader.example/c.json"), "k1"),
+    )
+    .await
+    .expect("seed log");
+
+    let path = format!(
+        "/account/spaces/{}/{}/{}",
+        urlenc(&remote.space_did),
+        urlenc(remote.space_type.as_str()),
+        urlenc(remote.space_key.as_str())
+    );
+    let (status, body, _) = f.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("Who has read your records"),
+        "a member should still see who read their records: {body}"
+    );
+    assert!(
+        !body.contains("Save settings"),
+        "a member must not be offered the authority's controls: {body}"
+    );
+    assert!(
+        !body.contains("Add member"),
+        "a member must not be offered the member list: {body}"
+    );
+}
+
+fn credential_for(
+    space: &SpaceUri,
+    client_id: Option<&str>,
+    jkt: &str,
+) -> atproto_space::credential::SpaceCredential {
+    atproto_space::credential::SpaceCredential {
+        iss: space.space_did.clone(),
+        sub: space.to_string(),
+        cnf: atproto_space::credential::Cnf {
+            jkt: jkt.to_string(),
+        },
+        client_id: client_id.map(str::to_string),
+        iat: 0,
+        exp: 0,
+        jti: "j".to_string(),
     }
 }

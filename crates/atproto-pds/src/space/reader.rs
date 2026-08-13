@@ -176,9 +176,11 @@ impl SpaceReader {
         collection: &str,
         rkey: &str,
     ) -> PdsResult<Option<RecordRow>> {
-        self.verify_auth(space, &auth).await?;
+        let credential = self.verify_auth(space, &auth).await?;
         self.ensure_space_live(space, &auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
+        self.note_access(store.pool(), space, credential.as_ref())
+            .await;
 
         // Takedown gate — admin moderation hides the record at read time.
         if is_record_taken_down(store.pool(), space, collection, rkey).await? {
@@ -251,9 +253,11 @@ impl SpaceReader {
             limit,
             reverse,
         } = listing;
-        self.verify_auth(space, &auth).await?;
+        let credential = self.verify_auth(space, &auth).await?;
         self.ensure_space_live(space, &auth).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
+        self.note_access(store.pool(), space, credential.as_ref())
+            .await;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
             SpaceRepo::new(space.clone(), storage);
@@ -370,6 +374,34 @@ impl SpaceReader {
     /// returned rather than discarded because `registerNotify` keys its
     /// subscription on them, and re-parsing a token this function has already
     /// parsed invites the two readings to disagree.
+    /// Attribute this read to the credential that authorised it.
+    ///
+    /// Only credential reads are recorded. An `OwnPds` read is the account
+    /// reading its own repo with its own session, which is not the question
+    /// this log answers -- and recording it would bury the entries that matter
+    /// under the account's own traffic.
+    ///
+    /// Best effort by construction: a read is not failed because its
+    /// bookkeeping was, so a storage error is logged and swallowed. The
+    /// consequence is worth stating -- the log undercounts rather than blocks.
+    async fn note_access(
+        &self,
+        actor_pool: &sqlx::SqlitePool,
+        space: &SpaceUri,
+        credential: Option<&SpaceCredential>,
+    ) {
+        let Some(credential) = credential else {
+            return;
+        };
+        if let Err(error) = crate::space::access_log::record(actor_pool, space, credential).await {
+            tracing::warn!(
+                error = ?error,
+                space = %space,
+                "could not record a space read; the access log will undercount"
+            );
+        }
+    }
+
     async fn verify_auth(
         &self,
         space: &SpaceUri,

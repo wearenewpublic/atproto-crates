@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- **One OAuth application can be revoked without ending the others.** The Access page listed every grant on
+  an account and offered exactly one control over them — sign out everywhere — so a holder who wanted a
+  single application gone had to end all of them and sign back in everywhere else. Each row now carries its
+  own Revoke.
+
+  Deleting the grant stops that application renewing its access; it does not reach the access token already
+  in its hands, because those are stateless 15-minute JWTs with no row to delete. The page says so rather
+  than implying an instant cutoff. `sign_out_everywhere` remains the instant option, at the cost of being
+  account-wide.
+
+- **An account can see which applications have read its permissioned records.** A space credential is minted
+  by the space authority, so a repo host never witnesses one being issued — only presented. The read path is
+  therefore the only place this question can be answered from, and credential reads of a repo now accumulate
+  in a `space_access_log` table in that account's own store, surfaced on the space's page in the portal.
+
+  What an entry can identify is bounded by the protocol, and the page says which case it is looking at. An
+  application that presented a client attestation is named by the `client_id` it proved. One that did not is
+  listed as unidentified: the only thing naming it is the DPoP thumbprint, and the permissioned-data draft
+  recommends a fresh keypair per credential, so it is a stranger again every time its credential rotates.
+  Showing that thumbprint as though it were an identity would be worse than admitting there isn't one.
+
+  Recording is best-effort — a read is never failed because its bookkeeping was — so the log undercounts
+  rather than blocks.
+
+- **A space page for members, not only authorities.** The page an authority uses to configure a space now
+  also serves anyone holding records in one hosted elsewhere, showing the readers of their own records and
+  none of the controls that belong to the authority.
+
 - **The portal can administer spaces.** A new **Spaces** section (`/account/spaces`) lists the spaces an
   account is in, separating the ones it is the authority for from the ones it merely belongs to, and gives
   each owned space a page for the two things only an authority can do: set the access policy

@@ -920,6 +920,15 @@ pub(crate) fn banner_for(msg: Option<&str>) -> String {
             "Password changed. Every other session was signed out.",
         ),
         Some("app-password-revoked") => notice("ok", "App password revoked."),
+        Some("grant-revoked") => notice(
+            "ok",
+            "That application can no longer renew its access. A token it already \
+             holds keeps working for up to 15 minutes.",
+        ),
+        Some("err-nothing-to-revoke") => notice(
+            "err",
+            "That application no longer had a grant on this account.",
+        ),
         // The secret itself is rendered from the session, not from here.
         Some("app-password-created") => String::new(),
         Some("policy-accepted") => notice(
@@ -1186,16 +1195,21 @@ pub async fn sessions(
         .await
         .map_err(XrpcError::from)?;
     let grant_rows = if grants.is_empty() {
-        r#"<tr><td colspan="3" class="muted">No OAuth sessions.</td></tr>"#.to_string()
+        r#"<tr><td colspan="4" class="muted">No OAuth sessions.</td></tr>"#.to_string()
     } else {
         grants
             .iter()
             .map(|(client, scope, issued)| {
                 format!(
-                    r#"<tr><td><code>{}</code></td><td class="muted">{}</td><td class="muted">{}</td></tr>"#,
+                    r#"<tr><td><code>{}</code></td><td class="muted">{}</td><td class="muted">{}</td>
+                    <td style="text-align:right">
+                      <form method="POST" action="/account/sessions/revoke" style="display:inline">
+                        <input type="hidden" name="client_id" value="{}">
+                        <button class="quiet" type="submit">Revoke</button></form></td></tr>"#,
                     esc(client),
                     esc(scope),
-                    esc(issued)
+                    esc(issued),
+                    esc(client)
                 )
             })
             .collect::<Vec<_>>()
@@ -1225,8 +1239,10 @@ in use.</p>
 
 <section>
 <h2 style="margin-top:0">OAuth sessions</h2>
-<p class="muted">Applications currently holding a grant on this account.</p>
-<table><thead><tr><th>Client</th><th>Scope</th><th>Granted</th></tr></thead>
+<p class="muted">Applications currently holding a grant on this account.
+Revoking one stops that application renewing its access and leaves the others
+alone; a token it already holds keeps working for up to 15 minutes.</p>
+<table><thead><tr><th>Client</th><th>Scope</th><th>Granted</th><th></th></tr></thead>
 <tbody>{grant_rows}</tbody></table>
 </section>
 
@@ -1832,6 +1848,47 @@ pub async fn revoke_app_password(
         .map_err(XrpcError::from)?;
     tracing::info!(did = %account.did, name = %form.name, "portal app-password revoked");
     Ok(redirect("/account/sessions?msg=app-password-revoked"))
+}
+
+/// Submitted by the per-application revoke control.
+#[derive(Debug, Deserialize)]
+pub struct RevokeGrantForm {
+    /// `client_id` of the application to cut off.
+    pub client_id: String,
+}
+
+/// `POST /account/sessions/revoke` — end one application's OAuth grant.
+///
+/// The scalpel beside `sign_out_everywhere`'s hammer: an account holder who
+/// wants one application gone had, until this existed, only the control that
+/// signs every application out.
+pub async fn revoke_grant(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<RevokeGrantForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let Some((_, account)) = current_account(&state, &headers).await else {
+        return Ok(redirect("/account/signin"));
+    };
+    let client_id = form.client_id.trim();
+    if client_id.is_empty() {
+        return Ok(redirect("/account/sessions?msg=err-nothing-to-revoke"));
+    }
+    let pool = state.reader.accounts().account_pool();
+    let removed = portal::revoke_oauth_grants_for_client(&pool, &account.did, client_id)
+        .await
+        .map_err(XrpcError::from)?;
+    if removed == 0 {
+        return Ok(redirect("/account/sessions?msg=err-nothing-to-revoke"));
+    }
+    tracing::info!(
+        did = %account.did,
+        client_id = %client_id,
+        grants = removed,
+        "portal oauth grant revoked"
+    );
+    Ok(redirect("/account/sessions?msg=grant-revoked"))
 }
 
 /// `POST /account/signout-everywhere`.

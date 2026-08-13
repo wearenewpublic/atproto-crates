@@ -5024,3 +5024,91 @@ async fn the_registration_window_is_configurable_and_reported() {
         "expiresAt should be the configured window, was {window}s"
     );
 }
+
+/// A credential read is attributed to whoever presented it.
+///
+/// The whole point of the access log is that this server never witnesses a
+/// credential being issued — only presented — so the read path is the one
+/// place the account can learn who has been reading its permissioned records.
+/// Asserting it here rather than only at the storage layer is deliberate: a
+/// log that records perfectly and is never called is the same as no log.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_read_is_recorded_against_the_repo_it_read() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+    let accounts = AccountDirectory::open(&data_dir.join("accounts.sqlite"))
+        .await
+        .unwrap();
+    let key_store: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+    let manager = Arc::new(AccountManager::new(
+        accounts.pool().clone(),
+        data_dir.clone(),
+        key_store,
+        KeyType::K256Private,
+    ));
+    let writer = Arc::new(RepoWriter::new(manager.clone(), data_dir.clone()));
+    let reader = Arc::new(RepoReader::new(accounts, data_dir.clone()));
+    let svc = Arc::new(SpaceService::with_accounts(
+        data_dir.clone(),
+        manager.clone(),
+    ));
+    let space_writer = Arc::new(SpaceWriter::new(manager.clone(), data_dir.clone()));
+    let space_reader = Arc::new(SpaceReader::new(manager.clone(), data_dir.clone()));
+    let space_sync = Arc::new(SpaceSync::new(data_dir.clone()));
+    let state = HttpState::with_account_manager(
+        reader,
+        manager.clone(),
+        "did:web:test.example".to_string(),
+        JWT_SECRET.to_vec(),
+        false,
+    )
+    .with_writer(writer)
+    .with_spaces(svc, space_writer, space_reader, space_sync);
+    let app = build_router(state);
+
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner_token, "default").await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.putRecord",
+        json!({
+            "repo": "did:plc:owner",
+            "space": uri,
+            "collection": "c.d.e",
+            "rkey": "r1",
+            "record": {"v": 1},
+        }),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fixture write: {body}");
+
+    let credential = mint_space_credential(&app, "did:plc:owner", &uri).await;
+    let (status, read) = get_json_cred(
+        &app,
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&collection=c.d.e&rkey=r1&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        &credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "credential read: {read}");
+
+    let store = atproto_pds::actor_store::sql::SqlActorStore::open(&data_dir, "did:plc:owner")
+        .await
+        .unwrap();
+    let space_uri: atproto_space::types::SpaceUri = uri.parse().unwrap();
+    let entries = atproto_pds::space::access_log::list(store.pool(), &space_uri)
+        .await
+        .expect("access log");
+    assert_eq!(entries.len(), 1, "the read should be recorded: {entries:?}");
+    assert_eq!(entries[0].reads, 1);
+    // This credential was minted without a client attestation, so there is no
+    // attested identity to record and the reader is anonymous by construction.
+    assert!(
+        !entries[0].is_attested(),
+        "an unattested credential must not be given a name: {entries:?}"
+    );
+}

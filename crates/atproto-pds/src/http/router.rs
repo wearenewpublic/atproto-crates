@@ -633,6 +633,7 @@ fn build_router_inner(
         .route("/account/password", post(portal::change_password))
         .route("/account/policy", post(portal::accept_policy))
         .route("/account/app-passwords", post(portal::create_app_password))
+        .route("/account/sessions/revoke", post(portal::revoke_grant))
         .route(
             "/account/app-passwords/revoke",
             post(portal::revoke_app_password),

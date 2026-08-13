@@ -167,6 +167,64 @@ async fn delete_oauth_refresh_for(pool: &AccountPool, did: &str) -> PdsResult<()
     })
 }
 
+/// Drop one application's OAuth grants, leaving every other application's
+/// alone.
+///
+/// Returns how many rows went, so a caller can tell "revoked" from "there was
+/// nothing to revoke" — the same request from a double-clicked button.
+///
+/// # What this does and does not end
+///
+/// The grant is what renews access, so deleting it stops the application
+/// obtaining anything further. It does **not** reach the access token already
+/// in that application's hands: those are stateless 15-minute JWTs with no row
+/// to delete, so one outstanding token keeps working until it expires. The UI
+/// says so rather than implying an instant cutoff.
+///
+/// The account-wide alternative, `sign_out_everywhere`, *is* instant because it
+/// advances the session epoch every token is checked against — at the cost of
+/// ending every other application's access too.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the delete fails.
+pub async fn revoke_oauth_grants_for_client(
+    pool: &AccountPool,
+    did: &str,
+    client_id: &str,
+) -> PdsResult<u64> {
+    let result = match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query("DELETE FROM oauth_refresh WHERE did = ? AND client_id = ?")
+                .bind(did)
+                .bind(client_id)
+                .execute(pool.as_sqlite())
+                .await
+                .map(|r| r.rows_affected())
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query("DELETE FROM oauth_refresh WHERE did = $1 AND client_id = $2")
+                .bind(did)
+                .bind(client_id)
+                .execute(pool.as_postgres())
+                .await
+                .map(|r| r.rows_affected())
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+    .map_err(|e| PdsError::Storage {
+        reason: format!("revoke oauth grants: {e}"),
+    })?;
+    Ok(result)
+}
+
 /// Every live OAuth grant for an account, newest first.
 ///
 /// # Errors
