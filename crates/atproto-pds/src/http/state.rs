@@ -50,6 +50,140 @@ pub struct PolicyDocuments {
     pub url: String,
 }
 
+/// What this server needs to be, to authenticate a delegate against another
+/// server.
+///
+/// Delegated sign-in inverts this PDS's usual role: for the length of one
+/// round trip it is an OAuth *client*, pushing an authorization request at
+/// somebody else's authorization server and proving itself with a signed
+/// assertion. That role needs an identity of its own -- a `client_id` that
+/// resolves to a metadata document, a redirect URI registered in it, and a
+/// published key the peer can verify against.
+///
+/// Resolved once at startup by [`DelegationStatus::resolve`] rather than
+/// recomputed per request, so every reader -- the consent page deciding
+/// whether to offer the link, the portal deciding what to render, the callback
+/// deciding whether to run -- gets the same answer.
+#[derive(Debug, Clone)]
+pub struct DelegationConfig {
+    /// This server's `client_id`: the URL its client metadata is served from.
+    pub client_id: String,
+    /// Where a delegate's authorization server sends them back to.
+    pub redirect_uri: String,
+    /// Where the peer fetches the key that signs this server's client
+    /// assertions. The existing `/oauth/jwks`, which already publishes it.
+    pub jwks_uri: String,
+    /// Human-readable name shown on the delegate's own consent screen.
+    pub client_name: String,
+    /// This server's front page, for the same screen.
+    pub client_uri: String,
+}
+
+/// Why delegated sign-in is not on offer, in terms an account holder can act
+/// on.
+///
+/// Rendered on the Delegation page rather than swallowed. A section that
+/// simply showed nothing would read as "no delegates", which is the wrong
+/// conclusion when the truth is "this server cannot do it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationUnavailable {
+    /// The operator has not set `PDS_DELEGATION_ENABLED`.
+    NotEnabled,
+    /// The server is not reachable over HTTPS, so no other server would fetch
+    /// its `client_id`.
+    InsecureOrigin,
+    /// No PDS signing key is configured, so no client assertion can be signed.
+    NoSigningKey,
+    /// The signing key is not P-256. AT Protocol OAuth client assertions are
+    /// `ES256`; a key of any other curve produces an assertion peers refuse.
+    UnsupportedSigningKey,
+}
+
+impl DelegationUnavailable {
+    /// One sentence naming the obstacle, for the Delegation page.
+    #[must_use]
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::NotEnabled => "The operator of this server has not enabled account delegation.",
+            Self::InsecureOrigin => {
+                "This server is not reachable over HTTPS. Delegation needs another \
+                 server to fetch this one's client metadata, which it will only do \
+                 over HTTPS."
+            }
+            Self::NoSigningKey => {
+                "This server has no signing key configured, so it cannot prove itself \
+                 to the server a delegate signs in on."
+            }
+            Self::UnsupportedSigningKey => {
+                "This server's signing key is not a P-256 key. AT Protocol OAuth \
+                 requires ES256 for the assertion this server would have to sign."
+            }
+        }
+    }
+}
+
+/// Whether this server can authenticate delegates, and if not, why.
+#[derive(Debug, Clone)]
+pub enum DelegationStatus {
+    /// Configured and usable.
+    Available(Arc<DelegationConfig>),
+    /// Not on offer, with the reason to show.
+    Unavailable(DelegationUnavailable),
+}
+
+impl DelegationStatus {
+    /// Decide the status from the operator's flag, this server's origin, and
+    /// the key it would sign client assertions with.
+    ///
+    /// Every precondition is checked here, once. The alternative -- each
+    /// caller checking the ones it happens to remember -- is how a page ends
+    /// up offering a control that the handler behind it refuses.
+    #[must_use]
+    pub fn resolve(enabled: bool, origin: &str, signing_key: Option<&KeyData>) -> Self {
+        if !enabled {
+            return Self::Unavailable(DelegationUnavailable::NotEnabled);
+        }
+        if !origin.starts_with("https://") {
+            return Self::Unavailable(DelegationUnavailable::InsecureOrigin);
+        }
+        let Some(key) = signing_key else {
+            return Self::Unavailable(DelegationUnavailable::NoSigningKey);
+        };
+        if !matches!(
+            key.0,
+            atproto_identity::key::KeyType::P256Private
+                | atproto_identity::key::KeyType::P256Public
+        ) {
+            return Self::Unavailable(DelegationUnavailable::UnsupportedSigningKey);
+        }
+        Self::Available(Arc::new(DelegationConfig {
+            client_id: format!("{origin}/oauth/delegation/client-metadata.json"),
+            redirect_uri: format!("{origin}/oauth/delegation/callback"),
+            jwks_uri: format!("{origin}/oauth/jwks"),
+            client_name: format!(
+                "{} account delegation",
+                origin.trim_start_matches("https://")
+            ),
+            client_uri: format!("{origin}/"),
+        }))
+    }
+
+    /// The configuration, when delegation is on offer.
+    #[must_use]
+    pub fn config(&self) -> Option<&Arc<DelegationConfig>> {
+        match self {
+            Self::Available(config) => Some(config),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    /// Whether delegated sign-in can be offered at all.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+}
+
 /// How long a built validation catalog stays usable.
 ///
 /// Matched to the lexicon resolver's own TTL: a catalog is a parse of the
@@ -262,6 +396,10 @@ pub struct HttpState {
     /// AppView base URL for `app.bsky.*` proxying. Default for the
     /// `Atproto-Proxy` middleware when the header is absent.
     pub bsky_app_view_url: Option<String>,
+    /// Whether this server can authenticate a delegate against another
+    /// server's OAuth, and if not, why. Set via `PDS_DELEGATION_ENABLED` plus
+    /// the preconditions [`DelegationStatus::resolve`] checks.
+    pub delegation: DelegationStatus,
 }
 
 impl HttpState {
@@ -276,6 +414,7 @@ impl HttpState {
             invite_required: false,
             admin_dids: Vec::new(),
             policy: None,
+            delegation: DelegationStatus::Unavailable(DelegationUnavailable::NotEnabled),
             oauth: OAuthState::new(),
             admin_password: None,
             space_service: None,
@@ -339,6 +478,7 @@ impl HttpState {
             invite_required,
             admin_dids: Vec::new(),
             policy: None,
+            delegation: DelegationStatus::Unavailable(DelegationUnavailable::NotEnabled),
             oauth: OAuthState::new(),
             admin_password: None,
             space_service: None,
@@ -473,6 +613,50 @@ impl HttpState {
     /// Configure the policy documents new accounts must accept.
     pub fn with_policy_documents(mut self, policy: Option<PolicyDocuments>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// This server's public origin, derived from its `did:web` service DID.
+    ///
+    /// A `did:web` names a host, so the origin is the one fact both are about.
+    /// Percent-decoded because a `did:web` with a port encodes the colon
+    /// (`did:web:localhost%3A3000`), and a URL built from the raw form points
+    /// at a host that does not exist.
+    #[must_use]
+    pub fn origin(&self) -> String {
+        format!("https://{}", self.host())
+    }
+
+    /// The host this server answers on, from its service DID.
+    #[must_use]
+    pub fn host(&self) -> String {
+        self.service_did
+            .strip_prefix("did:web:")
+            .unwrap_or(&self.service_did)
+            .replace("%3A", ":")
+            .replace("%3a", ":")
+    }
+
+    /// Settle whether delegated sign-in is on offer, from the operator's flag
+    /// and this state's own origin and signing key.
+    ///
+    /// Called after the signing key is attached: the key is one of the three
+    /// preconditions, so resolving before it is set would report
+    /// `NoSigningKey` for a server that has one.
+    #[must_use]
+    pub fn with_delegation_enabled(mut self, enabled: bool) -> Self {
+        let origin = self.origin();
+        self.delegation =
+            DelegationStatus::resolve(enabled, &origin, self.pds_signing_key.as_deref());
+        if let DelegationStatus::Unavailable(reason) = self.delegation
+            && enabled
+        {
+            tracing::warn!(
+                reason = ?reason,
+                "account delegation is enabled but cannot be offered: {}",
+                reason.explain()
+            );
+        }
         self
     }
 

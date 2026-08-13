@@ -54,7 +54,7 @@ use crate::security::SlidingWindowLimiter;
 /// Everything here either mints a credential or consumes one, so a caller
 /// making many attempts in a minute is doing something other than using the
 /// service.
-const AUTH_PATHS: [&str; 8] = [
+const AUTH_PATHS: [&str; 10] = [
     "/xrpc/com.atproto.server.createSession",
     "/xrpc/com.atproto.server.createAccount",
     "/xrpc/com.atproto.server.refreshSession",
@@ -68,6 +68,18 @@ const AUTH_PATHS: [&str; 8] = [
     // ordinary tier -- thousands of attempts per IP per window against a form
     // taking an identifier and a password.
     "/oauth/authorize",
+    // Delegated sign-in. `begin` mints nothing by itself but is the most
+    // expensive route this server has: one call fans out to DNS, a handle
+    // resolution, a DID document, a second handle resolution, two metadata
+    // documents and a pushed authorization request -- roughly six outbound
+    // requests to hosts the caller names, each with its own timeout. At the
+    // ordinary tier that is an amplifier pointed at third parties and a
+    // connection-exhaustion lever pointed at this server.
+    //
+    // `callback` is the step that actually issues an authorization code, which
+    // puts it in the same class as `/oauth/authorize` regardless of cost.
+    "/oauth/delegation/begin",
+    "/oauth/delegation/callback",
 ];
 
 /// Operator-tunable rate-limit policy.
@@ -336,5 +348,23 @@ mod tests {
         // Prefix matching would put `createSessionSomething` in the auth tier;
         // exact matching is what keeps the tiers meaning what they say.
         assert!(!is_auth_path("/xrpc/com.atproto.server.createSessionX"));
+    }
+
+    /// Delegated sign-in belongs in the tight tier on both counts: `begin` is
+    /// the most expensive route this server has, fanning out to half a dozen
+    /// hosts the caller names, and `callback` issues an authorization code.
+    ///
+    /// The listing is hand-maintained, so this is the assertion that fails if
+    /// somebody adds a delegation route and forgets it.
+    #[test]
+    fn delegated_sign_in_is_budgeted_as_an_auth_path() {
+        assert!(is_auth_path("/oauth/delegation/begin"));
+        assert!(is_auth_path("/oauth/delegation/callback"));
+        // The two that only render or publish stay at the ordinary tier: one
+        // is a static document a peer fetches, the other a page a browser is
+        // redirected to, and budgeting them alongside credential issuance
+        // would refuse ordinary use.
+        assert!(!is_auth_path("/oauth/delegation/start"));
+        assert!(!is_auth_path("/oauth/delegation/client-metadata.json"));
     }
 }

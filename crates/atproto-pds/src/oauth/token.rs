@@ -114,6 +114,21 @@ pub struct OAuthClaims {
     /// as epoch 0, which is what a never-revoked account carries.
     #[serde(default)]
     pub ses: i64,
+    /// The identity that authenticated, when it was not the account holder.
+    ///
+    /// `sub` is whose account this token acts on and stays the only thing
+    /// authorization reads. This says who proved themselves to obtain it — a
+    /// delegate signing in as themselves under
+    /// [`crate::account::delegation`]. Nothing decides anything from it: it is
+    /// carried so the access log, the portal's session list, and an account
+    /// holder deciding whether to withdraw a delegation can all answer "who
+    /// did this", which `sub` alone cannot.
+    ///
+    /// Absent from an ordinary grant's wire form rather than present-and-null,
+    /// so a token minted the usual way is byte-for-byte what it was before
+    /// delegation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<String>,
 }
 
 /// `cnf` claim for DPoP-bound access tokens (RFC 9449).
@@ -333,6 +348,9 @@ async fn handle_code(
             family_id: &family_for_code(code),
             client_kid: client_kid.as_deref(),
             started_at: chrono::Utc::now(),
+            // Set at the consent step and never by anything the client sends,
+            // so a delegated grant is marked as one from its first token.
+            acting_did: auth.acting_did.as_deref(),
         },
         &proof_jkt,
     )
@@ -553,6 +571,10 @@ async fn handle_refresh(
             family_id: &handle.family_id,
             client_kid: handle.client_kid.as_deref(),
             started_at: grant_started_at,
+            // Read off the stored row rather than the presented token: the
+            // refresh JWT carries `act` too, but a claim the holder supplies
+            // is not what should decide what the next one says.
+            acting_did: handle.acting_did.as_deref(),
         },
         &handle.dpop_jkt,
     )
@@ -628,6 +650,9 @@ struct Grant<'a> {
     client_kid: Option<&'a str>,
     /// When the holder approved, which is what the session cap measures from.
     started_at: chrono::DateTime<chrono::Utc>,
+    /// The identity that authenticated, when it was not the account holder --
+    /// a delegate acting for `did`. `None` for an ordinary grant.
+    acting_did: Option<&'a str>,
 }
 
 /// Mint an access/refresh pair bound to `dpop_jkt`.
@@ -655,6 +680,7 @@ async fn issue_pair(
         family_id,
         client_kid,
         started_at: grant_started_at,
+        acting_did,
     } = grant;
     let now = chrono::Utc::now().timestamp() as u64;
     let access_jti = random_jti();
@@ -726,6 +752,7 @@ async fn issue_pair(
         exp: now + access_ttl,
         jti: access_jti,
         ses: epoch,
+        act: acting_did.map(str::to_string),
     };
     let refresh_claims = OAuthClaims {
         fam: Some(family_id.to_string()),
@@ -739,6 +766,7 @@ async fn issue_pair(
         exp: now + refresh_ttl,
         jti: refresh_jti.clone(),
         ses: epoch,
+        act: acting_did.map(str::to_string),
     };
 
     let access_jwt = mint_oauth_jwt(TYP_ACCESS, &access_claims, &state.jwt_secret)
@@ -760,6 +788,7 @@ async fn issue_pair(
                 dpop_jkt: dpop_jkt.to_string(),
                 scope: scope.to_string(),
                 issued_at: Utc::now(),
+                acting_did: acting_did.map(str::to_string),
             },
         )
         .await
@@ -892,6 +921,7 @@ mod tests {
             exp: (chrono::Utc::now().timestamp() + 600) as u64,
             jti: "jti1".to_string(),
             ses: 0,
+            act: None,
         };
         let jwt = mint_oauth_jwt(TYP_ACCESS, &claims, secret).unwrap();
         let parsed = verify_oauth_jwt(&jwt, TYP_ACCESS, secret).unwrap();
@@ -914,6 +944,7 @@ mod tests {
             exp: (chrono::Utc::now().timestamp() + 600) as u64,
             jti: "jti1".to_string(),
             ses: 0,
+            act: None,
         };
         let access = mint_oauth_jwt(TYP_ACCESS, &claims, secret).unwrap();
         assert!(verify_oauth_jwt(&access, TYP_REFRESH, secret).is_err());

@@ -84,6 +84,13 @@ pub struct AuthorizationCode {
     pub request: OAuthRequest,
     /// Issuance timestamp.
     pub issued_at: DateTime<Utc>,
+    /// The identity that authenticated, when it was not the account holder.
+    ///
+    /// A delegate signs in as themselves and the code is issued for the
+    /// account they act for, so `did` and this answer two different questions.
+    /// `None` for every authorization an account holder made directly.
+    #[serde(default)]
+    pub acting_did: Option<String>,
 }
 
 /// Refresh-token rotation tracker — records which `jti`s are still valid
@@ -128,6 +135,17 @@ pub struct RefreshHandle {
     /// abandoned session leaves its last one behind, and nothing swept this
     /// table at all.
     pub expires_at: Option<DateTime<Utc>>,
+    /// The identity that authenticated, when it was not the account holder.
+    ///
+    /// Carried through every rotation unchanged, like `family_id`: the grant
+    /// was obtained by a delegate once, and refreshing it does not make it
+    /// something the account holder did. It is what lets the portal say who a
+    /// session belongs to and what withdrawing a delegation looks up.
+    ///
+    /// `None` on rows written before the column existed, and on every grant an
+    /// account holder made themselves.
+    #[serde(default)]
+    pub acting_did: Option<String>,
 }
 
 /// Backend dispatch for OAuth in-flight state.
@@ -193,18 +211,25 @@ impl OAuthState {
     }
 
     /// Issue an authorization code for a previously-staged PAR request.
+    ///
+    /// `acting_did` names the identity that actually authenticated when that
+    /// was not the account holder — a delegate signing in as themselves. `None`
+    /// for every ordinary authorization, which is what
+    /// [`authorize_handler`](crate::oauth::authorize::authorize_handler)
+    /// passes.
     pub async fn issue_code(
         &self,
         code: String,
         did: String,
         request: OAuthRequest,
+        acting_did: Option<String>,
     ) -> PdsResult<()> {
         match self {
             OAuthState::Memory(m) => {
-                m.issue_code(code, did, request);
+                m.issue_code(code, did, request, acting_did);
                 Ok(())
             }
-            OAuthState::Sql(s) => s.issue_code(code, did, request).await,
+            OAuthState::Sql(s) => s.issue_code(code, did, request, acting_did).await,
         }
     }
 
@@ -348,7 +373,13 @@ impl MemoryBackend {
         Some(req.clone())
     }
 
-    fn issue_code(&self, code: String, did: String, request: OAuthRequest) {
+    fn issue_code(
+        &self,
+        code: String,
+        did: String,
+        request: OAuthRequest,
+        acting_did: Option<String>,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         inner.auth_codes.insert(
             code,
@@ -356,6 +387,7 @@ impl MemoryBackend {
                 did,
                 request,
                 issued_at: Utc::now(),
+                acting_did,
             },
         );
         Self::gc_locked(&mut inner);
@@ -451,7 +483,7 @@ pub struct SqlBackend {
 }
 
 /// One `oauth_refresh` row as selected: did, client_id, dpop_jkt, scope,
-/// issued_at, family_id, client_kid.
+/// issued_at, family_id, client_kid, grant_started_at, expires_at, acting_did.
 type RefreshRow = (
     String,
     String,
@@ -459,6 +491,7 @@ type RefreshRow = (
     String,
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -574,7 +607,13 @@ impl SqlBackend {
         }))
     }
 
-    async fn issue_code(&self, code: String, did: String, request: OAuthRequest) -> PdsResult<()> {
+    async fn issue_code(
+        &self,
+        code: String,
+        did: String,
+        request: OAuthRequest,
+        acting_did: Option<String>,
+    ) -> PdsResult<()> {
         let now = Utc::now();
         let expires_at = (now + chrono::Duration::seconds(AUTH_CODE_TTL_SECS as i64)).to_rfc3339();
         let request_json = serde_json::to_string(&request).map_err(|e| PdsError::Storage {
@@ -582,14 +621,15 @@ impl SqlBackend {
         })?;
         sqlx::query(
             "INSERT OR REPLACE INTO oauth_code
-                (code, did, request_json, issued_at, expires_at)
-             VALUES (?, ?, ?, ?, ?)",
+                (code, did, request_json, issued_at, expires_at, acting_did)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&code)
         .bind(&did)
         .bind(&request_json)
         .bind(now.to_rfc3339())
         .bind(&expires_at)
+        .bind(&acting_did)
         .execute(&self.pool)
         .await
         .map_err(|e| PdsError::Storage {
@@ -600,8 +640,9 @@ impl SqlBackend {
     }
 
     async fn take_code(&self, code: &str) -> PdsResult<Option<AuthorizationCode>> {
-        let row: Option<(String, String, String, String)> = sqlx::query_as(
-            "SELECT did, request_json, issued_at, expires_at FROM oauth_code WHERE code = ?",
+        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT did, request_json, issued_at, expires_at, acting_did
+             FROM oauth_code WHERE code = ?",
         )
         .bind(code)
         .fetch_optional(&self.pool)
@@ -609,7 +650,7 @@ impl SqlBackend {
         .map_err(|e| PdsError::Storage {
             reason: format!("oauth_code select: {e}"),
         })?;
-        let Some((did, request_json, issued_at, expires_at)) = row else {
+        let Some((did, request_json, issued_at, expires_at, acting_did)) = row else {
             return Ok(None);
         };
         sqlx::query("DELETE FROM oauth_code WHERE code = ?")
@@ -640,6 +681,7 @@ impl SqlBackend {
             did,
             request,
             issued_at: issued,
+            acting_did,
         }))
     }
 
@@ -647,8 +689,8 @@ impl SqlBackend {
         sqlx::query(
             "INSERT OR REPLACE INTO oauth_refresh
                 (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
-                 grant_started_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 grant_started_at, expires_at, acting_did)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&jti)
         .bind(&handle.did)
@@ -660,6 +702,7 @@ impl SqlBackend {
         .bind(&handle.client_kid)
         .bind(handle.grant_started_at.map(|t| t.to_rfc3339()))
         .bind(handle.expires_at.map(|t| t.to_rfc3339()))
+        .bind(&handle.acting_did)
         .execute(&self.pool)
         .await
         .map_err(|e| PdsError::Storage {
@@ -678,7 +721,7 @@ impl SqlBackend {
         })?;
         let row: Option<RefreshRow> = sqlx::query_as(
             "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
-                    grant_started_at, expires_at
+                    grant_started_at, expires_at, acting_did
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(old_jti)
@@ -697,6 +740,7 @@ impl SqlBackend {
             client_kid,
             grant_started_at,
             expires_at,
+            acting_did,
         )) = row
         else {
             return Ok(None);
@@ -712,8 +756,8 @@ impl SqlBackend {
         sqlx::query(
             "INSERT INTO oauth_refresh
                 (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
-                 grant_started_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 grant_started_at, expires_at, acting_did)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_jti)
         .bind(&did)
@@ -726,6 +770,9 @@ impl SqlBackend {
         // Carried unchanged: the grant began when it began.
         .bind(grant_started_at.clone())
         .bind(expires_at.clone())
+        // Also carried unchanged: refreshing a grant a delegate obtained does
+        // not turn it into one the account holder made.
+        .bind(acting_did.clone())
         .execute(&mut *tx)
         .await
         .map_err(|e| PdsError::Storage {
@@ -749,13 +796,14 @@ impl SqlBackend {
             client_kid,
             grant_started_at: parse_opt_time(grant_started_at),
             expires_at: parse_opt_time(expires_at),
+            acting_did,
         }))
     }
 
     async fn peek_refresh(&self, jti: &str) -> PdsResult<Option<RefreshHandle>> {
         let row: Option<RefreshRow> = sqlx::query_as(
             "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
-                    grant_started_at, expires_at
+                    grant_started_at, expires_at, acting_did
              FROM oauth_refresh WHERE jti = ?",
         )
         .bind(jti)
@@ -774,6 +822,7 @@ impl SqlBackend {
             client_kid,
             grant_started_at,
             expires_at,
+            acting_did,
         )) = row
         else {
             return Ok(None);
@@ -792,6 +841,7 @@ impl SqlBackend {
             client_kid,
             grant_started_at: parse_opt_time(grant_started_at),
             expires_at: parse_opt_time(expires_at),
+            acting_did,
         }))
     }
 
@@ -947,7 +997,12 @@ mod tests {
     async fn auth_code_round_trip_memory() {
         let state = OAuthState::memory();
         state
-            .issue_code("code-1".to_string(), "did:plc:alice".to_string(), req())
+            .issue_code(
+                "code-1".to_string(),
+                "did:plc:alice".to_string(),
+                req(),
+                None,
+            )
             .await
             .unwrap();
         let consumed = state.take_code("code-1").await.unwrap().unwrap();
@@ -959,7 +1014,12 @@ mod tests {
     async fn auth_code_round_trip_sql() {
         let state = sql_backend().await;
         state
-            .issue_code("code-1".to_string(), "did:plc:alice".to_string(), req())
+            .issue_code(
+                "code-1".to_string(),
+                "did:plc:alice".to_string(),
+                req(),
+                None,
+            )
             .await
             .unwrap();
         let consumed = state.take_code("code-1").await.unwrap().unwrap();
@@ -1070,6 +1130,7 @@ mod tests {
             dpop_jkt: "thumb".to_string(),
             scope: "atproto".to_string(),
             issued_at: Utc::now(),
+            acting_did: None,
         }
     }
 

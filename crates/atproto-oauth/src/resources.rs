@@ -4,8 +4,55 @@
 //! PDS servers using RFC 8414 well-known endpoints.
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::errors::{AuthServerValidationError, OAuthClientError, ResourceValidationError};
+
+/// The most either well-known document may be.
+///
+/// Both are small, fixed-shape metadata documents: a handful of URLs and a few
+/// lists of algorithm names. A real one runs to a couple of kilobytes, and the
+/// largest plausible one — every optional field present, every list long — does
+/// not approach this. 256 KiB is chosen to be obviously beyond any correct
+/// server rather than to be tight.
+const MAX_DISCOVERY_BYTES: usize = 256 * 1024;
+
+/// Read a discovery document, refusing to buffer more than
+/// [`MAX_DISCOVERY_BYTES`].
+///
+/// # Why this is not `.json()`
+///
+/// `Response::json` buffers the entire body before it parses anything, and
+/// discovery is by definition a request to a server whose behaviour has not
+/// been established — the caller is asking who it is. A hostile or broken peer
+/// answering with an endless body therefore took the caller's memory with it,
+/// and one request per connection was enough to do it.
+///
+/// `Content-Length` is not consulted, because a chunked response has none and
+/// a hostile one may lie. The body is read chunk by chunk and abandoned the
+/// moment it goes past the ceiling, so the peak held is bounded by the limit
+/// plus one chunk regardless of what the sender claims.
+async fn read_capped<T: DeserializeOwned>(
+    response: reqwest::Response,
+    url: &str,
+) -> Result<T, OAuthClientError> {
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(OAuthClientError::DiscoveryReadFailed)?
+    {
+        if body.len() + chunk.len() > MAX_DISCOVERY_BYTES {
+            return Err(OAuthClientError::DiscoveryDocumentTooLarge {
+                url: url.to_string(),
+                limit: MAX_DISCOVERY_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(OAuthClientError::DiscoveryParseFailed)
+}
 
 /// OAuth 2.0 protected resource metadata from RFC 8414 oauth-protected-resource endpoint.
 ///
@@ -108,14 +155,12 @@ pub async fn oauth_protected_resource(
 ) -> Result<OAuthProtectedResource, OAuthClientError> {
     let destination = format!("{}/.well-known/oauth-protected-resource", pds);
 
-    let resource: OAuthProtectedResource = http_client
-        .get(destination)
+    let response = http_client
+        .get(&destination)
         .send()
         .await
-        .map_err(OAuthClientError::OAuthProtectedResourceRequestFailed)?
-        .json()
-        .await
-        .map_err(OAuthClientError::MalformedOAuthProtectedResourceResponse)?;
+        .map_err(OAuthClientError::OAuthProtectedResourceRequestFailed)?;
+    let resource: OAuthProtectedResource = read_capped(response, &destination).await?;
 
     if resource.resource != pds {
         return Err(OAuthClientError::InvalidOAuthProtectedResourceResponse(
@@ -146,14 +191,12 @@ pub async fn oauth_authorization_server(
 ) -> Result<AuthorizationServer, OAuthClientError> {
     let destination = format!("{}/.well-known/oauth-authorization-server", pds);
 
-    let resource: AuthorizationServer = http_client
-        .get(destination)
+    let response = http_client
+        .get(&destination)
         .send()
         .await
-        .map_err(OAuthClientError::AuthorizationServerRequestFailed)?
-        .json()
-        .await
-        .map_err(OAuthClientError::MalformedAuthorizationServerResponse)?;
+        .map_err(OAuthClientError::AuthorizationServerRequestFailed)?;
+    let resource: AuthorizationServer = read_capped(response, &destination).await?;
 
     // Validate AT Protocol requirements for authorization server metadata
 
@@ -263,4 +306,57 @@ pub async fn oauth_authorization_server(
     }
 
     Ok(resource)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `reqwest::Response` over a body, without a server to serve it.
+    fn response_of(body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn a_metadata_document_of_ordinary_size_is_read() {
+        let body = br#"{"resource":"https://pds.example","authorization_servers":["https://pds.example"]}"#;
+        let parsed: OAuthProtectedResource =
+            read_capped(response_of(body.to_vec()), "https://pds.example")
+                .await
+                .expect("an ordinary document should parse");
+        assert_eq!(parsed.resource, "https://pds.example");
+    }
+
+    /// The point of the cap: a peer answering a request for a few hundred
+    /// bytes with something enormous is refused rather than buffered.
+    #[tokio::test]
+    async fn an_oversized_document_is_refused_rather_than_buffered() {
+        let body = vec![b' '; MAX_DISCOVERY_BYTES + 1];
+        let outcome: Result<OAuthProtectedResource, _> =
+            read_capped(response_of(body), "https://hostile.example").await;
+
+        match outcome {
+            Err(OAuthClientError::DiscoveryDocumentTooLarge { url, limit }) => {
+                assert_eq!(url, "https://hostile.example");
+                assert_eq!(limit, MAX_DISCOVERY_BYTES);
+            }
+            Err(other) => panic!("an oversized document was refused for the wrong reason: {other}"),
+            Ok(_) => panic!("an oversized document was buffered and parsed"),
+        }
+    }
+
+    /// A body that is within the cap but is not the document it claims to be
+    /// fails as a parse error, not as a size one.
+    #[tokio::test]
+    async fn a_malformed_document_is_reported_as_a_parse_failure() {
+        let outcome: Result<OAuthProtectedResource, _> = read_capped(
+            response_of(b"not json at all".to_vec()),
+            "https://pds.example",
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(OAuthClientError::DiscoveryParseFailed(_))
+        ));
+    }
 }

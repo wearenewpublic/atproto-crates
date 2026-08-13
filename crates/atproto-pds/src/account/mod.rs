@@ -24,6 +24,11 @@ pub use pool::{AccountPool, AccountPoolKind};
 #[cfg(feature = "sqlite")]
 pub mod app_password;
 
+/// Which identities may act as an account, and the check the delegated
+/// sign-in path asks.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub mod delegation;
+
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod email_token;
 
@@ -61,6 +66,9 @@ pub mod setting;
 
 #[cfg(feature = "sqlite")]
 pub use app_password::{AppPasswordRow, CreatedAppPassword};
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub use delegation::DelegationRow;
 
 #[cfg(feature = "sqlite")]
 pub use directory::{AccountDirectory, AccountRow};

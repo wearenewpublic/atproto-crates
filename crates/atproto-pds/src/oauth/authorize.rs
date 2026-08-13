@@ -225,7 +225,10 @@ pub async fn authorize_handler(
     };
     state
         .oauth
-        .issue_code(code, account.did, request)
+        // No acting delegate: this is the account holder proving their own
+        // password. The delegated path issues its own code, in
+        // `oauth::delegation`.
+        .issue_code(code, account.did, request, None)
         .await
         .map_err(XrpcError::from)?;
     Ok(Json(response))

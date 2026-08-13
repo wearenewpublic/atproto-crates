@@ -74,6 +74,21 @@ impl AuthSubject {
         }
     }
 
+    /// The delegate who signed in to obtain this token, when it was not the
+    /// account holder ([`crate::account::delegation`]).
+    ///
+    /// For logging and display. [`Self::sub`] remains the only thing
+    /// authorization reads: a delegated grant carries exactly the authority
+    /// the account holder's own would, so a handler branching on this would be
+    /// inventing a rule that was never granted.
+    #[must_use]
+    pub fn acting_did(&self) -> Option<&str> {
+        match self {
+            AuthSubject::AppPassword(_) => None,
+            AuthSubject::OAuth(c) => c.act.as_deref(),
+        }
+    }
+
     /// `true` when this is an OAuth token bound to a DPoP key (the
     /// `cnf.jkt` claim is present).
     #[must_use]
@@ -392,6 +407,22 @@ pub async fn require_authn(
 
     require_current_epoch(state, &claims.sub, claims.ses).await?;
     require_not_revoked(state, &claims.jti).await?;
+
+    // Said once, here, where every authenticated OAuth request passes. The
+    // claim decides nothing -- a delegated grant is full authority by design,
+    // and a marker that changed what a request may do would be a second
+    // authorization path nobody documented. It is emitted so the log can
+    // answer "who did this", which `sub` alone cannot once an account has
+    // delegates.
+    if let Some(acting) = claims.act.as_deref() {
+        tracing::info!(
+            did = %claims.sub,
+            acting_did = %acting,
+            client_id = %claims.client_id,
+            "request authenticated by a delegate acting for this account"
+        );
+    }
+
     Ok(AuthSubject::OAuth(claims))
 }
 

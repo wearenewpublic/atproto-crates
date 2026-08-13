@@ -275,6 +275,55 @@ pub enum PdsError {
         reason: String,
     },
 
+    /// error-atproto-pds-delegation-1: delegated sign-in is not on offer here.
+    ///
+    /// Carries the reason rather than a bare refusal: an operator who enabled
+    /// the flag and still cannot use it needs to know which precondition is
+    /// missing, and "delegation is unavailable" does not say.
+    #[error("error-atproto-pds-delegation-1 delegation is unavailable: {reason}")]
+    DelegationUnavailable {
+        /// Which precondition failed, in the words the portal shows.
+        reason: String,
+    },
+
+    /// error-atproto-pds-delegation-2: an account cannot delegate to itself.
+    ///
+    /// Not merely useless. A self-delegation would be a second, unmarked way
+    /// to authenticate as the account, reachable without its password, which
+    /// is the opposite of what the delegation list is for.
+    #[error("error-atproto-pds-delegation-2 an account cannot delegate to itself: {did}")]
+    DelegationSelf {
+        /// The account that named itself.
+        did: String,
+    },
+
+    /// error-atproto-pds-delegation-3: the identity is already a delegate.
+    #[error("error-atproto-pds-delegation-3 already a delegate: {did}")]
+    DelegationExists {
+        /// The identity already on the list.
+        did: String,
+    },
+
+    /// error-atproto-pds-delegation-4: the named identity could not be
+    /// resolved, or did not resolve back to itself.
+    ///
+    /// Both failures are one error on purpose. A handle that resolves to a DID
+    /// whose document does not claim it back is not a weaker result than no
+    /// answer at all -- it is somebody else's identity wearing the name.
+    #[error("error-atproto-pds-delegation-4 identity could not be resolved: {handle}")]
+    DelegationUnresolvable {
+        /// The handle as it was typed.
+        handle: String,
+    },
+
+    /// error-atproto-pds-delegation-5: the delegated sign-in is unknown,
+    /// already completed, or out of time.
+    #[error("error-atproto-pds-delegation-5 delegated sign-in expired or unknown: {reason}")]
+    DelegationFlowLost {
+        /// What was wrong with it, for the log rather than the caller.
+        reason: String,
+    },
+
     /// error-atproto-pds-notify-1: notifier delivery failed (after retries exhausted).
     #[error("error-atproto-pds-notify-1 notifier delivery failed after retries: {reason}")]
     NotifierDelivery {

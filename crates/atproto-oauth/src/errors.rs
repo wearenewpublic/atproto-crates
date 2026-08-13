@@ -310,6 +310,33 @@ pub enum OAuthClientError {
         "error-atproto-oauth-client-17 Expected subject required: caller supplied an empty expected subject"
     )]
     MissingExpectedSubject,
+
+    /// Error when a discovery document exceeds the size a metadata document
+    /// may plausibly be.
+    ///
+    /// Both well-known documents are fetched from a server the caller has not
+    /// yet established anything about — that is what discovery is — so the
+    /// response is attacker-controlled by construction. Deserializing it
+    /// buffers the whole body, and nothing bounded that body, so a peer could
+    /// answer a request for a few hundred bytes of JSON with as many gigabytes
+    /// as it liked and the caller would hold all of them.
+    #[error(
+        "error-atproto-oauth-client-18 Discovery document too large: {url} exceeded {limit} bytes"
+    )]
+    DiscoveryDocumentTooLarge {
+        /// The document that was being fetched.
+        url: String,
+        /// The ceiling it went past.
+        limit: usize,
+    },
+
+    /// Error when a discovery document could not be read from the network.
+    #[error("error-atproto-oauth-client-19 Discovery document read failed: {0:?}")]
+    DiscoveryReadFailed(reqwest::Error),
+
+    /// Error when a discovery document is not the JSON it claims to be.
+    #[error("error-atproto-oauth-client-20 Discovery document parse failed: {0:?}")]
+    DiscoveryParseFailed(serde_json::Error),
 }
 
 /// Represents errors that can occur during OAuth resource validation.

@@ -138,6 +138,7 @@ mod tests {
             exp: now + ttl_secs,
             jti: jti.to_string(),
             ses: 0,
+            act: None,
         }
     }
 
@@ -197,6 +198,7 @@ mod tests {
                     dpop_jkt: String::new(),
                     scope: claims.scope.clone(),
                     issued_at: chrono::Utc::now(),
+                    acting_did: None,
                 },
             )
             .await

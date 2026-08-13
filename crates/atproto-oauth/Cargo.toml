@@ -50,6 +50,11 @@ ulid.workspace = true
 clap = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Lets the discovery-cap tests build a `reqwest::Response` over a body without
+# standing up a server to serve it.
+http.workspace = true
+
 [features]
 default = ["lru", "hickory-dns"]
 lru = ["dep:lru"]

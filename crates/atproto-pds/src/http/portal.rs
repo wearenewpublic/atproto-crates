@@ -22,14 +22,15 @@
 //! current browser, and the token is what still stops it if a future one
 //! relaxes them.
 //!
-//! # Four sections
+//! # Five sections
 //!
 //! The portal is a navigated set rather than one page: [`Section::Settings`] at
 //! `/account`, [`Section::Access`] at `/account/sessions`,
 //! [`Section::Repository`] at `/account/repository` (see
-//! [`crate::http::repository`]) and [`Section::Delegation`] at
-//! `/account/delegation`. Every page carries [`nav`], so each section is one
-//! click from any other and none of them is reachable only by knowing its URL.
+//! [`crate::http::repository`]), [`Section::Spaces`] at `/account/spaces` and
+//! [`Section::Delegation`] at `/account/delegation`. Every page carries
+//! [`nav`], so each section is one click from any other and none of them is
+//! reachable only by knowing its URL.
 
 use crate::account::{app_password, portal};
 use crate::http::errors::XrpcError;
@@ -314,7 +315,7 @@ pub(crate) fn notice(kind: &str, text: &str) -> String {
 //  Navigation
 // ---------------------------------------------------------------------------
 
-/// One of the portal's four sections.
+/// One of the portal's five sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
     /// `/account` — email, handle, password.
@@ -346,7 +347,7 @@ impl Section {
 
 /// The header every signed-in portal page carries.
 ///
-/// Identifies the account, offers sign-out, and links the four sections. The
+/// Identifies the account, offers sign-out, and links the five sections. The
 /// current section is text rather than a link — a link to the page you are on
 /// is a control that does nothing.
 ///
@@ -981,6 +982,21 @@ pub(crate) fn banner_for(msg: Option<&str>) -> String {
             "err",
             "That application no longer had a grant on this account.",
         ),
+        Some("delegate-added") => notice(
+            "ok",
+            "Delegate added. They can now sign in as themselves and act as this \
+             account, without its password.",
+        ),
+        Some("delegate-removed") => notice(
+            "ok",
+            "Delegate removed. They can no longer sign in as this account.",
+        ),
+        Some("delegate-removed-with-grants") => notice(
+            "ok",
+            "Delegate removed, and the applications they had authorized can no \
+             longer renew their access. A token one of them already holds keeps \
+             working for up to 15 minutes.",
+        ),
         // The secret itself is rendered from the session, not from here.
         Some("app-password-created") => String::new(),
         Some("policy-accepted") => notice(
@@ -1246,22 +1262,43 @@ pub async fn sessions(
     let grants = portal::list_oauth_grants(&pool, &account.did)
         .await
         .map_err(XrpcError::from)?;
+    // Names for the delegates any of these grants were obtained by. Read off
+    // the delegation rows rather than resolved over the network: this page is
+    // a list, and one DID resolution per row would make it as slow as the
+    // slowest stranger's DNS.
+    let delegate_names: std::collections::HashMap<String, String> =
+        crate::account::delegation::list(&pool, &account.did)
+            .await
+            .map_err(XrpcError::from)?
+            .into_iter()
+            .map(|row| (row.delegate_did, row.delegate_handle))
+            .collect();
     let grant_rows = if grants.is_empty() {
-        r#"<tr><td colspan="4" class="muted">No OAuth sessions.</td></tr>"#.to_string()
+        r#"<tr><td colspan="5" class="muted">No OAuth sessions.</td></tr>"#.to_string()
     } else {
         grants
             .iter()
-            .map(|(client, scope, issued)| {
+            .map(|grant| {
+                // A withdrawn delegation leaves grants behind until they are
+                // revoked, so a DID with no row left is rendered as itself
+                // rather than as an empty cell that would read as "you did
+                // this".
+                let acting = match grant.acting_did.as_deref() {
+                    Some(did) => esc(delegate_names.get(did).map_or(did, String::as_str)),
+                    None => "&mdash;".to_string(),
+                };
                 format!(
                     r#"<tr><td><code>{}</code></td><td class="muted">{}</td><td class="muted">{}</td>
+                    <td class="muted">{}</td>
                     <td style="text-align:right">
                       <form method="POST" action="/account/sessions/revoke" style="display:inline">
                         <input type="hidden" name="client_id" value="{}">
                         <button class="quiet" type="submit">Revoke</button></form></td></tr>"#,
-                    esc(client),
-                    esc(scope),
-                    esc(issued),
-                    esc(client)
+                    esc(&grant.client_id),
+                    esc(&grant.scope),
+                    esc(&grant.issued_at),
+                    acting,
+                    esc(&grant.client_id)
                 )
             })
             .collect::<Vec<_>>()
@@ -1294,7 +1331,11 @@ in use.</p>
 <p class="muted">Applications currently holding a grant on this account.
 Revoking one stops that application renewing its access and leaves the others
 alone; a token it already holds keeps working for up to 15 minutes.</p>
-<table><thead><tr><th>Client</th><th>Scope</th><th>Granted</th><th></th></tr></thead>
+<p class="muted"><b>Acting as</b> names the delegate who signed in to obtain the
+grant, where that was not you. Removing a delegate under
+<a href="/account/delegation">Delegation</a> revokes every grant they obtained,
+in one step.</p>
+<table><thead><tr><th>Client</th><th>Scope</th><th>Granted</th><th>Acting as</th><th></th></tr></thead>
 <tbody>{grant_rows}</tbody></table>
 </section>
 
@@ -1313,45 +1354,267 @@ when they expire. This browser stays signed in.</p>
     Ok(page("Access", &body).into_response())
 }
 
-/// `GET /account/delegation` — a placeholder that says so.
+/// `GET /account/delegation` — who may act as this account.
 ///
-/// Account delegation is one identity naming others that may authenticate on
-/// its behalf and act as it. None of that is built, and this page exists to
-/// hold the space in the nav rather than to do anything.
+/// # Why the unavailable notice is a whole panel
 ///
-/// It says "nothing is delegated" and "this does nothing yet" in as many words,
-/// deliberately. A section about letting other identities act as you is the
-/// last place to leave a reader guessing whether it is switched on — an empty
-/// table under a plausible heading reads as a feature with no entries, which is
-/// exactly the wrong conclusion.
+/// A section about letting other identities act as you is the last place to
+/// leave a reader guessing whether it is switched on. An empty table under a
+/// plausible heading reads as "a feature with no entries", which is exactly the
+/// wrong conclusion when the truth is "this server cannot do this". So when
+/// [`crate::http::state::DelegationStatus`] says no, the page says so first,
+/// names the obstacle, and offers no controls at all.
 pub async fn delegation(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<PortalQuery>,
 ) -> Result<Response, XrpcError> {
     let (_, account) = match section_account(&state, &headers).await {
         Ok(found) => found,
         Err(response) => return Ok(response),
     };
+    let nav_html = nav(Section::Delegation, &account, "");
 
-    let body = format!(
-        r#"{nav}
+    let unavailable = match &state.delegation {
+        crate::http::state::DelegationStatus::Available(_) => None,
+        crate::http::state::DelegationStatus::Unavailable(reason) => Some(reason.explain()),
+    };
+    if let Some(reason) = unavailable {
+        let body = format!(
+            r#"{nav_html}
 <h1>Delegation</h1>
 <p class="sub">Letting other identities act as this one.</p>
 <section>
-<div class="notice warn"><b>Not implemented.</b> Nothing on this page is switched
-on, and no identity can act as this account.</div>
-<p>Account delegation would let <code>{did}</code> name other identities that may
-authenticate on its behalf and act as it — signing in as themselves and
-operating with this account's authority, without holding its password or any app
-password.</p>
-<p class="muted">There is nothing to configure here yet. Until this section
-offers a control, the only credentials that can reach this account are the ones
+<div class="notice warn"><b>Not available on this server.</b> {reason}</div>
+<p>Delegation would let <code>{did}</code> name other AT Protocol identities that
+may sign in as themselves and act as this account — with this account's
+authority, and without ever holding its password.</p>
+<p class="muted">Nothing is delegated, and nothing can be until an operator
+turns this on. The only credentials that can reach this account are the ones
 listed under <a href="/account/sessions">Access</a>.</p>
 </section>"#,
-        nav = nav(Section::Delegation, &account, ""),
-        did = esc(&account.did),
+            reason = esc(reason),
+            did = esc(&account.did),
+        );
+        return Ok(page("Delegation", &body).into_response());
+    }
+
+    let pool = state.reader.accounts().account_pool();
+    let delegates = crate::account::delegation::list(&pool, &account.did)
+        .await
+        .map_err(XrpcError::from)?;
+    let grant_counts = portal::count_grants_by_delegate(&pool, &account.did)
+        .await
+        .map_err(XrpcError::from)?;
+
+    let rows = if delegates.is_empty() {
+        r#"<tr><td colspan="4" class="muted">No identity can act as this account.</td></tr>"#
+            .to_string()
+    } else {
+        delegates
+            .iter()
+            .map(|row| {
+                let grants = grant_counts.get(&row.delegate_did).copied().unwrap_or(0);
+                format!(
+                    r#"<tr><td><b>{handle}</b><br><code class="dim">{did}</code></td>
+                    <td class="muted">{created}</td>
+                    <td class="muted">{grants}</td>
+                    <td style="text-align:right">
+                      <form method="POST" action="/account/delegation/remove" style="display:inline">
+                        <input type="hidden" name="did" value="{did}">
+                        <button class="quiet" type="submit">Remove</button>
+                      </form></td></tr>"#,
+                    handle = esc(&row.delegate_handle),
+                    did = esc(&row.delegate_did),
+                    created = esc(&row.created_at),
+                    grants = grants,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let body = format!(
+        r#"{nav_html}
+<h1>Delegation</h1>
+<p class="sub">Letting other identities act as this one.</p>
+{banner}
+
+<section>
+<h2 style="margin-top:0">Delegated identities</h2>
+<p class="muted">Each row is an identity that may sign in as themselves, on
+their own server, and then authorize an application on this account. They never
+learn this account's password, and removing a row takes the ability away
+immediately.</p>
+<table><thead><tr><th>Identity</th><th>Added</th><th>Live sessions</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table>
+</section>
+
+<section>
+<h2 style="margin-top:0">Add a delegate</h2>
+<p class="muted">The handle is checked both ways before it is accepted: it must
+resolve to a DID, and that DID's document must claim the handle back. What is
+stored is the DID, so a delegate who later changes their handle keeps their
+access and whoever takes the old handle gets none.</p>
+<form method="POST" action="/account/delegation">
+  <label for="delegate">Handle of the identity to delegate to</label>
+  <input id="delegate" name="handle" type="text" placeholder="someone.example.com" required>
+  <button type="submit">Add delegate</button>
+</form>
+</section>
+
+<section>
+<h2 style="margin-top:0">What a delegate can do</h2>
+<dl class="explain">
+  <dt>Act as this account in any application</dt>
+  <dd>A delegate can approve an application and it receives a grant on this
+  account, exactly as if you had approved it yourself. Those grants are listed
+  under <a href="/account/sessions">Access</a>, with the delegate named.</dd>
+  <dt>Not sign in here</dt>
+  <dd>This page, and everything else under Account, still takes this account's
+  own password. A delegate cannot change the password, the email address, or
+  this list.</dd>
+  <dt>Be removed at any time</dt>
+  <dd>Removing a delegate stops them authorizing anything further and revokes
+  every application they already authorized on this account.</dd>
+</dl>
+</section>"#,
+        banner = banner_for(q.msg.as_deref()),
     );
     Ok(page("Delegation", &body).into_response())
+}
+
+/// Form body for adding a delegate.
+#[derive(Debug, Deserialize)]
+pub struct AddDelegateForm {
+    /// The handle of the identity to delegate to.
+    pub handle: String,
+}
+
+/// `POST /account/delegation` — name an identity as a delegate.
+///
+/// The handle is resolved and verified in both directions before anything is
+/// written ([`crate::oauth::delegation::resolve_identity`]), and the DID is
+/// what gets stored. Accepting a handle unverified would let anyone name a
+/// string they do not control and wait for somebody to claim it.
+pub async fn add_delegate(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<AddDelegateForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+    if !state.delegation.is_available() {
+        return Ok(redirect(
+            "/account/delegation?msg=err-delegation-is-not-available-on-this-server",
+        ));
+    }
+
+    let typed = form.handle.trim();
+    if typed.is_empty() {
+        return Ok(redirect("/account/delegation?msg=err-enter-a-handle"));
+    }
+
+    let resolved = match crate::oauth::delegation::resolve_identity(&state, typed).await {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::info!(handle = %typed, error = ?error, "portal delegate add: handle did not resolve");
+            return Ok(redirect(
+                "/account/delegation?msg=err-that-handle-could-not-be-verified",
+            ));
+        }
+    };
+
+    // A self-delegation would be a second way to authenticate as this account
+    // that its own password is not needed for, which is the opposite of what
+    // this list is for.
+    if resolved.did == account.did {
+        return Ok(redirect(
+            "/account/delegation?msg=err-you-cannot-delegate-to-yourself",
+        ));
+    }
+
+    let pool = state.reader.accounts().account_pool();
+    let added =
+        crate::account::delegation::add(&pool, &account.did, &resolved.did, &resolved.handle)
+            .await
+            .map_err(XrpcError::from)?;
+    if !added {
+        return Ok(redirect(
+            "/account/delegation?msg=err-that-identity-is-already-a-delegate",
+        ));
+    }
+
+    tracing::info!(
+        did = %account.did,
+        delegate_did = %resolved.did,
+        delegate_handle = %resolved.handle,
+        "portal delegate added"
+    );
+    Ok(redirect("/account/delegation?msg=delegate-added"))
+}
+
+/// Form body for removing a delegate.
+#[derive(Debug, Deserialize)]
+pub struct RemoveDelegateForm {
+    /// The delegate's DID, as the page rendered it.
+    pub did: String,
+}
+
+/// `POST /account/delegation/remove` — withdraw a delegation.
+///
+/// Two things, in one press. The row goes, so the delegate cannot authenticate
+/// as this account again; and every grant they already obtained goes with it,
+/// so the applications they authorized stop renewing. Leaving the grants would
+/// make "remove" mean less than it reads — the delegate would be gone and the
+/// access they arranged would not.
+pub async fn remove_delegate(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<RemoveDelegateForm>,
+) -> Result<Response, XrpcError> {
+    require_same_origin(&headers)?;
+    let (_, account) = match section_account(&state, &headers).await {
+        Ok(found) => found,
+        Err(response) => return Ok(response),
+    };
+
+    let did = form.did.trim();
+    if did.is_empty() {
+        return Ok(redirect("/account/delegation?msg=err-enter-a-did"));
+    }
+
+    let pool = state.reader.accounts().account_pool();
+    let removed = crate::account::delegation::remove(&pool, &account.did, did)
+        .await
+        .map_err(XrpcError::from)?;
+    if removed == 0 {
+        return Ok(redirect(
+            "/account/delegation?msg=err-that-identity-was-not-a-delegate",
+        ));
+    }
+
+    // After the row, not before: if this failed with the row still present the
+    // holder could press again, whereas a removed row and surviving grants
+    // would leave nothing on the page to press.
+    let grants = portal::revoke_oauth_grants_for_delegate(&pool, &account.did, did)
+        .await
+        .map_err(XrpcError::from)?;
+
+    tracing::info!(
+        did = %account.did,
+        delegate_did = %did,
+        grants_revoked = grants,
+        "portal delegate removed"
+    );
+    Ok(redirect(if grants > 0 {
+        "/account/delegation?msg=delegate-removed-with-grants"
+    } else {
+        "/account/delegation?msg=delegate-removed"
+    }))
 }
 
 /// The page a holder sees when they owe an acceptance.

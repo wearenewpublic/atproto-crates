@@ -485,13 +485,19 @@ async fn every_section_carries_the_nav() {
     }
 }
 
-/// The Delegation placeholder says it does nothing, in as many words.
+/// A server that has not enabled delegation says so, in as many words.
 ///
-/// A section about letting other identities act as you is the last place to
-/// leave a reader unsure whether it is switched on, and an empty table under a
-/// plausible heading reads as a feature with no entries.
+/// This harness leaves `PDS_DELEGATION_ENABLED` off, which is the default, so
+/// what it sees is what most operators see. A section about letting other
+/// identities act as you is the last place to leave a reader unsure whether it
+/// is switched on, and an empty table under a plausible heading reads as a
+/// feature with no entries.
+///
+/// The section's behaviour when it *is* enabled belongs to
+/// `tests/portal_delegation.rs`, which builds a server that meets every
+/// precondition.
 #[tokio::test(flavor = "multi_thread")]
-async fn delegation_says_it_is_not_implemented() {
+async fn delegation_says_when_it_is_not_available() {
     let (app, manager, writer, _tmp) = build_app().await;
     let cookie = signed_in_with_a_record(&manager, &writer).await;
 
@@ -499,12 +505,20 @@ async fn delegation_says_it_is_not_implemented() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("Not implemented"),
-        "the placeholder does not say it is a placeholder"
+        body.contains("Not available on this server"),
+        "the page does not say delegation is off"
     );
     assert!(
-        body.contains("authenticate on its behalf"),
-        "the placeholder does not say what delegation would be"
+        body.contains("has not enabled account delegation"),
+        "the page does not name the obstacle"
+    );
+    assert!(
+        body.contains("sign in as themselves and act as this account"),
+        "the page does not say what delegation would be"
+    );
+    assert!(
+        !body.contains("Add delegate"),
+        "a server that cannot delegate offered the control anyway"
     );
 }
 

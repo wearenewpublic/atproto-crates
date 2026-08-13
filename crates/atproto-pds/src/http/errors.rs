@@ -139,6 +139,40 @@ impl From<PdsError> for XrpcError {
             PdsError::InvalidSubject { reason } => {
                 XrpcError::new(StatusCode::BAD_REQUEST, "InvalidRequest", reason)
             }
+            // Delegation. The first is about this server's configuration and
+            // the rest are about what the caller asked for, so only the first
+            // is a 503.
+            PdsError::DelegationUnavailable { reason } => XrpcError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DelegationUnavailable",
+                reason,
+            ),
+            PdsError::DelegationSelf { did } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("{did} cannot be a delegate of itself"),
+            ),
+            PdsError::DelegationExists { did } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("{did} is already a delegate of this account"),
+            ),
+            PdsError::DelegationUnresolvable { handle } => XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                format!("{handle} does not resolve to an identity this server can verify"),
+            ),
+            // Deliberately the same shape a declined authorization gets. A
+            // caller learning that a `state` was once a real flow learns
+            // something about somebody else's sign-in.
+            PdsError::DelegationFlowLost { reason } => {
+                tracing::info!(reason, "a delegated sign-in could not be completed");
+                XrpcError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "this delegated sign-in is no longer valid; start again from the application",
+                )
+            }
             PdsError::SpaceNotFound { uri } => XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "SpaceNotFound",

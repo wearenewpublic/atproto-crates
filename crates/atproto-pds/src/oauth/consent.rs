@@ -67,7 +67,7 @@ pub struct ConsentQuery {
 /// that can run an OAuth client sends them, so their absence means the caller
 /// is not a browser — and a non-browser has no business rendering a consent
 /// screen.
-fn require_browser_navigation(parts: &Parts) -> Result<(), XrpcError> {
+pub(crate) fn require_browser_navigation(parts: &Parts) -> Result<(), XrpcError> {
     let header = |name: &str| {
         parts
             .headers
@@ -146,26 +146,32 @@ pub async fn consent_page(
             )
         })?;
 
-    // Best-effort: resolve the space-owner DIDs named in any `space:` scope to
-    // their bidirectionally-verified handles, so the consent screen can render
-    // a human-readable owner instead of an opaque DID. Failures fall back to
-    // the raw DID.
-    let handles = resolve_space_owner_handles(&state, &request.scope).await;
+    let scopes_list = render_scope_list(&state, &request.scope).await;
 
-    // Best-effort: resolve the space-type NSIDs named in any `space:` scope to
-    // their declaration `name` (the spec's "Consent" section). Failures fall back to the NSID.
-    let type_names = resolve_space_type_names(&state, &request.scope).await;
-    let permission_sets =
-        resolve_permission_sets(&state, &request.scope, &handles, &type_names).await;
+    // Offered only when this server can actually complete a delegated sign-in
+    // *and* the client named who is signing in. Without a hint there is no
+    // account to act for, and a link that asked for one would be a second
+    // identifier field on a password page.
+    let delegate_link = if state.delegation.is_available()
+        && prefill_identifier(request.login_hint.as_deref()).is_some()
+    {
+        format!(
+            r#"<p class="delegate">Signing in on behalf of someone else?
+  <a href="/oauth/delegation/start?request_uri={}">Sign in as a delegate</a>
+  — authenticate as yourself instead.</p>"#,
+            urlencode(&q.request_uri)
+        )
+    } else {
+        String::new()
+    };
 
     let html = render_consent(
         &q.request_uri,
         &request.client_id,
         &request.scope,
         request.login_hint.as_deref(),
-        &handles,
-        &type_names,
-        &permission_sets,
+        &scopes_list,
+        &delegate_link,
     );
     // Never cached. The page is per-user and per-request: it names the client
     // asking, the scopes it wants, and the account being asked. A copy served
@@ -184,6 +190,57 @@ pub async fn consent_page(
         axum::http::HeaderValue::from_static("no-cache"),
     );
     Ok(response)
+}
+
+/// The `<li>` list describing every scope in `scope`, resolved as far as this
+/// server can resolve it.
+///
+/// Shared by the consent page and the delegate handle-entry page. Both show a
+/// person what an application is asking for, immediately before they do the
+/// thing that grants it, and two renderings of one scope string that could
+/// disagree is a way to be shown one grant and make another.
+///
+/// Every resolution here is best-effort: an owner DID that will not verify
+/// renders as the DID, a space type that will not resolve renders as its NSID,
+/// a permission set that cannot be read is named rather than described.
+pub(crate) async fn render_scope_list(state: &HttpState, scope: &str) -> String {
+    // Best-effort: resolve the space-owner DIDs named in any `space:` scope to
+    // their bidirectionally-verified handles, so the screen can render a
+    // human-readable owner instead of an opaque DID.
+    let handles = resolve_space_owner_handles(state, scope).await;
+    // Best-effort: resolve the space-type NSIDs named in any `space:` scope to
+    // their declaration `name` (the spec's "Consent" section).
+    let type_names = resolve_space_type_names(state, scope).await;
+    let permission_sets = resolve_permission_sets(state, scope, &handles, &type_names).await;
+
+    scope
+        .split_whitespace()
+        .map(|s| {
+            let raw = html_escape(s);
+            let description = describe_scope(s, &handles, &type_names, &permission_sets);
+            format!(
+                "<li><code>{raw}</code><div class=\"scope-desc\">{}</div></li>",
+                html_escape(&description),
+            )
+        })
+        .collect()
+}
+
+/// Percent-encode a value for a query string.
+///
+/// Small on purpose: the only thing that goes through it is a `request_uri`
+/// this server minted, and reaching for a dependency to re-encode a token made
+/// of URL-safe characters would be the larger change.
+pub(crate) fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// Collect the distinct, concrete owner DIDs referenced by `space:` scopes in
@@ -450,7 +507,7 @@ fn dns_resolver_ref(state: &HttpState) -> Option<&dyn atproto_identity::traits::
 /// Handles come back normalized (lowercased, `at://` and `@` stripped) because
 /// that is what [`is_valid_handle`] returns and what the account lookup will do
 /// anyway; a DID is returned as given, since case is not ours to change.
-fn prefill_identifier(hint: Option<&str>) -> Option<String> {
+pub(crate) fn prefill_identifier(hint: Option<&str>) -> Option<String> {
     use atproto_identity::validation::{
         is_valid_did_method_plc, is_valid_did_method_web, is_valid_did_method_webvh,
         is_valid_handle,
@@ -479,22 +536,9 @@ fn render_consent(
     client_id: &str,
     scope: &str,
     login_hint: Option<&str>,
-    handles: &BTreeMap<String, String>,
-    type_names: &BTreeMap<String, String>,
-    permission_sets: &BTreeMap<String, String>,
+    scopes_list: &str,
+    delegate_link: &str,
 ) -> String {
-    let scopes_list: String = scope
-        .split_whitespace()
-        .map(|s| {
-            let raw = html_escape(s);
-            let description = describe_scope(s, handles, type_names, permission_sets);
-            format!(
-                "<li><code>{raw}</code><div class=\"scope-desc\">{}</div></li>",
-                html_escape(&description),
-            )
-        })
-        .collect();
-
     // Loud warning when any space scope grants access to *every* space on the
     // network (`type=* && did=*`) — the prominent-warning requirement of spec
     // lines 437-438.
@@ -556,6 +600,10 @@ fn render_consent(
     .deny    {{ background: #e5e5e5; color: #333; }}
     code {{ font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 0.9em; }}
     .meta {{ font-size: 0.8em; color: #777; margin-top: 1.5em; }}
+    /* Separated from the buttons by a rule: this is a different way to sign
+       in, not a third thing to do with the form above it. */
+    .delegate {{ border-top: 1px solid #ddd; padding-top: 1em; margin-top: 1.5em;
+                font-size: 0.9em; color: #555; }}
   </style>
 </head>
 <body>
@@ -587,6 +635,8 @@ fn render_consent(
       <button class="deny" type="submit" name="approve" value="false">Deny</button>
     </p>
   </form>
+
+  {delegate_link}
 
   <p class="meta">
     Powered by <code>atproto-pds</code>. Scopes shown above are what
@@ -906,7 +956,7 @@ fn space_type_declaration_name(nsid: &str, type_names: &BTreeMap<String, String>
         .unwrap_or_else(|| nsid.to_string())
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -933,6 +983,22 @@ mod tests {
         BTreeMap::new()
     }
 
+    /// The `<li>` list `render_scope_list` would produce for a scope nothing
+    /// resolves, which is every scope in these tests.
+    fn scope_list(scope: &str) -> String {
+        scope
+            .split_whitespace()
+            .map(|s| {
+                let raw = html_escape(s);
+                let description = describe_scope(s, &no_handles(), &no_names(), &no_names());
+                format!(
+                    "<li><code>{raw}</code><div class=\"scope-desc\">{}</div></li>",
+                    html_escape(&description),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn render_includes_client_id_and_scopes() {
         let html = render_consent(
@@ -940,9 +1006,8 @@ mod tests {
             "https://app.example/client-metadata.json",
             "atproto transition:generic",
             None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("atproto transition:generic"),
+            "",
         );
         assert!(html.contains("https://app.example/client-metadata.json"));
         assert!(html.contains("atproto"));
@@ -959,9 +1024,8 @@ mod tests {
             "https://evil/<script>",
             "atproto",
             None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("atproto"),
+            "",
         );
         // The injected `<script>` substring must show up escaped in the
         // attacker-controlled positions (page title + body header). The page
@@ -976,15 +1040,7 @@ mod tests {
 
     #[test]
     fn render_handles_empty_scope() {
-        let html = render_consent(
-            "uri",
-            "client",
-            "",
-            None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
-        );
+        let html = render_consent("uri", "client", "", None, &scope_list(""), "");
         assert!(html.contains("Requested scopes"));
     }
 
@@ -1365,9 +1421,8 @@ mod tests {
             "client",
             "space:*?authority=*",
             None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("space:*?authority=*"),
+            "",
         );
         assert!(html.contains("every space on the network"));
         assert!(html.contains("space-warning"));
@@ -1376,15 +1431,7 @@ mod tests {
         // must not raise the network-wide warning — a warning shown on a
         // narrow grant is a warning users learn to dismiss.
         assert!(!has_universal_space_scope("space:*"));
-        let own = render_consent(
-            "uri",
-            "client",
-            "space:*",
-            None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
-        );
+        let own = render_consent("uri", "client", "space:*", None, &scope_list("space:*"), "");
         assert!(!own.contains("every space on the network"));
     }
 
@@ -1397,9 +1444,8 @@ mod tests {
             "client",
             "space:*?did=did:plc:abc",
             None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("space:*?did=did:plc:abc"),
+            "",
         );
         assert!(!html.contains("every space on the network"));
     }
@@ -1416,9 +1462,8 @@ mod tests {
             "https://app.example/cm",
             "atproto space:app.bsky.group?action=read",
             None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("atproto space:app.bsky.group?action=read"),
+            "",
         );
         assert!(html.contains("core atproto session"));
         assert!(html.contains("read access to"));
@@ -1434,9 +1479,8 @@ mod tests {
             "client",
             "atproto",
             Some("Alice.Example.com"),
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("atproto"),
+            "",
         );
         assert!(
             html.contains(r#"value="alice.example.com""#),
@@ -1520,9 +1564,8 @@ mod tests {
                 "client",
                 "atproto",
                 Some(hint),
-                &no_handles(),
-                &no_names(),
-                &no_names(),
+                &scope_list("atproto"),
+                "",
             );
             assert!(!html.contains("onfocus"), "{hint:?} injected an attribute");
             assert!(
@@ -1539,15 +1582,7 @@ mod tests {
     /// With no hint the identifier keeps focus; with one, focus moves on.
     #[test]
     fn focus_follows_the_prefill() {
-        let without = render_consent(
-            "uri",
-            "client",
-            "atproto",
-            None,
-            &no_handles(),
-            &no_names(),
-            &no_names(),
-        );
+        let without = render_consent("uri", "client", "atproto", None, &scope_list("atproto"), "");
         assert!(
             without.contains(r#"id="identifier""#) && without.contains("autofocus"),
             "the identifier should be focused when empty"
@@ -1559,9 +1594,8 @@ mod tests {
             "client",
             "atproto",
             Some("alice.example.com"),
-            &no_handles(),
-            &no_names(),
-            &no_names(),
+            &scope_list("atproto"),
+            "",
         );
         assert_eq!(
             with.matches("autofocus").count(),

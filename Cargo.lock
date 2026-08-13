@@ -384,6 +384,7 @@ dependencies = [
  "clap",
  "ecdsa",
  "elliptic-curve",
+ "http 1.5.0",
  "k256",
  "lru 0.18.2",
  "multibase",

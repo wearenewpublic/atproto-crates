@@ -225,20 +225,131 @@ pub async fn revoke_oauth_grants_for_client(
     Ok(result)
 }
 
+/// Drop the OAuth grants one delegate obtained, leaving the account holder's
+/// own alone.
+///
+/// The counterpart to [`revoke_oauth_grants_for_client`], asking the other
+/// question: not "which application is this" but "who signed in to get it".
+/// Withdrawing a delegation is what calls it — the row stops the delegate
+/// authenticating again, and this stops the sessions they already have from
+/// renewing.
+///
+/// The same limit applies as everywhere else here: an access token already in
+/// an application's hands is a stateless fifteen-minute JWT with no row to
+/// delete, so it keeps working until it expires. The account-wide
+/// `sign_out_everywhere` is the only instant cutoff, at the cost of ending
+/// everything else too.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the delete fails.
+pub async fn revoke_oauth_grants_for_delegate(
+    pool: &AccountPool,
+    did: &str,
+    delegate_did: &str,
+) -> PdsResult<u64> {
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query("DELETE FROM oauth_refresh WHERE did = ? AND acting_did = ?")
+                .bind(did)
+                .bind(delegate_did)
+                .execute(pool.as_sqlite())
+                .await
+                .map(|r| r.rows_affected())
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query("DELETE FROM oauth_refresh WHERE did = $1 AND acting_did = $2")
+                .bind(did)
+                .bind(delegate_did)
+                .execute(pool.as_postgres())
+                .await
+                .map(|r| r.rows_affected())
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+    .map_err(|e| PdsError::Storage {
+        reason: format!("revoke delegate oauth grants: {e}"),
+    })
+}
+
+/// How many live grants each delegate of an account holds, by delegate DID.
+///
+/// One query rather than one per delegate: the Delegation page renders a count
+/// beside every row, and a list of ten delegates should not be ten reads.
+///
+/// # Errors
+///
+/// [`PdsError::Storage`] if the rows cannot be read.
+pub async fn count_grants_by_delegate(
+    pool: &AccountPool,
+    did: &str,
+) -> PdsResult<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(String, i64)> = match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query_as(
+                "SELECT acting_did, COUNT(*) FROM oauth_refresh
+             WHERE did = ? AND acting_did IS NOT NULL GROUP BY acting_did",
+            )
+            .bind(did)
+            .fetch_all(pool.as_sqlite())
+            .await
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query_as(
+                "SELECT acting_did, COUNT(*) FROM oauth_refresh
+             WHERE did = $1 AND acting_did IS NOT NULL GROUP BY acting_did",
+            )
+            .bind(did)
+            .fetch_all(pool.as_postgres())
+            .await
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature")
+        }
+    }
+    .map_err(|e| PdsError::Storage {
+        reason: format!("count delegate grants: {e}"),
+    })?;
+    Ok(rows.into_iter().collect())
+}
+
+/// One live OAuth grant, as the Access page lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRow {
+    /// The application holding the grant.
+    pub client_id: String,
+    /// What it was granted.
+    pub scope: String,
+    /// When the holder approved.
+    pub issued_at: String,
+    /// The delegate who signed in to obtain it, if it was not the account
+    /// holder themselves.
+    pub acting_did: Option<String>,
+}
+
 /// Every live OAuth grant for an account, newest first.
 ///
 /// # Errors
 ///
 /// [`PdsError::Storage`] if the rows cannot be read.
-pub async fn list_oauth_grants(
-    pool: &AccountPool,
-    did: &str,
-) -> PdsResult<Vec<(String, String, String)>> {
-    let rows: Vec<(String, String, String)> = match pool.kind() {
+pub async fn list_oauth_grants(pool: &AccountPool, did: &str) -> PdsResult<Vec<GrantRow>> {
+    let rows: Vec<(String, String, String, Option<String>)> = match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
             sqlx::query_as(
-                "SELECT client_id, scope, issued_at FROM oauth_refresh
+                "SELECT client_id, scope, issued_at, acting_did FROM oauth_refresh
              WHERE did = ? ORDER BY issued_at DESC",
             )
             .bind(did)
@@ -248,7 +359,7 @@ pub async fn list_oauth_grants(
         #[cfg(feature = "postgres")]
         AccountPoolKind::Postgres => {
             sqlx::query_as(
-                "SELECT client_id, scope, issued_at FROM oauth_refresh
+                "SELECT client_id, scope, issued_at, acting_did FROM oauth_refresh
              WHERE did = $1 ORDER BY issued_at DESC",
             )
             .bind(did)
@@ -265,7 +376,15 @@ pub async fn list_oauth_grants(
     .map_err(|e| PdsError::Storage {
         reason: format!("list oauth grants: {e}"),
     })?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|(client_id, scope, issued_at, acting_did)| GrantRow {
+            client_id,
+            scope,
+            issued_at,
+            acting_did,
+        })
+        .collect())
 }
 
 /// Record a portal sign-in. `cookie_value` is hashed, never stored.
@@ -644,6 +763,71 @@ mod tests {
         .await
         .unwrap();
         AccountPool::Sqlite(dir.pool().clone())
+    }
+
+    /// Insert a grant on `did`, obtained by `acting_did` when it was not the
+    /// account holder themselves.
+    async fn grant(pool: &AccountPool, jti: &str, did: &str, acting_did: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO oauth_refresh
+                (jti, did, client_id, dpop_jkt, scope, issued_at, family_id, acting_did)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(jti)
+        .bind(did)
+        .bind("https://app.example/cm")
+        .bind("thumb")
+        .bind("atproto")
+        .bind(Utc::now().to_rfc3339())
+        .bind(jti)
+        .bind(acting_did)
+        .execute(pool.as_sqlite())
+        .await
+        .unwrap();
+    }
+
+    /// Withdrawing one delegation must not reach another delegate's sessions,
+    /// nor the account holder's own. "Remove Alice" removing Bob's access is
+    /// the failure this pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_delegate_reaches_only_that_delegate() {
+        let pool = pool_with_account("did:plc:alice").await;
+        grant(&pool, "by-alice", "did:plc:alice", None).await;
+        grant(&pool, "by-bob", "did:plc:alice", Some("did:plc:bob")).await;
+        grant(&pool, "by-carol", "did:plc:alice", Some("did:plc:carol")).await;
+
+        assert_eq!(
+            revoke_oauth_grants_for_delegate(&pool, "did:plc:alice", "did:plc:bob")
+                .await
+                .unwrap(),
+            1
+        );
+
+        let left = list_oauth_grants(&pool, "did:plc:alice").await.unwrap();
+        let acting: Vec<_> = left.iter().map(|g| g.acting_did.as_deref()).collect();
+        assert_eq!(left.len(), 2, "the wrong number of grants survived");
+        assert!(acting.contains(&None), "the holder's own grant went");
+        assert!(
+            acting.contains(&Some("did:plc:carol")),
+            "another delegate's grant went"
+        );
+    }
+
+    /// The per-delegate counts the Delegation page renders, in one read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grants_are_counted_per_delegate_and_exclude_the_holders_own() {
+        let pool = pool_with_account("did:plc:alice").await;
+        grant(&pool, "by-alice", "did:plc:alice", None).await;
+        grant(&pool, "by-bob-1", "did:plc:alice", Some("did:plc:bob")).await;
+        grant(&pool, "by-bob-2", "did:plc:alice", Some("did:plc:bob")).await;
+        grant(&pool, "by-carol", "did:plc:alice", Some("did:plc:carol")).await;
+
+        let counts = count_grants_by_delegate(&pool, "did:plc:alice")
+            .await
+            .unwrap();
+        assert_eq!(counts.get("did:plc:bob"), Some(&2));
+        assert_eq!(counts.get("did:plc:carol"), Some(&1));
+        assert_eq!(counts.len(), 2, "the holder's own grant was counted");
     }
 
     /// The stashed secret comes back once, and only once.

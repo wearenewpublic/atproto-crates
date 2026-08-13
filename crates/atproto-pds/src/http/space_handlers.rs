@@ -3804,6 +3804,7 @@ mod scope_gate_tests {
             exp: u64::MAX,
             jti: "jti".to_string(),
             ses: 0,
+            act: None,
         })
     }
 

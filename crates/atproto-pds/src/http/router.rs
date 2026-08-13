@@ -334,6 +334,23 @@ fn build_router_inner(
         .route("/oauth/token", post(oauth::token_handler))
         .route("/oauth/revoke", post(oauth::revoke_handler))
         .route("/oauth/jwks", get(oauth::jwks_handler))
+        // Delegated sign-in. These four are this server acting as an OAuth
+        // *client* against somebody else's server -- the metadata document is
+        // what that server fetches to find out what is asking, and the
+        // callback is where it sends the delegate back.
+        .route(
+            "/oauth/delegation/client-metadata.json",
+            get(oauth::delegation::client_metadata),
+        )
+        .route(
+            "/oauth/delegation/start",
+            get(oauth::delegation::start_page),
+        )
+        .route("/oauth/delegation/begin", post(oauth::delegation::begin))
+        .route(
+            "/oauth/delegation/callback",
+            get(oauth::delegation::callback),
+        )
         // Identity discovery. `atproto-did` resolves a handle hosted on this
         // server's own domain; `did.json` is this server's own did:web
         // document, synthesised rather than served from a file.
@@ -554,9 +571,9 @@ fn build_router_inner(
         // The account portal. Not XRPC: these are HTML pages and form posts,
         // the only way to use this server with nothing but a browser.
         //
-        // Four sections, each a page in its own right and all four in the nav
-        // every page carries: Settings here, then Access, Repository and
-        // Delegation below.
+        // Five sections, each a page in its own right and all five in the nav
+        // every page carries: Settings here, then Access, Repository, Spaces
+        // and Delegation below.
         .route("/account", get(portal::dashboard))
         .route("/account/signin", get(portal::sign_in_page))
         .route("/account/signin", post(portal::sign_in))
@@ -566,6 +583,8 @@ fn build_router_inner(
         .route("/account/handle", post(portal::change_handle))
         .route("/account/sessions", get(portal::sessions))
         .route("/account/delegation", get(portal::delegation))
+        .route("/account/delegation", post(portal::add_delegate))
+        .route("/account/delegation/remove", post(portal::remove_delegate))
         // The Repository section: a browser over this account's records.
         // `{segment}` is a collection or a blob CID; `looks_like_cid` decides,
         // and nothing else needs to.

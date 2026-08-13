@@ -12,6 +12,9 @@
 //! - `oauth_par WHERE expires_at < now` and `oauth_code WHERE expires_at < now`
 //!   (the SQL-backed `OAuthState` does opportunistic GC on every write; this
 //!   sweep catches leftovers from low-traffic periods)
+//! - `delegation_login WHERE expires_at < now` — a completed delegated sign-in
+//!   deletes its own row, so this only collects abandoned ones, which hold a
+//!   per-flow private DPoP key until they go
 //! - `jti_replay WHERE expires_at < now` (§6.1 SQL backend)
 //! - `rate_limit_window WHERE request_at_ms < now - <window>` (§6.2 SQL backend)
 //! - **Per-actor**: `space_record_oplog` and `space_member_oplog` past the
@@ -82,6 +85,9 @@ pub struct GcReport {
     pub oauth_revoked_token: u64,
     /// Expired OAuth PAR + auth-code rows (combined).
     pub oauth_state: u64,
+    /// Abandoned delegated sign-ins, each of which holds a private DPoP key
+    /// until it is collected.
+    pub delegation_login: u64,
     /// Expired JTI replay rows (`jti_replay` table; §6.1 SQL backend).
     pub jti_replay: u64,
     /// Expired rate-limit-window rows (`rate_limit_window`; §6.2 SQL backend).
@@ -196,6 +202,11 @@ pub async fn tick_with(
     )
     .await;
     report.oauth_state = run_or_log("oauth_par+oauth_code", prune_oauth(pool, &now_iso)).await;
+    report.delegation_login = run_or_log(
+        "delegation_login",
+        crate::oauth::delegation_login::purge_expired(&account_pool),
+    )
+    .await;
     if opts.stream_event_retention_hours > 0 {
         let cutoff =
             (now - chrono::Duration::hours(opts.stream_event_retention_hours)).to_rfc3339();

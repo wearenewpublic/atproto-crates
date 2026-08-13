@@ -20,6 +20,12 @@ pub mod authorize;
 pub mod client_auth;
 pub mod client_metadata;
 pub mod consent;
+/// Delegated sign-in: this server as an OAuth client, proving who a delegate
+/// is against their own server.
+pub mod delegation;
+/// In-flight state for a delegated sign-in, parked while the delegate
+/// authenticates against their own server.
+pub mod delegation_login;
 pub mod dpop;
 pub mod extract;
 pub mod jwks;

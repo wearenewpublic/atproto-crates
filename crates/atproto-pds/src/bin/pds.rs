@@ -130,6 +130,20 @@ struct Args {
     #[arg(long, env = "PDS_POLICY_URL")]
     policy_url: Option<String>,
 
+    /// Offer account delegation: let an account name other AT Protocol
+    /// identities that may sign in as themselves and act as it.
+    ///
+    /// Off by default. Delegation is new authority over an account reached
+    /// without its password, and it also puts this server in the role of an
+    /// OAuth client against other people's servers -- both are things an
+    /// operator should turn on deliberately rather than inherit.
+    ///
+    /// Needs an HTTPS origin and a P-256 `PDS_OAUTH_KEY_JWK`; without either,
+    /// the portal's Delegation section says which one is missing instead of
+    /// offering a control that cannot work.
+    #[arg(long, env = "PDS_DELEGATION_ENABLED", default_value_t = false)]
+    delegation_enabled: bool,
+
     /// PLC directory hostname (e.g., `plc.directory`). When unset, PLC genesis
     /// is disabled and `createAccount` requires a caller-supplied DID.
     #[arg(long, env = "PDS_DID_PLC_URL")]
@@ -1038,6 +1052,10 @@ async fn main() -> anyhow::Result<()> {
     .with_crawlers(args.crawlers.clone())
     .with_policy_documents(policy_documents)
     .with_admin_dids(args.admin_dids.clone())
+    // After `with_pds_signing_key` above: the key is one of the preconditions
+    // delegation is resolved against, so asking before it is attached would
+    // report a server with a key as having none.
+    .with_delegation_enabled(args.delegation_enabled)
     // Persist OAuth in-flight state (PAR / auth-codes / refresh handles)
     // to the accounts DB so the lifecycle survives PDS restart. See
     // for the gap this closes.
