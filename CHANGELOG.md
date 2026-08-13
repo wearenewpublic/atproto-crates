@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- **A space's access controls now say what they do rather than what they are called.** The policy selector
+  offered "Anyone" and "Whatever the managing app decides" — the schema's own vocabulary, in a dropdown
+  where a mis-click publishes an outline to the network. Each option now names its consequence, and the
+  section states the three facts a person needs before choosing: a credential reads *every member's*
+  records rather than only the requester's, being issued one neither adds anyone to the member list nor
+  permits writes, and the policy and app-access settings are ANDed.
+
+  Also refuses a `managing-app` policy with no managing app named. The mint path has nowhere to ask and
+  answers `NotAuthorized`, so saving that pair produced a space that looked configured and admitted nobody —
+  the same trap as an empty allow list, reached from the other selector.
+
 ### Added
 - **Collection listings are grouped by the domain that publishes them.** A repository with a few dozen
   collections was a wall of reverse-DNS in which `app.bsky.feed.post` and `app.bsky.graph.follow` looked no

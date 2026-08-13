@@ -565,3 +565,71 @@ fn credential_for(
         jti: "j".to_string(),
     }
 }
+
+/// A managing-app policy with no managing app named is refused.
+///
+/// The mint path has nowhere to ask and answers `NotAuthorized`, so saving the
+/// pair produces a space that looks configured and admits nobody — the same
+/// trap as an empty allow list, arrived at from the other selector.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_managing_app_policy_needs_a_managing_app() {
+    let f = fixture().await;
+    let (status, location) = f
+        .post(
+            &format!("{}/config", f.base()),
+            "policy=managing-app&app_access=open&allowed=&managing_app=%20",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("{}?msg=err-managing-app-needs-a-service", f.base()).as_str())
+    );
+
+    let inputs = f
+        .svc
+        .load_mint_authz_inputs(&f.space, OWNER)
+        .await
+        .expect("read back");
+    assert_eq!(
+        inputs.config.mint_policy,
+        MintPolicy::MemberList,
+        "the space should have been left as it was"
+    );
+}
+
+/// The access controls say what they do to the space, not what they are called
+/// in the schema.
+///
+/// Each of these options gives away other people's records — the members' —
+/// rather than only the owner's, and the first version of this form named the
+/// mechanisms ("Anyone", "Whatever the managing app decides") in a dropdown
+/// where a mis-click publishes an outline to the network. This pins the
+/// consequences into the page so they cannot quietly soften back.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_access_controls_state_their_consequences() {
+    let f = fixture().await;
+    let (_, body, _) = f.get(&f.base()).await;
+    // Asserted against the prose rather than its line breaks: the copy is
+    // wrapped for the source file, and a reflow is not a regression.
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for phrase in [
+        // The public policy names its reach rather than saying "anyone".
+        "readable network-wide",
+        // A credential is not scoped to the requester's own records.
+        "every member's records",
+        // Nor does it make anyone a member, or let them write.
+        "does not add anyone to the member list and does not let them write",
+        // The managing app is asked per request, and its absence closes the
+        // space rather than opening it.
+        "while it is unreachable, no new credentials are issued",
+        // The two axes are ANDed, which decides whether an allow list helps.
+        "Both settings must pass",
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "the access section should say {phrase:?}: {flat}"
+        );
+    }
+}

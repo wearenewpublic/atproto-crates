@@ -115,6 +115,11 @@ fn banner(msg: Option<&str>) -> String {
         Some("err-enter-a-did") => ("err", "Enter the DID of the account to add."),
         Some("err-already-a-member") => ("err", "That account is already a member."),
         Some("err-not-a-member") => ("err", "That account is not a member of this space."),
+        Some("err-managing-app-needs-a-service") => (
+            "err",
+            "Name a managing app, or choose a policy that does not ask one. With \
+             none named, this space would refuse every request to read it.",
+        ),
         Some("err-allow-list-needs-an-entry") => (
             "err",
             "An allow list with no clients would lock every app out. Name at least one, or choose Open.",
@@ -439,10 +444,17 @@ pub async fn detail(
 <form method="POST" action="{base}/config">
   <label for="policy">Who may be issued a credential</label>
   <select id="policy" name="policy">
-    <option value="member-list"{ml}>Members of this space</option>
-    <option value="public"{pu}>Anyone</option>
-    <option value="managing-app"{ma}>Whatever the managing app decides</option>
+    <option value="member-list"{ml}>Only the members listed below</option>
+    <option value="public"{pu}>Any account that asks &mdash; readable network-wide</option>
+    <option value="managing-app"{ma}>Ask a service I nominate, on every request</option>
   </select>
+  <p class="muted">A credential reads <b>every member's records</b> in this space,
+  not only the requester's own. Being issued one does not add anyone to the
+  member list and does not let them write. Choosing "any account that asks"
+  therefore publishes what the members here have written to anyone who asks for
+  it. Choosing "ask a service" hands that decision to the managing app below,
+  which is asked afresh for each request &mdash; and while it is unreachable, no
+  new credentials are issued at all.</p>
 
   <fieldset>
     <legend>Which applications may reach it</legend>
@@ -450,17 +462,20 @@ pub async fn detail(
     <label><input type="radio" name="app_access" value="allow-list"{list_checked}> Only the applications I name</label>
     <label for="allowed">Allowed client IDs, one per line</label>
     <textarea id="allowed" name="allowed" rows="4" placeholder="https://example.app/oauth-client-metadata.json">{allowed}</textarea>
-    <p class="muted">An allow list is matched against the client identity an
-    application proves when it asks for a credential. An application that does
-    not prove one is refused, so an allow list also excludes every app that
-    cannot identify itself.</p>
+    <p class="muted">Both settings must pass: a request is refused unless the
+    policy above admits the person <em>and</em> this admits their application.
+    An allow list is matched against the client identity an application proves
+    when it asks for a credential, so it also excludes every app that cannot
+    identify itself &mdash; including any that does not present a client
+    attestation at all.</p>
   </fieldset>
 
   <label for="managing_app">Managing app</label>
   <input id="managing_app" name="managing_app" type="text" value="{managing}"
     placeholder="did:web:app.example#svc">
-  <p class="muted">Consulted only by the "whatever the managing app decides"
-  policy. Leave empty for none.</p>
+  <p class="muted">A service identifier this space routes application requests
+  to, such as join approvals. Required when the policy above asks it to decide
+  who may read; optional otherwise. Leave empty for none.</p>
 
   <button type="submit">Save settings</button>
 </form>
@@ -540,6 +555,16 @@ pub async fn save_config(
     let Ok(mint_policy) = MintPolicy::from_str_value(&form.policy) else {
         return Ok(redirect(&format!("{base}?msg=err-save-failed")));
     };
+
+    // A managing-app policy with no managing app named is a space that refuses
+    // every credential request: the mint path has nowhere to ask, and answers
+    // `NotAuthorized`. Saving it would produce a space that looks configured
+    // and admits nobody, which is the same trap as the empty allow list below.
+    if mint_policy == MintPolicy::ManagingApp && form.managing_app.trim().is_empty() {
+        return Ok(redirect(&format!(
+            "{base}?msg=err-managing-app-needs-a-service"
+        )));
+    }
 
     let app_access = if form.app_access == "allow-list" {
         let allowed: Vec<String> = form
