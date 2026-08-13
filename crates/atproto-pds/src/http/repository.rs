@@ -52,8 +52,11 @@ pub const ROOT: &str = "/account/repository";
 /// Records listed per page.
 const PAGE_SIZE: u32 = 50;
 
-/// Collections listed per page.
-const COLLECTIONS_PER_PAGE: usize = 50;
+/// How many authority domains one page of a collection listing shows.
+///
+/// Counted in groups rather than collections because the listing is paged by
+/// group; a publisher with thirty collections is one entry here.
+const GROUPS_PER_PAGE: usize = 25;
 
 /// Blob CIDs listed per page on the index.
 const BLOBS_PER_PAGE: u32 = 50;
@@ -314,6 +317,61 @@ async fn all_spaces(state: &HttpState, did: &str) -> Result<Vec<String>, XrpcErr
     Ok(out)
 }
 
+/// The registrable domain an NSID's authority lives under.
+///
+/// `app.bsky.feed.post` → `bsky.app`. The first two segments reversed, not the
+/// whole authority: `app.bsky.feed.post` and `app.bsky.graph.follow` are
+/// published by one party and belong together in a list, which is what a person
+/// reading their own repository is looking for. An NSID with fewer than the two
+/// segments a domain needs is its own group, since there is nothing to derive.
+fn nsid_domain(nsid: &str) -> String {
+    let mut parts = nsid.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(tld), Some(name)) if !tld.is_empty() && !name.is_empty() => {
+            format!("{name}.{tld}")
+        }
+        _ => nsid.to_string(),
+    }
+}
+
+/// Group collections by their authority domain, keeping both the groups and
+/// the collections inside them in the order they arrived (already sorted).
+fn group_by_domain(collections: &[String]) -> Vec<(String, Vec<&String>)> {
+    let mut groups: Vec<(String, Vec<&String>)> = Vec::new();
+    for collection in collections {
+        let domain = nsid_domain(collection);
+        match groups.last_mut() {
+            Some((current, members)) if *current == domain => members.push(collection),
+            _ => groups.push((domain, vec![collection])),
+        }
+    }
+    groups
+}
+
+/// A small square standing in for the domain's favicon.
+///
+/// Drawn rather than fetched. The portal's `Content-Security-Policy` is
+/// `default-src 'none'`, so a remote `<img>` would not load without opening
+/// `img-src` to other origins — which on a signed-in page means every NSID
+/// authority in the account's repository learns when the holder opens it, and
+/// an injected image tag gains somewhere to phone home to. A letter and a hue
+/// derived from the domain distinguishes the groups without either cost.
+fn domain_badge(domain: &str) -> String {
+    let hash = domain.bytes().fold(0u32, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(b))
+    });
+    let hue = hash % 360;
+    let initial = domain
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    format!(
+        r#"<span class="badge" style="background:hsl({hue} 45% 88%);color:hsl({hue} 55% 28%)">{}</span>"#,
+        esc(&initial)
+    )
+}
+
 /// Render a paginated collection listing for either realm.
 #[allow(clippy::too_many_arguments)]
 fn collections_view(
@@ -327,24 +385,38 @@ fn collections_view(
     msg: Option<&str>,
     create_form: &str,
 ) -> Response {
-    let start = page_no.saturating_mul(COLLECTIONS_PER_PAGE);
-    let slice: Vec<_> = collections
-        .iter()
-        .skip(start)
-        .take(COLLECTIONS_PER_PAGE)
-        .collect();
+    // Paged by group rather than by collection: a page boundary that lands in
+    // the middle of one publisher's collections splits the thing the grouping
+    // exists to show.
+    let groups = group_by_domain(collections);
+    let start = page_no.saturating_mul(GROUPS_PER_PAGE);
+    let slice: Vec<_> = groups.iter().skip(start).take(GROUPS_PER_PAGE).collect();
 
     let rows = if slice.is_empty() {
         r#"<tr><td class="muted">No collections.</td></tr>"#.to_string()
     } else {
         slice
             .iter()
-            .map(|c| {
-                format!(
-                    r#"<tr><td><a href="{child_base}{}">{}</a></td></tr>"#,
-                    esc(&urlenc(c)),
-                    esc(c)
-                )
+            .flat_map(|(domain, members)| {
+                members.iter().enumerate().map(move |(i, c)| {
+                    // The badge marks where a group starts; the rows under it
+                    // are indented instead of repeating it.
+                    let mark = if i == 0 {
+                        domain_badge(domain)
+                    } else {
+                        r#"<span class="badge-gap"></span>"#.to_string()
+                    };
+                    // The authority is the same for every row in the group, so
+                    // it is dimmed and the part that differs is left to read.
+                    let prefix_len = c.len() - c.rsplit('.').next().unwrap_or(c).len();
+                    let (prefix, tail) = c.split_at(prefix_len);
+                    format!(
+                        r#"<tr><td>{mark}<a href="{child_base}{}"><span class="dim">{}</span>{}</a></td></tr>"#,
+                        esc(&urlenc(c)),
+                        esc(prefix),
+                        esc(tail)
+                    )
+                })
             })
             .collect::<Vec<_>>()
             .join("")
@@ -357,7 +429,7 @@ fn collections_view(
             page_no - 1
         ));
     }
-    if start + COLLECTIONS_PER_PAGE < collections.len() {
+    if start + GROUPS_PER_PAGE < groups.len() {
         pager.push_str(&format!(
             r#"<a href="{self_url}?page={}">Next &rarr;</a>"#,
             page_no + 1
@@ -1217,6 +1289,52 @@ fn space_writer(state: &HttpState) -> Result<&crate::space::writer::SpaceWriter,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grouping key, on the shapes a repository actually holds.
+    #[test]
+    fn a_domain_is_the_first_two_segments_reversed() {
+        for (nsid, want) in [
+            ("app.bsky.feed.post", "bsky.app"),
+            ("app.bsky.graph.follow", "bsky.app"),
+            ("blue.badge.collection", "badge.blue"),
+            ("actor.rpg.stats", "rpg.actor"),
+            ("at.youandme.connection", "youandme.at"),
+            ("app.beaconbits.bookmark.folder", "beaconbits.app"),
+        ] {
+            assert_eq!(nsid_domain(nsid), want, "{nsid}");
+        }
+        // Nothing to derive a domain from is its own group rather than a panic
+        // or a silent lump with everything else short.
+        assert_eq!(nsid_domain("weird"), "weird");
+    }
+
+    /// Groups follow the sorted order they arrive in, and a publisher's
+    /// collections stay together.
+    #[test]
+    fn collections_group_by_publisher() {
+        let collections: Vec<String> = [
+            "app.bsky.feed.post",
+            "app.bsky.graph.follow",
+            "blue.badge.collection",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let groups = group_by_domain(&collections);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "bsky.app");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "badge.blue");
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    /// The badge is a pure function of the domain, so a publisher keeps the
+    /// same mark between page loads and between the two realms.
+    #[test]
+    fn a_domains_badge_is_stable_and_distinct() {
+        assert_eq!(domain_badge("bsky.app"), domain_badge("bsky.app"));
+        assert_ne!(domain_badge("bsky.app"), domain_badge("badge.blue"));
+    }
 
     /// A blob reference, as records actually carry one.
     #[test]

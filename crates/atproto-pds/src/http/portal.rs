@@ -223,6 +223,11 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
             background: #111; color: #fff; padding: 0.6em 0.8em; border-radius: 5px;
             word-break: break-all; }}
   .muted {{ color: #777; font-size: 0.88em; }}
+  .dim {{ color: #999; }}
+  .badge {{ display: inline-block; width: 1.35em; height: 1.35em; line-height: 1.35em;
+           text-align: center; border-radius: 4px; font-size: 0.8em; font-weight: 600;
+           margin-right: 0.55em; vertical-align: baseline; }}
+  .badge-gap {{ display: inline-block; width: 1.35em; margin-right: 0.55em; }}
   nav {{ margin-bottom: 1.5em; font-size: 0.9em; }}
   nav .sections {{ margin-top: 0.7em; padding-top: 0.6em; border-top: 1px solid #e2e2e2; }}
   nav .here {{ font-weight: 600; color: #1a1a1a; }}
@@ -242,6 +247,7 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     input[type=text], input[type=email], input[type=password] {{
       background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
     code {{ background: #232326; }}
+    .dim {{ color: #6b6b70; }}
     button.quiet {{ background: #2e2e33; color: #e8e8e8; }}
   }}
 </style>

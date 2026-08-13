@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- **Collection listings are grouped by the domain that publishes them.** A repository with a few dozen
+  collections was a wall of reverse-DNS in which `app.bsky.feed.post` and `app.bsky.graph.follow` looked no
+  more related than `app.bsky.feed.post` and `blue.badge.collection`. Both realms now group by the
+  authority's registrable domain — the first two NSID segments reversed — with each row dimming the shared
+  prefix so only the part that differs reads. Listings page by group rather than by collection, so a page
+  boundary no longer splits one publisher's collections in half.
+
+  Each group carries a small coloured mark derived from its domain rather than that domain's favicon. The
+  portal's `Content-Security-Policy` is `default-src 'none'`, and a remote image would need `img-src`
+  opened to other origins — which on a signed-in page means every NSID authority in the account's
+  repository learns when the holder opens it, and an injected `<img>` gains somewhere to report to. The
+  mark is a pure function of the domain, so a publisher keeps the same one across page loads and across
+  both realms.
+
 - **One OAuth application can be revoked without ending the others.** The Access page listed every grant on
   an account and offered exactly one control over them — sign out everywhere — so a holder who wanted a
   single application gone had to end all of them and sign back in everywhere else. Each row now carries its

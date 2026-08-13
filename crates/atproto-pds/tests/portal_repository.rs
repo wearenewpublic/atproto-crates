@@ -752,3 +752,65 @@ async fn revoking_a_grant_that_is_not_there_says_so() {
         Some("/account/sessions?msg=err-nothing-to-revoke")
     );
 }
+
+/// Collections are grouped by the domain that publishes them, and each row
+/// shows only the part that differs.
+///
+/// A repository with a few dozen collections is a wall of reverse-DNS in which
+/// `app.bsky.feed.post` and `app.bsky.graph.follow` look no more related than
+/// `app.bsky.feed.post` and `blue.badge.collection`. The publisher is the thing
+/// a person scans for.
+#[tokio::test(flavor = "multi_thread")]
+async fn collections_are_grouped_by_publishing_domain() {
+    let (app, manager, writer, _tmp) = build_app().await;
+    let cookie = signed_in_with_a_record(&manager, &writer).await;
+
+    for collection in [
+        "app.bsky.feed.post",
+        "app.bsky.graph.follow",
+        "blue.badge.collection",
+    ] {
+        writer
+            .apply_writes(
+                DID,
+                vec![WriteOp {
+                    action: WriteAction::Create,
+                    collection: collection.to_string(),
+                    rkey: "3kaaaaaaaaaa9".to_string(),
+                    value: Some(serde_json::json!({"$type": collection, "text": "x"})),
+                    swap_record: None,
+                }],
+            )
+            .await
+            .expect("seed record");
+    }
+
+    let (status, body, _) = get(&app, &cookie, "/account/repository/public/").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // One badge per publisher, not one per collection: the two app.bsky
+    // collections share a group, so there are two badges for three rows.
+    let badges = body.matches(r#"<span class="badge" "#).count();
+    assert_eq!(badges, 2, "expected one badge per domain group: {body}");
+    // Rows inside a group are indented under it rather than repeating it.
+    assert!(
+        body.contains(r#"<span class="badge-gap">"#),
+        "the second row of a group should be indented: {body}"
+    );
+    // The shared authority is dimmed and the distinguishing tail is not.
+    assert!(
+        body.contains(r#"<span class="dim">app.bsky.feed.</span>post"#),
+        "the row should dim everything but the last segment: {body}"
+    );
+    // Grouping is presentation only — every collection is still linked.
+    for collection in [
+        "app.bsky.feed.post",
+        "app.bsky.graph.follow",
+        "blue.badge.collection",
+    ] {
+        assert!(
+            body.contains(&format!("/account/repository/public/{collection}")),
+            "{collection} should still be reachable: {body}"
+        );
+    }
+}
