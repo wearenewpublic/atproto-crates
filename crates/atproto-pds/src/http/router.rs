@@ -8,6 +8,7 @@ use crate::http::handlers;
 use crate::http::identity_handlers;
 use crate::http::moderation_handlers;
 use crate::http::portal;
+use crate::http::portal_spaces;
 use crate::http::preference_handlers;
 use crate::http::proxy_handlers;
 use crate::http::repository;
@@ -602,6 +603,26 @@ fn build_router_inner(
             get(repository::space_record)
                 .post(repository::space_record_post)
                 .delete(repository::space_record_delete),
+        )
+        // Space administration. Separate from the repository browser above:
+        // browsing a space is something every member does, configuring one is
+        // something only its authority can.
+        .route("/account/spaces", get(portal_spaces::index))
+        .route(
+            "/account/spaces/{host}/{space_type}/{space_key}",
+            get(portal_spaces::detail),
+        )
+        .route(
+            "/account/spaces/{host}/{space_type}/{space_key}/config",
+            post(portal_spaces::save_config),
+        )
+        .route(
+            "/account/spaces/{host}/{space_type}/{space_key}/members",
+            post(portal_spaces::add_member),
+        )
+        .route(
+            "/account/spaces/{host}/{space_type}/{space_key}/members/remove",
+            post(portal_spaces::remove_member),
         )
         .route("/account/email", post(portal::change_email))
         .route("/account/email/verify", post(portal::verify_email))

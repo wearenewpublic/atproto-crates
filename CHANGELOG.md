@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- **The portal can administer spaces.** A new **Spaces** section (`/account/spaces`) lists the spaces an
+  account is in, separating the ones it is the authority for from the ones it merely belongs to, and gives
+  each owned space a page for the two things only an authority can do: set the access policy
+  (mint policy, `appAccess` open-or-allow-list, managing app) and manage the member list.
+
+  Deliberately separate from the repository browser rather than bolted onto it. Browsing a space is
+  something every member does; configuring one is something only its authority can, and a page full of
+  controls the viewer is not allowed to use is worse than a page that does not offer them.
+
+  Two refusals are worth naming. An allow list submitted with nothing in it is rejected rather than
+  saved — it is the shape the form takes when the radio is chosen and the box left blank, and storing it
+  would lock every application out of the space including the one the owner is using. And the authority's
+  own row in the member table carries no remove control, because a space's authority is a member of it and
+  cannot leave.
+
 - **The firehose log now has a retention window**, swept by the unified GC. `stream_event` had none
   at all — zero `DELETE` statements existed anywhere in the crate — so every record ever written was
   stored a second time, as a DAG-CBOR CAR, in the *shared* accounts database. At 20 writes/s and a

@@ -271,6 +271,8 @@ pub(crate) enum Section {
     Access,
     /// `/account/repository` — the repository browser.
     Repository,
+    /// `/account/spaces` — space settings and membership.
+    Spaces,
     /// `/account/delegation` — not implemented yet.
     Delegation,
 }
@@ -281,10 +283,11 @@ impl Section {
     /// The single source of both the paths and the labels: a section added
     /// here appears on every page at once, which is the property that stops a
     /// page from being reachable only by typing its URL.
-    const ALL: [(Self, &'static str, &'static str); 4] = [
+    const ALL: [(Self, &'static str, &'static str); 5] = [
         (Self::Settings, "/account", "Settings"),
         (Self::Access, "/account/sessions", "Access"),
         (Self::Repository, "/account/repository", "Repository"),
+        (Self::Spaces, "/account/spaces", "Spaces"),
         (Self::Delegation, "/account/delegation", "Delegation"),
     ];
 }

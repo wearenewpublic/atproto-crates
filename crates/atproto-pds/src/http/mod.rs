@@ -16,6 +16,7 @@ pub mod identity_handlers;
 pub mod moderation_handlers;
 /// The account portal -- what an account holder can do with only a browser.
 pub mod portal;
+pub mod portal_spaces;
 pub mod preference_handlers;
 pub mod proxy_handlers;
 pub mod proxy_target;
