@@ -191,19 +191,30 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
 <title>{title}</title>
 <style>
   :root {{ color-scheme: light dark; }}
+  /* Portal text is full of strings with no natural break points -- DIDs,
+     at:// URIs, CIDs, OAuth scope lists. `anywhere` lets them fold instead
+     of widening the page, and (unlike `break-word`) it also shrinks their
+     min-content size, which is what stops a table column containing one from
+     forcing the whole layout past the viewport. Inherited, so one declaration
+     covers headings, cells, code and links alike. */
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
          max-width: 42em; margin: 3em auto; padding: 0 1.2em; line-height: 1.5;
-         color: #1a1a1a; background: #fafafa; }}
+         color: #1a1a1a; background: #fafafa; overflow-wrap: anywhere; }}
   h1 {{ font-size: 1.35em; margin-bottom: 0.2em; }}
   h2 {{ font-size: 1.05em; margin-top: 2em; border-bottom: 1px solid #e2e2e2;
        padding-bottom: 0.3em; }}
   .sub {{ color: #666; font-size: 0.92em; margin-top: 0; }}
+  /* A wide table that still cannot fold (many columns on a narrow phone)
+     scrolls inside its card instead of dragging the page sideways. */
   section {{ background: #fff; border: 1px solid #e2e2e2; border-radius: 8px;
-            padding: 1em 1.2em; margin: 1em 0; }}
+            padding: 1em 1.2em; margin: 1em 0; overflow-x: auto; }}
   label {{ display: block; margin: 0.8em 0 0.25em; font-size: 0.9em; font-weight: 500; }}
   input[type=text], input[type=email], input[type=password] {{
     width: 100%; padding: 0.55em; border: 1px solid #c8c8c8; border-radius: 5px;
     font-size: 1em; box-sizing: border-box; background: #fff; color: #1a1a1a; }}
+  textarea {{ width: 100%; padding: 0.55em; border: 1px solid #c8c8c8; border-radius: 5px;
+             font-size: 0.95em; box-sizing: border-box; background: #fff; color: #1a1a1a;
+             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
   button {{ padding: 0.55em 1.1em; border: 0; border-radius: 5px; background: #1c64f2;
            color: #fff; font-size: 0.95em; cursor: pointer; margin-top: 0.9em; }}
   button.danger {{ background: #b91c1c; }}
@@ -242,12 +253,32 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
   table.groups tr.group td {{ padding-top: 0.75em; }}
   table.groups tr:first-child td {{ padding-top: 0; }}
   nav {{ margin-bottom: 1.5em; font-size: 0.9em; }}
+  /* Identity on the left, sign-out on the right, and on a phone the button
+     wraps under the DID instead of overlapping it (the float it replaces
+     did). */
+  nav .id-row {{ display: flex; align-items: center; gap: 0.6em; flex-wrap: wrap; }}
+  nav .id-row .who {{ flex: 1 1 auto; min-width: 0; }}
+  nav .id-row form {{ margin: 0; }}
   nav .sections {{ margin-top: 0.7em; padding-top: 0.6em; border-top: 1px solid #e2e2e2; }}
+  /* Inline-block gives each section link a real box, so the tap target is
+     taller than the text alone and wrapped rows keep a little air. */
+  nav .sections a, nav .sections .here {{ display: inline-block; padding: 0.15em 0; }}
   nav .here {{ font-weight: 600; color: #1a1a1a; }}
   nav .crumbs {{ margin: 0.6em 0 0; color: #666; }}
   details {{ margin-top: 1em; border-top: 1px solid #e2e2e2; padding-top: 0.6em; }}
   summary {{ cursor: pointer; font-size: 0.9em; font-weight: 500; }}
   a {{ color: #1c64f2; }}
+  @media (max-width: 640px) {{
+    body {{ margin: 1em auto; padding: 0 0.9em; }}
+    section {{ padding: 0.85em 0.9em; }}
+    h1 {{ font-size: 1.25em; }}
+    table {{ font-size: 0.85em; }}
+    th, td {{ padding: 0.35em 0.4em; }}
+    /* Finger-sized submit buttons; the quiet ones are secondary and stay
+       compact. */
+    button {{ padding: 0.7em 1.2em; }}
+    button.quiet {{ padding: 0.4em 0.8em; }}
+  }}
   @media (prefers-color-scheme: dark) {{
     body {{ color: #e8e8e8; background: #141416; }}
     section {{ background: #1c1c1f; border-color: #2e2e33; }}
@@ -259,6 +290,7 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     nav .crumbs {{ color: #aaa; }}
     input[type=text], input[type=email], input[type=password] {{
       background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
+    textarea {{ background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
     code {{ background: #232326; }}
     .dim {{ color: #6b6b70; }}
     dl.explain dd {{ color: #a8a8ad; }}
@@ -338,9 +370,9 @@ pub(crate) fn nav(current: Section, account: &crate::account::AccountRow, crumbs
         format!(r#"<p class="crumbs">{crumbs}</p>"#)
     };
     format!(
-        r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
-  <form method="POST" action="/account/signout" style="display:inline;float:right">
-    <button class="quiet" type="submit">Sign out</button></form>
+        r#"<nav><div class="id-row"><span class="who"><b>{handle}</b> &middot; <code>{did}</code></span>
+  <form method="POST" action="/account/signout">
+    <button class="quiet" type="submit">Sign out</button></form></div>
   <div class="sections">{links}</div>
   {crumb_line}</nav>"#,
         handle = esc(&account.handle),
