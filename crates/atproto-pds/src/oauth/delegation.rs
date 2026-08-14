@@ -397,6 +397,15 @@ fn start_response(html: String) -> Response {
         axum::http::header::PRAGMA,
         axum::http::HeaderValue::from_static("no-cache"),
     );
+    // Set here rather than left to the middleware, which only fills in a
+    // policy a handler did not choose. This page's form ends up at the
+    // delegate's authorization server, and the default `form-action 'self'`
+    // stops the browser following the redirect that takes it there. See
+    // `DELEGATION_START_CSP`.
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(crate::http::security_headers::DELEGATION_START_CSP),
+    );
     response
 }
 

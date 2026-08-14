@@ -1027,3 +1027,92 @@ async fn the_client_jwks_is_absent_when_delegation_is_off() {
         "a client this server will not act as should not publish keys for it"
     );
 }
+
+/// The handle page's form must be able to reach the delegate's server.
+///
+/// This is the second thing that broke delegated sign-in end to end, after the
+/// `kid` mismatch, and it was invisible from the server: the PAR succeeded, the
+/// flow was parked, a `303` went out, and the browser silently declined to
+/// follow it because `form-action 'self'` is enforced against the end of a
+/// redirect chain that began with a form submission. Nothing was logged
+/// anywhere, because nothing had failed -- the navigation simply never
+/// happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_handle_page_may_submit_onward_to_another_origin() {
+    let h = build(true).await;
+    stage_par(
+        &h.state,
+        "urn:ietf:params:oauth:request_uri:csp",
+        Some(HANDLE),
+    )
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(navigation(
+            "/oauth/delegation/start?request_uri=urn:ietf:params:oauth:request_uri:csp",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let csp = resp
+        .headers()
+        .get(axum::http::header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .expect("the handle page carries a policy")
+        .to_string();
+
+    assert!(
+        csp.contains("form-action 'self' https:"),
+        "this page's form ends up at a delegate's authorization server, on an \
+         origin not known until the handle resolves; under `form-action 'self'` \
+         the browser abandons the redirect and the flow dies silently.\n  got: {csp}"
+    );
+}
+
+/// Widening `form-action` is scoped to that one page.
+///
+/// The pages that take a password keep the strict policy. If this ever fails,
+/// the relaxation has leaked onto a surface that had a reason for the original
+/// directive.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_else_gets_the_widened_form_action() {
+    let h = build(true).await;
+
+    for path in ["/account/signin", "/oauth/delegation/client-metadata.json"] {
+        let resp = h
+            .app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csp = resp
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !csp.contains("https:"),
+            "{path} picked up the delegate page's widened form-action: {csp}"
+        );
+    }
+}
+
+/// The two policies differ in exactly one directive.
+///
+/// Stated so that a later edit to `HTML_CSP` -- a new directive, a tightened
+/// one -- cannot quietly fail to reach the delegate page, which would otherwise
+/// keep whatever the policy looked like on the day it was copied.
+#[test]
+fn the_delegate_policy_is_the_strict_one_with_one_directive_changed() {
+    use atproto_pds::http::security_headers::{DELEGATION_START_CSP, HTML_CSP};
+    assert_eq!(
+        HTML_CSP.replace("form-action 'self'", "form-action 'self' https:"),
+        DELEGATION_START_CSP,
+        "the delegate page's policy has drifted from the strict one by more \
+         than the directive it is allowed to differ in"
+    );
+}

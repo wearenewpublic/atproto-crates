@@ -95,6 +95,40 @@ pub const HTML_CSP: &str = "default-src 'none'; \
      frame-ancestors 'none'; \
      base-uri 'none'";
 
+/// [`HTML_CSP`] with `form-action` widened to any HTTPS origin, for the
+/// delegate handle-entry page and nothing else.
+///
+/// That page's form posts here and this server answers `303` to the delegate's
+/// own authorization server -- a different origin, and one not known until the
+/// handle has been resolved, so it cannot be named ahead of time.
+///
+/// A browser enforces `form-action` against the *end* of a redirect chain that
+/// began with a form submission, not just its first hop. Under `'self'` Chrome
+/// abandons the navigation silently: no console error the submitter sees, no
+/// request to the peer, a page that appears to do nothing. Delegated sign-in
+/// was completely broken by this and looked like a server fault. Verified by
+/// A/B -- same page, same `303`, only this directive changed.
+///
+/// The consent screen has the same shape and solves it differently, with a
+/// `fetch` and a `location` assignment, because a navigation is not a form
+/// submission. That costs a script, and the delegate page is required to work
+/// without one.
+///
+/// Widening it here is cheap: the page carries one text field for a handle and
+/// no password, its only interpolated value is a `login_hint` that
+/// `prefill_identifier` has already validated, and anyone who could inject a
+/// form into it could exfiltrate through `script-src 'unsafe-inline'` anyway.
+/// The pages that do take a password keep [`HTML_CSP`].
+pub const DELEGATION_START_CSP: &str = "default-src 'none'; \
+     img-src 'self' data:; \
+     font-src 'self'; \
+     style-src 'unsafe-inline'; \
+     script-src 'unsafe-inline'; \
+     connect-src 'self'; \
+     form-action 'self' https:; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
+
 /// Add the headers above to every response that does not already carry them.
 pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
