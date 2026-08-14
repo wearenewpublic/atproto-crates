@@ -1,0 +1,455 @@
+/* Portal stylesheet -- the single source of truth for the account portal's
+   appearance. Two consumers read this file:
+
+   - `page()` in `src/http/portal.rs`, via `build.rs`, which strips these
+     comments and inlines the result into every response. The portal's CSS is
+     never cached across pages, so the comments would otherwise ship on every
+     page view -- roughly half the stylesheet's bytes, to every visitor.
+   - `docs/style-guide/index.html`, which embeds this file verbatim, comments
+     and all, because it is a reference document read by people. A test
+     asserts the two stay identical. */
+
+/* Archivo, for everything that is read rather than compared.
+   A grotesque drawn by Omnibus-Type for legibility at small sizes, which is
+   where most of this interface's words live -- dense table cells, now set at
+   the 16px floor rather than below it. Its newspaper-and-timetable lineage is
+   the "dense, unimpressed" the design context asks for, and it is emphatically
+   not the reflex pick.
+   Upstream ships no variable cut, so these are static weights: 400 body,
+   500 label, 600 heading, 700 for `<b>`, plus a real italic for `<em>`.
+   The browser fetches only the cuts a given page uses. */
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-400.woff2") format("woff2"),
+       url("fonts/archivo-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-400-italic.woff2") format("woff2"),
+       url("fonts/archivo-400-italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-500.woff2") format("woff2"),
+       url("fonts/archivo-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-600.woff2") format("woff2"),
+       url("fonts/archivo-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-700.woff2") format("woff2"),
+       url("fonts/archivo-700.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* JetBrains Mono, for machine values only.
+   `font-display: swap` so a slow font never blanks the text: the system
+   monospace shows immediately and is replaced when the file lands. On this
+   page that matters more than usual -- the strings it renders are DIDs and
+   CIDs somebody may be mid-way through reading.
+   One file, 12 KB, carrying the whole 100-800 weight range. Served from
+   this origin under `font-src 'self'`; see `http::fonts` for why not a
+   data: URI. */
+@font-face {
+  font-family: "JetBrains Mono";
+  /* Two candidates, tried in order. The absolute path is what the server
+     answers. The relative one is for the style guide, which is a static
+     file opened straight from disk and would otherwise fall back to the
+     system monospace -- in the one document whose job is showing the real
+     face. A `src` list is a priority order: when the server serves this,
+     the first URL hits and the second is never fetched. */
+  src: url("/static/fonts/jetbrains-mono-var.woff2") format("woff2-variations"),
+       url("fonts/jetbrains-mono-var.woff2") format("woff2-variations");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+/* Type scale, in `rem`, with a 16px floor.
+   Every size here used to be `em`, and `em` compounds: `code` (0.88em)
+   inside `.muted` (0.88em) inside `table` (0.9em) resolved to 0.70em --
+   about 11px, in the densest, most-read part of the site. Nobody chose
+   that. Nobody chose the twelve distinct sizes between 11px and 16px it
+   produced either; they fell out of multiplication. `rem` fixed the
+   compounding; this fixes the floor.
+   Nothing renders below 16px. The scale previously ran down to 14px for
+   tables, labels, `.muted` and `code`, and 12px for badges -- which is
+   most of the words on the site, set below the size a phone can
+   comfortably read. 16px is also the threshold below which iOS Safari
+   zooms the viewport on focusing an input, so a 14px field actively
+   fought the reader.
+   Three steps rather than five, because a floor at 16px leaves the
+   bottom two with nowhere to stand: 12, 14 and 16 all collapse onto 16,
+   and keeping three names for one value would be a scale lying about
+   itself. Density that used to come from size now comes from colour
+   (`.muted`, `.dim`), weight and spacing -- all of which survive a
+   reader who has scaled their text up, which a 14px step does not.
+   The two steps above hold the 1.25 ratio that makes a heading read as
+   a heading. */
+:root {
+  color-scheme: light dark;
+  --text-base: 1rem;       /* 16px -- the floor: everything that is read */
+  --text-lg: 1.25rem;      /* 20px -- section headings */
+  --text-xl: 1.5625rem;    /* 25px -- page title */
+
+  /* Two families, two jobs.
+     `--font-ui` is Archivo, with the system stack behind it so a failed
+     fetch degrades to something reasonable rather than to Times.
+     `--font-mono` is semantic. It marks a value a person compares character
+     by character -- a DID, a CID, an AT-URI, a scope string, record JSON --
+     and JetBrains Mono is here because it disambiguates 0/O and 1/l/I
+     explicitly. It is not decoration and it is not a "technical" mood; using
+     it for prose would be the costume this design context rules out. */
+  --font-ui: "Archivo", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Leading, as a token because it differs by theme.
+     Line-height scales inversely with line length, and the column here is
+     deliberately wide -- a long line needs more leading, not the same, or
+     the eye loses the start of the next one on the return sweep. 1.5 was
+     tuned for a measure this layout no longer has.
+     Dark gets a further step: light text on a dark ground reads as a
+     lighter weight and wants the extra room. */
+  --leading: 1.65;
+
+  /* Spacing, on a 4pt scale.
+     Twenty-one hand-picked `em` values used to do this job, which is the
+     same failure the type scale had before it: relative units, no system,
+     each number chosen on its own. These are the steps; anything not on
+     them is either an inline metric (below) or a mistake.
+     4pt rather than 8pt because 12px between two things is a spacing you
+     genuinely want and an 8pt scale cannot express. */
+  --space-3xs: 0.25rem;   /* 4  */
+  --space-2xs: 0.5rem;    /* 8  */
+  --space-xs:  0.75rem;   /* 12 */
+  --space-sm:  1rem;      /* 16 */
+  --space-md:  1.5rem;    /* 24 */
+  --space-lg:  2rem;      /* 32 */
+  --space-xl:  3rem;      /* 48 */
+  --space-2xl: 4rem;      /* 64 */
+
+  /* Corner radius, three steps. Previously five values -- 3, 4, 5, 6 and 8px
+     -- each picked at the moment its component was written, which left
+     nothing to tell the next component which one it should take. Scaled by
+     the size of the thing being rounded: inline marks, then controls, then
+     the page's structural containers. */
+  --radius-sm: 3px;   /* inline: code spans, badges, focus rings */
+  --radius-md: 5px;   /* controls: buttons, fields, the secret panel */
+  --radius-lg: 8px;   /* containers: sections, notices */
+
+  /* Colour, as two drawn palettes rather than one plus patches.
+     Dark was previously a handful of overrides on top of light, which left
+     `.muted` -- the most-used class here -- `.sub`, the link colour and
+     every notice tint inheriting light values onto a near-black page.
+     `.muted` measured 3.80:1 and `.sub` 3.20:1 against AA's 4.5:1, in the
+     theme this audience actually runs. Both palettes are now stated in
+     full and both clear AA against every surface they land on. */
+  --bg: oklch(98.5% 0.0040 262.0);
+  --surface: oklch(99.5% 0.0030 262.0);  /* off pure white */
+  --raised: oklch(95.9% 0.0060 262.0);
+  --border: oklch(91.3% 0.0060 262.0);
+  --border-soft: oklch(95.5% 0.0050 262.0);
+  --text: oklch(21.8% 0.0080 262.0);
+  --muted: oklch(48.5% 0.0100 262.0);  /* 5.67:1 */
+  --dim: oklch(53.8% 0.0100 262.0);  /* 4.52:1 -- the AA floor */
+  --heading-soft: oklch(45.0% 0.0100 262.0);
+  --accent: oklch(55.2% 0.2244 262.0);
+  --btn-bg: oklch(55.2% 0.2244 262.0);
+  --btn-text: oklch(99.0% 0.0050 262.0);
+  --danger-bg: oklch(50.5% 0.1905 27.5);
+  --danger-text: oklch(99.0% 0.0050 262.0);
+  --quiet-bg: oklch(92.8% 0.0080 262.0);
+  --field-bg: oklch(99.5% 0.0030 262.0);
+  --field-border: oklch(83.3% 0.0080 262.0);
+  --ok-bg: oklch(97.9% 0.0221 160.2);
+  --ok-border: oklch(87.1% 0.0844 157.4);
+  --ok-text: oklch(43.1% 0.0995 157.7);
+  --err-bg: oklch(97.2% 0.0119 23.7);
+  --err-border: oklch(83.4% 0.0677 22.0);
+  --err-text: oklch(43.2% 0.1500 29.0);
+  --warn-bg: oklch(98.5% 0.0204 91.6);
+  --warn-border: oklch(88.5% 0.0941 85.7);
+  --warn-text: oklch(46.1% 0.0974 70.3);
+
+  /* Deliberately theme-invariant, and defined here rather than in both
+     palettes so it cannot be half-changed. A freshly minted app password is
+     shown exactly once; holding it on near-black in either theme marks it as
+     a different kind of value from everything else on the page, and keeps a
+     shoulder-surfer's glance from resolving it against a bright field.
+     19.37:1 -- the highest contrast anywhere in the portal, because this is
+     the string most likely to be transcribed by hand. */
+  --secret-bg: oklch(14.0% 0.0060 262.0);
+  --secret-text: oklch(99.0% 0.0050 262.0);
+}
+/* `.muted` and `.dim` are one step apart, not one shade.
+   Pushed to the AA floor they both resolve to the same grey, which would
+   collapse a distinction the pages rely on -- `.dim` marks the repeated
+   part of a value, `.muted` carries explanation. So `.muted` sits above
+   the floor and `.dim` on it, and the gap stays legible in both themes. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --leading: 1.72;
+    --bg: oklch(19.2% 0.0060 262.0);
+    --surface: oklch(22.8% 0.0080 262.0);
+    --raised: oklch(25.7% 0.0080 262.0);
+    --border: oklch(30.3% 0.0100 262.0);
+    --border-soft: oklch(25.7% 0.0080 262.0);
+    --text: oklch(93.1% 0.0060 262.0);
+    --muted: oklch(68.6% 0.0100 262.0);  /* 5.59:1 */
+    --dim: oklch(63.3% 0.0100 262.0);  /* 4.55:1 */
+    --heading-soft: oklch(73.8% 0.0100 262.0);
+    --accent: oklch(71.7% 0.1469 261.6);  /* 6.73:1 */
+    --btn-bg: oklch(71.7% 0.1469 261.6);
+    --btn-text: oklch(19.9% 0.0200 262.0);
+    --danger-bg: oklch(50.5% 0.1905 27.5);
+    --danger-text: oklch(99.0% 0.0050 262.0);
+    --quiet-bg: oklch(30.3% 0.0100 262.0);
+    --field-bg: oklch(25.7% 0.0080 262.0);
+    --field-border: oklch(35.1% 0.0100 262.0);
+    --ok-bg: oklch(24.7% 0.0344 162.8);
+    --ok-border: oklch(37.1% 0.0613 160.5);
+    --ok-text: oklch(83.2% 0.1212 158.2);
+    --err-bg: oklch(22.7% 0.0331 26.1);
+    --err-border: oklch(35.9% 0.0770 27.2);
+    --err-text: oklch(80.5% 0.0896 24.3);
+    --warn-bg: oklch(25.6% 0.0324 86.2);
+    --warn-border: oklch(41.0% 0.0694 84.4);
+    --warn-text: oklch(85.2% 0.1088 85.0);
+  }
+}
+/* Interactive surfaces had no states at all -- no `:focus-visible`, no
+   `:hover`, no `:active`, and `button` suppresses the browser's default
+   ring by restyling. A keyboard user tabbing through the page that revokes
+   credentials had nothing telling them what was focused. */
+a:focus-visible, button:focus-visible, summary:focus-visible,
+input:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+button:hover { filter: brightness(1.08); }
+button:active { filter: brightness(0.94); }
+a:hover { text-decoration-thickness: 2px; }
+input:focus, textarea:focus { border-color: var(--accent); }
+button { transition: filter 120ms ease-out; }
+/* Covers all three ways motion reaches the screen, not just the one this
+   stylesheet currently uses. Transitions are the only animation here today,
+   but a guard that only names what exists is a guard that silently stops
+   covering the page the moment somebody adds a keyframe or a smooth scroll. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+/* Portal text is full of strings with no natural break points -- DIDs,
+   at:// URIs, CIDs, OAuth scope lists. `anywhere` lets them fold instead
+   of widening the page, and (unlike `break-word`) it also shrinks their
+   min-content size, which is what stops a table column containing one from
+   forcing the whole layout past the viewport. Inherited, so one declaration
+   covers headings, cells, code and links alike. */
+/* The shell is sized for the widest thing on it, not the narrowest.
+   42em was a measure for prose, and it left the sections that are actually
+   tabular -- Access with five columns of client id, scope, grant date and
+   delegate; the repository listing; a space's member list -- folding and
+   side-scrolling inside their cards on a screen with a thousand spare
+   pixels either side.
+   `min()` rather than a bare `max-width` so the same declaration covers
+   both directions: it is the cap on a desktop and 100% of whatever there
+   is on a phone, with no breakpoint in between deciding which. `padding`
+   scales with the viewport for the same reason, and `border-box` keeps it
+   inside the cap instead of adding to it. */
+body { font-family: var(--font-ui);
+       max-width: min(72rem, 100%); margin: var(--space-xl) auto; line-height: var(--leading);
+       padding: 0 clamp(var(--space-xs), 2.5vw, var(--space-lg)); box-sizing: border-box;
+       color: var(--text); background: var(--bg); overflow-wrap: anywhere; }
+
+/* A single-line field is filled, not read, and one stretched to the full
+   shell is a target far larger than the handle, email or DID going into it.
+   `textarea` is deliberately absent: the only ones here hold record JSON,
+   which is code -- it wants every column the shell has, and capping it was
+   the first thing the widened layout got wrong. */
+form input[type=text], form input[type=email], form input[type=password] {
+  max-width: 34em; }
+h1 { font-size: var(--text-xl); margin-bottom: var(--space-3xs); letter-spacing: -0.01em; }
+h2 { font-size: var(--text-lg); margin-top: var(--space-lg); border-bottom: 1px solid var(--border);
+     padding-bottom: var(--space-2xs); letter-spacing: -0.005em; }
+.sub { color: var(--muted); font-size: var(--text-base); margin-top: 0; }
+/* A wide table that still cannot fold (many columns on a narrow phone)
+   scrolls inside its card instead of dragging the page sideways. */
+/* Cards fill the shell, and so does what is in them.
+   An earlier pass capped prose at a measure and then capped the card to
+   match, which left a wide window mostly empty. The decision here is that
+   the width is there to be used: the body, the card and the card's contents
+   all expand together. A line of prose on a 72rem display therefore runs
+   long by typographic convention -- that is the accepted trade, not an
+   oversight. */
+/* The first heading in a card sits flush with the card's padding. Nineteen
+   handlers said this with `style="margin-top:0"`, which is the stylesheet's
+   job -- and which every new card had to remember to repeat. */
+section > h1:first-child, section > h2:first-child, section > h3:first-child { margin-top: 0; }
+section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+          padding: var(--space-md) var(--space-md); margin: var(--space-md) 0; overflow-x: auto;
+          box-sizing: border-box; }
+label { display: block; margin: var(--space-xs) 0 var(--space-3xs); font-size: var(--text-base); font-weight: 500; }
+input[type=text], input[type=email], input[type=password] {
+  width: 100%; padding: var(--space-2xs); border: 1px solid var(--field-border); border-radius: var(--radius-md);
+  font-size: var(--text-base); box-sizing: border-box; background: var(--field-bg); color: var(--text); }
+textarea { width: 100%; padding: var(--space-2xs); border: 1px solid var(--field-border); border-radius: var(--radius-md);
+           font-size: var(--text-base); box-sizing: border-box; background: var(--field-bg); color: var(--text);
+           font-family: var(--font-mono); }
+/* Checkboxes are the smallest control on the site and the only one whose size
+   comes from the UA rather than from here -- 13x13px, roughly a quarter of the
+   minimum target. The one that matters gates a policy acceptance, so it is
+   both the smallest and among the most consequential. */
+input[type=checkbox] { width: 1.5em; height: 1.5em; min-width: 24px; min-height: 24px;
+                       accent-color: var(--accent); }
+/* A checkbox and the sentence it governs are one target, so the label wraps
+   both and lays them out as a row -- `gap` rather than a margin on the input,
+   so the spacing survives the input being restyled. */
+label.inline { display: inline-flex; align-items: center; gap: var(--space-2xs);
+              font-weight: 400; margin: 0; }
+/* Every control clears the 24px minimum target, including the compact ones.
+   `button.quiet` sits on the Revoke action -- a destructive control that was
+   31px tall on a phone, because the narrow breakpoint below re-stated the same
+   padding. Height is the axis that fails; the labels are wide enough already. */
+button { padding: var(--space-2xs) var(--space-sm); border: 0; border-radius: var(--radius-md); background: var(--btn-bg);
+         color: var(--btn-text); font-size: var(--text-base); cursor: pointer;
+         margin-top: var(--space-xs); min-height: 44px; }
+/* Two actions in one form: the secondary sits beside the primary, not
+   against it. Only between siblings, so a lone button is unaffected. */
+button + button { margin-left: var(--space-2xs); }
+button.danger { background: var(--danger-bg); color: var(--danger-text); }
+button.quiet { background: var(--quiet-bg); color: var(--text); margin-top: 0;
+               padding: var(--space-3xs) var(--space-xs); font-size: var(--text-base);
+               min-height: 24px; }
+table { border-collapse: collapse; width: 100%; font-size: var(--text-base); }
+/* `overflow-wrap: anywhere` is inherited from `body` and is right for the
+   values in a cell -- a client id, a scope list, an AT-URI should fold
+   rather than widen the page. It is wrong for the two things that carry no
+   foldable content: a column header and a button label. Left to fold they
+   became "Grante/d", "Actin/g as" and a Revoke button three lines tall on a
+   phone.
+   Holding them intact also restores the behaviour `section`'s
+   `overflow-x: auto` was added for. While every cell could shrink to any
+   width the table always fitted, so the scroll never engaged and a
+   five-column listing folded into an unreadable column of fragments
+   instead. Now the table keeps a floor, exceeds the card, and scrolls
+   inside it -- which is what the card was told to do. */
+th, button { overflow-wrap: normal; white-space: nowrap; }
+th { text-align: left; font-weight: 600; padding: var(--space-3xs) var(--space-2xs); color: var(--heading-soft);
+     border-bottom: 1px solid var(--border); }
+td { padding: var(--space-3xs) var(--space-2xs); border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+/* The action cell: the last column of a listing, holding the control for its
+   row. Right-aligned so the actions form a column of their own, and never
+   wrapped -- "Revoke" broken across two lines was a real regression once. */
+td.action { text-align: right; white-space: nowrap; }
+/* A form that sits inside a cell or a line of prose rather than owning a block.
+   Six handlers wrote `style="display:inline"` for this. */
+form.inline { display: inline; margin: 0; }
+/* `code` was 0.9em, which is the one rule the floor cannot tolerate: a
+   multiplier renders at 14.4px inside 16px text no matter what the scale
+   says. It inherits now. JetBrains Mono runs optically larger than Archivo
+   at a matched size, so the shrink was doing real work -- but a DID or a CID
+   is precisely the string that must not be the smallest thing on the page,
+   and the mono face is here to be read character by character. */
+code { font-family: var(--font-mono); font-size: 1em;
+       /* The one padding left in `em`, deliberately: inline code sits in
+          running text and its box must track whatever it is nested in. */
+       background: var(--raised); padding: 0.1em 0.35em; border-radius: var(--radius-sm); }
+.notice { border-radius: var(--radius-lg); padding: var(--space-xs) var(--space-sm); margin: var(--space-sm) 0;
+          font-size: var(--text-base); }
+.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: var(--ok-text); }
+.err { background: var(--err-bg); border: 1px solid var(--err-border); color: var(--err-text); }
+.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text); }
+.secret { font-family: var(--font-mono); font-size: var(--text-base);
+          background: var(--secret-bg); color: var(--secret-text);
+          padding: var(--space-2xs) var(--space-xs); border-radius: var(--radius-md);
+          word-break: break-all; }
+.muted { color: var(--muted); font-size: var(--text-base); }
+.dim { color: var(--dim); }
+dl.explain { margin: var(--space-2xs) 0 var(--space-xs); font-size: var(--text-base); }
+dl.explain dt { font-weight: 600; margin-top: var(--space-xs); }
+dl.explain dd { margin: var(--space-3xs) 0 0; color: var(--heading-soft); }
+/* One box, two appearances. Both arms must share every metric that decides
+   where the text after them starts -- including font-size, since a width in
+   `em` resolves against it and a 0.8em badge beside a 1em spacer put the
+   rows of one group a few pixels out from each other.
+   The box grew from 16px to 24px with the floor: it holds a single letter,
+   and a 16px glyph does not fit a 16px box. 24px is also the minimum target
+   size, which a badge that doubles as a row's affordance should clear. */
+.badge, .badge-gap { display: inline-block; width: 24px; height: 24px;
+         line-height: 24px; font-size: var(--text-base); margin-right: 8px;
+         text-align: center; vertical-align: middle; }
+.badge { border-radius: var(--radius-sm); font-weight: 600; }
+.badge img { width: 24px; height: 24px; display: block; border-radius: var(--radius-sm); }
+/* Grouped listings draw no row rules: the groups are the structure, and a
+   line under every row competes with them. */
+table.groups td { border-bottom: 0; padding: var(--space-3xs) var(--space-2xs); }
+table.groups tr.group td { padding-top: var(--space-2xs); }
+table.groups tr:first-child td { padding-top: 0; }
+nav { margin-bottom: var(--space-md); font-size: var(--text-base); }
+/* Identity on the left, sign-out on the right, and on a phone the button
+   wraps under the DID instead of overlapping it (the float it replaces
+   did). */
+nav .id-row { display: flex; align-items: center; gap: var(--space-2xs); flex-wrap: wrap; }
+nav .id-row .who { flex: 1 1 auto; min-width: 0; }
+nav .id-row form { margin: 0; }
+nav .sections { margin-top: var(--space-xs); padding-top: var(--space-2xs); border-top: 1px solid var(--border); }
+/* Inline-block gives each section link a real box, so the tap target is
+   taller than the text alone and wrapped rows keep a little air. */
+nav .sections a, nav .sections .here { display: inline-block; padding: var(--space-3xs) 0; }
+nav .here { font-weight: 600; color: var(--text); }
+nav .crumbs { margin: var(--space-2xs) 0 0; color: var(--muted); }
+details { margin-top: var(--space-sm); border-top: 1px solid var(--border); padding-top: var(--space-2xs); }
+/* Explanation stacked inside a notice or a disclosure is one thought in
+   several sentences, so the paragraphs sit closer than free-standing prose.
+   Nine handlers expressed this with `em` margins between 0.2 and 0.8 -- five
+   different values for one intent, none of them on the scale. */
+.notice > p, details > p { margin: var(--space-3xs) 0; }
+/* A form inside a notice follows the sentence that explains it. */
+.notice > form { margin-top: var(--space-2xs); }
+/* A summary is a control, not prose, so WCAG 2.5.8's exemption for links
+   inside a sentence does not reach it. It was one pixel under. */
+summary { cursor: pointer; font-size: var(--text-base); font-weight: 500;
+          min-height: 24px; padding: var(--space-3xs) 0; }
+/* Links in a table cell stand alone -- an NSID, a client name, a handle -- and
+   are the row's action as often as they are its label. Padding rather than
+   height so the row does not grow. */
+td a, th a { display: inline-block; min-height: 24px; padding: var(--space-3xs) 0; }
+a { color: var(--accent); }
+@media (max-width: 640px) {
+  /* Vertical only. Horizontal padding is the `clamp` above, which already
+     bottoms out here -- restating it would be a second place to change it
+     and a second place to forget. */
+  body { margin: var(--space-sm) auto; }
+  section { padding: var(--space-sm) var(--space-sm); }
+  /* On the scale, not beside it: one step down from --text-xl. */
+  h1 { font-size: var(--text-lg); }
+  /* Tables used to drop a step here. With a 16px floor there is no step to
+     drop to, so a narrow screen buys its room from padding instead. */
+  th, td { padding: var(--space-3xs) var(--space-3xs); }
+  /* Finger-sized submit buttons; the quiet ones are secondary and stay
+     compact. */
+  button { padding: var(--space-xs) var(--space-sm); }
+  button.quiet { padding: var(--space-3xs) var(--space-xs); }
+}
+/* The dark overrides that used to live here are gone: every value they set
+   is now a token above, and the ones they *forgot* to set -- `.muted`,
+   `.sub`, the link colour, all three notice tints -- were the defects. A
+   palette stated once cannot forget a member of itself. */

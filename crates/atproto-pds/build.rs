@@ -26,6 +26,98 @@ fn main() {
     println!("cargo:rustc-env=BUILD_REV={}", rev);
 
     generate_lexicon_table();
+    strip_portal_stylesheet();
+}
+
+/// Write `src/http/portal.css` into `OUT_DIR` with its comments removed.
+///
+/// The portal inlines its stylesheet into every response and there is no
+/// cross-page CSS cache, so every byte is paid on every page view. Roughly half
+/// of `portal.css` is commentary explaining why the values are what they are --
+/// worth keeping in the source, not worth sending to a browser. Stripping here
+/// rather than by hand means the explanation and the shipped bytes cannot drift.
+fn strip_portal_stylesheet() {
+    let manifest =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
+    let source = manifest.join("src/http/portal.css");
+    println!("cargo:rerun-if-changed=src/http/portal.css");
+
+    let css = std::fs::read_to_string(&source).expect("read the portal stylesheet");
+    let stripped = strip_css_comments(&css);
+
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set")).join("portal.css");
+    std::fs::write(&out, stripped).expect("write the stripped portal stylesheet");
+}
+
+/// Remove `/* ... */` comments and per-line padding from a stylesheet.
+///
+/// Verified by the unit tests on `STYLESHEET` in `src/http/portal.rs`, which
+/// assert against the file this actually produces. Tests written here would
+/// not run: `cargo test` does not execute a build script's test module.
+///
+/// String-aware, so a `/*` inside a `url("...")` or `content: "..."` is left
+/// alone. Line structure is kept -- this is a comment stripper, not a minifier,
+/// and the remaining newlines cost little against the clarity of a stylesheet
+/// that can still be read in a browser's devtools.
+///
+/// Every delimiter it looks for is ASCII, but the text between them need not be
+/// (`content: "\u{2191}"` is legal CSS), so this copies string slices rather
+/// than bytes and never splits a character.
+fn strip_css_comments(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut i = 0;
+    // Start of the run of retained text not yet copied into `out`.
+    let mut run = 0;
+    let mut quote: Option<u8> = None;
+
+    while i < bytes.len() {
+        match quote {
+            // Inside a string: skip escapes so a `\"` does not close it, and
+            // close on the matching quote. Nothing here is ever dropped.
+            Some(q) => {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if bytes[i] == b'"' || bytes[i] == b'\'' {
+                    quote = Some(bytes[i]);
+                    i += 1;
+                } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    // Flush what preceded the comment, then skip to the closing
+                    // delimiter -- or to the end, if it is unterminated.
+                    out.push_str(&css[run..i]);
+                    match css[i + 2..].find("*/") {
+                        Some(end) => i += 2 + end + 2,
+                        None => i = bytes.len(),
+                    }
+                    run = i;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    out.push_str(&css[run..]);
+
+    // Drop the indentation the comments were aligned to, and the blank lines
+    // they leave behind.
+    let mut result = String::with_capacity(out.len());
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        result.push_str(trimmed);
+        result.push('\n');
+    }
+    result
 }
 
 /// Walk `lexicons/` and write the `BUNDLED_LEXICONS` table into `OUT_DIR`.

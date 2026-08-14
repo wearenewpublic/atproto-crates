@@ -182,13 +182,13 @@ pub async fn index(
     let body = format!(
         r#"{banner}
 <section>
-<h2 style="margin-top:0">Public repository</h2>
+<h2>Public repository</h2>
 <p class="muted">Records anyone can read, published to the network.</p>
 <p><a href="{ROOT}/public/">Browse public records</a></p>
 </section>
 
 <section>
-<h2 style="margin-top:0">Spaces</h2>
+<h2>Spaces</h2>
 <p class="muted">Permissioned records, readable only by the members of each space.</p>
 <table>{space_rows}</table>
 </section>
@@ -223,7 +223,7 @@ async fn blob_section(
     // the question".
     let Some(manager) = state.account_manager.as_deref() else {
         return Ok(r#"<section>
-<h2 style="margin-top:0">Blobs</h2>
+<h2>Blobs</h2>
 <p class="muted">This server has no account manager configured, so blob storage
 cannot be read from here.</p>
 </section>"#
@@ -275,7 +275,7 @@ cannot be read from here.</p>
 
     Ok(format!(
         r#"<section>
-<h2 style="margin-top:0">Blobs</h2>
+<h2>Blobs</h2>
 <p class="muted">Images and other binaries referenced by a public record. Anyone
 holding the CID can fetch these; a blob referenced only from a space is not
 listed and is not public.</p>
@@ -542,7 +542,7 @@ fn record_view(
         String::new()
     } else {
         format!(
-            r#"<p class="muted" style="margin-top:0.8em">Linked content</p><table>{}</table>"#,
+            r#"<p class="muted">Linked content</p><table>{}</table>"#,
             cids.iter()
                 .map(|cid| format!(
                     r#"<tr><td><a href="{}{}"><code>{}</code></a></td></tr>"#,
@@ -566,16 +566,13 @@ fn record_view(
 {linked}
 <form method="POST" action="{action}">
   <label for="value">Record JSON</label>
-  <textarea id="value" name="value" rows="20" spellcheck="false"
-            style="width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-                   font-size:0.85em;padding:0.55em;border:1px solid #c8c8c8;
-                   border-radius:5px;box-sizing:border-box">{json}</textarea>
+  <textarea id="value" name="value" rows="20" spellcheck="false">{json}</textarea>
   <p class="muted">Saving replaces the record. Its <code>$type</code> must match
   the collection, and the server validates it the same way it validates a write
   from any client.</p>
   <button type="submit">Save record</button>
 </form>
-<form method="POST" action="{action}" style="margin-top:0.8em">
+<form method="POST" action="{action}">
   <input type="hidden" name="_method" value="delete">
   <button class="danger" type="submit">Delete record</button>
   <p class="muted">Deleting is published to the network and cannot be undone here.</p>
@@ -628,7 +625,7 @@ pub async fn public_collections(
     // starts from, not a placeholder.
     let create = format!(
         r#"<section>
-<h2 style="margin-top:0">Create a record</h2>
+<h2>Create a record</h2>
 <form method="POST" action="{ROOT}/public/">
   <label for="collection">Collection</label>
   <input id="collection" name="collection" type="text" spellcheck="false"
@@ -636,10 +633,7 @@ pub async fn public_collections(
   <label for="rkey">Record key</label>
   <input id="rkey" name="rkey" type="text" spellcheck="false" placeholder="leave blank for a TID">
   <label for="value">Record JSON</label>
-  <textarea id="value" name="value" rows="10" spellcheck="false"
-            style="width:100%;font-family:ui-monospace,monospace;font-size:0.85em;
-                   padding:0.55em;border:1px solid #c8c8c8;border-radius:5px;
-                   box-sizing:border-box">{{}}</textarea>
+  <textarea id="value" name="value" rows="10" spellcheck="false">{{}}</textarea>
   <button type="submit">Create record</button>
 </form>
 </section>"#

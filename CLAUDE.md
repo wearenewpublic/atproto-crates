@@ -208,3 +208,25 @@ All public and exported types, methods, and variables must be documented.
 All source files must have high level module documentation.
 
 Documentation must be brief and specific.
+
+## Account portal design
+
+Before changing anything the account portal renders — the HTML pages under
+`/account`, whose shared stylesheet is
+`crates/atproto-pds/src/http/portal.css` — read
+`crates/atproto-pds/docs/style-guide/.impeccable.md`. It holds the design
+context: audience, voice, aesthetic direction, the CSP and no-build-step
+constraints any change has to live inside, and the anti-references.
+
+`portal.css` is the single source of truth. `build.rs` strips its comments
+into `OUT_DIR` and `page()` inlines the result into every response, so the
+rationale stays in the source and does not ship on every page view.
+
+The portal's markup carries **no inline styles and no colour literals** —
+every rule lives in `portal.css`, where both themes and the type scale can
+reach it. A test enforces this, along with a 16px floor on every font size.
+
+`crates/atproto-pds/docs/style-guide/index.html` shows every component the
+portal is built from. It is hand-maintained and embeds a verbatim *copy* of
+`portal.css`, so a change has to be mirrored into it by hand — `cargo test
+--test style_guide` fails if the two drift. See the README in that directory.

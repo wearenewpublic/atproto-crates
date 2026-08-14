@@ -181,6 +181,15 @@ pub(crate) fn esc(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// The portal stylesheet, with its comments stripped by `build.rs`.
+///
+/// The source lives in `portal.css` next to this file and keeps its comments;
+/// only the bytes that go on the wire lose them. Roughly half of that file is
+/// commentary, and because the stylesheet is inlined into every response and
+/// never cached across pages, shipping it would cost every visitor those bytes
+/// on every page view.
+const STYLESHEET: &str = include_str!(concat!(env!("OUT_DIR"), "/portal.css"));
+
 /// Shared chrome. Every portal page is this with a different body.
 pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
@@ -190,113 +199,7 @@ pub(crate) fn page(title: &str, body: &str) -> Html<String> {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  /* Portal text is full of strings with no natural break points -- DIDs,
-     at:// URIs, CIDs, OAuth scope lists. `anywhere` lets them fold instead
-     of widening the page, and (unlike `break-word`) it also shrinks their
-     min-content size, which is what stops a table column containing one from
-     forcing the whole layout past the viewport. Inherited, so one declaration
-     covers headings, cells, code and links alike. */
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-         max-width: 42em; margin: 3em auto; padding: 0 1.2em; line-height: 1.5;
-         color: #1a1a1a; background: #fafafa; overflow-wrap: anywhere; }}
-  h1 {{ font-size: 1.35em; margin-bottom: 0.2em; }}
-  h2 {{ font-size: 1.05em; margin-top: 2em; border-bottom: 1px solid #e2e2e2;
-       padding-bottom: 0.3em; }}
-  .sub {{ color: #666; font-size: 0.92em; margin-top: 0; }}
-  /* A wide table that still cannot fold (many columns on a narrow phone)
-     scrolls inside its card instead of dragging the page sideways. */
-  section {{ background: #fff; border: 1px solid #e2e2e2; border-radius: 8px;
-            padding: 1em 1.2em; margin: 1em 0; overflow-x: auto; }}
-  label {{ display: block; margin: 0.8em 0 0.25em; font-size: 0.9em; font-weight: 500; }}
-  input[type=text], input[type=email], input[type=password] {{
-    width: 100%; padding: 0.55em; border: 1px solid #c8c8c8; border-radius: 5px;
-    font-size: 1em; box-sizing: border-box; background: #fff; color: #1a1a1a; }}
-  textarea {{ width: 100%; padding: 0.55em; border: 1px solid #c8c8c8; border-radius: 5px;
-             font-size: 0.95em; box-sizing: border-box; background: #fff; color: #1a1a1a;
-             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-  button {{ padding: 0.55em 1.1em; border: 0; border-radius: 5px; background: #1c64f2;
-           color: #fff; font-size: 0.95em; cursor: pointer; margin-top: 0.9em; }}
-  button.danger {{ background: #b91c1c; }}
-  button.quiet {{ background: #e5e7eb; color: #1a1a1a; margin-top: 0; padding: 0.3em 0.7em;
-                 font-size: 0.85em; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 0.9em; }}
-  th {{ text-align: left; font-weight: 600; padding: 0.4em 0.5em; color: #555;
-       border-bottom: 1px solid #e2e2e2; }}
-  td {{ padding: 0.45em 0.5em; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }}
-  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em;
-         background: #f1f1f4; padding: 0.1em 0.35em; border-radius: 3px; }}
-  .notice {{ border-radius: 6px; padding: 0.7em 0.9em; margin: 1em 0; font-size: 0.92em; }}
-  .ok {{ background: #ecfdf3; border: 1px solid #a6e6bf; color: #05603a; }}
-  .err {{ background: #fef3f2; border: 1px solid #f2b8b5; color: #912018; }}
-  .warn {{ background: #fffaeb; border: 1px solid #f5d590; color: #7a4d05; }}
-  .secret {{ font-family: ui-monospace, Menlo, monospace; font-size: 1.05em;
-            background: #111; color: #fff; padding: 0.6em 0.8em; border-radius: 5px;
-            word-break: break-all; }}
-  .muted {{ color: #777; font-size: 0.88em; }}
-  .dim {{ color: #999; }}
-  dl.explain {{ margin: 0.5em 0 0.9em; font-size: 0.9em; }}
-  dl.explain dt {{ font-weight: 600; margin-top: 0.6em; }}
-  dl.explain dd {{ margin: 0.15em 0 0; color: #555; }}
-  /* One box, two appearances. Both arms must share every metric that decides
-     where the text after them starts -- including font-size, since a width in
-     `em` resolves against it and a 0.8em badge beside a 1em spacer put the
-     rows of one group a few pixels out from each other. */
-  .badge, .badge-gap {{ display: inline-block; width: 16px; height: 16px;
-           line-height: 16px; font-size: 11px; margin-right: 8px;
-           text-align: center; vertical-align: middle; }}
-  .badge {{ border-radius: 4px; font-weight: 600; }}
-  .badge img {{ width: 16px; height: 16px; display: block; border-radius: 3px; }}
-  /* Grouped listings draw no row rules: the groups are the structure, and a
-     line under every row competes with them. */
-  table.groups td {{ border-bottom: 0; padding: 0.2em 0.5em; }}
-  table.groups tr.group td {{ padding-top: 0.75em; }}
-  table.groups tr:first-child td {{ padding-top: 0; }}
-  nav {{ margin-bottom: 1.5em; font-size: 0.9em; }}
-  /* Identity on the left, sign-out on the right, and on a phone the button
-     wraps under the DID instead of overlapping it (the float it replaces
-     did). */
-  nav .id-row {{ display: flex; align-items: center; gap: 0.6em; flex-wrap: wrap; }}
-  nav .id-row .who {{ flex: 1 1 auto; min-width: 0; }}
-  nav .id-row form {{ margin: 0; }}
-  nav .sections {{ margin-top: 0.7em; padding-top: 0.6em; border-top: 1px solid #e2e2e2; }}
-  /* Inline-block gives each section link a real box, so the tap target is
-     taller than the text alone and wrapped rows keep a little air. */
-  nav .sections a, nav .sections .here {{ display: inline-block; padding: 0.15em 0; }}
-  nav .here {{ font-weight: 600; color: #1a1a1a; }}
-  nav .crumbs {{ margin: 0.6em 0 0; color: #666; }}
-  details {{ margin-top: 1em; border-top: 1px solid #e2e2e2; padding-top: 0.6em; }}
-  summary {{ cursor: pointer; font-size: 0.9em; font-weight: 500; }}
-  a {{ color: #1c64f2; }}
-  @media (max-width: 640px) {{
-    body {{ margin: 1em auto; padding: 0 0.9em; }}
-    section {{ padding: 0.85em 0.9em; }}
-    h1 {{ font-size: 1.25em; }}
-    table {{ font-size: 0.85em; }}
-    th, td {{ padding: 0.35em 0.4em; }}
-    /* Finger-sized submit buttons; the quiet ones are secondary and stay
-       compact. */
-    button {{ padding: 0.7em 1.2em; }}
-    button.quiet {{ padding: 0.4em 0.8em; }}
-  }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e8e8e8; background: #141416; }}
-    section {{ background: #1c1c1f; border-color: #2e2e33; }}
-    h2 {{ border-color: #2e2e33; }}
-    th {{ color: #aaa; border-color: #2e2e33; }}
-    td {{ border-color: #232326; }}
-    nav .sections {{ border-color: #2e2e33; }}
-    nav .here {{ color: #e8e8e8; }}
-    nav .crumbs {{ color: #aaa; }}
-    input[type=text], input[type=email], input[type=password] {{
-      background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
-    textarea {{ background: #232326; border-color: #3a3a40; color: #e8e8e8; }}
-    code {{ background: #232326; }}
-    .dim {{ color: #6b6b70; }}
-    dl.explain dd {{ color: #a8a8ad; }}
-    button.quiet {{ background: #2e2e33; color: #e8e8e8; }}
-  }}
+<style>{STYLESHEET}</style>
 </style>
 </head>
 <body>
@@ -649,10 +552,9 @@ fn sign_up_body(state: &HttpState, message: Option<&str>, prior: &PortalQuery) -
         .map(|p| {
             format!(
                 r#"<div class="notice warn">
-                     <label style="font-weight:400;margin:0">
-                       <input type="checkbox" name="policy" value="accept" required
-                              style="width:auto;margin-right:0.5em">
-                       You must accept the policy <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> to continue.
+                     <label class="inline">
+                       <input type="checkbox" name="policy" value="accept" required>
+                       <span>You must accept the policy <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> to continue.</span>
                      </label>
                    </div>"#,
                 url = esc(&p.url),
@@ -1074,16 +976,16 @@ pub async fn dashboard(
     } else {
         r#"<div class="notice warn">
   <b>This address is not confirmed.</b>
-  <p class="muted" style="margin:0.3em 0 0">Password reset and account recovery
+  <p class="muted">Password reset and account recovery
   are sent here, so an address nobody has proved control of is a recovery route
   that may not work when it is needed.</p>
-  <form method="POST" action="/account/email/verify" style="margin-top:0.6em">
+  <form method="POST" action="/account/email/verify">
     <label for="verify_token">Confirmation code</label>
     <input id="verify_token" name="token" type="text" placeholder="XXXXX-XXXXX"
            autocomplete="one-time-code" spellcheck="false" required>
     <button type="submit">Confirm</button>
     <button class="quiet" type="submit" formaction="/account/email/verify/send"
-            formnovalidate style="margin-left:0.4em">Send me a code</button>
+            formnovalidate>Send me a code</button>
   </form>
 </div>"#
             .to_string()
@@ -1115,23 +1017,23 @@ pub async fn dashboard(
     // something they can be expected to have to hand.
     let handle_section = format!(
         r#"<section>
-<h2 style="margin-top:0">Handle</h2>
+<h2>Handle</h2>
 <p><code>{handle}</code></p>
 <form method="POST" action="/account/handle">
   <label for="handle">New handle</label>
   <input id="handle" name="handle" type="text" autocomplete="off" spellcheck="false"
          placeholder="name.example.com" required>
   {handle_domains}
-  <details style="margin-top:0.6em">
+  <details>
     <summary class="muted">Using a domain you own</summary>
-    <p class="muted" style="margin-bottom:0.3em">Point the domain at this account
+    <p class="muted">Point the domain at this account
     first, by either route:</p>
-    <p class="muted" style="margin:0.2em 0">DNS — a <code>TXT</code> record at
+    <p class="muted">DNS — a <code>TXT</code> record at
     <code>_atproto.&lt;your-domain&gt;</code> with the value
     <code>did={did}</code></p>
-    <p class="muted" style="margin:0.2em 0">HTTPS — <code>https://&lt;your-domain&gt;/.well-known/atproto-did</code>
+    <p class="muted">HTTPS — <code>https://&lt;your-domain&gt;/.well-known/atproto-did</code>
     returning <code>{did}</code></p>
-    <p class="muted" style="margin-top:0.3em">The change is refused until one of
+    <p class="muted">The change is refused until one of
     those resolves, so set it up before submitting.</p>
   </details>
   <p class="muted">Your DID never changes, so posts, followers and app passwords
@@ -1151,7 +1053,7 @@ pub async fn dashboard(
 {handle_section}
 
 <section>
-<h2 style="margin-top:0">Email</h2>
+<h2>Email</h2>
 <p>{email_display} {email_state}</p>
 {verify_block}
 <form method="POST" action="/account/email">
@@ -1164,7 +1066,7 @@ pub async fn dashboard(
 </section>
 
 <section>
-<h2 style="margin-top:0">Password</h2>
+<h2>Password</h2>
 <form method="POST" action="/account/password">
   <label for="current">Current password</label>
   <input id="current" name="current" type="password" autocomplete="current-password" required>
@@ -1239,8 +1141,8 @@ pub async fn sessions(
                 format!(
                     r#"<tr><td><code>{}</code></td><td class="muted">{}</td>
                     <td class="muted">{}</td>
-                    <td style="text-align:right">
-                      <form method="POST" action="/account/app-passwords/revoke" style="display:inline">
+                    <td class="action">
+                      <form method="POST" action="/account/app-passwords/revoke" class="inline">
                         <input type="hidden" name="name" value="{}">
                         <button class="quiet" type="submit">Revoke</button>
                       </form></td></tr>"#,
@@ -1290,8 +1192,8 @@ pub async fn sessions(
                 format!(
                     r#"<tr><td><code>{}</code></td><td class="muted">{}</td><td class="muted">{}</td>
                     <td class="muted">{}</td>
-                    <td style="text-align:right">
-                      <form method="POST" action="/account/sessions/revoke" style="display:inline">
+                    <td class="action">
+                      <form method="POST" action="/account/sessions/revoke" class="inline">
                         <input type="hidden" name="client_id" value="{}">
                         <button class="quiet" type="submit">Revoke</button></form></td></tr>"#,
                     esc(&grant.client_id),
@@ -1313,7 +1215,7 @@ pub async fn sessions(
 {fresh_secret}
 
 <section>
-<h2 style="margin-top:0">App passwords</h2>
+<h2>App passwords</h2>
 <p class="muted">Each row is a standing grant. A session minted from one is a
 stateless token with no row of its own, so "last used" is the only sign one is
 in use.</p>
@@ -1327,7 +1229,7 @@ in use.</p>
 </section>
 
 <section>
-<h2 style="margin-top:0">OAuth sessions</h2>
+<h2>OAuth sessions</h2>
 <p class="muted">Applications currently holding a grant on this account.
 Revoking one stops that application renewing its access and leaves the others
 alone; a token it already holds keeps working for up to 15 minutes.</p>
@@ -1340,7 +1242,7 @@ in one step.</p>
 </section>
 
 <section>
-<h2 style="margin-top:0">Sign out everywhere</h2>
+<h2>Sign out everywhere</h2>
 <p class="muted">Ends every app-password session and every OAuth grant on this
 account at once. Tokens already issued stop working immediately rather than
 when they expire. This browser stays signed in.</p>
@@ -1419,8 +1321,8 @@ listed under <a href="/account/sessions">Access</a>.</p>
                     r#"<tr><td><b>{handle}</b><br><code class="dim">{did}</code></td>
                     <td class="muted">{created}</td>
                     <td class="muted">{grants}</td>
-                    <td style="text-align:right">
-                      <form method="POST" action="/account/delegation/remove" style="display:inline">
+                    <td class="action">
+                      <form method="POST" action="/account/delegation/remove" class="inline">
                         <input type="hidden" name="did" value="{did}">
                         <button class="quiet" type="submit">Remove</button>
                       </form></td></tr>"#,
@@ -1441,7 +1343,7 @@ listed under <a href="/account/sessions">Access</a>.</p>
 {banner}
 
 <section>
-<h2 style="margin-top:0">Delegated identities</h2>
+<h2>Delegated identities</h2>
 <p class="muted">Each row is an identity that may sign in as themselves, on
 their own server, and then authorize an application on this account. They never
 learn this account's password, and removing a row takes the ability away
@@ -1451,7 +1353,7 @@ immediately.</p>
 </section>
 
 <section>
-<h2 style="margin-top:0">Add a delegate</h2>
+<h2>Add a delegate</h2>
 <p class="muted">The handle is checked both ways before it is accepted: it must
 resolve to a DID, and that DID's document must claim the handle back. What is
 stored is the DID, so a delegate who later changes their handle keeps their
@@ -1464,7 +1366,7 @@ access and whoever takes the old handle gets none.</p>
 </section>
 
 <section>
-<h2 style="margin-top:0">What a delegate can do</h2>
+<h2>What a delegate can do</h2>
 <dl class="explain">
   <dt>Act as this account in any application</dt>
   <dd>A delegate can approve an application and it receives a grant on this
@@ -1636,9 +1538,13 @@ fn policy_prompt(
         _ => String::new(),
     };
     format!(
-        r#"<nav><b>{handle}</b> &middot; <code>{did}</code>
-  <form method="POST" action="/account/signout" style="display:inline;float:right">
-    <button class="quiet" type="submit">Sign out</button></form></nav>
+        // The identity row from `nav()`, without the section links: this page
+        // is a gate, and until the policy is accepted there is nowhere to go.
+        // The float this used to use did not wrap on a narrow screen, which
+        // is the whole reason `.id-row` is a flex row.
+        r#"<nav><div class="id-row"><span class="who"><b>{handle}</b> &middot; <code>{did}</code></span>
+  <form method="POST" action="/account/signout">
+    <button class="quiet" type="submit">Sign out</button></form></div></nav>
 <h1>Accept the policy</h1>
 <p class="sub">This account cannot sign in to any application until the current
 policy is accepted.</p>
@@ -1646,10 +1552,9 @@ policy is accepted.</p>
 <section>
 <form method="POST" action="/account/policy">
   <div class="notice warn">
-    <label style="font-weight:400;margin:0">
-      <input type="checkbox" name="policy" value="accept" required
-             style="width:auto;margin-right:0.5em">
-      You must accept the policy <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> to continue.
+    <label class="inline">
+      <input type="checkbox" name="policy" value="accept" required>
+      <span>You must accept the policy <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> to continue.</span>
     </label>
   </div>
   <button type="submit">Accept and continue</button>
@@ -2249,6 +2154,59 @@ fn urlencoding_encode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The shell every portal section is rendered into scales in both
+    /// directions from one declaration.
+    ///
+    /// The cap is what stops a section from being a ribbon down the middle of
+    /// a wide display; the `100%` arm is what keeps that cap from becoming a
+    /// horizontal scrollbar on a phone. Written as one `min()` rather than a
+    /// width plus a breakpoint, because two rules that have to agree are two
+    /// rules that can stop agreeing.
+    #[test]
+    fn the_shell_is_capped_on_a_wide_screen_and_fluid_below_it() {
+        let html = page("Test", "<p>body</p>").0;
+        assert!(
+            html.contains("max-width: min(72rem, 100%)"),
+            "the shell is not both capped and fluid"
+        );
+        // The behaviour, not the literals: the floor and ceiling are spacing
+        // tokens now, and pinning their values here would make this test fail
+        // every time the scale is retuned without anything actually breaking.
+        assert!(
+            html.contains("padding: 0 clamp(var(--space-")
+                && html.contains("2.5vw")
+                && html.contains("var(--space-lg))"),
+            "the gutter does not scale with the viewport between two scale steps"
+        );
+        // Without this the gutter is added to the cap rather than taken out
+        // of it, so the column is wider than it says it is.
+        assert!(html.contains("box-sizing: border-box"));
+    }
+
+    /// The shell's width reaches the content, not just the page.
+    ///
+    /// An earlier pass capped prose to a reading measure and then capped the
+    /// card to match it, which made a wide window mostly empty and read as
+    /// content cut off. The decision is that the width is there to be used:
+    /// body, card and contents expand together. Nothing between the shell and
+    /// the text may reintroduce a cap.
+    #[test]
+    fn nothing_between_the_shell_and_the_text_caps_the_width() {
+        let html = page("Test", "<p>body</p>").0;
+        for capped in [
+            "p, .sub, label, dl.explain { max-width:",
+            "section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;\n            padding: var(--space-md) var(--space-md); margin: var(--space-md) 0; overflow-x: auto;\n            box-sizing: border-box;\n            max-width:",
+        ] {
+            assert!(
+                !html.contains(capped),
+                "a width cap is back between the shell and the text: {capped}"
+            );
+        }
+        // The shell itself still caps, and tables still fill their container.
+        assert!(html.contains("max-width: min(72rem, 100%)"));
+        assert!(html.contains("table { border-collapse: collapse; width: 100%"));
+    }
+
     /// Build read-only state with a chosen proxy-trust setting.
     async fn state_with_hops(hops: usize) -> HttpState {
         let tmp = tempfile::tempdir().unwrap();
@@ -2425,5 +2383,147 @@ mod tests {
         let out = esc(r#"<script>alert("x")</script>"#);
         assert!(!out.contains('<'), "{out}");
         assert!(out.contains("&lt;script&gt;"), "{out}");
+    }
+
+    /// The shipped stylesheet carries no comments.
+    ///
+    /// This is the whole point of routing `portal.css` through `build.rs`: the
+    /// source keeps its rationale, the wire does not. A regression here is
+    /// silent -- the page still renders -- so it has to be asserted.
+    #[test]
+    fn stylesheet_ships_without_comments() {
+        assert!(
+            !STYLESHEET.contains("/*"),
+            "the stripped stylesheet still contains a comment"
+        );
+        assert!(
+            !STYLESHEET.contains("*/"),
+            "the stripped stylesheet still contains a comment terminator"
+        );
+    }
+
+    /// Stripping did not eat any rules.
+    ///
+    /// A comment stripper that loses a brace produces CSS the browser silently
+    /// discards from the error onward, which is exactly the failure that would
+    /// not show up in a passing test suite.
+    #[test]
+    fn stylesheet_survives_stripping_intact() {
+        let source = include_str!("portal.css");
+        assert_eq!(
+            STYLESHEET.matches('{').count(),
+            source.matches('{').count(),
+            "brace count changed between source and shipped stylesheet"
+        );
+        assert_eq!(
+            STYLESHEET.matches('{').count(),
+            STYLESHEET.matches('}').count(),
+            "unbalanced braces in the shipped stylesheet"
+        );
+        // A few load-bearing declarations, spot-checked by name.
+        for needle in [
+            "--radius-md",
+            "--secret-bg",
+            "input[type=checkbox]",
+            "prefers-reduced-motion",
+            "@font-face",
+        ] {
+            assert!(
+                STYLESHEET.contains(needle),
+                "`{needle}` did not survive stripping"
+            );
+        }
+    }
+
+    /// Nothing in the stylesheet sets type below 16px.
+    ///
+    /// The floor exists for phones and for readers who need larger text, and
+    /// it is the kind of rule that erodes one convenient exception at a time --
+    /// a 0.9em `code`, a 12px badge -- each of which looked reasonable alone.
+    /// Sizes are either a scale token or a bare `1em`, and the scale bottoms
+    /// out at `1rem`.
+    #[test]
+    fn no_type_is_set_below_sixteen_pixels() {
+        let source = include_str!("portal.css");
+
+        // Only these tokens exist, and the smallest is the 16px floor.
+        for banned in ["--text-sm", "--text-xs"] {
+            assert!(
+                !source.contains(banned),
+                "`{banned}` is below the 16px floor and should not exist"
+            );
+        }
+
+        let mut offenders = Vec::new();
+        for line in source.lines() {
+            let Some(rest) = line.split_once("font-size:") else {
+                continue;
+            };
+            let value = rest.1.trim_start();
+            let value = value.split(';').next().unwrap_or(value).trim();
+            let acceptable = value.starts_with("var(--text-")
+                || value == "1em"
+                || value == "1rem"
+                || value == "inherit";
+            if !acceptable {
+                offenders.push(value.to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "font sizes that bypass the scale, and so the 16px floor: {offenders:?}"
+        );
+    }
+
+    /// The handlers style nothing themselves.
+    ///
+    /// An earlier version of this guard only read `portal.css`, and two record
+    /// JSON textareas in `repository.rs` sat outside it the whole time --
+    /// carrying a hard-coded monospace stack that shut JetBrains Mono out, a
+    /// `0.85em` that broke the floor, and a `#c8c8c8` border that stayed light
+    /// grey in dark mode. A stylesheet only governs the markup that lets it.
+    #[test]
+    fn portal_markup_carries_no_inline_styles() {
+        let sources = [
+            ("portal.rs", include_str!("portal.rs")),
+            ("portal_spaces.rs", include_str!("portal_spaces.rs")),
+            ("repository.rs", include_str!("repository.rs")),
+        ];
+        // Assembled at run time so neither needle appears literally in this
+        // file, which `include_str!` above reads back and would otherwise
+        // match against the test's own source.
+        let style_attr = format!("style{}{}", '=', '"');
+        let mono_stack = format!("ui{}monospace", '-');
+
+        for (name, source) in sources {
+            let count = source.matches(style_attr.as_str()).count();
+            assert_eq!(
+                count, 0,
+                "{name} carries {count} inline style attribute(s); \
+                 the rule belongs in portal.css, where both themes and the \
+                 type scale can reach it"
+            );
+            assert!(
+                !source.contains(mono_stack.as_str()),
+                "{name} names a font stack directly; use var(--font-mono)"
+            );
+        }
+    }
+
+    /// Stripping is worth doing.
+    ///
+    /// If this ever fails it means the comments have gone from the source, not
+    /// that the stripper broke -- and the source is where they belong.
+    #[test]
+    fn stripping_removes_a_meaningful_share_of_the_bytes() {
+        let source = include_str!("portal.css");
+        let saved = source.len().saturating_sub(STYLESHEET.len());
+        assert!(
+            saved * 100 / source.len() >= 30,
+            "expected stripping to save at least 30% of the stylesheet, saved {}% \
+             ({saved} of {} bytes)",
+            saved * 100 / source.len(),
+            source.len()
+        );
     }
 }

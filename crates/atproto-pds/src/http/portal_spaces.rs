@@ -224,7 +224,7 @@ so there is nothing to administer here.</div>
 <p class="sub">Permissioned data you share with a named set of people.</p>
 
 <section>
-<h2 style="margin-top:0">Spaces you host</h2>
+<h2>Spaces you host</h2>
 <p class="muted">You are the authority for these, so you set who may join and
 which applications may reach them.</p>
 <table><thead><tr><th>Space</th><th>Created</th></tr></thead>
@@ -232,7 +232,7 @@ which applications may reach them.</p>
 </section>
 
 <section>
-<h2 style="margin-top:0">Spaces you are in</h2>
+<h2>Spaces you are in</h2>
 <p class="muted">Hosted by another account, which decides their membership and
 access. Your records in them are yours and live in your repository, and each one
 shows what has been reading them.</p>
@@ -290,14 +290,14 @@ async fn access_log_section(
                 let is_blocked = blocked.contains(&identity);
                 let control = if is_blocked {
                     format!(
-                        r#"<form method="POST" action="{base}/readers/unblock" style="display:inline">
+                        r#"<form method="POST" action="{base}/readers/unblock" class="inline">
   <input type="hidden" name="identity" value="{}">
   <button class="quiet" type="submit">Unblock</button></form>"#,
                         esc(&identity)
                     )
                 } else {
                     format!(
-                        r#"<form method="POST" action="{base}/readers/block" style="display:inline">
+                        r#"<form method="POST" action="{base}/readers/block" class="inline">
   <input type="hidden" name="identity" value="{}">
   <button class="quiet" type="submit">Block</button></form>"#,
                         esc(&identity)
@@ -319,8 +319,8 @@ async fn access_log_section(
                 };
                 format!(
                     r#"<tr><td>{who} {state}</td><td class="muted">{}</td><td class="muted">{}</td>
-<td class="muted" style="text-align:right">{}</td>
-<td style="text-align:right">{control}</td></tr>"#,
+<td class="muted action">{}</td>
+<td class="action">{control}</td></tr>"#,
                     esc(&e.first_seen),
                     esc(&e.last_seen),
                     e.reads
@@ -342,7 +342,7 @@ each time its credential is renewed.</p>"#
 
     Ok(format!(
         r#"<section>
-<h2 style="margin-top:0">Who has read your records</h2>
+<h2>Who has read your records</h2>
 <p class="muted">Applications that presented a credential from this space's
 authority to read your records on this server. Reads of other members' records,
 on their own servers, are not visible here.</p>
@@ -441,7 +441,7 @@ pub async fn detail(
                     r#"<span class="muted">authority</span>"#.to_string()
                 } else {
                     format!(
-                        r#"<form method="POST" action="{base}/members/remove" style="display:inline">
+                        r#"<form method="POST" action="{base}/members/remove" class="inline">
   <input type="hidden" name="did" value="{}">
   <button class="quiet" type="submit">Remove</button></form>"#,
                         esc(&m.did)
@@ -449,7 +449,7 @@ pub async fn detail(
                 };
                 format!(
                     r#"<tr><td><code>{}</code></td><td class="muted">{}</td>
-<td style="text-align:right">{control}</td></tr>"#,
+<td class="action">{control}</td></tr>"#,
                     esc(&m.did),
                     esc(&m.added_at)
                 )
@@ -485,7 +485,7 @@ pub async fn detail(
 <p class="sub">Who may join this space, and which applications may reach it.</p>
 
 <section>
-<h2 style="margin-top:0">Access</h2>
+<h2>Access</h2>
 <p class="muted">Two questions decide who may read this space, and <b>both</b>
 must say yes: which <em>people</em> may be issued a credential, and which
 <em>applications</em> may use one. A credential is a key to the whole space —
@@ -547,7 +547,7 @@ one neither adds anyone to the member list nor lets them write anything.</p>
 {readers}
 
 <section>
-<h2 style="margin-top:0">Members</h2>
+<h2>Members</h2>
 <p class="muted">Members hold their own records for this space, in their own
 repositories. Removing someone stops this space issuing them new credentials;
 it does not reach into their repository, and a credential already issued works

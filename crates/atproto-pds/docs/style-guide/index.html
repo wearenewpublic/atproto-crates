@@ -1,0 +1,935 @@
+<!doctype html>
+<!--
+  Account portal style guide.
+
+  Hand-maintained. Nothing generates this file: edit it directly, open it in a
+  browser, commit it.
+
+  The first stylesheet below is a verbatim copy of src/http/portal.css, which
+  is the source of truth for both this document and the server. `page()` serves
+  that file with its comments stripped; this copy keeps them, because a
+  reference document is read by people. `cargo test --test style_guide` fails
+  if the two drift.
+
+  The second stylesheet is guide-only furniture -- the contents list and the
+  back-to-contents links, neither of which the portal has. Nothing in it should
+  be copied into portal.css.
+
+  Adding a component:
+    1. add the rule to src/http/portal.css
+    2. copy that file into the first <style> block below
+    3. add a block for it in the body, with a Markup disclosure sample
+
+  The nav at the top is a live example of the component, not navigation: its
+  links point at #nav. Forms are inert for the same reason.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portal style guide</title>
+<style>
+/* Portal stylesheet -- the single source of truth for the account portal's
+   appearance. Two consumers read this file:
+
+   - `page()` in `src/http/portal.rs`, via `build.rs`, which strips these
+     comments and inlines the result into every response. The portal's CSS is
+     never cached across pages, so the comments would otherwise ship on every
+     page view -- roughly half the stylesheet's bytes, to every visitor.
+   - `docs/style-guide/index.html`, which embeds this file verbatim, comments
+     and all, because it is a reference document read by people. A test
+     asserts the two stay identical. */
+
+/* Archivo, for everything that is read rather than compared.
+   A grotesque drawn by Omnibus-Type for legibility at small sizes, which is
+   where most of this interface's words live -- dense table cells, now set at
+   the 16px floor rather than below it. Its newspaper-and-timetable lineage is
+   the "dense, unimpressed" the design context asks for, and it is emphatically
+   not the reflex pick.
+   Upstream ships no variable cut, so these are static weights: 400 body,
+   500 label, 600 heading, 700 for `<b>`, plus a real italic for `<em>`.
+   The browser fetches only the cuts a given page uses. */
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-400.woff2") format("woff2"),
+       url("fonts/archivo-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-400-italic.woff2") format("woff2"),
+       url("fonts/archivo-400-italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-500.woff2") format("woff2"),
+       url("fonts/archivo-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-600.woff2") format("woff2"),
+       url("fonts/archivo-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Archivo";
+  src: url("/static/fonts/archivo-700.woff2") format("woff2"),
+       url("fonts/archivo-700.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* JetBrains Mono, for machine values only.
+   `font-display: swap` so a slow font never blanks the text: the system
+   monospace shows immediately and is replaced when the file lands. On this
+   page that matters more than usual -- the strings it renders are DIDs and
+   CIDs somebody may be mid-way through reading.
+   One file, 12 KB, carrying the whole 100-800 weight range. Served from
+   this origin under `font-src 'self'`; see `http::fonts` for why not a
+   data: URI. */
+@font-face {
+  font-family: "JetBrains Mono";
+  /* Two candidates, tried in order. The absolute path is what the server
+     answers. The relative one is for the style guide, which is a static
+     file opened straight from disk and would otherwise fall back to the
+     system monospace -- in the one document whose job is showing the real
+     face. A `src` list is a priority order: when the server serves this,
+     the first URL hits and the second is never fetched. */
+  src: url("/static/fonts/jetbrains-mono-var.woff2") format("woff2-variations"),
+       url("fonts/jetbrains-mono-var.woff2") format("woff2-variations");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+/* Type scale, in `rem`, with a 16px floor.
+   Every size here used to be `em`, and `em` compounds: `code` (0.88em)
+   inside `.muted` (0.88em) inside `table` (0.9em) resolved to 0.70em --
+   about 11px, in the densest, most-read part of the site. Nobody chose
+   that. Nobody chose the twelve distinct sizes between 11px and 16px it
+   produced either; they fell out of multiplication. `rem` fixed the
+   compounding; this fixes the floor.
+   Nothing renders below 16px. The scale previously ran down to 14px for
+   tables, labels, `.muted` and `code`, and 12px for badges -- which is
+   most of the words on the site, set below the size a phone can
+   comfortably read. 16px is also the threshold below which iOS Safari
+   zooms the viewport on focusing an input, so a 14px field actively
+   fought the reader.
+   Three steps rather than five, because a floor at 16px leaves the
+   bottom two with nowhere to stand: 12, 14 and 16 all collapse onto 16,
+   and keeping three names for one value would be a scale lying about
+   itself. Density that used to come from size now comes from colour
+   (`.muted`, `.dim`), weight and spacing -- all of which survive a
+   reader who has scaled their text up, which a 14px step does not.
+   The two steps above hold the 1.25 ratio that makes a heading read as
+   a heading. */
+:root {
+  color-scheme: light dark;
+  --text-base: 1rem;       /* 16px -- the floor: everything that is read */
+  --text-lg: 1.25rem;      /* 20px -- section headings */
+  --text-xl: 1.5625rem;    /* 25px -- page title */
+
+  /* Two families, two jobs.
+     `--font-ui` is Archivo, with the system stack behind it so a failed
+     fetch degrades to something reasonable rather than to Times.
+     `--font-mono` is semantic. It marks a value a person compares character
+     by character -- a DID, a CID, an AT-URI, a scope string, record JSON --
+     and JetBrains Mono is here because it disambiguates 0/O and 1/l/I
+     explicitly. It is not decoration and it is not a "technical" mood; using
+     it for prose would be the costume this design context rules out. */
+  --font-ui: "Archivo", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Leading, as a token because it differs by theme.
+     Line-height scales inversely with line length, and the column here is
+     deliberately wide -- a long line needs more leading, not the same, or
+     the eye loses the start of the next one on the return sweep. 1.5 was
+     tuned for a measure this layout no longer has.
+     Dark gets a further step: light text on a dark ground reads as a
+     lighter weight and wants the extra room. */
+  --leading: 1.65;
+
+  /* Spacing, on a 4pt scale.
+     Twenty-one hand-picked `em` values used to do this job, which is the
+     same failure the type scale had before it: relative units, no system,
+     each number chosen on its own. These are the steps; anything not on
+     them is either an inline metric (below) or a mistake.
+     4pt rather than 8pt because 12px between two things is a spacing you
+     genuinely want and an 8pt scale cannot express. */
+  --space-3xs: 0.25rem;   /* 4  */
+  --space-2xs: 0.5rem;    /* 8  */
+  --space-xs:  0.75rem;   /* 12 */
+  --space-sm:  1rem;      /* 16 */
+  --space-md:  1.5rem;    /* 24 */
+  --space-lg:  2rem;      /* 32 */
+  --space-xl:  3rem;      /* 48 */
+  --space-2xl: 4rem;      /* 64 */
+
+  /* Corner radius, three steps. Previously five values -- 3, 4, 5, 6 and 8px
+     -- each picked at the moment its component was written, which left
+     nothing to tell the next component which one it should take. Scaled by
+     the size of the thing being rounded: inline marks, then controls, then
+     the page's structural containers. */
+  --radius-sm: 3px;   /* inline: code spans, badges, focus rings */
+  --radius-md: 5px;   /* controls: buttons, fields, the secret panel */
+  --radius-lg: 8px;   /* containers: sections, notices */
+
+  /* Colour, as two drawn palettes rather than one plus patches.
+     Dark was previously a handful of overrides on top of light, which left
+     `.muted` -- the most-used class here -- `.sub`, the link colour and
+     every notice tint inheriting light values onto a near-black page.
+     `.muted` measured 3.80:1 and `.sub` 3.20:1 against AA's 4.5:1, in the
+     theme this audience actually runs. Both palettes are now stated in
+     full and both clear AA against every surface they land on. */
+  --bg: oklch(98.5% 0.0040 262.0);
+  --surface: oklch(99.5% 0.0030 262.0);  /* off pure white */
+  --raised: oklch(95.9% 0.0060 262.0);
+  --border: oklch(91.3% 0.0060 262.0);
+  --border-soft: oklch(95.5% 0.0050 262.0);
+  --text: oklch(21.8% 0.0080 262.0);
+  --muted: oklch(48.5% 0.0100 262.0);  /* 5.67:1 */
+  --dim: oklch(53.8% 0.0100 262.0);  /* 4.52:1 -- the AA floor */
+  --heading-soft: oklch(45.0% 0.0100 262.0);
+  --accent: oklch(55.2% 0.2244 262.0);
+  --btn-bg: oklch(55.2% 0.2244 262.0);
+  --btn-text: oklch(99.0% 0.0050 262.0);
+  --danger-bg: oklch(50.5% 0.1905 27.5);
+  --danger-text: oklch(99.0% 0.0050 262.0);
+  --quiet-bg: oklch(92.8% 0.0080 262.0);
+  --field-bg: oklch(99.5% 0.0030 262.0);
+  --field-border: oklch(83.3% 0.0080 262.0);
+  --ok-bg: oklch(97.9% 0.0221 160.2);
+  --ok-border: oklch(87.1% 0.0844 157.4);
+  --ok-text: oklch(43.1% 0.0995 157.7);
+  --err-bg: oklch(97.2% 0.0119 23.7);
+  --err-border: oklch(83.4% 0.0677 22.0);
+  --err-text: oklch(43.2% 0.1500 29.0);
+  --warn-bg: oklch(98.5% 0.0204 91.6);
+  --warn-border: oklch(88.5% 0.0941 85.7);
+  --warn-text: oklch(46.1% 0.0974 70.3);
+
+  /* Deliberately theme-invariant, and defined here rather than in both
+     palettes so it cannot be half-changed. A freshly minted app password is
+     shown exactly once; holding it on near-black in either theme marks it as
+     a different kind of value from everything else on the page, and keeps a
+     shoulder-surfer's glance from resolving it against a bright field.
+     19.37:1 -- the highest contrast anywhere in the portal, because this is
+     the string most likely to be transcribed by hand. */
+  --secret-bg: oklch(14.0% 0.0060 262.0);
+  --secret-text: oklch(99.0% 0.0050 262.0);
+}
+/* `.muted` and `.dim` are one step apart, not one shade.
+   Pushed to the AA floor they both resolve to the same grey, which would
+   collapse a distinction the pages rely on -- `.dim` marks the repeated
+   part of a value, `.muted` carries explanation. So `.muted` sits above
+   the floor and `.dim` on it, and the gap stays legible in both themes. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --leading: 1.72;
+    --bg: oklch(19.2% 0.0060 262.0);
+    --surface: oklch(22.8% 0.0080 262.0);
+    --raised: oklch(25.7% 0.0080 262.0);
+    --border: oklch(30.3% 0.0100 262.0);
+    --border-soft: oklch(25.7% 0.0080 262.0);
+    --text: oklch(93.1% 0.0060 262.0);
+    --muted: oklch(68.6% 0.0100 262.0);  /* 5.59:1 */
+    --dim: oklch(63.3% 0.0100 262.0);  /* 4.55:1 */
+    --heading-soft: oklch(73.8% 0.0100 262.0);
+    --accent: oklch(71.7% 0.1469 261.6);  /* 6.73:1 */
+    --btn-bg: oklch(71.7% 0.1469 261.6);
+    --btn-text: oklch(19.9% 0.0200 262.0);
+    --danger-bg: oklch(50.5% 0.1905 27.5);
+    --danger-text: oklch(99.0% 0.0050 262.0);
+    --quiet-bg: oklch(30.3% 0.0100 262.0);
+    --field-bg: oklch(25.7% 0.0080 262.0);
+    --field-border: oklch(35.1% 0.0100 262.0);
+    --ok-bg: oklch(24.7% 0.0344 162.8);
+    --ok-border: oklch(37.1% 0.0613 160.5);
+    --ok-text: oklch(83.2% 0.1212 158.2);
+    --err-bg: oklch(22.7% 0.0331 26.1);
+    --err-border: oklch(35.9% 0.0770 27.2);
+    --err-text: oklch(80.5% 0.0896 24.3);
+    --warn-bg: oklch(25.6% 0.0324 86.2);
+    --warn-border: oklch(41.0% 0.0694 84.4);
+    --warn-text: oklch(85.2% 0.1088 85.0);
+  }
+}
+/* Interactive surfaces had no states at all -- no `:focus-visible`, no
+   `:hover`, no `:active`, and `button` suppresses the browser's default
+   ring by restyling. A keyboard user tabbing through the page that revokes
+   credentials had nothing telling them what was focused. */
+a:focus-visible, button:focus-visible, summary:focus-visible,
+input:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+button:hover { filter: brightness(1.08); }
+button:active { filter: brightness(0.94); }
+a:hover { text-decoration-thickness: 2px; }
+input:focus, textarea:focus { border-color: var(--accent); }
+button { transition: filter 120ms ease-out; }
+/* Covers all three ways motion reaches the screen, not just the one this
+   stylesheet currently uses. Transitions are the only animation here today,
+   but a guard that only names what exists is a guard that silently stops
+   covering the page the moment somebody adds a keyframe or a smooth scroll. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+/* Portal text is full of strings with no natural break points -- DIDs,
+   at:// URIs, CIDs, OAuth scope lists. `anywhere` lets them fold instead
+   of widening the page, and (unlike `break-word`) it also shrinks their
+   min-content size, which is what stops a table column containing one from
+   forcing the whole layout past the viewport. Inherited, so one declaration
+   covers headings, cells, code and links alike. */
+/* The shell is sized for the widest thing on it, not the narrowest.
+   42em was a measure for prose, and it left the sections that are actually
+   tabular -- Access with five columns of client id, scope, grant date and
+   delegate; the repository listing; a space's member list -- folding and
+   side-scrolling inside their cards on a screen with a thousand spare
+   pixels either side.
+   `min()` rather than a bare `max-width` so the same declaration covers
+   both directions: it is the cap on a desktop and 100% of whatever there
+   is on a phone, with no breakpoint in between deciding which. `padding`
+   scales with the viewport for the same reason, and `border-box` keeps it
+   inside the cap instead of adding to it. */
+body { font-family: var(--font-ui);
+       max-width: min(72rem, 100%); margin: var(--space-xl) auto; line-height: var(--leading);
+       padding: 0 clamp(var(--space-xs), 2.5vw, var(--space-lg)); box-sizing: border-box;
+       color: var(--text); background: var(--bg); overflow-wrap: anywhere; }
+
+/* A single-line field is filled, not read, and one stretched to the full
+   shell is a target far larger than the handle, email or DID going into it.
+   `textarea` is deliberately absent: the only ones here hold record JSON,
+   which is code -- it wants every column the shell has, and capping it was
+   the first thing the widened layout got wrong. */
+form input[type=text], form input[type=email], form input[type=password] {
+  max-width: 34em; }
+h1 { font-size: var(--text-xl); margin-bottom: var(--space-3xs); letter-spacing: -0.01em; }
+h2 { font-size: var(--text-lg); margin-top: var(--space-lg); border-bottom: 1px solid var(--border);
+     padding-bottom: var(--space-2xs); letter-spacing: -0.005em; }
+.sub { color: var(--muted); font-size: var(--text-base); margin-top: 0; }
+/* A wide table that still cannot fold (many columns on a narrow phone)
+   scrolls inside its card instead of dragging the page sideways. */
+/* Cards fill the shell, and so does what is in them.
+   An earlier pass capped prose at a measure and then capped the card to
+   match, which left a wide window mostly empty. The decision here is that
+   the width is there to be used: the body, the card and the card's contents
+   all expand together. A line of prose on a 72rem display therefore runs
+   long by typographic convention -- that is the accepted trade, not an
+   oversight. */
+/* The first heading in a card sits flush with the card's padding. Nineteen
+   handlers said this with `style="margin-top:0"`, which is the stylesheet's
+   job -- and which every new card had to remember to repeat. */
+section > h1:first-child, section > h2:first-child, section > h3:first-child { margin-top: 0; }
+section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+          padding: var(--space-md) var(--space-md); margin: var(--space-md) 0; overflow-x: auto;
+          box-sizing: border-box; }
+label { display: block; margin: var(--space-xs) 0 var(--space-3xs); font-size: var(--text-base); font-weight: 500; }
+input[type=text], input[type=email], input[type=password] {
+  width: 100%; padding: var(--space-2xs); border: 1px solid var(--field-border); border-radius: var(--radius-md);
+  font-size: var(--text-base); box-sizing: border-box; background: var(--field-bg); color: var(--text); }
+textarea { width: 100%; padding: var(--space-2xs); border: 1px solid var(--field-border); border-radius: var(--radius-md);
+           font-size: var(--text-base); box-sizing: border-box; background: var(--field-bg); color: var(--text);
+           font-family: var(--font-mono); }
+/* Checkboxes are the smallest control on the site and the only one whose size
+   comes from the UA rather than from here -- 13x13px, roughly a quarter of the
+   minimum target. The one that matters gates a policy acceptance, so it is
+   both the smallest and among the most consequential. */
+input[type=checkbox] { width: 1.5em; height: 1.5em; min-width: 24px; min-height: 24px;
+                       accent-color: var(--accent); }
+/* A checkbox and the sentence it governs are one target, so the label wraps
+   both and lays them out as a row -- `gap` rather than a margin on the input,
+   so the spacing survives the input being restyled. */
+label.inline { display: inline-flex; align-items: center; gap: var(--space-2xs);
+              font-weight: 400; margin: 0; }
+/* Every control clears the 24px minimum target, including the compact ones.
+   `button.quiet` sits on the Revoke action -- a destructive control that was
+   31px tall on a phone, because the narrow breakpoint below re-stated the same
+   padding. Height is the axis that fails; the labels are wide enough already. */
+button { padding: var(--space-2xs) var(--space-sm); border: 0; border-radius: var(--radius-md); background: var(--btn-bg);
+         color: var(--btn-text); font-size: var(--text-base); cursor: pointer;
+         margin-top: var(--space-xs); min-height: 44px; }
+/* Two actions in one form: the secondary sits beside the primary, not
+   against it. Only between siblings, so a lone button is unaffected. */
+button + button { margin-left: var(--space-2xs); }
+button.danger { background: var(--danger-bg); color: var(--danger-text); }
+button.quiet { background: var(--quiet-bg); color: var(--text); margin-top: 0;
+               padding: var(--space-3xs) var(--space-xs); font-size: var(--text-base);
+               min-height: 24px; }
+table { border-collapse: collapse; width: 100%; font-size: var(--text-base); }
+/* `overflow-wrap: anywhere` is inherited from `body` and is right for the
+   values in a cell -- a client id, a scope list, an AT-URI should fold
+   rather than widen the page. It is wrong for the two things that carry no
+   foldable content: a column header and a button label. Left to fold they
+   became "Grante/d", "Actin/g as" and a Revoke button three lines tall on a
+   phone.
+   Holding them intact also restores the behaviour `section`'s
+   `overflow-x: auto` was added for. While every cell could shrink to any
+   width the table always fitted, so the scroll never engaged and a
+   five-column listing folded into an unreadable column of fragments
+   instead. Now the table keeps a floor, exceeds the card, and scrolls
+   inside it -- which is what the card was told to do. */
+th, button { overflow-wrap: normal; white-space: nowrap; }
+th { text-align: left; font-weight: 600; padding: var(--space-3xs) var(--space-2xs); color: var(--heading-soft);
+     border-bottom: 1px solid var(--border); }
+td { padding: var(--space-3xs) var(--space-2xs); border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+/* The action cell: the last column of a listing, holding the control for its
+   row. Right-aligned so the actions form a column of their own, and never
+   wrapped -- "Revoke" broken across two lines was a real regression once. */
+td.action { text-align: right; white-space: nowrap; }
+/* A form that sits inside a cell or a line of prose rather than owning a block.
+   Six handlers wrote `style="display:inline"` for this. */
+form.inline { display: inline; margin: 0; }
+/* `code` was 0.9em, which is the one rule the floor cannot tolerate: a
+   multiplier renders at 14.4px inside 16px text no matter what the scale
+   says. It inherits now. JetBrains Mono runs optically larger than Archivo
+   at a matched size, so the shrink was doing real work -- but a DID or a CID
+   is precisely the string that must not be the smallest thing on the page,
+   and the mono face is here to be read character by character. */
+code { font-family: var(--font-mono); font-size: 1em;
+       /* The one padding left in `em`, deliberately: inline code sits in
+          running text and its box must track whatever it is nested in. */
+       background: var(--raised); padding: 0.1em 0.35em; border-radius: var(--radius-sm); }
+.notice { border-radius: var(--radius-lg); padding: var(--space-xs) var(--space-sm); margin: var(--space-sm) 0;
+          font-size: var(--text-base); }
+.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: var(--ok-text); }
+.err { background: var(--err-bg); border: 1px solid var(--err-border); color: var(--err-text); }
+.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text); }
+.secret { font-family: var(--font-mono); font-size: var(--text-base);
+          background: var(--secret-bg); color: var(--secret-text);
+          padding: var(--space-2xs) var(--space-xs); border-radius: var(--radius-md);
+          word-break: break-all; }
+.muted { color: var(--muted); font-size: var(--text-base); }
+.dim { color: var(--dim); }
+dl.explain { margin: var(--space-2xs) 0 var(--space-xs); font-size: var(--text-base); }
+dl.explain dt { font-weight: 600; margin-top: var(--space-xs); }
+dl.explain dd { margin: var(--space-3xs) 0 0; color: var(--heading-soft); }
+/* One box, two appearances. Both arms must share every metric that decides
+   where the text after them starts -- including font-size, since a width in
+   `em` resolves against it and a 0.8em badge beside a 1em spacer put the
+   rows of one group a few pixels out from each other.
+   The box grew from 16px to 24px with the floor: it holds a single letter,
+   and a 16px glyph does not fit a 16px box. 24px is also the minimum target
+   size, which a badge that doubles as a row's affordance should clear. */
+.badge, .badge-gap { display: inline-block; width: 24px; height: 24px;
+         line-height: 24px; font-size: var(--text-base); margin-right: 8px;
+         text-align: center; vertical-align: middle; }
+.badge { border-radius: var(--radius-sm); font-weight: 600; }
+.badge img { width: 24px; height: 24px; display: block; border-radius: var(--radius-sm); }
+/* Grouped listings draw no row rules: the groups are the structure, and a
+   line under every row competes with them. */
+table.groups td { border-bottom: 0; padding: var(--space-3xs) var(--space-2xs); }
+table.groups tr.group td { padding-top: var(--space-2xs); }
+table.groups tr:first-child td { padding-top: 0; }
+nav { margin-bottom: var(--space-md); font-size: var(--text-base); }
+/* Identity on the left, sign-out on the right, and on a phone the button
+   wraps under the DID instead of overlapping it (the float it replaces
+   did). */
+nav .id-row { display: flex; align-items: center; gap: var(--space-2xs); flex-wrap: wrap; }
+nav .id-row .who { flex: 1 1 auto; min-width: 0; }
+nav .id-row form { margin: 0; }
+nav .sections { margin-top: var(--space-xs); padding-top: var(--space-2xs); border-top: 1px solid var(--border); }
+/* Inline-block gives each section link a real box, so the tap target is
+   taller than the text alone and wrapped rows keep a little air. */
+nav .sections a, nav .sections .here { display: inline-block; padding: var(--space-3xs) 0; }
+nav .here { font-weight: 600; color: var(--text); }
+nav .crumbs { margin: var(--space-2xs) 0 0; color: var(--muted); }
+details { margin-top: var(--space-sm); border-top: 1px solid var(--border); padding-top: var(--space-2xs); }
+/* Explanation stacked inside a notice or a disclosure is one thought in
+   several sentences, so the paragraphs sit closer than free-standing prose.
+   Nine handlers expressed this with `em` margins between 0.2 and 0.8 -- five
+   different values for one intent, none of them on the scale. */
+.notice > p, details > p { margin: var(--space-3xs) 0; }
+/* A form inside a notice follows the sentence that explains it. */
+.notice > form { margin-top: var(--space-2xs); }
+/* A summary is a control, not prose, so WCAG 2.5.8's exemption for links
+   inside a sentence does not reach it. It was one pixel under. */
+summary { cursor: pointer; font-size: var(--text-base); font-weight: 500;
+          min-height: 24px; padding: var(--space-3xs) 0; }
+/* Links in a table cell stand alone -- an NSID, a client name, a handle -- and
+   are the row's action as often as they are its label. Padding rather than
+   height so the row does not grow. */
+td a, th a { display: inline-block; min-height: 24px; padding: var(--space-3xs) 0; }
+a { color: var(--accent); }
+@media (max-width: 640px) {
+  /* Vertical only. Horizontal padding is the `clamp` above, which already
+     bottoms out here -- restating it would be a second place to change it
+     and a second place to forget. */
+  body { margin: var(--space-sm) auto; }
+  section { padding: var(--space-sm) var(--space-sm); }
+  /* On the scale, not beside it: one step down from --text-xl. */
+  h1 { font-size: var(--text-lg); }
+  /* Tables used to drop a step here. With a 16px floor there is no step to
+     drop to, so a narrow screen buys its room from padding instead. */
+  th, td { padding: var(--space-3xs) var(--space-3xs); }
+  /* Finger-sized submit buttons; the quiet ones are secondary and stay
+     compact. */
+  button { padding: var(--space-xs) var(--space-sm); }
+  button.quiet { padding: var(--space-3xs) var(--space-xs); }
+}
+/* The dark overrides that used to live here are gone: every value they set
+   is now a token above, and the ones they *forgot* to set -- `.muted`,
+   `.sub`, the link colour, all three notice tints -- were the defects. A
+   palette stated once cannot forget a member of itself. */
+</style>
+<style>
+/* Guide-only. The portal has no back-to-contents links and no contents list,
+   so these rules are not part of the mirrored stylesheet above. Kept in a
+   separate block for exactly that reason: anything here is guide furniture,
+   and copying it into `page()` would be a mistake. */
+
+/* Both of these are navigation targets rather than links inside a sentence,
+   so WCAG 2.5.8's inline exemption does not cover them. The arrow was the
+   worst offender on the page at 7x15px -- a single glyph, and the only link
+   in its heading. Negative margin keeps the enlarged hit area from moving
+   the glyph or opening up the line. */
+.to-top {
+  display: inline-block;
+  min-width: 24px;
+  min-height: 24px;
+  padding: var(--space-3xs);
+  margin: calc(var(--space-3xs) * -1);
+  color: var(--muted);
+  font-weight: 400;
+  font-size: var(--text-base);
+  text-align: center;
+  text-decoration: none;
+}
+.to-top:hover { color: var(--text); }
+dl.explain dd a { display: inline-block; padding: var(--space-3xs) 0; min-height: 24px; }
+
+/* One more step at the top, for this document only.
+   The guide carries a heading level the portal does not -- the four group
+   dividers -- and the portal's scale tops out at --text-xl, which the page
+   title already uses. Without a fourth step the title and the group headings
+   render identically at 25px, so the outline says two levels and the page
+   shows one. The portal needs no such step and does not get one; the h1 it
+   documents is the sample in "Headings & text", not this document's title. */
+:root { --text-2xl: 1.953rem; }   /* 31px -- continues the 1.25 ratio */
+h1 { font-size: var(--text-2xl); }
+
+/* Rhythm, so thirteen cards do not read as one repeated card.
+   The components fall into four groups, which the contents list already
+   named and the document did not honour -- the order was arbitrary and every
+   card sat the same distance from the last. A group heading, generous space
+   above it and tighter space between the cards inside it makes the grouping
+   visible without a rule or a box around anything. */
+h2.group {
+  margin-top: var(--space-2xl);
+  border-bottom: 0;
+  font-size: var(--text-xl);
+  letter-spacing: -0.01em;
+}
+h2.group:first-of-type { margin-top: var(--space-xl); }
+.group-lede { margin: 0 0 var(--space-sm); max-width: 62ch; }
+h2.group + .group-lede + section { margin-top: 0; }
+main > section { margin-top: var(--space-sm); }
+
+/* Section headings own their spacing here rather than carrying it inline. */
+section h4 { margin-top: var(--space-md); margin-bottom: var(--space-2xs);
+             font-size: var(--text-base); }
+/* A heading that links to itself is how you send someone one component rather
+   than the whole page, so it is a real navigation target and has to clear the
+   minimum like one. */
+h2 > a, h3 > a { color: inherit; text-decoration: none;
+                 display: inline-block; min-height: 24px; }
+/* A component heading is an h3 now, under its group -- it should still look
+   like the section heading it is. */
+section > h3 { font-size: var(--text-lg); border-bottom: 1px solid var(--border);
+               padding-bottom: var(--space-3xs); margin-bottom: var(--space-sm); }
+.guide-lede { margin: var(--space-3xs) 0 var(--space-2xs); }
+.guide-gap { margin-top: var(--space-sm); }
+details.markup { margin-top: var(--space-md); }
+</style>
+</head>
+<body>
+
+<nav><div class="id-row"><span class="who"><b>bulleted.app</b> &middot; <code>did:plc:iu5fzdrrfrc6kk7vmmatvin2</code></span>
+  <form method="POST" action="/account/signout">
+    <button class="quiet" type="submit">Sign out</button></form></div>
+  <div class="sections"><span class="here">Settings</span> &middot; <a href="#nav">Access</a> &middot; <a href="#nav">Repository</a> &middot; <a href="#nav">Spaces</a> &middot; <a href="#nav">Delegation</a></div>
+  </nav>
+
+<main>
+<h1>Account portal — style guide</h1>
+<p class="sub">Every block, component and element the account management site
+is built from. The stylesheet below is a copy of
+<code>src/http/portal.css</code>, which the server inlines with its comments
+stripped; copy that file in by hand when it changes, and a test will tell you
+if you forget.</p>
+
+<section id="contents">
+<h2>Contents</h2>
+<p class="muted">Thirteen components in four groups. Every heading below is a
+link to itself, so you can send someone one component rather than the page.</p>
+<dl class="explain">
+  <dt>Foundations</dt>
+  <dd><a href="#shell">Shell &amp; measure</a> &middot;
+      <a href="#text">Headings &amp; text</a> &middot;
+      <a href="#states">Adaptive states</a></dd>
+  <dt>Containers</dt>
+  <dd><a href="#cards">Cards</a> &middot;
+      <a href="#nav">Navigation</a> &middot;
+      <a href="#disclosure">Disclosure</a></dd>
+  <dt>Telling the holder something</dt>
+  <dd><a href="#notices">Notices</a> &middot;
+      <a href="#secret">Secret reveal</a> &middot;
+      <a href="#explain">Explanation list</a></dd>
+  <dt>Data &amp; controls</dt>
+  <dd><a href="#tables">Tables</a> &middot;
+      <a href="#grouped">Grouped listing &amp; badges</a> &middot;
+      <a href="#forms">Forms</a> &middot;
+      <a href="#buttons">Buttons</a></dd>
+</dl>
+</section>
+
+<h2 class="group">Foundations</h2>
+<p class="muted group-lede">The page itself: how wide it is, what the type does, and how it answers the reader's colour scheme and viewport.</p>
+<section id="shell">
+<h3><a href="#shell">Shell &amp; measure</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p>The column caps at <code>72rem</code> and is fluid below it:
+<code>max-width: min(72rem, 100%)</code> is one declaration covering both
+directions, with no breakpoint deciding which. The gutter scales with the
+viewport via <code>clamp(0.9rem, 2.5vw, 2rem)</code>, and
+<code>box-sizing: border-box</code> keeps it inside the cap rather than added
+to it.</p>
+<p>Nothing between the shell and the text caps the width. The card fills the
+shell and its contents fill the card, so this paragraph runs the full measure
+of the column on a wide display rather than stopping short of the card edge.
+A line therefore runs longer than typographic convention likes; using the width
+is the accepted trade.</p>
+<p class="muted">The one exception is a single-line input, which caps at
+<code>34em</code>. A field is filled rather than read, and one stretched across
+the whole column is a target far larger than the handle going into it.
+<code>textarea</code> has no cap, because the only ones here hold record
+JSON.</p>
+<p class="muted">Everything inherits <code>overflow-wrap: anywhere</code>, so
+DIDs, AT-URIs, CIDs and scope lists fold instead of widening the page:
+<code>at://did:plc:iu5fzdrrfrc6kk7vmmatvin2/app.bsky.feed.post/3msw44754okhn</code></p>
+</section>
+<section id="text">
+<h3><a href="#text">Headings &amp; text</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p style="font-size:var(--text-xl);font-weight:700;letter-spacing:-0.01em;margin:var(--space-3xs) 0">Page title <span class="muted">(<code>h1</code>, one per page)</span></p>
+<p class="sub">Subtitle under a page title — <code>.sub</code></p>
+<p style="font-size:var(--text-lg);font-weight:600;border-bottom:1px solid var(--border);padding-bottom:var(--space-3xs);margin-top:var(--space-md)">Section heading <span class="muted">(<code>h2</code>)</span></p>
+<p class="muted">The first heading in a card sits flush with the card's
+padding; later ones keep their top margin. The stylesheet does this — a card
+does not have to remember to ask for it.</p>
+<p>Body prose — plain <code>p</code>. Carries <b>bold</b> for emphasis,
+<a href="#text">links</a>, and <code>inline code</code> for identifiers,
+header names and anything typed.</p>
+<p class="muted">Explanatory text — <code>.muted</code>. Used for the sentence
+under a heading that says what a control does, and for the caveat under a
+form. By far the most-used class on the site.</p>
+<p><span class="dim">Dimmed —</span> <code>.dim</code>. A shade below muted;
+used for the repeated part of a value where only the tail differs, and for a
+DID under the handle that names it.</p>
+</section>
+<section id="states">
+<h3><a href="#states">Adaptive states</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">Two, both automatic and neither with a control.</p>
+<dl class="explain">
+  <dt>Colour scheme</dt>
+  <dd><code>prefers-color-scheme: dark</code> repaints the shell, cards,
+  borders, inputs and code backgrounds. Switch your OS appearance with this
+  page open to check it — every block above should follow.</dd>
+  <dt>Narrow viewport</dt>
+  <dd>Under <code>640px</code> the page margin tightens, cards lose padding,
+  and submit buttons grow to finger height while the quiet ones stay compact.
+  Drag this window narrow to check it.</dd>
+</dl>
+</section>
+<h2 class="group">Containers</h2>
+<p class="muted group-lede">Things that hold other things.</p>
+<section id="cards">
+<h3><a href="#cards">Cards</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">Every group of related controls sits in a
+<code>section</code>: white card, hairline border, 8px radius. It scrolls
+horizontally inside itself, so a table too wide to fold on a narrow phone
+scrolls in the card rather than dragging the page sideways.</p>
+<p class="muted">This block, and every other block on this page, is one.</p>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="5" spellcheck="false" aria-label="Markup for cards">&lt;section&gt;
+  &lt;h2&gt;Heading&lt;/h2&gt;
+  &lt;p class="muted"&gt;What this group of controls does.&lt;/p&gt;
+&lt;/section&gt;</textarea>
+</details>
+</section>
+<section id="nav">
+<h3><a href="#nav">Navigation</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">The real component, rendered at the top of this page. Identity
+on the left, sign-out on the right; on a phone the button wraps under the DID
+instead of overlapping it. The current section is text
+(<code>.here</code>) rather than a link, because a link to the page you are on
+is a control that does nothing.</p>
+<p class="muted">A trail within a section is <code>nav .crumbs</code>, omitted
+when empty. Only the repository browser and space detail go deep enough to
+carry one:</p>
+<div class="crumbs">Repository &middot; Public &middot; app.bsky.feed.post</div>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="10" spellcheck="false" aria-label="Markup for navigation">&lt;nav&gt;
+  &lt;div class="id-row"&gt;
+    &lt;span class="who"&gt;&lt;b&gt;{handle}&lt;/b&gt; &amp;middot; &lt;code&gt;{did}&lt;/code&gt;&lt;/span&gt;
+    &lt;form method="POST" action="/account/signout"&gt;
+      &lt;button class="quiet" type="submit"&gt;Sign out&lt;/button&gt;&lt;/form&gt;
+  &lt;/div&gt;
+  &lt;div class="sections"&gt;{links}&lt;/div&gt;
+  &lt;p class="crumbs"&gt;{crumbs}&lt;/p&gt;
+&lt;/nav&gt;</textarea>
+</details>
+</section>
+<section id="disclosure">
+<h3><a href="#disclosure">Disclosure</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">A <code>details</code> block for the option most people do not
+need. Two variants: a plain <code>summary</code>, and <code>summary.muted</code>
+where the disclosure is secondary to the field above it.</p>
+<details>
+  <summary>Advanced — bring your own keys</summary>
+  <p class="muted">Both optional. Generate either with
+    <code>goat key generate</code>, which prints a <code>did:key:…</code>
+    string; the bare multibase form works too.</p>
+</details>
+<details class="guide-gap">
+  <summary class="muted">Using a domain you own</summary>
+  <p class="muted" style="margin:var(--space-3xs) 0">DNS — a <code>TXT</code> record at
+  <code>_atproto.&lt;your-domain&gt;</code> with the value
+  <code>did=did:plc:iu5fzdrrfrc6kk7vmmatvin2</code></p>
+</details>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="9" spellcheck="false" aria-label="Markup for the disclosure">&lt;details&gt;
+  &lt;summary&gt;Advanced &amp;mdash; bring your own keys&lt;/summary&gt;
+  &lt;p class="muted"&gt;Both optional.&lt;/p&gt;
+&lt;/details&gt;
+
+&lt;details class="guide-gap"&gt;
+  &lt;summary class="muted"&gt;Secondary to the field above it&lt;/summary&gt;
+&lt;/details&gt;</textarea>
+</details>
+</section>
+<h2 class="group">Telling the holder something</h2>
+<p class="muted group-lede">Four registers, from routine confirmation to a value shown exactly once.</p>
+<section id="notices">
+<h3><a href="#notices">Notices</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">One-line banners above a page body, or inline in a card. Set
+by the handler that redirected, via <code>?msg=</code>.</p>
+<div class="notice ok">Delegate added. They can now sign in as themselves and act as this account, without its password.</div>
+<div class="notice err">That handle could not be verified.</div>
+<div class="notice warn"><b>Not available on this server.</b> The operator of this server has not enabled account delegation.</div>
+<p class="muted"><code>.notice.ok</code> for a thing that happened,
+<code>.notice.err</code> for a refusal, <code>.notice.warn</code> for a
+standing condition the holder should know about. Full-width by design: an
+alert that stopped short of the card edge would read as unfinished.</p>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="4" spellcheck="false" aria-label="Markup for notices">&lt;div class="notice ok"&gt;Delegate added.&lt;/div&gt;
+&lt;div class="notice err"&gt;That handle could not be verified.&lt;/div&gt;
+&lt;div class="notice warn"&gt;&lt;b&gt;Not available.&lt;/b&gt; The operator has not enabled it.&lt;/div&gt;</textarea>
+</details>
+</section>
+<section id="secret">
+<h3><a href="#secret">Secret reveal</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">A freshly minted credential, shown exactly once. Carried in
+the session row rather than a redirect query string — a live secret in a URL is
+written to history, the address bar, the access log and every proxy on the way,
+none of which can be un-written.</p>
+<div class="notice warn"><b>Your new app password</b>
+<div class="secret">k7fp-2xqm-9wla-33vt</div>
+This is the only time it is shown. Store it now.</div>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="5" spellcheck="false" aria-label="Markup for the secret reveal">&lt;div class="notice warn"&gt;&lt;b&gt;Your new app password&lt;/b&gt;
+  &lt;div class="secret"&gt;k7fp-2xqm-9wla-33vt&lt;/div&gt;
+  This is the only time it is shown. Store it now.
+&lt;/div&gt;</textarea>
+</details>
+</section>
+<section id="explain">
+<h3><a href="#explain">Explanation list</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted"><code>dl.explain</code> — for enumerating what a capability
+does and does not permit, where prose would bury the distinctions.</p>
+<dl class="explain">
+  <dt>Act as this account in any application</dt>
+  <dd>A delegate can approve an application and it receives a grant on this
+  account, exactly as if you had approved it yourself.</dd>
+  <dt>Not sign in here</dt>
+  <dd>This page still takes this account's own password. A delegate cannot
+  change the password, the email address, or this list.</dd>
+  <dt>Be removed at any time</dt>
+  <dd>Removing a delegate revokes every application they authorized.</dd>
+</dl>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="7" spellcheck="false" aria-label="Markup for the explanation list">&lt;dl class="explain"&gt;
+  &lt;dt&gt;What it permits&lt;/dt&gt;
+  &lt;dd&gt;The consequence, stated plainly.&lt;/dd&gt;
+  &lt;dt&gt;What it does not&lt;/dt&gt;
+  &lt;dd&gt;The limit, in the same breath.&lt;/dd&gt;
+&lt;/dl&gt;</textarea>
+</details>
+</section>
+<h2 class="group">Data &amp; controls</h2>
+<p class="muted group-lede">Where the account holder reads a value and acts on it.</p>
+<section id="tables">
+<h3><a href="#tables">Tables</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">The standard listing: header row, one row per live thing, and
+a right-aligned action cell holding an inline form. Full width, and exempt from
+the prose measure.</p>
+<table><thead><tr><th>Client</th><th>Scope</th><th>Granted</th><th>Acting as</th><th></th></tr></thead>
+<tbody>
+<tr><td><code>https://bulleted.app/client-metadata.json</code></td><td class="muted">atproto transition:generic</td><td class="muted">2026-08-13T09:14:00Z</td><td class="muted">&mdash;</td>
+  <td class="action"><form method="POST" action="#" class="inline"><button class="quiet" type="submit">Revoke</button></form></td></tr>
+<tr><td><code>https://graze.social/oauth/client-metadata.json</code></td><td class="muted">atproto repo:app.bsky.feed.post?action=create rpc:app.bsky.feed.getTimeline?aud=did:web:api.bsky.app</td><td class="muted">2026-08-12T18:02:00Z</td><td class="muted">alice.example.com</td>
+  <td class="action"><form method="POST" action="#" class="inline"><button class="quiet" type="submit">Revoke</button></form></td></tr>
+</tbody></table>
+<h4>Empty state</h4>
+<p class="muted">A single spanning cell that says what the emptiness means,
+never a blank table.</p>
+<table><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+<tbody><tr><td colspan="4" class="muted">No app passwords.</td></tr></tbody></table>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="18" spellcheck="false" aria-label="Markup for tables">&lt;table&gt;
+  &lt;thead&gt;&lt;tr&gt;&lt;th&gt;Client&lt;/th&gt;&lt;th&gt;Scope&lt;/th&gt;&lt;th&gt;&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+  &lt;tbody&gt;
+    &lt;tr&gt;
+      &lt;td&gt;&lt;code&gt;{client_id}&lt;/code&gt;&lt;/td&gt;
+      &lt;td class="muted"&gt;{scope}&lt;/td&gt;
+      &lt;td class="action"&gt;
+        &lt;form method="POST" action="/account/sessions/revoke"  class="inline"&gt;
+          &lt;input type="hidden" name="client_id" value="{client_id}"&gt;
+          &lt;button class="quiet" type="submit"&gt;Revoke&lt;/button&gt;
+        &lt;/form&gt;
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;!-- empty state: say what the emptiness means --&gt;
+    &lt;tr&gt;&lt;td colspan="3" class="muted"&gt;No OAuth sessions.&lt;/td&gt;&lt;/tr&gt;
+  &lt;/tbody&gt;
+&lt;/table&gt;</textarea>
+</details>
+</section>
+<section id="grouped">
+<h3><a href="#grouped">Grouped listing &amp; badges</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted"><code>table.groups</code> — no row rules, because the groups
+are the structure and a line under every row competes with them. The badge
+marks where a group starts; rows under it are indented with
+<code>.badge-gap</code>, a spacer sharing every metric that decides where the
+text after it begins.</p>
+<table class="groups">
+<tr class="group"><td><span class="badge"><img src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%231185fe'/%3E%3C/svg%3E" alt="" width="16" height="16" title="bsky.app"></span><a href="#grouped"><span class="dim">app.bsky.</span>actor.profile</a></td></tr>
+<tr><td><span class="badge-gap"></span><a href="#grouped"><span class="dim">app.bsky.feed.</span>post</a></td></tr>
+<tr class="group"><td><span class="badge"><img src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%23b91c1c'/%3E%3C/svg%3E" alt="" width="16" height="16" title="bulleted.app"></span><a href="#grouped"><span class="dim">app.bulleted.</span>outline</a></td></tr>
+</table>
+<p class="muted">Icons are served from this origin rather than hot-linked, and
+a domain with none gets a drawn fallback — so an authority costs one cache
+entry, not a fetch on every page view.</p>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="14" spellcheck="false" aria-label="Markup for the grouped listing">&lt;table class="groups"&gt;
+  &lt;!-- first row of a group carries the badge --&gt;
+  &lt;tr class="group"&gt;&lt;td&gt;
+    &lt;span class="badge"&gt;&lt;img src="/account/repository/icon/{nsid}" alt=""
+          width="16" height="16" title="{domain}"&gt;&lt;/span&gt;
+    &lt;a href="{href}"&gt;&lt;span class="dim"&gt;{prefix}&lt;/span&gt;{tail}&lt;/a&gt;
+  &lt;/td&gt;&lt;/tr&gt;
+  &lt;!-- the rest are indented by a spacer of identical metrics --&gt;
+  &lt;tr&gt;&lt;td&gt;
+    &lt;span class="badge-gap"&gt;&lt;/span&gt;
+    &lt;a href="{href}"&gt;&lt;span class="dim"&gt;{prefix}&lt;/span&gt;{tail}&lt;/a&gt;
+  &lt;/td&gt;&lt;/tr&gt;
+&lt;/table&gt;</textarea>
+</details>
+</section>
+<section id="forms">
+<h3><a href="#forms">Forms</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p class="muted">Label above field, caveat below. Every mutating form is a
+POST guarded three ways: a <code>SameSite=Strict</code> session cookie,
+<code>Sec-Fetch-Site: same-origin</code>, and the session itself.</p>
+<label for="sg-text">Text field — <code>input[type=text]</code></label>
+<input id="sg-text" name="sg-text" type="text" placeholder="someone.example.com" spellcheck="false">
+<p class="muted">Caps at <code>34em</code>. A field is filled, not read, and one
+stretched to the full shell is a target far larger than the handle going into
+it.</p>
+<label for="sg-email">Email — <code>input[type=email]</code></label>
+<input id="sg-email" name="sg-email" type="email" placeholder="you@example.com">
+<label for="sg-pw">Password — <code>input[type=password]</code></label>
+<input id="sg-pw" name="sg-pw" type="password" autocomplete="current-password">
+<label for="sg-json">Record JSON — <code>textarea</code></label>
+<textarea id="sg-json" rows="6" spellcheck="false">{
+  "$type": "app.bsky.feed.post",
+  "text": "the quick brown fox jumps over the lazy dog",
+  "createdAt": "2026-08-13T09:14:00Z"
+}</textarea>
+<p class="muted">Uncapped on purpose. This is code, and it wants every column
+the shell has.</p>
+<h4>Checkbox in a notice</h4>
+<p class="muted">The one place a checkbox appears: the policy gate, where the
+control and the thing being agreed to have to be inseparable.</p>
+<div class="notice warn">
+  <label class="inline" style="font-weight:400;margin:0">
+    <input type="checkbox" name="policy" value="accept" id="policy">
+    <span>You must accept the policy <a href="#forms">https://example.com/policy</a> to continue.</span>
+  </label>
+</div>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="8" spellcheck="false" aria-label="Markup for forms">&lt;label for="handle"&gt;Handle of the identity to delegate to&lt;/label&gt;
+&lt;input id="handle" name="handle" type="text"
+       placeholder="someone.example.com" spellcheck="false" required&gt;
+&lt;p class="muted"&gt;The caveat, next to the control rather than in a help page.&lt;/p&gt;
+
+&lt;label for="value"&gt;Record JSON&lt;/label&gt;
+&lt;textarea id="value" name="value" rows="10" spellcheck="false"&gt;&lt;/textarea&gt;</textarea>
+</details>
+</section>
+<section id="buttons">
+<h3><a href="#buttons">Buttons</a> <a href="#contents" class="to-top" aria-label="Back to contents">&uarr;</a></h3>
+<p><button type="button">Primary</button></p>
+<p class="muted"><code>button</code> is the one thing the form is for. Blue,
+full padding.</p>
+<p><button class="danger" type="button">Destructive</button></p>
+<p class="muted"><code>button.danger</code>: sign out everywhere, delete a
+record, revoke everything. Red.</p>
+<p><button class="quiet" type="button">Secondary</button></p>
+<p class="muted"><code>button.quiet</code> is grey and compact, with no top
+margin so it sits inline in a table cell or beside another control.</p>
+<h4>Two actions, one form</h4>
+<p class="muted">A second button overriding the target with
+<code>formaction</code>, so one set of fields serves both.</p>
+<form method="POST" action="#">
+  <button type="button">Confirm</button>
+  <button class="quiet" type="button">Send a new code</button>
+</form>
+<details class="guide-gap">
+<summary class="muted">Markup</summary>
+<textarea readonly tabindex="-1" rows="11" spellcheck="false" aria-label="Markup for buttons">&lt;button type="submit"&gt;Change handle&lt;/button&gt;
+&lt;button class="danger" type="submit"&gt;Sign out everywhere&lt;/button&gt;
+&lt;button class="quiet" type="submit"&gt;Revoke&lt;/button&gt;
+
+&lt;!-- two targets, one set of fields --&gt;
+&lt;form method="POST" action="/account/email/verify"&gt;
+  &lt;button type="submit"&gt;Confirm&lt;/button&gt;
+  &lt;button class="quiet" type="submit"
+          formaction="/account/email/verify/send"&gt;Send me a code&lt;/button&gt;
+&lt;/form&gt;</textarea>
+</details>
+</section>
+</main>
+
+</body>
+</html>
