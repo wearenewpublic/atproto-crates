@@ -46,6 +46,12 @@ use axum::response::Response;
 
 /// The policy for this server's own HTML.
 ///
+/// `font-src 'self'` is the one directive that is not merely permissive: the
+/// portal serves a typeface from `/static/fonts/` and would otherwise fall
+/// back to `default-src 'none'`, under which no font loads at all -- not even
+/// a `data:` URI. `'self'` and nothing more, so a stylesheet that ever tried
+/// to pull a face off a CDN is refused rather than quietly working.
+///
 /// `default-src 'none'` and then only what the pages actually use. These are
 /// server-rendered pages with no assets: no images, no fonts, no stylesheets,
 /// no XHR except the consent form's own submit, which `connect-src 'self'`
@@ -81,6 +87,7 @@ use axum::response::Response;
 /// tag re-pointing the form's relative action.
 pub const HTML_CSP: &str = "default-src 'none'; \
      img-src 'self' data:; \
+     font-src 'self'; \
      style-src 'unsafe-inline'; \
      script-src 'unsafe-inline'; \
      connect-src 'self'; \

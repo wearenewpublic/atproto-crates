@@ -600,6 +600,12 @@ fn build_router_inner(
             "/account/repository/icon/{nsid}",
             get(crate::http::icons::icon),
         )
+        // Static assets -- fonts now, stylesheets or images if they are ever
+        // split out of the inline `<style>`. Served from this origin so
+        // `font-src 'self'` can stay tight and the bytes are cached once
+        // rather than inlined into every response. Deliberately not
+        // session-gated: the sign-in page needs the font before anyone has one.
+        .route("/static/{*path}", get(crate::http::static_assets::asset))
         .route("/account/repository/", get(repository::index))
         .route(
             "/account/repository/public/",

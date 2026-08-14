@@ -12,7 +12,6 @@ pub mod errors;
 pub mod extract;
 pub mod handlers;
 
-/// The account portal -- what an account holder can do with only a browser.
 pub mod icons;
 pub mod identity_handlers;
 pub mod moderation_handlers;
@@ -31,6 +30,8 @@ pub mod service_describe;
 pub mod space_auth;
 pub mod space_handlers;
 pub mod state;
+/// The account portal -- what an account holder can do with only a browser.
+pub mod static_assets;
 pub mod subscribe_handlers;
 pub mod write_handlers;
 

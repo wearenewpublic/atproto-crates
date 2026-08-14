@@ -9,3 +9,6 @@
 
 # Local remediation notes and agent worktrees.
 /.claude/
+
+# macOS Finder metadata.
+.DS_Store

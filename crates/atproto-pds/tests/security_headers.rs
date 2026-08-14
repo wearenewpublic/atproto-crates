@@ -13,7 +13,8 @@ use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -140,5 +141,45 @@ async fn a_response_no_handler_produced_still_carries_them() {
     assert_eq!(
         response.headers().get("x-content-type-options").unwrap(),
         "nosniff"
+    );
+}
+
+/// The font the portal's stylesheet asks for is actually reachable, and is
+/// reachable *without* a session.
+///
+/// Three things have to line up for a typeface to render, and each is in a
+/// different file: the `@font-face` URL in `page()`, the route in the router,
+/// and `font-src` in the policy above. Any one of them wrong produces the same
+/// symptom -- a page that renders perfectly well in a fallback face -- which is
+/// close to invisible in review. This asserts all three at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_portal_font_is_served_from_static_without_a_session() {
+    let (app, _tmp) = build_app().await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/static/fonts/jetbrains-mono-var.woff2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the sign-in page needs this before anyone has a session"
+    );
+    assert_eq!(response.headers()["content-type"], "font/woff2");
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..4], b"wOF2", "that is not a woff2");
+
+    // And the policy permits fetching it.
+    assert!(
+        atproto_pds::http::security_headers::HTML_CSP.contains("font-src 'self'"),
+        "the font is served but the policy forbids loading it"
     );
 }
