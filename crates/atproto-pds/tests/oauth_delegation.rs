@@ -118,6 +118,19 @@ async fn body_of(resp: axum::response::Response) -> String {
     .unwrap()
 }
 
+/// GET a JSON document, or `None` if the status was not 200.
+async fn get_json(app: &axum::Router, uri: &str) -> Option<Value> {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    if resp.status() != StatusCode::OK {
+        return None;
+    }
+    serde_json::from_str(&body_of(resp).await).ok()
+}
+
 // ---------------------------------------------------------------------------
 //  Client metadata
 // ---------------------------------------------------------------------------
@@ -151,7 +164,10 @@ async fn the_client_metadata_document_is_self_consistent() {
         doc["redirect_uris"][0], "https://pds.test/oauth/delegation/callback",
         "the registered callback must be the route that exists"
     );
-    assert_eq!(doc["jwks_uri"], "https://pds.test/oauth/jwks");
+    assert_eq!(
+        doc["jwks_uri"], "https://pds.test/oauth/delegation/jwks.json",
+        "the client-role set, not the provider set -- they name keys differently"
+    );
     assert_eq!(doc["token_endpoint_auth_method"], "private_key_jwt");
     assert_eq!(doc["token_endpoint_auth_signing_alg"], "ES256");
     assert_eq!(doc["dpop_bound_access_tokens"], true);
@@ -163,23 +179,13 @@ async fn the_client_metadata_document_is_self_consistent() {
         serde_json::json!(["authorization_code"])
     );
 
-    // And the key the assertion is signed with is actually published.
-    let jwks: Value = serde_json::from_str(
-        &body_of(
-            h.app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/oauth/jwks")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
-        )
-        .await,
-    )
-    .unwrap();
+    // That the advertised document publishes *a* key. That it publishes the
+    // key the assertion actually names is
+    // `the_assertion_kid_resolves_against_the_published_client_jwks`, which is
+    // the part this test used to leave unchecked.
+    let jwks = get_json(&h.app, "/oauth/delegation/jwks.json")
+        .await
+        .expect("the advertised jwks_uri is fetchable");
     assert!(
         jwks["keys"].as_array().is_some_and(|k| !k.is_empty()),
         "the advertised jwks_uri publishes no keys: {jwks}"
@@ -910,5 +916,114 @@ async fn the_acting_delegate_survives_a_code_exchange_and_a_rotation() {
             .acting_did
             .as_deref(),
         Some(delegate)
+    );
+}
+
+/// The `kid` a peer is told to look for is the `kid` it will actually find.
+///
+/// This is the check that was missing when delegation first shipped. The
+/// client metadata pointed `jwks_uri` at `/oauth/jwks`, which names keys by
+/// RFC 7638 thumbprint, while the client assertion names its key by `did:key`
+/// -- so every pushed authorization request came back `invalid_client` from a
+/// real peer, and nothing here noticed, because nothing compared the two.
+#[tokio::test]
+async fn the_assertion_kid_resolves_against_the_published_client_jwks() {
+    let h = build(true).await;
+
+    // What a peer is told to fetch.
+    let metadata: serde_json::Value = get_json(&h.app, "/oauth/delegation/client-metadata.json")
+        .await
+        .expect("client metadata");
+    let jwks_uri = metadata["jwks_uri"].as_str().expect("a jwks_uri");
+    assert!(
+        jwks_uri.ends_with("/oauth/delegation/jwks.json"),
+        "the client set is what a peer must be sent to, not the provider set: {jwks_uri}"
+    );
+
+    // What it finds there.
+    let published: serde_json::Value = get_json(&h.app, "/oauth/delegation/jwks.json")
+        .await
+        .expect("delegation jwks");
+    let kids: Vec<&str> = published["keys"]
+        .as_array()
+        .expect("a keys array")
+        .iter()
+        .filter_map(|k| k["kid"].as_str())
+        .collect();
+    assert!(!kids.is_empty(), "the client set publishes no key");
+
+    // What this server actually puts in the assertion it signs -- built the
+    // same way `oauth_init` builds it, from the same key.
+    let signing_key = h.state.pds_signing_key.clone().expect("a signing key");
+    let header: atproto_oauth::jwt::Header = (*signing_key)
+        .clone()
+        .try_into()
+        .expect("an assertion header");
+    let assertion_kid = header.key_id.expect("the assertion names its key");
+
+    assert!(
+        kids.contains(&assertion_kid.as_str()),
+        "a peer resolving the assertion's kid finds nothing.\n  \
+         assertion kid: {assertion_kid}\n  published kids: {kids:?}"
+    );
+    assert_eq!(
+        header.algorithm.as_deref(),
+        Some("ES256"),
+        "the metadata promises ES256"
+    );
+}
+
+/// The two key sets are genuinely different, so the test above is not vacuous.
+///
+/// If `/oauth/jwks` ever started naming keys the way an assertion does, the
+/// original bug would be gone and so would the reason for a second document --
+/// this says so out loud rather than leaving a route nobody can justify.
+#[tokio::test]
+async fn the_provider_set_names_the_same_key_differently() {
+    let h = build(true).await;
+
+    let provider: serde_json::Value = get_json(&h.app, "/oauth/jwks")
+        .await
+        .expect("provider jwks");
+    let client: serde_json::Value = get_json(&h.app, "/oauth/delegation/jwks.json")
+        .await
+        .expect("client jwks");
+
+    let kid_of = |v: &serde_json::Value| -> String {
+        v["keys"][0]["kid"].as_str().unwrap_or_default().to_string()
+    };
+    let provider_kid = kid_of(&provider);
+    let client_kid = kid_of(&client);
+
+    assert!(!provider_kid.is_empty() && !client_kid.is_empty());
+    assert_ne!(
+        provider_kid, client_kid,
+        "the two sets agree; the second document has no reason to exist"
+    );
+    assert!(
+        client_kid.starts_with("did:key:"),
+        "a client assertion names its key by did:key, got {client_kid}"
+    );
+}
+
+/// The client key set is behind the same gate as the metadata document.
+#[tokio::test]
+async fn the_client_jwks_is_absent_when_delegation_is_off() {
+    let h = build(false).await;
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/delegation/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "a client this server will not act as should not publish keys for it"
     );
 }

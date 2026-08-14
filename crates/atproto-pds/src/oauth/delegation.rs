@@ -211,8 +211,62 @@ pub struct DelegationClientMetadata {
     pub token_endpoint_auth_signing_alg: &'static str,
     /// Required of every AT Protocol client.
     pub dpop_bound_access_tokens: bool,
-    /// The existing `/oauth/jwks`, which already publishes the signing key.
+    /// `/oauth/delegation/jwks.json`, and deliberately *not* `/oauth/jwks`.
+    ///
+    /// Both publish the same key. They disagree about what to call it: the
+    /// provider set names keys by RFC 7638 thumbprint, and the client
+    /// assertion this server signs names its key by `did:key`, because that is
+    /// what `atproto_oauth`'s header builder puts in `kid`. Pointing a peer at
+    /// the provider set made it look for a `kid` that set does not contain,
+    /// and every pushed request came back `invalid_client`.
     pub jwks_uri: String,
+}
+
+/// `GET /oauth/delegation/jwks.json`.
+///
+/// The public half of the key this server signs client assertions with, named
+/// the way those assertions name it.
+///
+/// This exists because the same key wears two hats. As an authorization
+/// *server* the PDS publishes `/oauth/jwks`, where `kid` is a JWK thumbprint;
+/// as an OAuth *client* against a delegate's server it signs an assertion
+/// whose `kid` is the key's `did:key` form. A peer resolves the assertion's
+/// `kid` against whatever `jwks_uri` names, so the two have to agree, and the
+/// convention that has to win here is the client one -- it is the assertion
+/// that is being verified. Changing `/oauth/jwks` instead would break anyone
+/// pinning the thumbprint, and changing the shared header builder would change
+/// behaviour for every other consumer of `atproto-oauth`.
+///
+/// Only the current signer is published. Historical rotations belong in the
+/// provider set, where they let a consumer verify a token issued before a
+/// rotation; here they would only widen what a peer accepts, since an
+/// assertion is signed fresh with the current key every time.
+pub async fn jwks(State(state): State<HttpState>) -> Result<Json<serde_json::Value>, XrpcError> {
+    // Behind the same gate as the metadata document: a client that this server
+    // will not act as should not publish keys for it.
+    let _ = require_delegation(&state)?;
+
+    let Some(signing_key) = state.pds_signing_key.as_deref() else {
+        return Err(PdsError::DelegationUnavailable {
+            reason: "this server has no signing key".to_string(),
+        }
+        .into());
+    };
+
+    let public = atproto_identity::key::to_public(signing_key).map_err(|error| {
+        tracing::error!(error = ?error, "delegation JWKS: could not derive the public key");
+        PdsError::DelegationUnavailable {
+            reason: "this server's signing key could not be published".to_string(),
+        }
+    })?;
+    let jwk = atproto_oauth::jwk::generate(&public).map_err(|error| {
+        tracing::error!(error = ?error, "delegation JWKS: could not build the JWK");
+        PdsError::DelegationUnavailable {
+            reason: "this server's signing key could not be published".to_string(),
+        }
+    })?;
+
+    Ok(Json(serde_json::json!({ "keys": [jwk] })))
 }
 
 /// `GET /oauth/delegation/client-metadata.json`.

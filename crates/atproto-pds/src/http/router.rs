@@ -334,7 +334,7 @@ fn build_router_inner(
         .route("/oauth/token", post(oauth::token_handler))
         .route("/oauth/revoke", post(oauth::revoke_handler))
         .route("/oauth/jwks", get(oauth::jwks_handler))
-        // Delegated sign-in. These four are this server acting as an OAuth
+        // Delegated sign-in. These five are this server acting as an OAuth
         // *client* against somebody else's server -- the metadata document is
         // what that server fetches to find out what is asking, and the
         // callback is where it sends the delegate back.
@@ -342,6 +342,12 @@ fn build_router_inner(
             "/oauth/delegation/client-metadata.json",
             get(oauth::delegation::client_metadata),
         )
+        // The client-role key set. Separate from `/oauth/jwks` above because
+        // the two name the same key differently -- thumbprint there, `did:key`
+        // here, which is what the client assertion's `kid` carries. A peer
+        // resolving that `kid` against the provider set finds nothing and
+        // refuses the request as `invalid_client`.
+        .route("/oauth/delegation/jwks.json", get(oauth::delegation::jwks))
         .route(
             "/oauth/delegation/start",
             get(oauth::delegation::start_page),

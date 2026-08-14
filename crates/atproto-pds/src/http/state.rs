@@ -71,7 +71,12 @@ pub struct DelegationConfig {
     /// Where a delegate's authorization server sends them back to.
     pub redirect_uri: String,
     /// Where the peer fetches the key that signs this server's client
-    /// assertions. The existing `/oauth/jwks`, which already publishes it.
+    /// assertions.
+    ///
+    /// `/oauth/delegation/jwks.json`, not the provider's `/oauth/jwks`. Same
+    /// key, different name for it: the provider set uses a JWK thumbprint as
+    /// `kid`, a client assertion uses the key's `did:key` form, and the peer
+    /// resolves the assertion's `kid` against this document.
     pub jwks_uri: String,
     /// Human-readable name shown on the delegate's own consent screen.
     pub client_name: String,
@@ -159,7 +164,7 @@ impl DelegationStatus {
         Self::Available(Arc::new(DelegationConfig {
             client_id: format!("{origin}/oauth/delegation/client-metadata.json"),
             redirect_uri: format!("{origin}/oauth/delegation/callback"),
-            jwks_uri: format!("{origin}/oauth/jwks"),
+            jwks_uri: format!("{origin}/oauth/delegation/jwks.json"),
             client_name: format!(
                 "{} account delegation",
                 origin.trim_start_matches("https://")
