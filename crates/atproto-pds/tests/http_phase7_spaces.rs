@@ -29,7 +29,7 @@
 
 use atproto_identity::key::{KeyData, KeyType, generate_key};
 use atproto_oauth::dpop::{auth_dpop, extract_jwk_thumbprint, request_dpop};
-use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
+use atproto_pds::account::{AccountDirectory, AccountManager, AccountState, CreateAccountParams};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::{RepoReader, RepoWriter};
@@ -5247,4 +5247,214 @@ async fn a_blocked_reader_stops_being_served() {
     );
     // Refused the same way a stranger is, so a block cannot be probed for.
     assert_eq!(refused["error"], "SpaceNotFound", "{refused}");
+}
+
+// ---------------------------------------------------------------------------
+//  Account hosting status.
+//
+//  0016's "Account lifecycle" section says the events already in the protocol
+//  carry over unchanged: a deactivated account's data stops being served, and
+//  a moderated one's stops too. The public realm has had that gate since a
+//  takedown was found not to take anything down; the permissioned realm did
+//  not have it at all, on any endpoint.
+// ---------------------------------------------------------------------------
+
+/// Seed a member's repo with one record and hand back a space credential for
+/// reading it, which is the shape a syncer arrives in.
+async fn seed_repo_and_credential(
+    app: &axum::Router,
+    manager: &Arc<AccountManager>,
+) -> (String, String, SpaceCred) {
+    let owner = create_account_and_token(app, manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(app, &owner, "default").await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "repo": "did:plc:owner",
+            "space": uri,
+            "writes": [{
+                "action": "create", "collection": "c.d.e", "rkey": "one", "value": {"v": 1}
+            }]
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed write: {body}");
+    let cred = mint_space_credential(app, "did:plc:owner", &uri).await;
+    (owner, uri, cred)
+}
+
+/// Every read path a syncer has into a repo, once it holds a credential.
+fn syncer_read_paths(uri: &str) -> Vec<String> {
+    let space = urlencode(uri);
+    vec![
+        format!(
+            "/xrpc/com.atproto.space.getRecord?space={space}&repo=did:plc:owner&collection=c.d.e&rkey=one"
+        ),
+        format!("/xrpc/com.atproto.space.listRecords?space={space}&repo=did:plc:owner"),
+        format!("/xrpc/com.atproto.space.listBlobs?space={space}&repo=did:plc:owner"),
+        format!("/xrpc/com.atproto.space.getLatestCommit?space={space}&repo=did:plc:owner"),
+        format!("/xrpc/com.atproto.space.getRepo?space={space}&repo=did:plc:owner"),
+        format!("/xrpc/com.atproto.space.listRepoOps?space={space}&repo=did:plc:owner"),
+    ]
+}
+
+/// Deactivating an account withdraws its permissioned repo from the syncers
+/// reading it, on every read path rather than one.
+///
+/// The credential stays valid throughout — it is minted by the authority and
+/// nothing can revoke it — which is the point: what changed is whether this
+/// host will answer for the account behind the repo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deactivated_account_stops_serving_its_permissioned_repo_to_a_syncer() {
+    let (app, manager, _tmp) = build_app().await;
+    let (_owner, uri, cred) = seed_repo_and_credential(&app, &manager).await;
+
+    for path in syncer_read_paths(&uri) {
+        let (status, body) = get_json_cred(&app, &path, &cred).await;
+        assert_eq!(status, StatusCode::OK, "{path} while active: {body}");
+    }
+
+    manager
+        .set_state("did:plc:owner", AccountState::Deactivated)
+        .await
+        .unwrap();
+
+    for path in syncer_read_paths(&uri) {
+        let (status, body) = get_json_cred(&app, &path, &cred).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path} must stop being served once the account is deactivated: {body}"
+        );
+        assert_eq!(body["error"], "RepoDeactivated", "{path}: {body}");
+    }
+}
+
+/// A takedown reaches the permissioned realm too, and names itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taken_down_account_stops_serving_its_permissioned_repo() {
+    let (app, manager, _tmp) = build_app().await;
+    let (_owner, uri, cred) = seed_repo_and_credential(&app, &manager).await;
+
+    manager
+        .set_state("did:plc:owner", AccountState::Takendown)
+        .await
+        .unwrap();
+
+    for path in syncer_read_paths(&uri) {
+        let (status, body) = get_json_cred(&app, &path, &cred).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], "RepoTakendown", "{path}: {body}");
+    }
+}
+
+/// Deactivation withdraws a repo from its readers and not from its owner.
+///
+/// The same asymmetry the public realm draws: locking an account holder out of
+/// their own records the moment they deactivate would make the state a trap
+/// rather than a pause, and their records are what they came back for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deactivated_account_still_reads_its_own_permissioned_records() {
+    let (app, manager, _tmp) = build_app().await;
+    let (owner, uri, _cred) = seed_repo_and_credential(&app, &manager).await;
+
+    manager
+        .set_state("did:plc:owner", AccountState::Deactivated)
+        .await
+        .unwrap();
+
+    for path in syncer_read_paths(&uri) {
+        let (status, body) = get_json(app.clone(), &path, Some(&owner)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} must still answer its own account: {body}"
+        );
+    }
+}
+
+/// A takedown is not lifted by holding the account's own token.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taken_down_account_cannot_read_its_own_permissioned_records() {
+    let (app, manager, _tmp) = build_app().await;
+    let (owner, uri, _cred) = seed_repo_and_credential(&app, &manager).await;
+
+    manager
+        .set_state("did:plc:owner", AccountState::Takendown)
+        .await
+        .unwrap();
+
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.listRecords?space={}&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "RepoTakendown", "{body}");
+}
+
+/// An account that may not write does not write permissioned records either.
+///
+/// Both states are checked because they fail for different reasons: a
+/// takedown is a moderation action, and a deactivation is a withdrawal whose
+/// records nothing would then be allowed to sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inactive_account_cannot_write_permissioned_records() {
+    for state in [AccountState::Takendown, AccountState::Deactivated] {
+        let (app, manager, _tmp) = build_app().await;
+        let (owner, uri, _cred) = seed_repo_and_credential(&app, &manager).await;
+        manager.set_state("did:plc:owner", state).await.unwrap();
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.applyWrites",
+            json!({
+                "repo": "did:plc:owner",
+                "space": uri,
+                "writes": [{
+                    "action": "create", "collection": "c.d.e", "rkey": "two", "value": {"v": 2}
+                }]
+            }),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{state:?} applyWrites: {body}"
+        );
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.space.createRecord",
+            json!({
+                "repo": "did:plc:owner", "space": uri,
+                "collection": "c.d.e", "rkey": "three", "record": {"v": 3}
+            }),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{state:?} createRecord: {body}"
+        );
+
+        // And cannot administer the space it owns, which is a write by any
+        // other name.
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.simplespace.addMember",
+            json!({"space": uri, "did": "did:plc:alice"}),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{state:?} addMember: {body}");
+    }
 }

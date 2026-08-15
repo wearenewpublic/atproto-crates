@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `create`/`update`/`delete` is now refused outright, because the scope grammar those expand into has a
   closed value set — an unknown verb would have been the same silent drop one layer down.
 
+- **A deactivated or taken-down account stops serving its permissioned records, and stops writing them.**
+  Account state was enforced across the public realm and on nothing under `com.atproto.space.*`. A space
+  credential is minted by the space authority and cannot be revoked, so a syncer holding one kept reading
+  a moderated account's permissioned repo — `getRecord`, `listRecords`, `listBlobs`, `getLatestCommit`,
+  `getRepo` and `listRepoOps` alike — and the account kept writing new records into it until its refresh
+  token expired.
+
+  Reads now pass the same account-state gate as the public sync and blob endpoints, taken at the one place
+  every space read resolves its target repo. Deactivation withdraws a repo from its readers and not from
+  its owner, exactly as in the public realm; a space credential proves nothing about who is asking beyond
+  the authority's say-so, so it is read as anonymous, which is the audience deactivation withdraws from. A
+  repo this server does not host is left alone rather than refused, so the gate does not turn these
+  endpoints into a directory of which DIDs are local.
+
+  Writes — the four record methods and the five `simplespace` management procedures — require an account
+  that may write, which is `active` alone. There is no migration carve-out because there is no inbound
+  migration path that writes permissioned records yet.
+
 ### Added
 - **A space type is named on the consent screen in the reader's language.** A space type declaration may
   publish `name:lang`, a map of localised names, and 0016 puts it there for exactly this screen — the one a

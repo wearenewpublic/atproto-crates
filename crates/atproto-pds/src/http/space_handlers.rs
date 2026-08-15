@@ -141,6 +141,107 @@ async fn require_session_auth(
     require_authn(parts, state, &htm, &htu).await
 }
 
+/// Refuse to serve a permissioned repo whose account this server may no longer
+/// serve.
+///
+/// 0016's "Account lifecycle" section is explicit that the events already in
+/// the protocol carry over unchanged: a deleted account's permissioned data is
+/// deleted, and a deactivated account's is not served. So this is the same
+/// account-state gate the public sync and blob endpoints pass through, applied
+/// to the repo a space read names.
+///
+/// `caller` is the DID authenticated by an OAuth or session token, and `None`
+/// for a space credential. That distinction is the whole point of taking the
+/// caller at all: deactivation withdraws a repository from everyone except its
+/// owner, and a space credential is the one auth mode here that proves nothing
+/// about who is asking beyond the space authority's say-so. Reading it as
+/// anonymous is correct — its holder is a syncer, which is exactly the
+/// audience deactivation withdraws from.
+///
+/// # Why `require_readable_if_present` and not `require_available_for`
+///
+/// A repo this server does not host is not this gate's business to answer for.
+/// Cross-host membership is ordinary here — `assert_space_membership` defers to
+/// the authority precisely because the member list may name accounts that live
+/// elsewhere — so resolving the identifier and refusing what is missing would
+/// turn "not hosted here" into a refusal, ahead of the scope check that should
+/// have answered first. Doing it that way also makes this endpoint a directory:
+/// an under-scoped caller could tell a DID this server hosts from one it does
+/// not by which error came back.
+///
+/// Membership is checked separately and does not overlap: it asks whether the
+/// repo belongs to this space, and this asks whether the account behind it is
+/// still one this server answers for.
+///
+/// # Errors
+///
+/// [`PdsError::RepoUnavailable`](crate::errors::PdsError::RepoUnavailable),
+/// rendered as `RepoDeactivated` / `RepoTakendown` / `RepoSuspended`, matching
+/// what a caller already branches on for the public realm.
+async fn require_repo_hosted(
+    state: &HttpState,
+    repo: &str,
+    caller: Option<&str>,
+) -> Result<(), XrpcError> {
+    state
+        .reader
+        .require_readable_if_present(repo, caller)
+        .await
+        .map_err(XrpcError::from)
+}
+
+/// Authenticate a space write, and refuse an account whose state disallows
+/// writing.
+///
+/// The mirror of [`require_repo_hosted`], and needed for the same reason the
+/// public realm needed `require_writable_session`: a valid token is not an
+/// account permitted to write, and a moderated account kept writing until its
+/// refresh token expired — up to 90 days after the action.
+///
+/// `allows_writes` is `Active` alone, so a deactivated account is refused here
+/// where it is permitted to *read* its own repo above. That asymmetry is
+/// deliberate and matches the public realm: deactivation is a withdrawal, and
+/// letting it keep writing would mean records accruing in a repo nothing is
+/// allowed to sync. The public realm's one carve-out, `require_migration_session`,
+/// has no counterpart here because there is no inbound-migration path that
+/// writes permissioned records — when one lands it will need the same
+/// exception, and will have to say so.
+///
+/// # Errors
+///
+/// Whatever [`require_authn`] returns, or 403 `AccountDeactivated` /
+/// `AccountTakendown` when the account may not write.
+async fn require_writable_session_auth(
+    parts: &Parts,
+    state: &HttpState,
+) -> Result<crate::http::auth::AuthSubject, XrpcError> {
+    let subject = require_session_auth(parts, state).await?;
+    let account = state
+        .reader
+        .accounts()
+        .lookup_did(subject.sub())
+        .await
+        .map_err(XrpcError::from)?;
+    if let Some(account) = account
+        && !account.state.allows_writes()
+    {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            match account.state {
+                crate::account::AccountState::Deactivated => "AccountDeactivated",
+                crate::account::AccountState::Takendown => "AccountTakendown",
+                crate::account::AccountState::Suspended => "AccountSuspended",
+                _ => "AccountInactive",
+            },
+            format!(
+                "this account is {} and may not write permissioned records",
+                account.state.as_str()
+            ),
+        ));
+    }
+    Ok(subject)
+}
+
 // ---------------------------------------------------------------------------
 //  Management endpoints.
 // ---------------------------------------------------------------------------
@@ -200,7 +301,7 @@ pub async fn create_space(
     parts: Parts,
     Json(input): Json<CreateSpaceInput>,
 ) -> Result<Json<CreateSpaceResponse>, XrpcError> {
-    let subject = require_session_auth(&parts, &state).await?;
+    let subject = require_writable_session_auth(&parts, &state).await?;
     let caller = subject.sub().to_string();
     // The space authority defaults to the caller; an explicit `did` must
     // match (callers may only create spaces under their own authority).
@@ -299,7 +400,7 @@ pub async fn update_space(
     parts: Parts,
     Json(input): Json<UpdateSpaceInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let subject = require_session_auth(&parts, &state).await?;
+    let subject = require_writable_session_auth(&parts, &state).await?;
     let owner = subject.sub().to_string();
     let uri = parse_space_uri(&input.space)?;
     assert_space_manage(
@@ -340,7 +441,7 @@ pub async fn delete_space(
     parts: Parts,
     Json(input): Json<DeleteSpaceInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let subject = require_session_auth(&parts, &state).await?;
+    let subject = require_writable_session_auth(&parts, &state).await?;
     let owner = subject.sub().to_string();
     let uri = parse_space_uri(&input.space)?;
     assert_space_manage(
@@ -535,7 +636,7 @@ pub async fn add_member(
     parts: Parts,
     Json(input): Json<MemberInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let subject = require_session_auth(&parts, &state).await?;
+    let subject = require_writable_session_auth(&parts, &state).await?;
     let owner = subject.sub().to_string();
     let uri = parse_space_uri(&input.space)?;
     assert_space_manage(
@@ -556,7 +657,7 @@ pub async fn remove_member(
     parts: Parts,
     Json(input): Json<MemberInput>,
 ) -> Result<StatusCode, XrpcError> {
-    let subject = require_session_auth(&parts, &state).await?;
+    let subject = require_writable_session_auth(&parts, &state).await?;
     let owner = subject.sub().to_string();
     let uri = parse_space_uri(&input.space)?;
     assert_space_manage(
@@ -779,7 +880,7 @@ pub async fn apply_writes(
     parts: Parts,
     Json(input): Json<ApplyWritesInput>,
 ) -> Result<Json<ApplyWritesResponse>, XrpcError> {
-    let auth = require_session_auth(&parts, &state).await?;
+    let auth = require_writable_session_auth(&parts, &state).await?;
     let member_did = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &member_did)?;
     let uri = parse_space_uri(&input.space)?;
@@ -883,7 +984,7 @@ pub async fn create_record_write(
     parts: Parts,
     Json(input): Json<CreateRecordInput>,
 ) -> Result<Json<WriteRecordResponse>, XrpcError> {
-    let auth = require_session_auth(&parts, &state).await?;
+    let auth = require_writable_session_auth(&parts, &state).await?;
     let subject = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &subject)?;
     let uri = parse_space_uri(&input.space)?;
@@ -934,7 +1035,7 @@ pub async fn put_record_write(
     parts: Parts,
     Json(input): Json<PutRecordInput>,
 ) -> Result<Json<WriteRecordResponse>, XrpcError> {
-    let auth = require_session_auth(&parts, &state).await?;
+    let auth = require_writable_session_auth(&parts, &state).await?;
     let subject = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &subject)?;
     let uri = parse_space_uri(&input.space)?;
@@ -985,7 +1086,7 @@ pub async fn delete_record_write(
     parts: Parts,
     Json(input): Json<DeleteRecordInput>,
 ) -> Result<Json<serde_json::Value>, XrpcError> {
-    let auth = require_session_auth(&parts, &state).await?;
+    let auth = require_writable_session_auth(&parts, &state).await?;
     let subject = auth.sub().to_string();
     require_repo_matches_subject(&input.repo, &subject)?;
     let uri = parse_space_uri(&input.space)?;
@@ -1417,6 +1518,10 @@ async fn resolve_record_auth<'a>(
             // What is checked here is that the repo it names belongs to this
             // space.
             assert_space_membership(state, space, None, repo).await?;
+            // A credential says the authority admitted this reader to the
+            // space. It says nothing about whether this server may still serve
+            // the repo, which is the account holder's and this host's business.
+            require_repo_hosted(state, repo, None).await?;
             Ok(ResolvedRecordAuth {
                 auth: SpaceReadAuth::SpaceCredential { token: raw },
                 target_repo: repo.to_string(),
@@ -1467,6 +1572,7 @@ async fn resolve_record_auth<'a>(
             let sub = subject.sub().to_string();
             let target_repo = repo.map(|r| r.to_string()).unwrap_or_else(|| sub.clone());
             assert_space_membership(state, space, Some(&sub), &target_repo).await?;
+            require_repo_hosted(state, &target_repo, Some(&sub)).await?;
             Ok(ResolvedRecordAuth {
                 auth: SpaceReadAuth::OwnPds { account_did: sub },
                 target_repo,
