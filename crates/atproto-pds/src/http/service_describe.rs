@@ -24,6 +24,11 @@
 //! deliberately absent. This server forwards those rather than implementing
 //! them, and claiming them would describe the AppView's capabilities as its
 //! own.
+//!
+//! [`COMPAT_ALIASES`] are absent for a different reason: they are routes kept
+//! for callers written against an older draft of a method that has since been
+//! renamed or dropped. They answer, and they are not part of the surface a
+//! caller should be discovering.
 
 use axum::Json;
 use serde::Serialize;
@@ -39,7 +44,7 @@ const ROLES: [&str; 1] = ["pds"];
 ///
 /// Held to the router by `the_described_methods_match_the_router`. Add a route
 /// without adding it here and the tests fail, which is the point.
-const METHODS: [&str; 100] = [
+const METHODS: [&str; 98] = [
     "app.bsky.actor.getPreferences",
     "app.bsky.actor.putPreferences",
     "com.atproto.admin.deleteAccount",
@@ -117,8 +122,6 @@ const METHODS: [&str; 100] = [
     "com.atproto.space.getLatestCommit",
     "com.atproto.space.getRecord",
     "com.atproto.space.getRepo",
-    "com.atproto.space.getRepoState",
-    "com.atproto.space.getSpace",
     "com.atproto.space.getSpaceCredential",
     "com.atproto.space.listRecords",
     "com.atproto.space.listRepoOps",
@@ -142,6 +145,34 @@ const METHODS: [&str; 100] = [
     // This method itself: a description that omitted it would be the one
     // claim a caller could disprove from the response in hand.
     "community.lexicon.service.describe",
+];
+
+/// Routes served but not described: compatibility aliases for methods the
+/// permissioned-data draft has since renamed or dropped.
+///
+/// Each entry answers exactly as it did, so a caller built against the older
+/// draft keeps working. None is advertised, because this endpoint's answer is
+/// what a caller discovers the protocol through, and a name the draft no
+/// longer carries would be learned here as though it still did.
+///
+/// - `com.atproto.space.getSpace` — moved to `com.atproto.simplespace.getSpace`
+///   by proposals#100. Describing a space is space-management, not protocol:
+///   what a `getSpace` answer contains depends on which management
+///   implementation the space uses, and `simplespace` is one of them.
+/// - `com.atproto.space.getRepoState` — never a draft method. The draft names
+///   `getLatestCommit` for a repo's current signed commit, which this server
+///   routes to the same handler and does describe.
+///
+/// An entry earns removal when the callers are gone, not on a schedule; until
+/// then `every_compat_alias_is_routed` keeps the list from outliving its
+/// routes.
+///
+/// Public where `ROLES` and `METHODS` are not, because those two are readable
+/// from the endpoint's own response and this is the one fact about what this
+/// server serves that the response deliberately omits.
+pub const COMPAT_ALIASES: [&str; 2] = [
+    "com.atproto.space.getRepoState",
+    "com.atproto.space.getSpace",
 ];
 
 /// One entry in `methods`.
@@ -189,14 +220,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Every routed method is described, and every described method is routed.
-    ///
-    /// The whole value of this endpoint is that its answer is true. A hand-kept
-    /// list drifts the first time a route is added without touching this file,
-    /// and a service that misdescribes itself is worse than one that says
-    /// nothing — a caller can handle silence.
-    #[test]
-    fn the_described_methods_match_the_router() {
+    /// Collect the NSIDs `router.rs` mounts.
+    fn routed_methods() -> BTreeSet<String> {
         let router = include_str!("router.rs");
 
         let mut routed = BTreeSet::new();
@@ -213,14 +238,34 @@ mod tests {
                 rest = &rest[end..];
             }
         }
+        routed
+    }
 
+    /// Every routed method is described or an acknowledged alias, and every
+    /// described method is routed.
+    ///
+    /// The whole value of this endpoint is that its answer is true. A hand-kept
+    /// list drifts the first time a route is added without touching this file,
+    /// and a service that misdescribes itself is worse than one that says
+    /// nothing — a caller can handle silence.
+    ///
+    /// The one permitted gap is [`COMPAT_ALIASES`], and it is checked as an
+    /// equality rather than an exemption: an alias that stops being routed
+    /// fails this, and so does a genuinely new method someone forgot to
+    /// describe. Leaving a route out of the answer stays a decision made in
+    /// this file, not something a diff can do quietly.
+    #[test]
+    fn the_described_methods_match_the_router() {
+        let routed = routed_methods();
         let described: BTreeSet<String> = METHODS.iter().map(|s| (*s).to_string()).collect();
+        let aliases: BTreeSet<String> = COMPAT_ALIASES.iter().map(|s| (*s).to_string()).collect();
 
-        let undeclared: Vec<_> = routed.difference(&described).collect();
-        assert!(
-            undeclared.is_empty(),
-            "these methods are routed but not described, so the description \
-             understates what this server serves: {undeclared:?}"
+        let undeclared: BTreeSet<String> = routed.difference(&described).cloned().collect();
+        assert_eq!(
+            undeclared, aliases,
+            "the routes this server does not describe must be exactly the \
+             compatibility aliases: anything else routed is understating what \
+             it serves, and a listed alias no longer routed is a dead entry"
         );
 
         let unrouted: Vec<_> = described.difference(&routed).collect();
@@ -229,6 +274,48 @@ mod tests {
             "these methods are described but not routed, so the description \
              claims what this server does not serve: {unrouted:?}"
         );
+    }
+
+    /// An alias is a route, not a name in a list.
+    ///
+    /// Kept separate from the equality above so a failure says which of the two
+    /// went wrong: this one names the alias that lost its route.
+    #[test]
+    fn every_compat_alias_is_routed() {
+        let routed = routed_methods();
+        for alias in COMPAT_ALIASES {
+            assert!(
+                routed.contains(alias),
+                "{alias} is listed as a compatibility alias but nothing routes \
+                 it, so callers relying on it get 501 while this file says \
+                 they are being carried"
+            );
+        }
+    }
+
+    /// The method each alias stands in for is described.
+    ///
+    /// An alias is only defensible while the current name is discoverable.
+    /// Dropping both would leave the capability served and unfindable.
+    #[test]
+    fn the_current_name_of_each_alias_is_described() {
+        for (alias, current) in [
+            (
+                "com.atproto.space.getSpace",
+                "com.atproto.simplespace.getSpace",
+            ),
+            (
+                "com.atproto.space.getRepoState",
+                "com.atproto.space.getLatestCommit",
+            ),
+        ] {
+            assert!(COMPAT_ALIASES.contains(&alias), "{alias} is not an alias");
+            assert!(
+                METHODS.contains(&current),
+                "{alias} is undescribed and so is {current}, which leaves the \
+                 capability served by nothing a caller can discover"
+            );
+        }
     }
 
     /// The union member is discriminated, or a client cannot tell which of the

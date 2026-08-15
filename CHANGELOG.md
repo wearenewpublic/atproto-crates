@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that may write, which is `active` alone. There is no migration carve-out because there is no inbound
   migration path that writes permissioned records yet.
 
+### Changed
+- **`community.lexicon.service.describe` stops advertising two space methods the draft does not have.**
+  `com.atproto.space.getSpace` moved to `com.atproto.simplespace.getSpace` in proposals#100, and
+  `com.atproto.space.getRepoState` was never a draft method — the draft calls it `getLatestCommit`. Both
+  routes still answer, unchanged, for callers written against them. They are no longer named in the
+  discovery response, which is where a caller learns what the protocol is, and a name the draft has
+  dropped was being learned there as though it had not.
+
+  The test that holds the described list to the router now permits exactly the routes named as
+  compatibility aliases, so leaving one out of the answer stays a decision recorded in that file rather
+  than something a diff can do quietly, and an alias that loses its route fails the build.
+
 ### Added
 - **A space type is named on the consent screen in the reader's language.** A space type declaration may
   publish `name:lang`, a map of localised names, and 0016 puts it there for exactly this screen — the one a
