@@ -95,6 +95,13 @@ pub struct RateLimitPolicy {
     /// job. Without this an operator has to choose between limiting attackers
     /// and letting their own infrastructure work.
     bypass: Arc<HashSet<IpAddr>>,
+    /// Per-address ceiling on concurrent `getRepo` exports. `getRepo` is exempt
+    /// from the rate buckets (it is the sync path), but each call buffers a
+    /// whole repo CAR in memory, so without this one address could hold open
+    /// enough of them to exhaust the process and starve the global concurrency
+    /// budget every other route shares. Keyed by address, shared across the
+    /// policy's clones through the `Arc`.
+    get_repo_inflight: Arc<dashmap::DashMap<IpAddr, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl RateLimitPolicy {
@@ -115,6 +122,7 @@ impl RateLimitPolicy {
             auth,
             trusted_proxy_hops,
             bypass: Arc::new(bypass),
+            get_repo_inflight: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -181,6 +189,11 @@ fn client_ip_parts(
 /// middleware for why.
 const SYNC_GET_REPO_PATH: &str = "/xrpc/com.atproto.sync.getRepo";
 
+/// Maximum concurrent `getRepo` exports one address may have in flight. A
+/// caller over the ceiling gets a 429 to retry, not an outage; the number is
+/// small because each export holds a whole repo CAR in memory at once.
+const MAX_GET_REPO_INFLIGHT_PER_IP: usize = 4;
+
 /// Whether a path belongs to the tighter auth tier.
 #[must_use]
 pub fn is_auth_path(path: &str) -> bool {
@@ -213,6 +226,25 @@ pub async fn rate_limit_middleware(
     // address's budget for everything else. The reference excludes it from its
     // global-ip bucket for the same reason (packages/pds/src/rate-limits.ts).
     if path == SYNC_GET_REPO_PATH {
+        // Still outside the shared rate buckets, but bounded per address:
+        // acquire a `getRepo` slot for this IP and hold it for the export. Over
+        // the per-address ceiling is a 429 the caller retries, far better than an
+        // unbounded pile of in-memory CAR builds from one source. The permit
+        // releases when the request future completes.
+        let semaphore = policy
+            .get_repo_inflight
+            .entry(ip)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_GET_REPO_INFLIGHT_PER_IP)))
+            .clone();
+        let Ok(_permit) = semaphore.try_acquire_owned() else {
+            tracing::debug!(ip = %ip, "getRepo per-address concurrency limit exceeded");
+            return XrpcError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RateLimited",
+                "too many concurrent repository exports from this address; retry shortly",
+            )
+            .into_response();
+        };
         return next.run(request).await;
     }
 

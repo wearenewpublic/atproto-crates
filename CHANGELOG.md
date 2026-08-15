@@ -480,6 +480,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   There is no behaviour change for the `pds` binary, whose `--admin-password` default is the dev
   sentinel and is unchanged.
 
+### Security
+- **`getRepo` is bounded per address.** The repository export is exempt from the shared rate buckets (it is
+  the high-volume sync path), but each call buffers a whole repo CAR in memory and there was no per-address
+  ceiling, so a single source could hold open enough concurrent exports to exhaust the process and starve
+  the global concurrency budget every other route shares. A per-address limit of four concurrent exports
+  now applies; a caller over it gets a 429 to retry. The path stays out of the rate buckets, so ordinary
+  migration and backfill are unaffected.
+
 ### Fixed
 - **Every Dockerfile now names the toolchain the workspace pins.** The raise to 1.97 updated
   `rust-toolchain.toml`, `rust-version` in the workspace `Cargo.toml` and the builder stage in
