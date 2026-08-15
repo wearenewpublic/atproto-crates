@@ -114,6 +114,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client-metadata path applies (HTTPS, no address literals, no embedded credentials, port 443), and the
   resolver's client no longer follows redirects, closing the public-name-to-internal-address pivot.
 
+### Security
+- **A discoverable OAuth client can no longer request a scope it never declared.** The PAR scope ceiling —
+  a client may be granted no scope outside its client metadata's `scope` field — was skipped entirely when
+  that field was absent, so a discoverable client that omitted `scope` faced no ceiling and could request
+  anything (consent being the only remaining barrier). An absent `scope` is now read as declaring none, per
+  the field's own documented meaning; the loopback development client, which declares none deliberately,
+  stays unconstrained by name rather than by the absent field.
+
 ### Changed
 - **`community.lexicon.service.describe` stops advertising two space methods the draft does not have.**
   `com.atproto.space.getSpace` moved to `com.atproto.simplespace.getSpace` in proposals#100, and

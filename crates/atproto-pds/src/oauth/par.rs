@@ -291,7 +291,19 @@ pub async fn par_handler(
     // Keyed on the `space:` prefix rather than on the presence of `?`, because
     // the self-authority form carries parameters without one -- which is what
     // the space suite caught when the first version of this used `?`.
-    if let Some(declared) = metadata.scope.as_deref() {
+    // A discoverable client's declared scope is the ceiling — it may be granted
+    // no scope it did not register for. An absent `scope` means it declared
+    // none, so the ceiling is empty and any non-`space:` scope is unregistered.
+    // The block used to be skipped entirely when the field was absent, which
+    // let such a client request any scope; that reading was written for the
+    // loopback development client, which legitimately declares no scope and is
+    // left unconstrained here by name rather than by the absent field.
+    let declared_ceiling: Option<&str> = match metadata.scope.as_deref() {
+        Some(declared) => Some(declared),
+        None if crate::oauth::client_metadata::is_loopback_client_id(&resolved.client_id) => None,
+        None => Some(""),
+    };
+    if let Some(declared) = declared_ceiling {
         let allowed: Vec<&str> = declared.split_whitespace().collect();
         if let Some(extra) = resolved
             .scope
