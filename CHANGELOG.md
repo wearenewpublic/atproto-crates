@@ -152,6 +152,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own-repo — a cross-member `OwnPds` read sees the tombstone exactly as a SpaceCredential read does — and
   the blob endpoints enforce the same gate.
 
+### Security
+- **`revokeAppPassword` refuses the reserved `__primary__` name.** The account password is stored in a
+  `__primary__` app-password row, and the XRPC revoke handler forwarded the requested name verbatim — so a
+  caller could delete it and break the legacy `createSession` password login. The portal and the create
+  path already refused the name; the revoke handler now does too.
+
 ### Added
 - **A space type is named on the consent screen in the reader's language.** A space type declaration may
   publish `name:lang`, a map of localised names, and 0016 puts it there for exactly this screen — the one a

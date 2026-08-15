@@ -1164,6 +1164,17 @@ pub async fn revoke_app_password(
     let claims = require_access_jwt(&parts, &state).await?;
     require_full_session(&claims, "com.atproto.server.revokeAppPassword")?;
     let manager = account_manager(&state)?;
+    // The account password is stored in a reserved `__primary__` app-password
+    // row (see `AccountManager`). Revoking it here would delete the legacy
+    // `createSession` password login, so it is refused — exactly as the portal
+    // and the create path already refuse the name.
+    if input.name == "__primary__" {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "the account password cannot be revoked as an app password",
+        ));
+    }
     let removed = app_password::revoke(&manager.account_pool(), &claims.sub, &input.name)
         .await
         .map_err(XrpcError::from)?;
