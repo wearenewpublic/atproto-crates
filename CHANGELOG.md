@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   portal page passes through — so a static title is unaffected and a request-derived one can no longer
   carry markup.
 
+### Security
+- **Authorization codes and PAR requests are consumed atomically.** `take_code` and `take_par` read the
+  row with one statement and deleted it with another, so two concurrent redemptions of a single code (or
+  `request_uri`) could both observe it before either delete committed — a replayed code redeemable twice,
+  with the token endpoint's reuse-detection never firing because neither redemption reached the
+  already-gone branch. Both now consume via `DELETE ... RETURNING`, a single atomic statement, so exactly
+  one caller wins and a replay reads nothing.
+
 ### Changed
 - **`/xrpc/_health` reports `version` and `status`, and nothing else.** It also named the SetHash
   implementation in use, so that federation peers could confirm interop without trial-and-error commits.

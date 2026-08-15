@@ -538,17 +538,62 @@ impl SqlBackend {
     }
 
     async fn take_par(&self, request_uri: &str) -> PdsResult<Option<OAuthRequest>> {
-        let row = self.fetch_par(request_uri).await?;
-        if row.is_some() {
-            sqlx::query("DELETE FROM oauth_par WHERE request_uri = ?")
-                .bind(request_uri)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| PdsError::Storage {
-                    reason: format!("oauth_par delete: {e}"),
-                })?;
+        // Consume atomically, for the same reason as `take_code`: reading via
+        // `fetch_par` and then issuing a separate DELETE let two concurrent
+        // redemptions of one `request_uri` both observe the row, so it could be
+        // consumed twice. `DELETE ... RETURNING` removes and reads it in one
+        // statement, so exactly one caller wins. `peek_par` keeps using the
+        // non-consuming `fetch_par`. An expired row is deleted and reported
+        // absent, matching `fetch_par`'s treatment of expiry.
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "DELETE FROM oauth_par WHERE request_uri = ?
+             RETURNING client_id, redirect_uri, scope, state_param,
+                       code_challenge, code_challenge_method, dpop_jkt, login_hint,
+                       created_at, expires_at",
+        )
+        .bind(request_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| PdsError::Storage {
+            reason: format!("oauth_par delete-returning: {e}"),
+        })?;
+        let Some(row) = row else { return Ok(None) };
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&row.9)
+            .map_err(|e| PdsError::Storage {
+                reason: format!("parse expires_at: {e}"),
+            })?
+            .with_timezone(&Utc);
+        if Utc::now() > expires_at {
+            return Ok(None);
         }
-        Ok(row)
+        let created_at = chrono::DateTime::parse_from_rfc3339(&row.8)
+            .map_err(|e| PdsError::Storage {
+                reason: format!("parse created_at: {e}"),
+            })?
+            .with_timezone(&Utc);
+        Ok(Some(OAuthRequest {
+            client_id: row.0,
+            redirect_uri: row.1,
+            scope: row.2,
+            state: row.3,
+            code_challenge: row.4,
+            code_challenge_method: row.5,
+            dpop_jkt: row.6,
+            login_hint: row.7,
+            created_at,
+        }))
     }
 
     async fn peek_par(&self, request_uri: &str) -> PdsResult<Option<OAuthRequest>> {
@@ -640,26 +685,25 @@ impl SqlBackend {
     }
 
     async fn take_code(&self, code: &str) -> PdsResult<Option<AuthorizationCode>> {
+        // Consume atomically. A separate SELECT then DELETE let two concurrent
+        // redemptions of one code both observe the row before either delete
+        // committed, so a replayed code could be redeemed twice and the
+        // reuse-detection in the token endpoint never fired. `DELETE ...
+        // RETURNING` removes and reads the row in one statement, so exactly one
+        // caller can win; a second presentation reads nothing and is refused.
         let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT did, request_json, issued_at, expires_at, acting_did
-             FROM oauth_code WHERE code = ?",
+            "DELETE FROM oauth_code WHERE code = ?
+             RETURNING did, request_json, issued_at, expires_at, acting_did",
         )
         .bind(code)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| PdsError::Storage {
-            reason: format!("oauth_code select: {e}"),
+            reason: format!("oauth_code delete-returning: {e}"),
         })?;
         let Some((did, request_json, issued_at, expires_at, acting_did)) = row else {
             return Ok(None);
         };
-        sqlx::query("DELETE FROM oauth_code WHERE code = ?")
-            .bind(code)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| PdsError::Storage {
-                reason: format!("oauth_code delete: {e}"),
-            })?;
         let exp = chrono::DateTime::parse_from_rfc3339(&expires_at)
             .map_err(|e| PdsError::Storage {
                 reason: format!("parse expires_at: {e}"),
