@@ -40,10 +40,35 @@
 //! about a key somebody else controls, where a proof is a demonstration that
 //! the requester holds the private half.
 //!
+//! # `client_id` is an extension, not a 0016 claim
+//!
+//! The draft's space credential carries `iss`, `sub`, `cnf`, `iat`, `exp` and
+//! `jti`, and nothing else. `client_id` is this implementation's addition. The
+//! name is not invented: it is the claim IANA registers for "the client
+//! identifier of the OAuth 2.0 client that requested the token" ([RFC 9068]
+//! §2.2.3.1), and an attested `client_id` here is the same fact about the same
+//! kind of actor, so a future draft that adopts one is unlikely to mean
+//! something else by it.
+//!
+//! What it is not is something a repo host may rely on. Three bounds hold:
+//!
+//! - A conformant authority that is not this one has no reason to set it, so a
+//!   credential arriving from elsewhere carries no `client_id` even when the
+//!   app that obtained it did attest. Anything keyed on the claim must have an
+//!   answer for `None` that is not "unknown app, therefore allow".
+//! - Where it is set, it is the *issuing authority's* assertion. This server
+//!   verifies a client attestation before writing the claim, and a credential
+//!   minted elsewhere reaches a repo host with whatever its authority chose to
+//!   put there, signed. It identifies an app to the extent the authority is
+//!   honest about apps.
+//! - It is not part of the binding. `cnf.jkt` is what a host checks a proof
+//!   against; `client_id` names who the authority believed it was issuing to.
+//!
 //! Both JWTs use the same compact-form encoding:
 //! `b64url(header).b64url(payload).b64url(sig)`, signed with ECDSA over an
 //! atproto signing key (P-256 → ES256, K-256 → ES256K).
 //!
+//! [RFC 9068]: https://www.rfc-editor.org/rfc/rfc9068#section-2.2.3.1
 //! [`com.atproto.space.getDelegationToken`]: https://atproto.com
 //! [`com.atproto.space.getSpaceCredential`]: https://atproto.com
 
@@ -188,8 +213,11 @@ pub struct SpaceCredential {
     /// `cnf` is refused rather than treated as unbound.
     pub cnf: Cnf,
     /// Attested application identity (the verified client attestation's
-    /// `iss`). Omitted on the wire when the request carried no attestation
-    /// (the spec's "Space credential" section).
+    /// `iss`), omitted on the wire when the request carried no attestation.
+    ///
+    /// An extension to the draft's credential rather than one of its claims,
+    /// and `None` for every credential a third-party authority mints. See the
+    /// module docs for what may and may not be built on it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub client_id: Option<String>,
     /// Issued-at timestamp.
@@ -462,8 +490,11 @@ pub fn verify_delegation_token(
 ///
 /// `client_id` is the attested application identity (the verified client
 /// attestation's `iss`); pass `None` when the request carried no attestation,
-/// in which case the claim is omitted (the spec's "Space credential" section). The header
-/// carries `kid="#atproto_space"` and the payload has no `aud`.
+/// in which case the claim is omitted. It is an extension to the draft's
+/// credential, so pass only an identity this authority verified — a caller
+/// that forwards an unattested value writes an app identity into a signed
+/// token on nothing but the caller's word. The header carries
+/// `kid="#atproto_space"` and the payload has no `aud`.
 ///
 /// # Errors
 ///

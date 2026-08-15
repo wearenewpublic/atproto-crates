@@ -20,6 +20,22 @@
 //! the account holder is shown it plainly rather than being handed a list of
 //! hashes that looks like a list of applications.
 //!
+//! There is a second reason a reader lands in the anonymous case, and it does
+//! not depend on the application at all. `client_id` is not a claim the draft
+//! defines — it is an extension this server writes when it is the authority
+//! minting the credential. A space anchored on another host is read with a
+//! credential that host minted, and a conformant one has no reason to carry
+//! the claim, so every reader of such a space is anonymous here however
+//! diligently it attested. Being named in this table is therefore evidence
+//! about the authority as much as about the reader.
+//!
+//! That bounds what a block can reach, and the bound is worth stating because
+//! it is not obvious from the portal: a block is keyed on the identity the
+//! credential presents, so blocking an attested `client_id` stops credentials
+//! that carry it and does not stop the same application reading with a
+//! credential that carries none. Against a space this server is the authority
+//! for, an attesting app is named on every credential and the block holds.
+//!
 //! # Best effort
 //!
 //! Recording a read must never fail one. Callers log and continue.
