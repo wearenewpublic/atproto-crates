@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them deliberately — `community.lexicon.service.describe` for the methods this server routes. A test now
   asserts the response's exact key set, since the field to keep out is the one nobody thought to forbid.
 
+### Security
+- **Delegated sign-in validates the delegate's authorization-server endpoints before contacting them
+  (SSRF).** Only the delegate's PDS URL was checked against the URL policy; the authorization server's
+  issuer, PAR, token and authorization endpoints were read verbatim from the delegate PDS's metadata and
+  used as request targets. A delegate could therefore name an internal host, port or scheme — a cloud
+  metadata service, an internal admin port, loopback — as its PAR or token endpoint, and `begin`/`callback`
+  would POST to it, a blind SSRF with a success/timing oracle reachable behind the delegation feature. Those
+  four endpoints are now validated with the same syntactic policy the PDS endpoint already used (HTTPS, a
+  public non-literal host, port 443, no embedded credentials) before any request is issued to them.
+
 ### Fixed
 - **A permission set asking to administer a space now grants it.** proposals#101 added `manage` to the
   space permission a permission set may declare, alongside `spaceType`, `authority`, `skey`, `collection`

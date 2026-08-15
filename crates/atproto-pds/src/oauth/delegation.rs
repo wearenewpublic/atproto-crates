@@ -665,6 +665,22 @@ pub async fn begin(
             }
         })?;
 
+    // SSRF egress guard. `pds_resources` read the authorization server's
+    // endpoints out of the delegate PDS's (attacker-controlled) metadata, and
+    // this server is about to POST its pushed authorization request to one and,
+    // at callback, its token request and an issuer re-read to the others. The
+    // PDS endpoint was validated during DID-document resolution; these were not.
+    validate_authorization_server_endpoints(&auth_server).map_err(|e| {
+        tracing::warn!(
+            delegate_did = %delegate.did,
+            error = %e,
+            "a delegate's authorization server named a non-permitted endpoint"
+        );
+        PdsError::DelegationUnresolvable {
+            handle: typed.to_string(),
+        }
+    })?;
+
     let (pkce_verifier, code_challenge) = atproto_oauth::pkce::generate();
     let oauth_state = random_hex();
     let nonce = random_hex();
@@ -1219,6 +1235,35 @@ async fn lookup_local_account(
 // ---------------------------------------------------------------------------
 //  Small shared pieces
 // ---------------------------------------------------------------------------
+
+/// Refuse an authorization server whose endpoints are not permitted request
+/// targets.
+///
+/// `pds_resources` reads these out of the delegate PDS's metadata document,
+/// which is attacker-controlled, and delegated sign-in POSTs to the PAR and
+/// token endpoints and re-reads the issuer. Only `pds_url` was validated
+/// (`pds_endpoints_validated`); these endpoints were not, so without this the
+/// server could be aimed at any host, port or scheme — a cloud metadata
+/// service, an internal admin port, loopback. This applies the same syntactic
+/// URL policy: HTTPS, a public non-literal host, port 443, no embedded
+/// credentials. It does not resolve DNS, so it does not defend against
+/// rebinding or a public name pointing inside — the limitation the PDS-endpoint
+/// guard shares.
+fn validate_authorization_server_endpoints(server: &AuthorizationServer) -> Result<(), String> {
+    for (label, url) in [
+        ("issuer", &server.issuer),
+        ("authorization_endpoint", &server.authorization_endpoint),
+        ("token_endpoint", &server.token_endpoint),
+        (
+            "pushed_authorization_request_endpoint",
+            &server.pushed_authorization_request_endpoint,
+        ),
+    ] {
+        atproto_identity::validation::validate_service_endpoint(url)
+            .map_err(|e| format!("{label} {url}: {e}"))?;
+    }
+    Ok(())
+}
 
 /// Re-read the delegate's authorization server metadata at callback time.
 ///
