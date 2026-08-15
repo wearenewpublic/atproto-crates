@@ -450,6 +450,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate matches on those constants, so a second copy of each string is a gate that silently stops
   working when somebody edits one of them.
 
+### Security
+- **The portal's CSRF documentation matches the code.** The module doc claimed each form carried a
+  session-tied synchroniser token as a third CSRF control; no such token exists. The real defences —
+  `SameSite=Strict` on the session cookie and the `Sec-Fetch-Site` origin check — are present and
+  consistently applied, so this is a documentation-integrity fix, not a behaviour change: the doc no longer
+  describes a control the code does not implement.
+
 ### Removed
 - **`atproto_pds::admin::handlers::DEFAULT_ADMIN_PASSWORD` is gone, and an unconfigured admin
   password now refuses every admin request** instead of falling back to it.

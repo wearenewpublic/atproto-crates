@@ -15,12 +15,18 @@
 //!
 //! # Cross-site request forgery
 //!
-//! Every mutating route is a form POST guarded three ways: the session cookie
-//! is `SameSite=Strict`, so a cross-site POST arrives with no session at all;
-//! `Sec-Fetch-Site` must say `same-origin`; and each form carries a token tied
-//! to the session. The first two are what actually stop the attack in any
-//! current browser, and the token is what still stops it if a future one
-//! relaxes them.
+//! Every mutating route is a form POST guarded two ways: the session cookie is
+//! `SameSite=Strict`, so a cross-site POST arrives with no session at all, and
+//! [`require_same_origin`] refuses the request unless `Sec-Fetch-Site` says the
+//! POST came from this site (a header-less navigation -- a typed URL or a
+//! bookmark -- is allowed, which is how the sign-in page is reached). Either
+//! one turns away a forged cross-site POST on its own in any current browser.
+//!
+//! There is deliberately no per-form synchroniser token: with two independent
+//! controls already covering the attack, a token would be the defence-in-depth
+//! move to make only if one of them were ever relaxed. This paragraph once
+//! claimed such a token existed; it did not, and the claim is corrected here so
+//! the file describes the code as written.
 //!
 //! # Five sections
 //!
