@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration path that writes permissioned records yet.
 
 ### Security
+- **A single-use invite code can no longer mint multiple accounts.** The invite gate was a non-consuming
+  `peek`, with redemption deferred until after the account row existed (to satisfy the
+  `invite_code.used_by` foreign key) and treated as non-fatal — so N concurrent `createAccount` calls with
+  distinct handles could all pass the `peek` on one single-use code and all succeed, the losers merely
+  logged. Account creation is now gated on an atomic `reserve` (a single conditional `UPDATE` that consumes
+  a slot) run before the row is inserted; exactly `available_uses` racers win and the rest are refused. The
+  `used_by` pairing is recorded afterward, once the account the key references exists.
+
+### Security
 - **Lexicon resolution during record validation no longer fetches arbitrary attacker-chosen URLs (SSRF).**
   Writing a record in a collection outside the bundled vocabulary resolves that NSID's lexicon over the
   network: an attacker-owned DNS name → an attacker-controlled `did=` TXT record → a DID document whose

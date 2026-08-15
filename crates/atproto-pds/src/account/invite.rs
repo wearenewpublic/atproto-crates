@@ -257,6 +257,110 @@ pub async fn redeem(pool: &AccountPool, code: &str, did: &str) -> PdsResult<bool
     }
 }
 
+/// Atomically reserve one slot of an invite code, without recording who used it.
+///
+/// A single conditional `UPDATE` — decrement only while a slot remains and the
+/// code is live — so exactly `available_uses` concurrent callers succeed and
+/// the rest see zero rows affected. This is what gates account creation: run
+/// before the account row exists, it stops one single-use code from minting N
+/// accounts, which the non-consuming [`peek`] could not. It deliberately does
+/// not write `used_by` — the account the FK `invite_code.used_by ->
+/// account(did)` points at does not exist yet — so [`record_invite_use`] records
+/// the pairing afterward.
+///
+/// Returns `true` when a slot was consumed, `false` when the code is unknown,
+/// disabled, or exhausted.
+pub async fn reserve(pool: &AccountPool, code: &str) -> PdsResult<bool> {
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            let res = sqlx::query(
+                "UPDATE invite_code SET available_uses = available_uses - 1
+                 WHERE code = ? AND disabled = 0 AND available_uses > 0",
+            )
+            .bind(code)
+            .execute(pool.as_sqlite())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("invite reserve: {e}"),
+            })?;
+            Ok(res.rows_affected() == 1)
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            let res = sqlx::query(
+                "UPDATE invite_code SET available_uses = available_uses - 1
+                 WHERE code = $1 AND disabled = false AND available_uses > 0",
+            )
+            .bind(code)
+            .execute(pool.as_postgres())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("invite reserve: {e}"),
+            })?;
+            Ok(res.rows_affected() == 1)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => {
+            unreachable!("AccountPool::Sqlite without `sqlite` feature");
+        }
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature");
+        }
+    }
+}
+
+/// Record which account used a code, after the account row exists and a slot has
+/// already been consumed by [`reserve`].
+///
+/// Sets `used_by` on the row when it is exhausted and not yet attributed,
+/// preserving the "who used the last slot" audit semantics. Never decrements —
+/// the single-use guarantee was already enforced by [`reserve`]. Best-effort: a
+/// failure here loses the pairing, not a slot.
+pub async fn record_invite_use(pool: &AccountPool, code: &str, did: &str) -> PdsResult<()> {
+    match pool.kind() {
+        #[cfg(feature = "sqlite")]
+        AccountPoolKind::Sqlite => {
+            sqlx::query(
+                "UPDATE invite_code SET used_by = ?
+                 WHERE code = ? AND available_uses = 0 AND used_by IS NULL",
+            )
+            .bind(did)
+            .bind(code)
+            .execute(pool.as_sqlite())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("invite record use: {e}"),
+            })?;
+            Ok(())
+        }
+        #[cfg(feature = "postgres")]
+        AccountPoolKind::Postgres => {
+            sqlx::query(
+                "UPDATE invite_code SET used_by = $1
+                 WHERE code = $2 AND available_uses = 0 AND used_by IS NULL",
+            )
+            .bind(did)
+            .bind(code)
+            .execute(pool.as_postgres())
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("invite record use: {e}"),
+            })?;
+            Ok(())
+        }
+        #[cfg(not(feature = "sqlite"))]
+        AccountPoolKind::Sqlite => {
+            unreachable!("AccountPool::Sqlite without `sqlite` feature");
+        }
+        #[cfg(not(feature = "postgres"))]
+        AccountPoolKind::Postgres => {
+            unreachable!("AccountPool::Postgres without `postgres` feature");
+        }
+    }
+}
+
 /// List codes issued by a DID (excludes admin-issued codes where
 /// `created_by_did` is null).
 ///

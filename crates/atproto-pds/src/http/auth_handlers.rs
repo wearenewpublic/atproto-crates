@@ -315,23 +315,22 @@ pub async fn create_account(
             "this email address is denied by the operator",
         ));
     }
-    // §2.3: invite-code lifecycle has three phases:
-    //   1. peek (cheap pre-check) — fail fast on a clearly invalid code
-    //      before spending a PLC-genesis op.
-    //   2. PLC genesis (if needed) + account row insert.
-    //   3. redeem — must come AFTER the account row exists because the
-    //      `invite_code.used_by` FK references `account(did)`. Pre-§2.3
-    //      the handler used a `"did:plc:pending"` placeholder to satisfy
-    //      this FK; we now defer the redeem until the real DID is in the
-    //      account table, which both keeps the placeholder out of the DB
-    //      and lets the FK do its job.
-    //
-    // TOCTOU note: between `peek` and `redeem` another caller may exhaust
-    // the code. In that case `redeem` returns `false` and we have an
-    // account without a corresponding invite consumption — operators see
-    // an `account_without_invite` log line and reconcile out-of-band. The
-    // alternative (transactional spanning a network call to PLC) is
-    // impossible.
+    // §2.3: invite-code lifecycle.
+    //   1. peek (cheap pre-check) — fail fast on a clearly invalid code before
+    //      spending a PLC-genesis op. Non-consuming, so it is only an
+    //      optimisation, never the gate.
+    //   2. reserve (atomic consume) — a single conditional UPDATE run just
+    //      before the account row is inserted. This is the single-use gate:
+    //      exactly `available_uses` concurrent callers succeed and the rest are
+    //      refused before any account exists, which is what stops one single-use
+    //      code from minting N accounts. `peek` alone could not: it does not
+    //      consume, so N racers with distinct handles all passed it.
+    //   3. record_invite_use — after the account row exists (so the FK
+    //      `invite_code.used_by -> account(did)` is satisfiable), record which
+    //      account used the code. Best-effort: a failure loses the audit
+    //      pairing, not the single-use guarantee `reserve` already enforced.
+    //      `reserve` cannot write `used_by` itself because it runs before the
+    //      account exists.
     let invite_code: Option<&str> = if state.invite_required {
         let Some(code) = input.invite_code.as_deref() else {
             return Err(XrpcError::new(
@@ -456,6 +455,25 @@ pub async fn create_account(
             )
         };
 
+    // §2.3 phase 2: consume an invite slot atomically, now, before the account
+    // exists. `peek` above only pre-checked; this is the gate that makes the
+    // code single-use. A `false` means the code was exhausted — a concurrent
+    // createAccount won the last slot after our peek — and no account is
+    // created. (A create failure below leaks the reserved slot rather than
+    // creating an unpaid-for account; an operator can restore it, and it is the
+    // safe direction to err.)
+    if let Some(code) = invite_code
+        && !invite::reserve(&manager.account_pool(), code)
+            .await
+            .map_err(XrpcError::from)?
+    {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidInviteCode",
+            "invite code unknown, disabled, or exhausted",
+        ));
+    }
+
     let row = manager
         .create_account(CreateAccountParams {
             // A verified inbound migration lands deactivated: until the DID
@@ -478,40 +496,20 @@ pub async fn create_account(
         .await
         .map_err(XrpcError::from)?;
 
-    // §2.3 phase 3: now that the account row exists, atomically redeem the
-    // invite against the real DID. The FK on `invite_code.used_by` is now
-    // satisfied. A `false` return means another caller raced us between
-    // `peek` and here — log + continue (the account is already real;
-    // operators reconcile orphans).
-    if let Some(code) = invite_code {
-        match invite::redeem(&manager.account_pool(), code, &row.did).await {
-            Ok(true) => {}
-            Ok(false) => {
-                // The code is named here and not in the arm below, because
-                // `false` *is* the report that it is exhausted: somebody else
-                // redeemed it between the peek and here. A spent code is not a
-                // credential, and the operator reconciling this orphan has no
-                // other handle on which code it was.
-                tracing::warn!(
-                    did = %row.did,
-                    code = %code,
-                    "account_without_invite: invite code raced (peek ok, redeem now exhausted) — operator reconcile"
-                );
-            }
-            Err(e) => {
-                // No code on this path. The redeem did not complete, so the
-                // code may well still be live -- and a live invite code in a
-                // log is a credential in a log, readable by anyone the logs
-                // reach and usable by them. The DID is enough to find the
-                // account; `invite_code.used_by` is where the pairing lives
-                // once storage is working again.
-                tracing::warn!(
-                    did = %row.did,
-                    error = ?e,
-                    "account_without_invite: invite redeem storage error — operator reconcile"
-                );
-            }
-        }
+    // §2.3 phase 3: the slot was already consumed atomically by `reserve`
+    // above; now that the account row exists (so the FK
+    // `invite_code.used_by -> account(did)` is satisfiable), record which
+    // account used the code. Best-effort — a failure here loses only the audit
+    // pairing, not the single-use guarantee, and no invite code is named in the
+    // log line (a live code in a log is a credential in a log).
+    if let Some(code) = invite_code
+        && let Err(e) = invite::record_invite_use(&manager.account_pool(), code, &row.did).await
+    {
+        tracing::warn!(
+            did = %row.did,
+            error = ?e,
+            "invite consumed but used_by not recorded (storage error) — operator reconcile"
+        );
     }
 
     // Give the account an empty repository, so it *has* one rather than
