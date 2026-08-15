@@ -718,6 +718,13 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("{e}")
     })?;
 
+    // Key the operator denylist with a pepper derived from the server secret,
+    // now that the production-safety gate has confirmed that secret is real.
+    // Without a key the denylist hash is a plain digest of a low-entropy handle
+    // or email, which a stolen accounts DB can enumerate by dictionary attack.
+    // Rows stored before this change no longer match and must be re-added.
+    atproto_pds::denylist::set_pepper(args.jwt_secret.as_bytes());
+
     // §1.1: validate `PDS_STORAGE_PROFILE` against the compiled-in storage
     // backend. Fail fast on mismatch so an operator who set
     // PDS_STORAGE_PROFILE=fjall but installed the SQLite binary (or vice

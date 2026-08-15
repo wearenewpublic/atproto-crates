@@ -371,6 +371,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that never runs is indistinguishable from one that does not exist, which is how the firehose log
   grew unbounded while a GC loop was ostensibly running.
 
+### Security
+- **The operator denylist hash is keyed, closing the DB-theft enumeration the module promised to prevent.**
+  Handles and email addresses were stored as an unkeyed SHA-256 truncation, and both are low-entropy, so an
+  attacker who stole the accounts database could confirm a guessed handle or email against a row with a
+  single dictionary pass — the "no enumeration on DB theft" property was not actually delivered. The hash
+  is now a keyed HMAC-SHA256 under a pepper derived from the server secret at boot, which an attacker
+  without the key cannot compute. **Operational note:** this changes every stored value, so existing
+  denylist entries no longer match and must be re-added after upgrading (only the hashes were stored, so old
+  rows cannot be re-keyed automatically).
+
 ### Added
 - **`describe_scope` covers `repo:`, `blob:` and `rpc:`.** All three fell through to "request access
   to scope `…`", which is the string the consent page exists not to show. An `rpc` grant reads as

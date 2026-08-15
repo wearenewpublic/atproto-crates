@@ -6,17 +6,47 @@
 //! is one-way: no enumeration of the denylist by an attacker who steals
 //! the DB.
 //!
-//! The plan called for `MetroHash64`; we use SHA-256 truncated to 8 bytes
-//! instead — same privacy property (one-way, fixed-size), no extra
-//! dependency. Both kinds of hash are 64-bit; consumers who pull blocked
-//! ids from another deployment must re-hash with the local algorithm.
+//! The hash is a **keyed** HMAC-SHA256 truncated to 8 bytes, under a
+//! process-wide pepper derived from the server secret ([`set_pepper`], called at
+//! boot). Keying is what actually delivers the "no enumeration on DB theft"
+//! property the module promises: handles and email addresses are low-entropy,
+//! so an *unkeyed* hash is confirmable by dictionary attack on a stolen table.
+//! Without the pepper an attacker cannot compute a row's value to compare
+//! against. When no pepper is configured (tests, or a library embedding that
+//! skips `set_pepper`) the hash falls back to unkeyed SHA-256. Both forms are
+//! 64-bit; consumers who pull blocked ids from another deployment must re-hash
+//! with the local key.
 //!
 //! All functions accept `&AccountPool` and dispatch to the correct
 //! backend at runtime.
 
 use crate::account::{AccountPool, AccountPoolKind};
 use crate::errors::{PdsError, PdsResult};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+
+/// Process-wide pepper keying the denylist hash. Set once at boot from the
+/// server secret; absent in a process that never configured one.
+static DENYLIST_PEPPER: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Configure the process-wide denylist pepper from the server secret.
+///
+/// Derives a domain-separated key so the same secret used elsewhere (JWT
+/// signing) cannot be cross-correlated with denylist rows, and stores it once —
+/// the first call wins, later calls are ignored. Call at boot, before serving.
+///
+/// Changing the pepper, or upgrading a deployment whose rows were stored
+/// unkeyed, changes every stored value: existing denylist entries no longer
+/// match and must be re-added. This is unavoidable — only the hashes were
+/// stored, so old rows cannot be re-keyed.
+pub fn set_pepper(server_secret: &[u8]) {
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(server_secret).expect("HMAC accepts a key of any length");
+    mac.update(b"atproto-pds:denylist-pepper:v1");
+    let pepper = mac.finalize().into_bytes().to_vec();
+    let _ = DENYLIST_PEPPER.set(pepper);
+}
 
 /// Identifier kind (`"handle"` or `"email"`). Stored alongside the hash so
 /// we can scope a query to the right namespace without expanding the index.
@@ -27,12 +57,22 @@ pub const KIND_EMAIL: &str = "email";
 
 /// Hash an identifier to its 8-byte denylist signature.
 ///
-/// SHA-256 truncated to the first 8 bytes — collision-resistant enough
-/// for the deny-list use case and irreversible without a precomputed
-/// rainbow table covering the candidate input space.
+/// Keyed HMAC-SHA256 under the process pepper, truncated to the first 8 bytes.
+/// The key is what makes a stolen table unenumerable: without it a dictionary
+/// pass over candidate handles/emails cannot confirm a row. Falls back to plain
+/// SHA-256 when no pepper is configured (see the module docs).
 #[must_use]
 pub fn hash_identifier(value: &str) -> [u8; 8] {
-    let digest = Sha256::digest(value.trim().to_ascii_lowercase().as_bytes());
+    let normalized = value.trim().to_ascii_lowercase();
+    let digest = match DENYLIST_PEPPER.get() {
+        Some(pepper) => {
+            let mut mac =
+                <Hmac<Sha256>>::new_from_slice(pepper).expect("HMAC accepts a key of any length");
+            mac.update(normalized.as_bytes());
+            mac.finalize().into_bytes()
+        }
+        None => Sha256::digest(normalized.as_bytes()),
+    };
     let mut out = [0u8; 8];
     out.copy_from_slice(&digest[..8]);
     out
