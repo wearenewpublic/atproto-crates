@@ -148,12 +148,40 @@ impl SpaceReader {
     /// own records the moment the space was deleted. That is stricter than the
     /// spec and, for a personal space, means the account cannot read data
     /// nobody else ever could.
-    async fn ensure_space_live(&self, space: &SpaceUri, auth: &SpaceReadAuth<'_>) -> PdsResult<()> {
-        if matches!(auth, SpaceReadAuth::OwnPds { .. }) {
+    async fn ensure_space_live(
+        &self,
+        space: &SpaceUri,
+        auth: &SpaceReadAuth<'_>,
+        target_repo: &str,
+    ) -> PdsResult<()> {
+        // The exemption is keyed on OWN-REPO, not on auth mode. A member reading
+        // its own repo in a deleted space is exempt (0016: the member's own data
+        // stays readable through the member's own account). An OwnPds read of
+        // *another* member's repo is not: it must see the tombstone, exactly as
+        // a SpaceCredential read does. Keying this on the auth mode alone let a
+        // co-member keep reading a deleted space's records after deletion, since
+        // member rows are not purged on delete.
+        if let SpaceReadAuth::OwnPds { account_did } = auth
+            && account_did.as_str() == target_repo
+        {
             return Ok(());
         }
         ensure_space_live(&self.data_dir, space).await?;
         Ok(())
+    }
+
+    /// Tombstone gate for callers that do not route through the record-read
+    /// methods — the `getBlob`/`listBlobs` endpoints. Same own-repo exemption
+    /// as [`Self::get_record`]. Without it a deleted space's blobs stay
+    /// fetchable, including to a still-valid pre-deletion SpaceCredential that
+    /// the record reads already refuse.
+    pub async fn ensure_space_readable(
+        &self,
+        space: &SpaceUri,
+        auth: &SpaceReadAuth<'_>,
+        target_repo: &str,
+    ) -> PdsResult<()> {
+        self.ensure_space_live(space, auth, target_repo).await
     }
 
     /// `getRecord` — fetch a single record by `(collection, rkey)` from the
@@ -177,7 +205,7 @@ impl SpaceReader {
         rkey: &str,
     ) -> PdsResult<Option<RecordRow>> {
         let credential = self.verify_auth(space, &auth).await?;
-        self.ensure_space_live(space, &auth).await?;
+        self.ensure_space_live(space, &auth, target_repo).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
         self.refuse_if_blocked(store.pool(), space, credential.as_ref())
             .await?;
@@ -215,7 +243,7 @@ impl SpaceReader {
         auth: &SpaceReadAuth<'_>,
         target_repo: &str,
     ) -> PdsResult<Vec<String>> {
-        self.ensure_space_live(space, auth).await?;
+        self.ensure_space_live(space, auth, target_repo).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
         let storage = SqlSpaceRepoStorage::new(store.pool().clone());
         let repo: SpaceRepo<SqlSpaceRepoStorage, PdsSetHash> =
@@ -256,7 +284,7 @@ impl SpaceReader {
             reverse,
         } = listing;
         let credential = self.verify_auth(space, &auth).await?;
-        self.ensure_space_live(space, &auth).await?;
+        self.ensure_space_live(space, &auth, target_repo).await?;
         let store = SqlActorStore::open(&self.data_dir, target_repo).await?;
         self.refuse_if_blocked(store.pool(), space, credential.as_ref())
             .await?;

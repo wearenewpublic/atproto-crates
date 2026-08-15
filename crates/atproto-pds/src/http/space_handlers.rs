@@ -3100,6 +3100,14 @@ pub async fn list_blobs(
         .verify_read_auth(&space, &resolved.auth)
         .await
         .map_err(XrpcError::from)?;
+    // Tombstone gate. The record endpoints refuse a deleted space; the blob
+    // endpoints did not consult it at all, so a deleted space's blobs stayed
+    // fetchable — including to a still-valid pre-deletion SpaceCredential that
+    // the record reads already refuse. Same own-repo exemption as the reads.
+    space_reader(&state)?
+        .ensure_space_readable(&space, &resolved.auth, &q.repo)
+        .await
+        .map_err(XrpcError::from)?;
 
     let manager = account_manager(&state)?;
     let store = SqlActorStore::open(manager.data_dir(), &q.repo)
@@ -3167,6 +3175,14 @@ pub async fn get_blob(
     }
     space_reader(&state)?
         .verify_read_auth(&space, &resolved.auth)
+        .await
+        .map_err(XrpcError::from)?;
+    // Tombstone gate. The record endpoints refuse a deleted space; the blob
+    // endpoints did not consult it at all, so a deleted space's blobs stayed
+    // fetchable — including to a still-valid pre-deletion SpaceCredential that
+    // the record reads already refuse. Same own-repo exemption as the reads.
+    space_reader(&state)?
+        .ensure_space_readable(&space, &resolved.auth, &q.repo)
         .await
         .map_err(XrpcError::from)?;
 

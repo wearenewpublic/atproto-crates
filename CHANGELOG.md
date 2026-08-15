@@ -95,6 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compatibility aliases, so leaving one out of the answer stays a decision recorded in that file rather
   than something a diff can do quietly, and an alias that loses its route fails the build.
 
+### Security
+- **A deleted space's records and blobs stop being readable by its former co-members.** The
+  deleted-space tombstone was skipped for every own-account (`OwnPds`) read rather than only for a member
+  reading its *own* repo, so a member who passed `repo=<other member>` kept reading a co-member's
+  permissioned records after the space was deleted — member rows are not purged on deletion, so the
+  membership check still passed. The `getBlob`/`listBlobs` endpoints consulted the tombstone not at all,
+  leaving a deleted space's blobs fetchable to any reader the record endpoints already refused, including a
+  still-valid pre-deletion SpaceCredential (which cannot be revoked). The exemption is now keyed on
+  own-repo — a cross-member `OwnPds` read sees the tombstone exactly as a SpaceCredential read does — and
+  the blob endpoints enforce the same gate.
+
 ### Added
 - **A space type is named on the consent screen in the reader's language.** A space type declaration may
   publish `name:lang`, a map of localised names, and 0016 puts it there for exactly this screen — the one a
