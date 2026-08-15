@@ -88,13 +88,30 @@ pub async fn ready(State(state): State<HttpState>) -> Result<StatusCode, XrpcErr
 
 /// AT Protocol spec-compliant health endpoint.
 ///
-/// Beyond the spec-required `version`, also exposes the SetHash impl name so
-/// federation peers can confirm interop without trial-and-error commits.
+/// `version` and `status`, and deliberately nothing else.
+///
+/// This is an unauthenticated endpoint, so everything in it is published to
+/// anyone who asks. A version string is the one thing that has to be: it is
+/// what the spec asks for, it is what an operator reads to tell which build is
+/// running, and a build identifier is a fact about this deployment rather than
+/// about what it can do.
+///
+/// A capability is a different kind of fact, and it does not belong here. This
+/// response used to name the SetHash implementation so federation peers could
+/// check interop without trial-and-error commits — a real use, served the
+/// wrong way. Advertising which of a protocol's optional constructions a
+/// server implements tells an unauthenticated caller what to attempt against
+/// it, and it ages badly besides: a health check that grows a field per
+/// capability becomes a feature manifest nobody meant to publish and nobody
+/// can remove without breaking a client that started reading it.
+///
+/// Capabilities belong where a caller can ask for them deliberately and the
+/// answer is versioned — `community.lexicon.service.describe` for the methods
+/// this server routes, and the protocol's own negotiation for anything else.
 pub async fn xrpc_health() -> Json<Value> {
     Json(json!({
         "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), BUILD_REV),
         "status": "ok",
-        "setHash": crate::realm::SET_HASH_NAME,
     }))
 }
 

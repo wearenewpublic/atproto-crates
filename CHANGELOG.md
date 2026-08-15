@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- **`/xrpc/_health` reports `version` and `status`, and nothing else.** It also named the SetHash
+  implementation in use, so that federation peers could confirm interop without trial-and-error commits.
+  That was a real need served in the wrong place: the endpoint is unauthenticated, so the field told any
+  anonymous caller which of the protocol's optional constructions to attempt against this server, and a
+  health check that grows a field per capability becomes a feature manifest nobody meant to publish and
+  nobody can remove without breaking whoever started reading it.
+
+  The build identifier stays. It says which build is running rather than what the build can do, which is
+  what the spec asks of `version` and what an operator needs. Capabilities belong where a caller asks for
+  them deliberately — `community.lexicon.service.describe` for the methods this server routes. A test now
+  asserts the response's exact key set, since the field to keep out is the one nobody thought to forbid.
+
 ### Fixed
 - **A permission set asking to administer a space now grants it.** proposals#101 added `manage` to the
   space permission a permission set may declare, alongside `spaceType`, `authority`, `skey`, `collection`

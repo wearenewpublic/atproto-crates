@@ -23,10 +23,6 @@
 /// [0016 Permissioned Data]: https://github.com/bluesky-social/proposals/blob/main/0016-permissioned-data/README.md
 pub type PdsSetHash = atproto_space::set_hash::LtHash;
 
-/// Constant identifying the SetHash impl in use. Surfaced in `_health` so
-/// operators + federation peers can compare.
-pub const SET_HASH_NAME: &str = "lthash";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,10 +34,5 @@ mod tests {
         h.add(b"alice");
         let d = h.digest();
         assert!(!d.is_empty());
-    }
-
-    #[test]
-    fn set_hash_name_is_lthash() {
-        assert_eq!(SET_HASH_NAME, "lthash");
     }
 }

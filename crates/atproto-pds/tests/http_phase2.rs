@@ -117,6 +117,37 @@ async fn xrpc_health_responds() {
     assert!(body["version"].as_str().unwrap().contains("+"));
 }
 
+/// The health response is `version` and `status`, and nothing else.
+///
+/// Asserted as an exact key set rather than by naming the fields that must be
+/// absent, because the thing being prevented is a field nobody thought to
+/// forbid. This endpoint is unauthenticated, so anything added here is
+/// published to the world; it once carried the SetHash implementation name,
+/// which told an anonymous caller which of a protocol's optional
+/// constructions to attempt against this server.
+///
+/// A build identifier is the exception and stays: it says which build is
+/// running, not what the build can do.
+#[tokio::test(flavor = "multi_thread")]
+async fn xrpc_health_publishes_no_capabilities() {
+    let (app, _tmp) = build_app().await;
+    let (_, body) = get_json(app, "/xrpc/_health").await;
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("the health response is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["status", "version"],
+        "the health response gained a field; if it names a capability it does \
+         not belong in an unauthenticated endpoint, and if it names the \
+         deployment it belongs in `version`"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn alive_and_ready() {
     let (app, _tmp) = build_app().await;
