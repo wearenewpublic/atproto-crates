@@ -103,6 +103,25 @@ impl LexiconResolver for NetworkLexiconResolver {
             .find(|s| s.r#type == "AtprotoPersonalDataServer")
             .map(|s| s.service_endpoint.clone())?;
 
+        // SSRF egress guard. `pds` is a service endpoint from a DID document an
+        // attacker-chosen collection NSID resolved to, and this server is about
+        // to GET it during record validation. Without this the endpoint is a
+        // request generator pointed wherever the attacker names — a cloud
+        // metadata service, an internal admin port, loopback. This applies the
+        // same syntactic policy the OAuth client-metadata path uses (HTTPS only,
+        // no address literals, no embedded credentials, port 443). It does not
+        // resolve DNS, so a public name pointing inside is caught instead by the
+        // resolver's redirect policy, which is set to none where the client is
+        // built.
+        if let Err(e) = atproto_identity::validation::validate_service_endpoint(&pds) {
+            tracing::warn!(
+                endpoint = %pds,
+                error = %e,
+                "lexicon resolution: refusing a non-permitted service endpoint"
+            );
+            return None;
+        }
+
         let url = format!(
             "{}/xrpc/com.atproto.repo.getRecord",
             pds.trim_end_matches('/')

@@ -1129,6 +1129,12 @@ async fn main() -> anyhow::Result<()> {
         let lexicon_http = reqwest::Client::builder()
             .user_agent(user_agent())
             .timeout(std::time::Duration::from_secs(5))
+            // Do not follow redirects. The lexicon resolver validates the
+            // endpoint it fetches (HTTPS, no address literals, port 443), but
+            // that guard is syntactic; without this a validated public host
+            // could 302 the fetch to 169.254.169.254 or an internal port. The
+            // OAuth client-metadata fetch is pinned the same way.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
         let lexicon_network = atproto_pds::repo::lexicon::NetworkLexiconResolver::new(

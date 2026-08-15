@@ -71,6 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that may write, which is `active` alone. There is no migration carve-out because there is no inbound
   migration path that writes permissioned records yet.
 
+### Security
+- **Lexicon resolution during record validation no longer fetches arbitrary attacker-chosen URLs (SSRF).**
+  Writing a record in a collection outside the bundled vocabulary resolves that NSID's lexicon over the
+  network: an attacker-owned DNS name → an attacker-controlled `did=` TXT record → a DID document whose
+  `AtprotoPersonalDataServer` endpoint this server then `GET`s. The endpoint was taken verbatim and the
+  resolver's HTTP client followed redirects, so any authenticated account holder writing to their own repo
+  could point the fetch at a cloud metadata service, an internal admin port, or loopback — reachable on a
+  default deployment and firing even with `validate:false`, since the record-key rule resolves the
+  collection unconditionally. The endpoint is now checked with the same syntactic policy the OAuth
+  client-metadata path applies (HTTPS, no address literals, no embedded credentials, port 443), and the
+  resolver's client no longer follows redirects, closing the public-name-to-internal-address pivot.
+
 ### Changed
 - **`community.lexicon.service.describe` stops advertising two space methods the draft does not have.**
   `com.atproto.space.getSpace` moved to `com.atproto.simplespace.getSpace` in proposals#100, and
