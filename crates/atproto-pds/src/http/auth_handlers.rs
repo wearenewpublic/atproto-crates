@@ -1127,6 +1127,11 @@ pub async fn list_app_passwords(
     parts: Parts,
 ) -> Result<Json<ListAppPasswordsResponse>, XrpcError> {
     let claims = require_access_jwt(&parts, &state).await?;
+    // App-password management is reserved to a full account-password session,
+    // the same line `createAppPassword` draws. An ordinary app password is
+    // handed to third-party tools, and one must not be able to enumerate — or
+    // revoke — the account's other credentials.
+    require_full_session(&claims, "com.atproto.server.listAppPasswords")?;
     let manager = account_manager(&state)?;
     let rows = app_password::list(&manager.account_pool(), &claims.sub)
         .await
@@ -1159,6 +1164,7 @@ pub async fn revoke_app_password(
     Json(input): Json<RevokeAppPasswordInput>,
 ) -> Result<StatusCode, XrpcError> {
     let claims = require_access_jwt(&parts, &state).await?;
+    require_full_session(&claims, "com.atproto.server.revokeAppPassword")?;
     let manager = account_manager(&state)?;
     let removed = app_password::revoke(&manager.account_pool(), &claims.sub, &input.name)
         .await

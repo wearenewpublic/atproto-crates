@@ -56,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   four endpoints are now validated with the same syntactic policy the PDS endpoint already used (HTTPS, a
   public non-literal host, port 443, no embedded credentials) before any request is issued to them.
 
+### Security
+- **`listAppPasswords` and `revokeAppPassword` now require a full account-password session.** Both accepted
+  any valid session token, so an ordinary (non-full) app password — the kind handed to a third-party tool —
+  could enumerate the account's other app passwords and revoke any of them. `createAppPassword` already
+  drew this line; the read and revoke siblings now do too, reserving app-password management to the
+  account-password session as the reference does.
+
 ### Fixed
 - **A permission set asking to administer a space now grants it.** proposals#101 added `manage` to the
   space permission a permission set may declare, alongside `spaceType`, `authority`, `skey`, `collection`
