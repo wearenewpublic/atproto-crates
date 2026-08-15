@@ -1,25 +1,26 @@
 //! `DelegationToken` and `SpaceCredential` JWTs (0016 Permissioned Data).
 //!
 //! A syncing app obtains a `SpaceCredential` via a two-step flow, per the
-//! 0016 spec "Credential flow" (README lines 232-254):
+//! spec's "Credential flow" section:
 //!
 //! 1. An app holding an OAuth session on a member's PDS calls
 //!    [`com.atproto.space.getDelegationToken`]. The member's PDS mints a
-//!    **delegation token** (spec "Delegation token", lines 147-176): a JWT with
+//!    **delegation token** (the spec's "Delegation token" section): a JWT with
 //!    header `typ=atproto-space-delegation+jwt`, `kid="#atproto"`, signed by
 //!    the member's atproto signing key. Claims: `iss` (member DID),
 //!    `aud=<spaceDid>#atproto_space_host`, `sub` (the space `at://` URI),
 //!    `iat`, `exp=iat+60`, `jti`. It carries no `lxm` claim and says nothing
 //!    about the app. Single-use, default 60-second TTL.
 //! 2. The app presents that delegation token (in the `Authorization: Bearer`
-//!    header), the `dpopJkt` thumbprint of a key it holds, and an optional
+//!    header), a **DPoP proof** signed by the key it wants the credential
+//!    bound to (in the `DPoP` header), and an optional
 //!    client attestation to the space authority at
 //!    [`com.atproto.space.getSpaceCredential`]. The authority verifies it and
-//!    mints a **space credential** (spec "Space credential", lines 200-230): a
+//!    mints a **space credential** (the spec's "Space credential" section): a
 //!    JWT with header `typ=atproto-space-credential+jwt`,
 //!    `kid="#atproto_space"`, signed by the authority's space signing key.
 //!    Claims: `iss` (authority DID), `sub` (the space `at://` URI),
-//!    `cnf.jkt` (the requested thumbprint), `client_id` (the attested app,
+//!    `cnf.jkt` (the proof key's thumbprint), `client_id` (the attested app,
 //!    omitted when no attestation), `iat`, `exp=iat+7200`, `jti`. It has no
 //!    `aud`. Default 2-hour TTL.
 //!
@@ -31,6 +32,13 @@
 //! by its RFC 7638 thumbprint, and a holder proves possession per request.
 //! Minting one without a thumbprint is not expressible: [`Cnf`] is not
 //! optional, and [`create_space_credential`] takes the thumbprint by value.
+//!
+//! The thumbprint an authority binds is one it computed itself, from the
+//! `jwk` of a proof it verified on the `getSpaceCredential` request. It is
+//! never a value the request asserted: a thumbprint carried as a parameter is
+//! a claim about a key, which anyone holding a delegation token could make
+//! about a key somebody else controls, where a proof is a demonstration that
+//! the requester holds the private half.
 //!
 //! Both JWTs use the same compact-form encoding:
 //! `b64url(header).b64url(payload).b64url(sig)`, signed with ECDSA over an
@@ -442,10 +450,15 @@ pub fn verify_delegation_token(
 /// Mint a space credential signed by the space authority's `#atproto_space`
 /// signing key.
 ///
-/// `dpop_jkt` is the RFC 7638 thumbprint the requesting app sent as the
-/// `dpopJkt` parameter; it is copied verbatim into `cnf.jkt`, binding the
-/// credential to that key. The authority never sees the key itself and nothing
-/// is registered — the thumbprint is the whole binding.
+/// `dpop_jkt` is the RFC 7638 thumbprint the authority computed from the `jwk`
+/// of the DPoP proof it verified on the `getSpaceCredential` request; it is
+/// copied verbatim into `cnf.jkt`, binding the credential to that key. Nothing
+/// is published or registered — the thumbprint is the whole binding.
+///
+/// Callers must pass a thumbprint taken from a verified proof rather than one
+/// read off the request body. This function cannot tell the two apart, and a
+/// body parameter would let any holder of a delegation token bind a credential
+/// to a key it does not have.
 ///
 /// `client_id` is the attested application identity (the verified client
 /// attestation's `iss`); pass `None` when the request carried no attestation,
