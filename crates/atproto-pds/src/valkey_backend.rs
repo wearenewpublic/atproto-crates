@@ -116,11 +116,19 @@ impl ValkeyJtiInner {
                 jti: jti.to_string(),
             }),
             Err(e) => {
-                tracing::error!(error = ?e, jti = %jti, "valkey: jti SET NX failed; failing open");
-                // Fail-open under transient connectivity issues so the
-                // PDS keeps serving traffic; the operator alarm should
-                // fire on the structured error log.
-                Ok(())
+                tracing::error!(error = ?e, jti = %jti, "valkey: jti SET NX failed; refusing (fail closed)");
+                // Fail closed. Single-use is the whole guarantee of this guard,
+                // and a backend that cannot answer has not established it —
+                // admitting on error silently disables the RFC 9449 replay
+                // protection the DPoP, refresh-token, client-assertion and
+                // space-attestation paths depend on, for the duration of the
+                // outage. The SQLite backend already refuses the same way
+                // (`JtiRejection::Unavailable`); the posture must not depend on
+                // which durability backend an operator wired.
+                Err(JtiReplay {
+                    reason: JtiRejection::Unavailable,
+                    jti: jti.to_string(),
+                })
             }
         }
     }

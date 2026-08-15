@@ -143,6 +143,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hosted, and for a space you own, removing the member is the stronger step because it stops new
   credentials being issued at all.
 
+### Security
+- **The Valkey JTI replay guard fails closed on a backend error, matching the SQLite guard.** On any
+  Valkey/Redis error the guard returned "accepted", which every caller — the DPoP proof check, the
+  refresh-token single-use check, client-assertion and space-credential attestation verification — reads as
+  "not a replay". A transient Redis outage therefore silently disabled the RFC 9449 replay protection those
+  paths depend on for as long as it lasted, so a captured DPoP proof (or a live refresh token) could be
+  replayed within the window. The SQLite guard already refuses when it cannot answer
+  (`JtiRejection::Unavailable`), on the reasoning that single-use is the whole guarantee and a guard that
+  cannot establish it has not. Valkey now does the same, so the replay posture no longer depends on which
+  durability backend an operator wired.
+
 ### Changed
 - **Grouped collection listings drop their row rules and line up.** Rows in a group sat a few pixels out
   from the row that carried the mark: a `0.8em` badge beside a `1em` spacer resolves two different widths
