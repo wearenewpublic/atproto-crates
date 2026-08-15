@@ -275,6 +275,16 @@ pub enum PdsError {
         reason: String,
     },
 
+    /// error-atproto-pds-auth-3: a session token has lapsed.
+    ///
+    /// Distinct from [`PdsError::AuthDenied`] because the session lexicons
+    /// declare `ExpiredToken` by name and clients switch on it — an expired
+    /// token means "refresh and retry", a denied one means "sign in again".
+    /// Session verification checks the signature before the expiry, so this
+    /// variant only ever describes a token this server minted.
+    #[error("error-atproto-pds-auth-3 session token expired")]
+    SessionExpired,
+
     /// error-atproto-pds-delegation-1: delegated sign-in is not on offer here.
     ///
     /// Carries the reason rather than a bare refusal: an operator who enabled

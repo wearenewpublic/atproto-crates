@@ -236,6 +236,12 @@ impl From<PdsError> for XrpcError {
             PdsError::AuthDenied { reason } => {
                 XrpcError::new(StatusCode::FORBIDDEN, "Forbidden", reason)
             }
+            // `refreshSession` and `getSession` declare `ExpiredToken` by
+            // name, and clients switch on it to decide "refresh and retry"
+            // versus "re-authenticate". 400 matches the reference.
+            PdsError::SessionExpired => {
+                XrpcError::new(StatusCode::BAD_REQUEST, "ExpiredToken", "token has expired")
+            }
             PdsError::InvalidAccountTransition { from, to } => XrpcError::new(
                 StatusCode::BAD_REQUEST,
                 "InvalidAccountState",

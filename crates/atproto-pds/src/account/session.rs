@@ -180,10 +180,11 @@ fn verify(token: &str, expected_typ: &str, secret: &[u8]) -> PdsResult<SessionCl
         serde_json::from_slice(&payload_bytes).map_err(|e| PdsError::AuthDenied {
             reason: format!("payload json: {e}"),
         })?;
+    // Checked after the signature: an expired classification must only ever
+    // apply to a token this server minted, because callers surface it to
+    // clients as `ExpiredToken` and clients answer it by refreshing.
     if claims.exp <= now_secs() {
-        return Err(PdsError::AuthDenied {
-            reason: "token expired".to_string(),
-        });
+        return Err(PdsError::SessionExpired);
     }
     Ok(claims)
 }
@@ -387,7 +388,12 @@ mod tests {
         .unwrap();
         // Sleep past expiration — exp is now-secs which already lapses with TTL=0.
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        assert!(verify_access(&pair.access_jwt, secret()).is_err());
+        // Specifically `SessionExpired`, not a generic denial: the HTTP layer
+        // turns this variant into the `ExpiredToken` name clients refresh on.
+        assert!(matches!(
+            verify_access(&pair.access_jwt, secret()),
+            Err(PdsError::SessionExpired)
+        ));
     }
 
     #[test]

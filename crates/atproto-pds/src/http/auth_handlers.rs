@@ -1235,9 +1235,11 @@ async fn admin_did_from_service_auth(
     };
     // A session JWT is this server's own HMAC and will never verify as
     // service auth; leave it to the session path rather than reporting a
-    // confusing signature failure.
-    if session::verify_access(token, &state.jwt_secret).is_ok() {
-        return Ok(None);
+    // confusing signature failure. An expired session JWT is still a session
+    // JWT — the session path answers it with `ExpiredToken`.
+    match session::verify_access(token, &state.jwt_secret) {
+        Ok(_) | Err(crate::errors::PdsError::SessionExpired) => return Ok(None),
+        Err(_) => {}
     }
 
     let http = reqwest::Client::builder()

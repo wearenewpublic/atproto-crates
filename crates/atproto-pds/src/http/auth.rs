@@ -355,14 +355,25 @@ pub async fn require_authn(
     // token is never proof-of-possession bound, so it is a Bearer token and
     // presenting it as `DPoP` is a category error rather than a stricter
     // request.
-    if let Ok(claims) = session::verify_access(raw, &state.jwt_secret) {
-        require_scheme(
-            scheme,
-            AuthScheme::Bearer,
-            "an app-password session token is not bound",
-        )?;
-        require_current_epoch(state, &claims.sub, claims.ses).await?;
-        return Ok(AuthSubject::AppPassword(claims));
+    match session::verify_access(raw, &state.jwt_secret) {
+        Ok(claims) => {
+            require_scheme(
+                scheme,
+                AuthScheme::Bearer,
+                "an app-password session token is not bound",
+            )?;
+            require_current_epoch(state, &claims.sub, claims.ses).await?;
+            return Ok(AuthSubject::AppPassword(claims));
+        }
+        // The signature verified and the typ matched — this is a session
+        // token this server minted, merely lapsed. Say so by name: clients
+        // refresh on `ExpiredToken` and cannot act on a generic 401, and
+        // falling through would report this token as not-OAuth instead.
+        Err(e @ crate::errors::PdsError::SessionExpired) => {
+            return Err(XrpcError::from(e));
+        }
+        // Not a session token. Fall through to OAuth.
+        Err(_) => {}
     }
 
     // Fall back to OAuth. If the token isn't OAuth-flavored either, we

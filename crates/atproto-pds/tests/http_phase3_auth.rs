@@ -4,7 +4,9 @@
 //! against an in-memory SQLite-backed PDS.
 
 use atproto_identity::key::KeyType;
-use atproto_pds::account::{AccountDirectory, AccountManager, CreateAccountParams};
+use atproto_pds::account::{
+    AccountDirectory, AccountManager, CreateAccountParams, DEFAULT_REFRESH_TTL_SECS,
+};
 use atproto_pds::http::{HttpState, build_router};
 use atproto_pds::keys::{KeyStore, MemoryKeyStore};
 use atproto_pds::repo::RepoReader;
@@ -265,6 +267,75 @@ async fn refresh_with_access_jwt_rejected() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Mint a session pair with the harness's JWT secret and chosen TTLs.
+///
+/// TTL 0 yields `exp == iat`, which the verifier already treats as lapsed —
+/// no sleeping past a clock boundary required.
+fn mint_pair(access_ttl_secs: u64, refresh_ttl_secs: u64) -> (String, String) {
+    use atproto_pds::account::session::{SessionAuthority, issue_pair};
+    let pair = issue_pair(
+        "did:web:test.example",
+        "did:plc:alice",
+        "ap-1",
+        SessionAuthority::AppPassword,
+        b"test-secret-do-not-use-in-prod-32!",
+        access_ttl_secs,
+        refresh_ttl_secs,
+        0,
+    )
+    .expect("mint session pair");
+    (pair.access_jwt, pair.refresh_jwt)
+}
+
+/// An expired access token must answer `400 ExpiredToken` by name, on both
+/// authentication paths — clients refresh on that name and cannot act on a
+/// generic 401. This is what lets atpxrpc/atpmcp refresh instead of erroring.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_access_token_names_expired_token() {
+    let (app, _manager, _tmp) = build_app(false).await;
+    let (expired_access, _) = mint_pair(0, DEFAULT_REFRESH_TTL_SECS);
+
+    // `getSession` — the require_access_jwt path.
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        Some(&expired_access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "ExpiredToken", "body: {body}");
+
+    // `getPreferences` — the require_authn path, which previously fell
+    // through to OAuth verification and reported `AuthenticationRequired`.
+    let (status, body) = get_json(
+        app,
+        "/xrpc/app.bsky.actor.getPreferences",
+        Some(&expired_access),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "ExpiredToken", "body: {body}");
+}
+
+/// An expired refresh token on `refreshSession` is also `400 ExpiredToken`,
+/// matching the lexicon's declared error — that name tells the client the
+/// session is beyond refreshing and it must re-authenticate.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_refresh_token_names_expired_token() {
+    let (app, _manager, _tmp) = build_app(false).await;
+    let (_, expired_refresh) = mint_pair(0, 0);
+
+    let (status, body) = post_json(
+        app,
+        "/xrpc/com.atproto.server.refreshSession",
+        json!({}),
+        Some(&expired_refresh),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["error"], "ExpiredToken", "body: {body}");
 }
 
 /// A conflicting handle or email is caught before PLC genesis, not after.
