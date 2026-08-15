@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserts the response's exact key set, since the field to keep out is the one nobody thought to forbid.
 
 ### Security
+- **The AppView proxy caps the upstream response it buffers.** `proxy_call` read the whole upstream body
+  into memory with no ceiling, and the target is any service a caller names in `Atproto-Proxy` — so a
+  hostile upstream could stream an unbounded body and exhaust the process, a small request buying a
+  multi-gibibyte allocation repeatable up to the concurrency limit. A response over 16 MiB (by declared
+  `Content-Length`, or caught while streaming) is now refused with a 502.
+
+### Security
 - **Delegated sign-in validates the delegate's authorization-server endpoints before contacting them
   (SSRF).** Only the delegate's PDS URL was checked against the URL policy; the authorization server's
   issuer, PAR, token and authorization endpoints were read verbatim from the delegate PDS's metadata and

@@ -157,6 +157,56 @@ pub async fn proxy_app_bsky(
     proxy_call(&state, &nsid, uri.query(), method, headers, body).await
 }
 
+/// Upper bound on an upstream response this proxy will buffer into memory.
+///
+/// `proxy_call` reads the whole upstream body before answering, and the target
+/// is an attacker-influenced service (any DID whose endpoint passes the URL
+/// policy). Without a ceiling a hostile upstream could stream an unbounded body
+/// and exhaust this process — a tiny request buying a multi-gibibyte
+/// allocation, repeatable up to the concurrency limit. AppView responses are
+/// JSON of at most a few hundred KiB; 16 MiB is generous headroom while still
+/// bounding the amplification.
+const MAX_PROXY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read an upstream response body, refusing one larger than `cap`.
+///
+/// A declared `Content-Length` over the cap is refused before a byte is read;
+/// an undeclared or lying length is caught while streaming, so a chunked
+/// response cannot slip past. Returns 502 on overflow — the failure is the
+/// upstream's, not the caller's.
+async fn read_capped_upstream_body(
+    resp: reqwest::Response,
+    cap: usize,
+) -> Result<axum::body::Bytes, XrpcError> {
+    let too_large = || {
+        XrpcError::new(
+            StatusCode::BAD_GATEWAY,
+            "ProxyResponseTooLarge",
+            format!("upstream response exceeds {cap} bytes"),
+        )
+    };
+    if let Some(len) = resp.content_length()
+        && len > cap as u64
+    {
+        return Err(too_large());
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        XrpcError::new(
+            StatusCode::BAD_GATEWAY,
+            "ProxyForwardFailed",
+            format!("read upstream body: {e}"),
+        )
+    })? {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(axum::body::Bytes::from(buf))
+}
+
 /// Core proxy logic. Resolves the target, mints a service-auth bearer
 /// signed by the caller's signing key, and forwards the request.
 async fn proxy_call(
@@ -275,13 +325,7 @@ async fn proxy_call(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .map(str::to_string);
-    let body_bytes = resp.bytes().await.map_err(|e| {
-        XrpcError::new(
-            StatusCode::BAD_GATEWAY,
-            "ProxyForwardFailed",
-            format!("read upstream body: {e}"),
-        )
-    })?;
+    let body_bytes = read_capped_upstream_body(resp, MAX_PROXY_RESPONSE_BYTES).await?;
     // Every proxied read passes through here, and AppView reads are the bulk
     // of what a client does -- so one line per call at INFO is one line per
     // timeline fetch, per profile view, per thread open. At the default
