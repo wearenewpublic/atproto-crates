@@ -414,16 +414,19 @@ pub async fn oauth_init_with_prompt(
         params.push(("prompt", value));
     }
 
-    let response = dpop_retry_client
-        .post(par_url)
+    let http_response = dpop_retry_client
+        .post(par_url.as_str())
         .header("DPoP", dpop_token.as_str())
         .form(&params)
         .send()
         .await
-        .map_err(OAuthClientError::PARHttpRequestFailed)?
-        .json()
-        .await
-        .map_err(OAuthClientError::PARResponseJsonParsingFailed)?;
+        .map_err(OAuthClientError::PARHttpRequestFailed)?;
+    // Cap the buffered body. The PAR endpoint belongs to the delegate's
+    // authorization server — in delegated login a stranger's, attacker-chosen
+    // host — so `.json()`, which buffers the whole body before parsing, let a
+    // hostile peer take the caller's memory. Read under the same ceiling as a
+    // discovery document instead.
+    let response = crate::resources::read_capped(http_response, par_url.as_str()).await?;
 
     Ok(response)
 }
@@ -509,16 +512,17 @@ pub async fn oauth_complete(
         .with(ChainMiddleware::new(dpop_retry.clone()))
         .build();
 
-    let token_response: TokenResponse = dpop_retry_client
-        .post(token_endpoint)
+    let http_response = dpop_retry_client
+        .post(token_endpoint.as_str())
         .header("DPoP", dpop_token.as_str())
         .form(&params)
         .send()
         .await
-        .map_err(OAuthClientError::TokenHttpRequestFailed)?
-        .json()
-        .await
-        .map_err(OAuthClientError::TokenResponseJsonParsingFailed)?;
+        .map_err(OAuthClientError::TokenHttpRequestFailed)?;
+    // Cap the buffered token-endpoint body, same reasoning as the PAR read:
+    // this endpoint is the delegate authorization server's too.
+    let token_response: TokenResponse =
+        crate::resources::read_capped(http_response, token_endpoint.as_str()).await?;
 
     bind_token_subject(expected_subject, &token_response)?;
 
@@ -602,16 +606,17 @@ pub async fn oauth_refresh(
         .with(ChainMiddleware::new(dpop_retry.clone()))
         .build();
 
-    let token_response: TokenResponse = dpop_retry_client
-        .post(token_endpoint)
+    let http_response = dpop_retry_client
+        .post(token_endpoint.as_str())
         .header("DPoP", dpop_token.as_str())
         .form(&params)
         .send()
         .await
-        .map_err(OAuthClientError::TokenHttpRequestFailed)?
-        .json()
-        .await
-        .map_err(OAuthClientError::TokenResponseJsonParsingFailed)?;
+        .map_err(OAuthClientError::TokenHttpRequestFailed)?;
+    // Cap the buffered token-endpoint body, same reasoning as the PAR read:
+    // this endpoint is the delegate authorization server's too.
+    let token_response: TokenResponse =
+        crate::resources::read_capped(http_response, token_endpoint.as_str()).await?;
 
     bind_token_subject(&expected_subject, &token_response)?;
 

@@ -32,7 +32,7 @@ const MAX_DISCOVERY_BYTES: usize = 256 * 1024;
 /// a hostile one may lie. The body is read chunk by chunk and abandoned the
 /// moment it goes past the ceiling, so the peak held is bounded by the limit
 /// plus one chunk regardless of what the sender claims.
-async fn read_capped<T: DeserializeOwned>(
+pub(crate) async fn read_capped<T: DeserializeOwned>(
     response: reqwest::Response,
     url: &str,
 ) -> Result<T, OAuthClientError> {

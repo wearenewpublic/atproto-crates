@@ -135,6 +135,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than something a diff can do quietly, and an alias that loses its route fails the build.
 
 ### Security
+- **Delegated-login PAR and token responses are size-capped like discovery documents.** The delegate's
+  authorization-server responses were read with `.json()`, which buffers the whole body before parsing, so
+  a hostile authorization server (a stranger's, attacker-chosen host in the delegated flow) could answer
+  with an endless body and take the caller's memory. The PAR, token-exchange, and refresh reads now use the
+  same 256 KiB-capped reader the discovery documents already used.
+
+### Security
 - **A deleted space's records and blobs stop being readable by its former co-members.** The
   deleted-space tombstone was skipped for every own-account (`OwnPds`) read rather than only for a member
   reading its *own* repo, so a member who passed `repo=<other member>` kept reading a co-member's
