@@ -158,6 +158,16 @@ pub enum SpaceError {
         rkey: String,
     },
 
+    /// error-atproto-space-repo-3: a batch named the same (collection, rkey)
+    /// more than once, which cannot be applied without desyncing the SetHash.
+    #[error("error-atproto-space-repo-3 duplicate key in batch: {collection}/{rkey}")]
+    DuplicateKeyInBatch {
+        /// NSID collection.
+        collection: String,
+        /// Record key.
+        rkey: String,
+    },
+
     /// error-atproto-space-members-1: attempt to add a duplicate member.
     #[error("error-atproto-space-members-1 member already exists: {did}")]
     MemberAlreadyExists {

@@ -245,6 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers `NotAuthorized`, so saving that pair produced a space that looked configured and admitted nobody —
   the same trap as an empty allow list, reached from the other selector.
 
+### Security
+- **A space write batch is rejected if it names the same record twice.** `format_commit` derives each op's
+  SetHash delta from pre-batch storage with no intra-batch view, so a batch naming one `(collection, rkey)`
+  twice (two updates, an update and a delete, and so on) folded a delta against stale state — leaving the
+  persisted SetHash, and the signed commit derived from it, out of step with the single row that survived.
+  A batch with a duplicate key is now refused outright.
+
 ### Added
 - **Collection listings are grouped by the domain that publishes them.** A repository with a few dozen
   collections was a wall of reverse-DNS in which `app.bsky.feed.post` and `app.bsky.graph.follow` looked no

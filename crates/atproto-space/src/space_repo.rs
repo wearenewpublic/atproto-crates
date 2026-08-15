@@ -125,6 +125,25 @@ impl<S: SpaceRepoStorage, H: SetHash> SpaceRepo<S, H> {
     /// Format a batch of ops into a `PreparedCommit`. Does NOT persist — call
     /// `apply_commit` to persist atomically.
     pub async fn format_commit(&self, ops: &[Op]) -> SpaceResult<PreparedCommit<H>> {
+        // A batch may not name the same (collection, rkey) twice. Each op below
+        // derives its SetHash delta from pre-batch storage — there is no
+        // intra-batch view — so a second op on the same key folds a delta
+        // computed against stale state, leaving the persisted SetHash (and the
+        // signed commit derived from it) out of step with the single durable row
+        // that survives. Reject the batch, which is also what a spec-conformant
+        // peer that validates keys does.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(ops.len());
+            for op in ops {
+                if !seen.insert((op.collection.as_str(), op.rkey.as_str())) {
+                    return Err(SpaceError::DuplicateKeyInBatch {
+                        collection: op.collection.clone(),
+                        rkey: op.rkey.clone(),
+                    });
+                }
+            }
+        }
+
         // Load current state to derive the new SetHash incrementally.
         let state = self.storage.current_state(&self.space).await?;
         let mut set_hash = match state.set_hash {
