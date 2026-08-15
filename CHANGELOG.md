@@ -196,6 +196,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credentials being issued at all.
 
 ### Security
+- **`refreshIdentity` validates a handle before adopting it.** The handler took the handle from the
+  refreshed PLC document's `alsoKnownAs` and wrote it into `account.handle` with none of the syntax,
+  service-domain reserved-name, or operator-denylist checks that `updateHandle` and `createAccount`
+  enforce. Since this server is authoritative for its own handles, a crafted PLC operation could plant a
+  reserved name — `admin.<service-domain>` — pointing at the attacker's DID. The observed handle now passes
+  the same validation before adoption; one that fails is logged and skipped, and the account keeps its
+  current handle.
+
+### Security
 - **The Valkey JTI replay guard fails closed on a backend error, matching the SQLite guard.** On any
   Valkey/Redis error the guard returned "accepted", which every caller — the DPoP proof check, the
   refresh-token single-use check, client-assertion and space-credential attestation verification — reads as

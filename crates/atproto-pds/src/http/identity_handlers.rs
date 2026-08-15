@@ -229,6 +229,44 @@ async fn validate_handle_for(
     Ok(handle)
 }
 
+/// Validate a handle observed in a refreshed PLC document before adopting it.
+///
+/// `updateHandle` and `createAccount` enforce handle syntax, the service-domain
+/// reserved-name policy, and the operator denylist; `refreshIdentity` wrote the
+/// observed `alsoKnownAs` straight through, so a crafted PLC operation could
+/// plant a reserved or denied handle — `admin.<service-domain>`, say — that this
+/// server would then answer `resolveHandle` for. Returns the normalized handle,
+/// or a human-readable reason it was refused. The DNS-ownership half is proved
+/// separately by `refreshIdentity` and is deliberately not checked here.
+async fn validate_refreshed_handle(
+    state: &HttpState,
+    manager: &crate::account::AccountManager,
+    handle: &str,
+) -> Result<String, String> {
+    let normalized = crate::handle::normalize_and_validate(handle)
+        .map_err(|e| format!("invalid syntax: {e}"))?;
+    if crate::handle::is_service_domain(&normalized, &state.service_handle_domains)
+        && let Err(e) = crate::handle::ensure_service_constraints(
+            &normalized,
+            &state.service_handle_domains,
+            false,
+        )
+    {
+        return Err(format!("reserved service handle: {e}"));
+    }
+    if crate::denylist::contains(
+        &manager.account_pool(),
+        crate::denylist::KIND_HANDLE,
+        &normalized,
+    )
+    .await
+    .map_err(|e| format!("denylist lookup: {e}"))?
+    {
+        return Err("handle is on the operator denylist".to_string());
+    }
+    Ok(normalized)
+}
+
 /// Require that `handle` already resolves to `did` on the open internet.
 ///
 /// This is the only thing standing between "I typed a domain" and "this
@@ -832,23 +870,41 @@ pub async fn refresh_identity(
         if let Some(current_handle) = current_handle
             && &current_handle != new_handle
         {
-            manager
-                .set_handle(&input.did, new_handle)
-                .await
-                .map_err(|e| {
-                    XrpcError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "InternalError",
-                        format!("update local handle: {e}"),
-                    )
-                })?;
-            tracing::info!(
-                did = %input.did,
-                old = %current_handle,
-                new = %new_handle,
-                "refreshIdentity: local handle reconciled with PLC alsoKnownAs"
-            );
-            handle_updated = true;
+            // Validate before adopting a handle observed in the PLC document.
+            // A handle failing syntax, the service-domain reserved-name policy,
+            // or the operator denylist is not adopted — the account keeps its
+            // current handle. Without this a crafted `alsoKnownAs` was written
+            // straight into `account.handle`. The DNS-ownership half is proved
+            // separately below.
+            match validate_refreshed_handle(&state, manager, new_handle).await {
+                Ok(normalized) => {
+                    manager
+                        .set_handle(&input.did, &normalized)
+                        .await
+                        .map_err(|e| {
+                            XrpcError::new(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "InternalError",
+                                format!("update local handle: {e}"),
+                            )
+                        })?;
+                    tracing::info!(
+                        did = %input.did,
+                        old = %current_handle,
+                        new = %normalized,
+                        "refreshIdentity: local handle reconciled with PLC alsoKnownAs"
+                    );
+                    handle_updated = true;
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        did = %input.did,
+                        observed = %new_handle,
+                        reason = %reason,
+                        "refreshIdentity: observed handle failed validation; not adopting"
+                    );
+                }
+            }
         }
     }
 
