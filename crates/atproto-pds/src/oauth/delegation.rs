@@ -72,7 +72,9 @@ use crate::account::delegation;
 use crate::errors::PdsError;
 use crate::http::errors::XrpcError;
 use crate::http::state::{DelegationConfig, HttpState};
-use crate::oauth::consent::{html_escape, prefill_identifier, render_scope_list, urlencode};
+use crate::oauth::consent::{
+    accepted_languages, html_escape, prefill_identifier, render_scope_list, urlencode,
+};
 use crate::oauth::delegation_login::{ParkedLogin, binding_id, park, take};
 use atproto_identity::key::{KeyType, generate_key, identify_key};
 use atproto_oauth::resources::{AuthorizationServer, oauth_authorization_server, pds_resources};
@@ -366,7 +368,8 @@ pub async fn start_page(
         ));
     };
 
-    let scopes_list = render_scope_list(&state, &request.scope).await;
+    let languages = accepted_languages(&parts.headers);
+    let scopes_list = render_scope_list(&state, &request.scope, &languages).await;
     Ok(start_response(render_start(
         &q.request_uri,
         &request.client_id,
@@ -539,6 +542,9 @@ pub async fn begin(
 ) -> Result<Response, XrpcError> {
     let config = require_delegation(&state)?.clone();
     crate::http::portal::require_same_origin(&parts.headers)?;
+    // Every refusal below re-renders the same page, so the reader's languages
+    // are read once here rather than at each of them.
+    let languages = accepted_languages(&parts.headers);
 
     let request = state
         .oauth
@@ -578,7 +584,7 @@ pub async fn begin(
 
     let typed = form.handle.trim();
     if typed.is_empty() {
-        let scopes_list = render_scope_list(&state, &request.scope).await;
+        let scopes_list = render_scope_list(&state, &request.scope, &languages).await;
         return Ok(refuse("Enter your handle to continue.", &scopes_list));
     }
 
@@ -609,7 +615,7 @@ pub async fn begin(
 
     let (Some(delegate), Some(core)) = (delegate, core) else {
         tracing::debug!("a delegated sign-in could not be started");
-        let scopes_list = render_scope_list(&state, &request.scope).await;
+        let scopes_list = render_scope_list(&state, &request.scope, &languages).await;
         return Ok(refuse(cannot_start, &scopes_list));
     };
 
@@ -618,7 +624,7 @@ pub async fn begin(
     // in a generic refusal. It reveals nothing: the account being acted for is
     // already named on this page.
     if delegate.did == core.did {
-        let scopes_list = render_scope_list(&state, &request.scope).await;
+        let scopes_list = render_scope_list(&state, &request.scope, &languages).await;
         return Ok(refuse(
             "That is the account you are signing in to. Go back and use its own password.",
             &scopes_list,

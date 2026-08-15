@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed value set — an unknown verb would have been the same silent drop one layer down.
 
 ### Added
+- **A space type is named on the consent screen in the reader's language.** A space type declaration may
+  publish `name:lang`, a map of localised names, and 0016 puts it there for exactly this screen — the one a
+  person reads before granting an application access to their spaces. It was parsed and then dropped, so
+  every reader saw the undifferentiated `name` whatever their browser asked for.
+
+  The reader's `Accept-Language` now selects among the published names: the whole tag first, so `pt-BR`
+  takes a Brazilian entry over a European one, then the primary subtag in both directions, so a reader
+  asking for `es-MX` gets an `es` entry and one asking for `es` gets `es-419` when that is the only Spanish
+  published. Weights order the list and `q=0` drops an entry, since that is how a client refuses a
+  language. Falling back to the declaration's own `name` is the normal path, not an error one: `name` is
+  required of a declaration and `name:lang` is not.
+
 - **Collection listings show each authority's favicon**, fetched and cached by this server and served from
   its own origin at `/account/repository/icon/{nsid}`. Hot-linking would have needed `img-src` opened to
   other origins, and on a signed-in page that tells every NSID authority in the repository when the holder

@@ -3783,6 +3783,7 @@ mod scope_gate_tests {
             "app.bsky.group".to_string(),
             SpaceDeclaration {
                 name: "Group".to_string(),
+                name_lang: std::collections::BTreeMap::new(),
                 key: "tid".to_string(),
                 collections: vec!["app.bsky.feed.post".to_string()],
             },

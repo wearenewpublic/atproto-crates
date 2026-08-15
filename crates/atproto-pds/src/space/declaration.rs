@@ -30,6 +30,7 @@
 
 use atproto_lexicon::validation::schema::SchemaDef;
 use atproto_lexicon::validation::schema_file::SchemaFile;
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,11 +41,56 @@ use std::time::Duration;
 pub struct SpaceDeclaration {
     /// Human-readable name for the space type (consent-screen label).
     pub name: String,
+    /// Localised `name` values by language code, from the declaration's
+    /// `name:lang`. Keys are lowercased on the way in, so lookup can compare
+    /// language tags case-insensitively as BCP 47 requires.
+    ///
+    /// Empty when the declaration publishes none, which is the common case:
+    /// [`SpaceDeclaration::localized_name`] then answers with `name`.
+    pub name_lang: BTreeMap<String, String>,
     /// Recommended space-key (`skey`) type for spaces of this type.
     pub key: String,
     /// Declared record-collection NSIDs — the default `collection` set for a
     /// bare `space:` grant of this type (the spec's "Matching" section).
     pub collections: Vec<String>,
+}
+
+impl SpaceDeclaration {
+    /// The name to show a person who reads `languages`, in preference order.
+    ///
+    /// `languages` is the reader's accepted language tags, most-preferred
+    /// first. Each is tried two ways before the next is considered, which is
+    /// RFC 4647 basic filtering reduced to what a one-level map can express:
+    ///
+    /// 1. the whole tag, so `pt-BR` takes a `pt-BR` entry over a `pt` one;
+    /// 2. the primary subtag, which matches in both directions — a reader
+    ///    asking for `es-MX` gets an `es` entry, and one asking for `es` gets
+    ///    `es-419` when that is the only Spanish published.
+    ///
+    /// Falls back to [`name`](Self::name). A declaration's `name` is required
+    /// and its `name:lang` is not, so the fallback is the normal path rather
+    /// than an error case, and showing the undifferentiated name is always
+    /// better than showing the NSID.
+    #[must_use]
+    pub fn localized_name(&self, languages: &[String]) -> &str {
+        for wanted in languages {
+            let wanted = wanted.to_ascii_lowercase();
+            if let Some(name) = self.name_lang.get(&wanted).filter(|n| !n.is_empty()) {
+                return name;
+            }
+            let primary = wanted.split('-').next().unwrap_or(&wanted);
+            if let Some(name) = self
+                .name_lang
+                .iter()
+                .filter(|(_, name)| !name.is_empty())
+                .find(|(lang, _)| lang.split('-').next() == Some(primary))
+                .map(|(_, name)| name)
+            {
+                return name;
+            }
+        }
+        &self.name
+    }
 }
 
 /// Resolves a space-type NSID to its [`SpaceDeclaration`].
@@ -181,6 +227,11 @@ fn parse_space_declaration(value: &serde_json::Value) -> Option<SpaceDeclaration
     match file.main()? {
         SchemaDef::Space(space) => Some(SpaceDeclaration {
             name: space.name.clone(),
+            name_lang: space
+                .name_lang
+                .iter()
+                .map(|(lang, name)| (lang.to_ascii_lowercase(), name.clone()))
+                .collect(),
             key: space.key.clone(),
             collections: space.collections.clone(),
         }),
@@ -344,6 +395,101 @@ mod tests {
         );
     }
 
+    /// `name:lang` survives parsing, lowercased so lookup can be
+    /// case-insensitive without re-normalising on every consent render.
+    #[test]
+    fn parse_space_declaration_reads_localized_names() {
+        let value = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.atmoboards.forum",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "any",
+                    "name": "AtmoBoards Forum",
+                    "name:lang": { "es": "Foro AtmoBoards", "PT-BR": "Fórum AtmoBoards" },
+                    "collections": ["com.atmoboards.thread"]
+                }
+            }
+        });
+        let decl = parse_space_declaration(&value).expect("space declaration");
+        assert_eq!(decl.name_lang.get("es").unwrap(), "Foro AtmoBoards");
+        assert_eq!(
+            decl.name_lang.get("pt-br").unwrap(),
+            "Fórum AtmoBoards",
+            "language tags are case-insensitive, so the key is lowercased"
+        );
+    }
+
+    fn localized(name_lang: &[(&str, &str)]) -> SpaceDeclaration {
+        SpaceDeclaration {
+            name: "AtmoBoards Forum".to_string(),
+            name_lang: name_lang
+                .iter()
+                .map(|(l, n)| ((*l).to_string(), (*n).to_string()))
+                .collect(),
+            key: "any".to_string(),
+            collections: Vec::new(),
+        }
+    }
+
+    fn langs(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    /// The reader's first preference wins, and a whole tag beats its primary
+    /// subtag: someone asking for `pt-BR` gets the Brazilian entry rather than
+    /// the European one that also starts with `pt`.
+    #[test]
+    fn localized_name_prefers_the_most_specific_match() {
+        let decl = localized(&[("pt", "Fórum"), ("pt-br", "Fórum brasileiro")]);
+        assert_eq!(decl.localized_name(&langs(&["pt-br"])), "Fórum brasileiro");
+        assert_eq!(decl.localized_name(&langs(&["pt"])), "Fórum");
+    }
+
+    /// Primary-subtag matching works in both directions, which is what makes a
+    /// one-level map usable: a reader asking for a region gets the plain
+    /// language, and a reader asking for a plain language gets whatever region
+    /// was published.
+    #[test]
+    fn localized_name_falls_back_across_the_subtag() {
+        assert_eq!(
+            localized(&[("es", "Foro")]).localized_name(&langs(&["es-mx"])),
+            "Foro"
+        );
+        assert_eq!(
+            localized(&[("es-419", "Foro")]).localized_name(&langs(&["es"])),
+            "Foro"
+        );
+    }
+
+    /// Preferences are tried in order, so a language the declaration does not
+    /// publish yields to the next one the reader named.
+    #[test]
+    fn localized_name_walks_the_preference_list() {
+        let decl = localized(&[("ja", "掲示板")]);
+        assert_eq!(decl.localized_name(&langs(&["de", "ja", "es"])), "掲示板");
+    }
+
+    /// The declaration's own `name` is the answer when nothing matches, when
+    /// nothing is asked for, and when the matching entry is empty. It is the
+    /// required field; `name:lang` is not.
+    #[test]
+    fn localized_name_falls_back_to_the_declared_name() {
+        let decl = localized(&[("es", "Foro"), ("ja", "")]);
+        assert_eq!(decl.localized_name(&langs(&["de"])), "AtmoBoards Forum");
+        assert_eq!(decl.localized_name(&[]), "AtmoBoards Forum");
+        assert_eq!(
+            decl.localized_name(&langs(&["ja"])),
+            "AtmoBoards Forum",
+            "an empty localisation is not a label"
+        );
+        assert_eq!(
+            localized(&[]).localized_name(&langs(&["es"])),
+            "AtmoBoards Forum"
+        );
+    }
+
     #[test]
     fn parse_space_declaration_rejects_non_space_main() {
         let value = serde_json::json!({
@@ -374,6 +520,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             decl: SpaceDeclaration {
                 name: "Forum".to_string(),
+                name_lang: BTreeMap::new(),
                 key: "any".to_string(),
                 collections: vec!["com.atmoboards.thread".to_string()],
             },
@@ -400,6 +547,7 @@ mod tests {
             "com.atmoboards.forum".to_string(),
             SpaceDeclaration {
                 name: "Forum".to_string(),
+                name_lang: BTreeMap::new(),
                 key: "any".to_string(),
                 collections: vec![
                     "com.atmoboards.thread".to_string(),

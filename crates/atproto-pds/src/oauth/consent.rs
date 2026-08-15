@@ -146,7 +146,8 @@ pub async fn consent_page(
             )
         })?;
 
-    let scopes_list = render_scope_list(&state, &request.scope).await;
+    let languages = accepted_languages(&parts.headers);
+    let scopes_list = render_scope_list(&state, &request.scope, &languages).await;
 
     // Offered only when this server can actually complete a delegated sign-in
     // *and* the client named who is signing in. Without a hint there is no
@@ -203,14 +204,24 @@ pub async fn consent_page(
 /// Every resolution here is best-effort: an owner DID that will not verify
 /// renders as the DID, a space type that will not resolve renders as its NSID,
 /// a permission set that cannot be read is named rather than described.
-pub(crate) async fn render_scope_list(state: &HttpState, scope: &str) -> String {
+///
+/// `languages` is the reader's `Accept-Language` preference, from
+/// [`accepted_languages`]. It selects among a space type declaration's
+/// `name:lang` entries; an empty slice asks for the declaration's own `name`,
+/// which is what a caller with no request headers to hand should pass.
+pub(crate) async fn render_scope_list(
+    state: &HttpState,
+    scope: &str,
+    languages: &[String],
+) -> String {
     // Best-effort: resolve the space-owner DIDs named in any `space:` scope to
     // their bidirectionally-verified handles, so the screen can render a
     // human-readable owner instead of an opaque DID.
     let handles = resolve_space_owner_handles(state, scope).await;
     // Best-effort: resolve the space-type NSIDs named in any `space:` scope to
-    // their declaration `name` (the spec's "Consent" section).
-    let type_names = resolve_space_type_names(state, scope).await;
+    // their declaration `name` (the spec's "Consent" section), localised to
+    // the reader where the declaration publishes a `name:lang` for them.
+    let type_names = resolve_space_type_names(state, scope, languages).await;
     let permission_sets = resolve_permission_sets(state, scope, &handles, &type_names).await;
 
     scope
@@ -388,7 +399,11 @@ fn summarise_permissions(
     (granted, refused)
 }
 
-async fn resolve_space_type_names(state: &HttpState, scope: &str) -> BTreeMap<String, String> {
+async fn resolve_space_type_names(
+    state: &HttpState,
+    scope: &str,
+    languages: &[String],
+) -> BTreeMap<String, String> {
     let mut nsids: Vec<String> = Vec::new();
     for token in scope.split_whitespace() {
         if let Ok(Scope::Space(perm)) = Scope::parse(token)
@@ -401,11 +416,60 @@ async fn resolve_space_type_names(state: &HttpState, scope: &str) -> BTreeMap<St
 
     let mut out = BTreeMap::new();
     for nsid in nsids {
-        if let Some(name) = resolve_space_declaration_name(state, &nsid).await {
+        if let Some(name) = resolve_space_declaration_name(state, &nsid, languages).await {
             out.insert(nsid, name);
         }
     }
     out
+}
+
+/// The reader's language preferences, most-preferred first, from
+/// `Accept-Language`.
+///
+/// Enough of RFC 9110 §12.5.4 to order a header: entries are split on `,`,
+/// a `;q=` weight is read where present and defaults to 1, entries weighted 0
+/// are dropped because that is the syntax for refusing a language, and the
+/// rest are sorted by descending weight with the header's own order breaking
+/// ties. `*` is dropped: it means "anything else", which is what the
+/// declaration's own `name` already is.
+///
+/// A malformed weight makes that one entry a 1 rather than failing the header.
+/// The consequence of getting this wrong is a space type labelled in the wrong
+/// language on a consent screen, and refusing to read a header some proxy
+/// mangled would label it in no language at all.
+pub(crate) fn accepted_languages(headers: &axum::http::HeaderMap) -> Vec<String> {
+    let Some(header) = headers
+        .get(axum::http::header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Vec::new();
+    };
+
+    let mut weighted: Vec<(usize, f32, String)> = Vec::new();
+    for (position, entry) in header.split(',').enumerate() {
+        let mut parts = entry.split(';');
+        let Some(tag) = parts.next().map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        if tag == "*" {
+            continue;
+        }
+        let weight = parts
+            .filter_map(|p| p.trim().strip_prefix("q="))
+            .next()
+            .map_or(1.0, |q| q.trim().parse::<f32>().unwrap_or(1.0));
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted.push((position, weight, tag.to_ascii_lowercase()));
+    }
+
+    weighted.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    weighted.into_iter().map(|(_, _, tag)| tag).collect()
 }
 
 /// Resolve a space-type NSID to its declaration `name` for the consent screen
@@ -418,13 +482,23 @@ async fn resolve_space_type_names(state: &HttpState, scope: &str) -> BTreeMap<St
 /// consent UI and the gate never diverge. Returns `None` when no resolver is
 /// configured, resolution fails, or the declaration has an empty `name`
 /// (callers fall back to the raw NSID).
-async fn resolve_space_declaration_name(state: &HttpState, nsid: &str) -> Option<String> {
+///
+/// `languages` selects among the declaration's `name:lang` entries. The
+/// declaration publishes them so the label can be read by the person granting
+/// access, and the person granting access is the one whose browser sent
+/// `Accept-Language`.
+async fn resolve_space_declaration_name(
+    state: &HttpState,
+    nsid: &str,
+    languages: &[String],
+) -> Option<String> {
     let declaration = state
         .space_declaration_resolver
         .as_ref()?
         .resolve(nsid)
         .await?;
-    (!declaration.name.is_empty()).then_some(declaration.name)
+    let name = declaration.localized_name(languages);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Resolve `did` to its handle and verify the binding bidirectionally:
@@ -981,6 +1055,58 @@ mod tests {
 
     fn no_names() -> BTreeMap<String, String> {
         BTreeMap::new()
+    }
+
+    /// A `HeaderMap` carrying one `Accept-Language`.
+    fn accept_language(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT_LANGUAGE,
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    /// Weight orders the list, and the header's own order breaks ties.
+    #[test]
+    fn accepted_languages_are_ordered_by_weight() {
+        assert_eq!(
+            accepted_languages(&accept_language("en;q=0.5, ja, es;q=0.8")),
+            vec!["ja", "es", "en"]
+        );
+        assert_eq!(
+            accepted_languages(&accept_language("fr, de")),
+            vec!["fr", "de"],
+            "equal weights keep the order they were sent in"
+        );
+    }
+
+    /// `q=0` is how a client says "not this one", and `*` says "whatever you
+    /// have" — which is the declaration's own `name`, so neither belongs in a
+    /// list of things to look up.
+    #[test]
+    fn accepted_languages_drops_refusals_and_the_wildcard() {
+        assert_eq!(
+            accepted_languages(&accept_language("de, en;q=0, *;q=0.1")),
+            vec!["de"]
+        );
+    }
+
+    /// No header is no preference, not an error.
+    #[test]
+    fn accepted_languages_is_empty_without_the_header() {
+        assert!(accepted_languages(&axum::http::HeaderMap::new()).is_empty());
+    }
+
+    /// A weight that will not parse costs that entry its position, not the
+    /// whole header: a consent screen in the wrong language beats one that
+    /// fell back to raw NSIDs because a proxy mangled a `q`.
+    #[test]
+    fn accepted_languages_survives_a_malformed_weight() {
+        assert_eq!(
+            accepted_languages(&accept_language("pt-BR;q=high, en;q=0.9")),
+            vec!["pt-br", "en"]
+        );
     }
 
     /// The `<li>` list `render_scope_list` would produce for a scope nothing
