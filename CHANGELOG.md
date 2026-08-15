@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- **A permission set asking to administer a space now grants it.** proposals#101 added `manage` to the
+  space permission a permission set may declare, alongside `spaceType`, `authority`, `skey`, `collection`
+  and `action`. Neither the lexicon model nor the expander knew the field, so it was dropped on
+  deserialization and the set expanded to a `space:` scope with no `manage=` at all.
+
+  The failure was quiet in the worst way: the consent screen described an administrative grant from the
+  same expansion, the account holder approved one, and every `simplespace` call the application then made
+  was refused for a scope it had been told it held. Publishing a set with a `manage` verb outside
+  `create`/`update`/`delete` is now refused outright, because the scope grammar those expand into has a
+  closed value set — an unknown verb would have been the same silent drop one layer down.
+
 ### Added
 - **Collection listings show each authority's favicon**, fetched and cached by this server and served from
   its own origin at `/account/repository/icon/{nsid}`. Hot-linking would have needed `img-src` opened to

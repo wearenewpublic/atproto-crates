@@ -602,6 +602,25 @@ pub enum DataValidationError {
     )]
     SpacePermissionWildcardSpaceType,
 
+    /// A space permission's `manage` list names a verb that is not one of
+    /// `create`, `update`, `delete`.
+    #[error(
+        "error-atproto-lexicon-data-validation-95 Space permission 'manage' verb is not one of create/update/delete: {verb}"
+    )]
+    SpacePermissionInvalidManageVerb {
+        /// The unrecognised verb.
+        verb: String,
+    },
+
+    /// A space permission carries `manage` as an empty array.
+    ///
+    /// Omitting `manage` grants no management capability, and an empty array
+    /// says the same thing in a way that reads like an oversight.
+    #[error(
+        "error-atproto-lexicon-data-validation-96 Space permission 'manage' must not be an empty array; omit it instead"
+    )]
+    SpacePermissionEmptyManage,
+
     /// The `ref`/`union` indirection depth exceeded the configured limit.
     ///
     /// Raised before the native stack can overflow. See

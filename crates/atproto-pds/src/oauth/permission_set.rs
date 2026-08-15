@@ -197,8 +197,8 @@ pub(crate) fn scopes_for_permission(
     Ok(scopes)
 }
 
-/// `space:<spaceType>[?authority=…][&skey=…][&collection=…][&action=…]` for a
-/// space permission.
+/// `space:<spaceType>[?authority=…][&skey=…][&collection=…][&action=…][&manage=…]`
+/// for a space permission.
 ///
 /// # The space type must be concrete
 ///
@@ -267,6 +267,23 @@ fn space_scopes(perm: &serde_json::Value) -> Result<Vec<String>, String> {
     };
     for action in actions {
         params.push(format!("action={action}"));
+    }
+    // `manage` is the other axis and has no default: omitted, it grants no
+    // administrative capability at all, so there is nothing to fill in and
+    // every verb here was asked for explicitly.
+    //
+    // An unrecognised verb is refused rather than dropped. Dropping it would
+    // narrow a grant the consent screen described, and emitting it would build
+    // a scope string `Scope::parse` rejects outright -- which takes the
+    // record access down with the administrative grant that was malformed.
+    for verb in string_list(&perm["manage"]) {
+        if !matches!(verb.as_str(), "create" | "update" | "delete") {
+            return Err(format!(
+                "`{verb}` is not a space-management verb; a permission set may name only create, \
+                 update or delete"
+            ));
+        }
+        params.push(format!("manage={verb}"));
     }
 
     Ok(vec![if params.is_empty() {
@@ -698,6 +715,112 @@ mod tests {
                 "{field}: {out}"
             );
         }
+    }
+
+    /// A set's `manage` verbs reach the scope it expands to.
+    ///
+    /// Until they did, a set asking to administer a user's spaces expanded to
+    /// a scope with no `manage` at all: the consent screen described an
+    /// administrative grant, the account holder approved one, and every
+    /// `simplespace` call the application then made was refused for a scope it
+    /// had been told it was given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_carries_its_manage_verbs() {
+        let r = resolver(serde_json::json!({
+            "defs": {"main": {"type": "permission-set", "permissions": [
+                {
+                    "type": "permission",
+                    "resource": "space",
+                    "spaceType": "com.atmoboards.forum",
+                    "authority": "*",
+                    "action": ["read_self"],
+                    "manage": ["update", "delete"]
+                }
+            ]}}
+        }));
+        let out = expand(Some(&r), "include:com.atmoboards.access").await;
+        assert!(
+            out.contains(
+                "space:com.atmoboards.forum?authority=*&action=read_self&manage=update&manage=delete"
+            ),
+            "{out}"
+        );
+
+        // And the emitted scope confers the verbs, rather than merely spelling
+        // them: expansion feeding a string the enforcement layer reads
+        // differently would fail as silently as the drop it replaces.
+        let scopes = atproto_oauth::scopes::ScopesSet::from_scope_string_for(&out, "did:plc:me");
+        for verb in [
+            atproto_oauth::scopes::SpaceManageVerb::Update,
+            atproto_oauth::scopes::SpaceManageVerb::Delete,
+        ] {
+            assert!(
+                scopes
+                    .assert_space_manage(&atproto_oauth::scopes::SpaceManageTarget::new(
+                        "com.atmoboards.forum",
+                        "did:plc:abc",
+                        "default",
+                        verb,
+                    ))
+                    .is_ok(),
+                "the emitted scope must confer {verb:?}: {out}"
+            );
+        }
+        assert!(
+            scopes
+                .assert_space_manage(&atproto_oauth::scopes::SpaceManageTarget::new(
+                    "com.atmoboards.forum",
+                    "did:plc:abc",
+                    "default",
+                    atproto_oauth::scopes::SpaceManageVerb::Create,
+                ))
+                .is_err(),
+            "a verb the set did not name must not be conferred: {out}"
+        );
+    }
+
+    /// Omitting `manage` stays the default, and the default is nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_without_manage_confers_no_administration() {
+        let r = resolver(serde_json::json!({
+            "defs": {"main": {"type": "permission-set", "permissions": [
+                {
+                    "type": "permission",
+                    "resource": "space",
+                    "spaceType": "com.example.bookmarks",
+                    "action": ["read"]
+                }
+            ]}}
+        }));
+        let out = expand(Some(&r), "include:com.example.access").await;
+        assert!(out.contains("space:com.example.bookmarks"), "{out}");
+        assert!(!out.contains("manage="), "got: {out}");
+    }
+
+    /// An unrecognised verb takes the permission out rather than being dropped
+    /// from it.
+    ///
+    /// Dropping it would narrow a grant the consent screen had described.
+    /// Emitting it would produce a scope string `Scope::parse` refuses whole,
+    /// which loses the record access alongside the administrative grant that
+    /// was actually malformed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_permission_refuses_a_verb_that_is_not_a_verb() {
+        let r = resolver(serde_json::json!({
+            "defs": {"main": {"type": "permission-set", "permissions": [
+                {
+                    "type": "permission",
+                    "resource": "space",
+                    "spaceType": "com.atmoboards.forum",
+                    "manage": ["administer"]
+                }
+            ]}}
+        }));
+        let out = expand(Some(&r), "include:com.atmoboards.access").await;
+        assert!(
+            !out.contains("space:"),
+            "an unknown manage verb must grant nothing: {out}"
+        );
     }
 
     /// A wildcard space type is refused rather than expanded.

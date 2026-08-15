@@ -353,6 +353,20 @@ pub struct Permission {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skey: Option<String>,
 
+    /// Space-management verbs for `space` resources.
+    ///
+    /// A separate axis from [`action`](Self::action): `action` governs the
+    /// records in a space, `manage` governs the space itself, and each takes
+    /// `create`, `update` or `delete`. Omitted by default, so an ordinary
+    /// record-access permission confers no administrative capability.
+    ///
+    /// What each verb permits is defined by the space-management
+    /// implementation rather than the protocol — in `com.atproto.simplespace`,
+    /// `manage=update` authorises `updateSpace`, `addMember` and
+    /// `removeMember`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manage: Option<Vec<String>>,
+
     /// The permission set NSID an `include` permission references.
     ///
     /// `include` is the spec's "meta" resource: it pulls in another
@@ -393,6 +407,13 @@ pub const PERMISSION_RESOURCES_WITHOUT_NSIDS: &[&str] = &["blob", "identity", "a
 
 /// Valid actions for repo permissions
 pub const REPO_ACTIONS: &[&str] = &["create", "update", "delete"];
+
+/// Valid `manage` verbs for space permissions.
+///
+/// The same three words as [`REPO_ACTIONS`] and a different axis: these apply
+/// to a space rather than to the records in one, and are kept separate so a
+/// future divergence in either list does not silently widen the other.
+pub const SPACE_MANAGE_VERBS: &[&str] = &["create", "update", "delete"];
 
 /// Space schema - declares a permissioned-data space type.
 ///

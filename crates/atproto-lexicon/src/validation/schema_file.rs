@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::validation::data_errors::DataValidationError;
 use crate::validation::schema::{
     PERMISSION_RESOURCES, PERMISSION_RESOURCES_WITHOUT_NSIDS, Permission, PermissionSetSchema,
-    REPO_ACTIONS, SchemaDef, SpaceSchema,
+    REPO_ACTIONS, SPACE_MANAGE_VERBS, SchemaDef, SpaceSchema,
 };
 use crate::validation::syntax::validate_nsid;
 
@@ -358,6 +358,12 @@ fn validate_include_permission(
 /// [Namespace Authority](https://atproto.com/specs/permission#namespace-authority)
 /// requirement — it must fall under the set's `namespace` (spec line 465), the
 /// same constraint enforced for repo `collection` and rpc `lxm`.
+///
+/// `manage` is checked against the three verbs the spec defines. It is checked
+/// where `action` is not because a `manage` verb has no default: an unknown
+/// one cannot be read as "the usual set", and the scope grammar it expands
+/// into has a closed value set, so publishing a set naming one produces a
+/// permission that describes an administrative grant and confers none.
 fn validate_space_permission(
     permission: &Permission,
     namespace: &str,
@@ -374,6 +380,18 @@ fn validate_space_permission(
             nsid: space_type.clone(),
             namespace: namespace.to_string(),
         });
+    }
+    if let Some(manage) = &permission.manage {
+        if manage.is_empty() {
+            return Err(DataValidationError::SpacePermissionEmptyManage);
+        }
+        for verb in manage {
+            if !SPACE_MANAGE_VERBS.contains(&verb.as_str()) {
+                return Err(DataValidationError::SpacePermissionInvalidManageVerb {
+                    verb: verb.clone(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1002,6 +1020,49 @@ mod tests {
         let serialized = serde_json::to_string(&schema).unwrap();
         let reparsed = SchemaFile::parse(&serialized).unwrap();
         assert_eq!(schema, reparsed);
+    }
+
+    /// `manage` survives parsing and round-trips, so a set that declares an
+    /// administrative grant still declares one after this crate has read it.
+    #[test]
+    fn test_permission_set_space_manage() {
+        let json = r#"{"lexicon":1,"id":"com.example.lexicon.perms","defs":{"main":{"type":"permission-set","title":"test case","detail":"test detail","permissions":[{"type":"permission","resource":"space","spaceType":"com.example.lexicon.group","action":["read_self"],"manage":["update","delete"]}]}}}"#;
+        let schema = SchemaFile::parse(json).unwrap();
+        let Some(SchemaDef::PermissionSet(ps)) = schema.main() else {
+            panic!("Expected PermissionSet schema");
+        };
+        assert_eq!(
+            ps.permissions[0].manage,
+            Some(vec!["update".to_string(), "delete".to_string()])
+        );
+
+        let reparsed = SchemaFile::parse(&serde_json::to_string(&schema).unwrap()).unwrap();
+        assert_eq!(schema, reparsed, "manage must survive a serialize/parse");
+    }
+
+    /// A verb outside `create`/`update`/`delete` is refused at publication.
+    ///
+    /// The scope grammar `manage` expands into has a closed value set, so a
+    /// set naming anything else describes an administrative grant on a consent
+    /// screen and confers none.
+    #[test]
+    fn test_space_permission_unknown_manage_verb_rejected() {
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "com.example.lexicon.group", "manage": ["administer"]}]}}}"#;
+        assert!(matches!(
+            SchemaFile::parse(json),
+            Err(DataValidationError::SpacePermissionInvalidManageVerb { ref verb }) if verb == "administer"
+        ));
+    }
+
+    /// An empty `manage` is the same grant as no `manage` and reads like an
+    /// oversight, so it is refused rather than silently meaning nothing.
+    #[test]
+    fn test_space_permission_empty_manage_rejected() {
+        let json = r#"{"lexicon": 1, "id": "com.example.lexicon.perms", "defs": {"main": {"type": "permission-set", "title": "test case", "detail": "test detail", "permissions": [{"type": "permission", "resource": "space", "spaceType": "com.example.lexicon.group", "manage": []}]}}}"#;
+        assert!(matches!(
+            SchemaFile::parse(json),
+            Err(DataValidationError::SpacePermissionEmptyManage)
+        ));
     }
 
     #[test]
