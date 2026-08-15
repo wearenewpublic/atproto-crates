@@ -341,6 +341,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Sent only when events are genuinely missing — `read_after` returns rows strictly after the cursor,
   so a cursor of exactly `earliest - 1` is contiguous and gets no notice.
 
+### Security
+- **`importRepo` rejects a CAR whose commits are not the importing account's.** The import indexed records
+  under the caller's DID and re-broadcast the head on the firehose regardless of the `did` the commits
+  named, and per-commit signature verification is opt-in (off for `did:web` or a PLC-less deployment). Every
+  commit in the chain is now required to carry `did == account_did`; a mismatch is refused, so a hostile or
+  malformed CAR cannot attribute an imported repo to the wrong identity even when signatures are not
+  checked.
+
 ### Changed
 - **The `registerNotify` registration window is configurable and now defaults to 60 days**, via
   `--space-register-notify-ttl-seconds` / `PDS_SPACE_REGISTER_NOTIFY_TTL_SECONDS` (clamped to

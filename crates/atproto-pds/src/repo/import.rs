@@ -401,6 +401,25 @@ impl<'a> RepoImporter<'a> {
         // actually present, which is the stronger source anyway.
         let mut prev_data: Option<atproto_dasl::Cid> = None;
         for commit in &chain {
+            // Every commit in the chain must belong to the importing account.
+            // Records are indexed under `account_did` regardless of what the
+            // commit names, and the head is re-broadcast on the firehose, so a
+            // commit whose `did` is a foreign identity would attribute an
+            // imported repo to the wrong DID. `importRepo` only ever targets the
+            // caller's own repo (`account_did` is the caller's `sub`), so a
+            // mismatch is a malformed or hostile CAR, not a supported
+            // cross-account import — and this holds even when per-commit
+            // signature verification is opted out (the fail-open path below).
+            if commit.did != account_did {
+                return Err(PdsError::Repo(
+                    atproto_repo::errors::RepoError::InvalidCommit {
+                        reason: format!(
+                            "commit did {} does not match the importing account {account_did}",
+                            commit.did
+                        ),
+                    },
+                ));
+            }
             let new_root = commit.data.clone();
             verify_inductive(prev_data.clone(), new_root.clone(), &blocks)
                 .map_err(PdsError::Repo)?;
