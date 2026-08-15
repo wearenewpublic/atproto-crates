@@ -215,6 +215,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot establish it has not. Valkey now does the same, so the replay posture no longer depends on which
   durability backend an operator wired.
 
+### Security
+- **`getSpace` requires the caller to be a member.** `com.atproto.simplespace.getSpace` (and its
+  deprecated `com.atproto.space.getSpace` alias) authenticated the caller but never checked membership, so
+  any local account's session could read an arbitrary space's configuration — mint policy, allow-listed
+  client IDs, managing app — and tell an existing space from a missing one. A session/OAuth caller now must
+  be a member, mirroring `listMembers`; a verified SpaceCredential, being the authority's signed statement,
+  is unaffected.
+
 ### Changed
 - **Grouped collection listings drop their row rules and line up.** Rows in a group sat a few pixels out
   from the row that carried the mark: a `0.8em` badge beside a `1em` spacer resolves two different widths

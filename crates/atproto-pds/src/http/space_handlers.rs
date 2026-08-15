@@ -569,6 +569,18 @@ async fn describe_space(
     let uri = parse_space_uri(&q.space)?;
     let subject = require_any_authn(parts, state, &uri).await?;
     assert_space_read_opt(state, &subject, &uri).await?;
+    // A session/OAuth caller must be a member to read a space's configuration.
+    // Holding a `space:` scope is the account holder's consent to an app, not
+    // evidence the account is in the space; without this any local account
+    // could read an arbitrary space's policy (mint policy, allow-listed
+    // clients, managing app) and probe which spaces exist. This mirrors the
+    // sibling `listMembers`. A verified `SpaceCredential` (`None`) is the
+    // authority's own signed statement and needs no further check, exactly as
+    // the record reads treat it.
+    if let Some(subject) = &subject {
+        let caller = subject.sub();
+        assert_space_membership(state, &uri, Some(caller), caller).await?;
+    }
     let svc = space_service(state)?;
     svc.get_space(&uri).await.map_err(XrpcError::from)
 }
