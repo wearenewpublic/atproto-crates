@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security
+- **The account-portal repository browser escapes the collection/rkey it echoes back, closing a
+  reflected XSS.** `GET /account/repository/public/{segment}` (and the record and space variants) rendered
+  the path segment straight into the page `<h1>` and `<title>` while escaping the very same value in the
+  breadcrumb one line over. Because the portal serves its HTML under a `script-src 'unsafe-inline'` CSP, a
+  segment like `<img src=x onerror=…>` executed — driving any portal mutation with the visitor's session.
+  Delivery was bounded by the `SameSite=Strict` session cookie (a cross-site navigation arrives without it
+  and is redirected to sign-in), so it was never a one-click takeover, but it was a real injection. The
+  title is now escaped at both sinks — the browser heading and the shared `page()` `<title>`, which every
+  portal page passes through — so a static title is unaffected and a request-derived one can no longer
+  carry markup.
+
 ### Changed
 - **`/xrpc/_health` reports `version` and `status`, and nothing else.** It also named the SetHash
   implementation in use, so that federation peers could confirm interop without trial-and-error commits.

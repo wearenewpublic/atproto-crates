@@ -131,11 +131,16 @@ fn browse_page(
     crumbs: &str,
     body: &str,
 ) -> Response {
+    // `title` is a collection NSID, an rkey, or a handle taken from the request
+    // path, so the heading is an injection sink and must be escaped — exactly as
+    // the breadcrumb built from the same value already is. `page` escapes the
+    // `<title>` it puts this in for the same reason.
+    let heading = esc(title);
     page(
         title,
         &format!(
             r#"{}
-<h1>{title}</h1>
+<h1>{heading}</h1>
 {body}"#,
             nav(Section::Repository, account, crumbs)
         ),

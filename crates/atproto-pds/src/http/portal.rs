@@ -192,6 +192,12 @@ const STYLESHEET: &str = include_str!(concat!(env!("OUT_DIR"), "/portal.css"));
 
 /// Shared chrome. Every portal page is this with a different body.
 pub(crate) fn page(title: &str, body: &str) -> Html<String> {
+    // Escape the title. Every portal page funnels through here, and some pass a
+    // request-derived value (a collection, an rkey, a handle) as the title, so
+    // an unescaped `<title>` is a reflected-XSS sink under this origin's
+    // `script-src 'unsafe-inline'` CSP. Escaping a static title ("Settings") is
+    // a no-op.
+    let title = esc(title);
     Html(format!(
         r#"<!doctype html>
 <html lang="en">
