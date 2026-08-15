@@ -420,6 +420,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches responses no handler produced: the 503 from load shedding, the 408 from a deadline, the
   500 from a caught panic.
 
+### Security
+- **The AppView proxy authenticates before resolving the target.** `resolve_target` dereferences the
+  caller-named `Atproto-Proxy` DID — an outbound DID-document fetch — and ran before `require_authn`, so an
+  unauthenticated request already triggered an outbound fetch (a blind request primitive, bounded only by
+  the syntactic host policy). Authentication now runs first; the target is resolved afterward, where it is
+  first needed for the `rpc:` scope check.
+
 ### Changed
 - A permission whose expansion produces a non-token string now grants **nothing**, rather than
   granting the members that parsed. One malformed member is not evidence the rest are trustworthy,

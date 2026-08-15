@@ -217,6 +217,20 @@ async fn proxy_call(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, XrpcError> {
+    // Authenticate before resolving the target. `resolve_target` dereferences
+    // the caller-named `Atproto-Proxy` DID — an outbound DID-document fetch —
+    // so running it first made an unauthenticated request a request generator.
+    // The target is only needed after this, for the `rpc:` scope check below,
+    // so authentication is the first thing that happens.
+    //
+    // `nsid` is the request path with `/xrpc/` stripped, so this reconstructs
+    // exactly what the client addressed. The query is deliberately absent:
+    // `htu` excludes it (RFC 9449 §4.2) and `request_htm_htu` would strip it
+    // again anyway.
+    let parts = build_parts_for_authn(&headers, &method, &format!("/xrpc/{nsid}"))?;
+    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
+    let subject = crate::http::auth::require_authn(&parts, state, &htm, &htu).await?;
+
     let target = match resolve_target(&headers, state, nsid).await? {
         Some(t) => t,
         None => {
@@ -241,13 +255,6 @@ async fn proxy_call(
             "account management is not configured on this PDS",
         )
     })?;
-    // `nsid` is the request path with `/xrpc/` stripped, so this reconstructs
-    // exactly what the client addressed. The query is deliberately absent:
-    // `htu` excludes it (RFC 9449 §4.2) and `request_htm_htu` would strip it
-    // again anyway.
-    let parts = build_parts_for_authn(&headers, &method, &format!("/xrpc/{nsid}"))?;
-    let (htm, htu) = request_htm_htu(&parts, state.trusted_proxy_hops);
-    let subject = crate::http::auth::require_authn(&parts, state, &htm, &htu).await?;
 
     // `rpc:` scopes bound which method may be called at which audience. Without
     // this a token could proxy arbitrary calls to arbitrary services on the
