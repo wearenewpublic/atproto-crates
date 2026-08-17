@@ -159,26 +159,65 @@ async fn fetch_did_document(
     Ok(Some(document))
 }
 
+/// What a service identifier resolved to.
+///
+/// The two unresolved outcomes are one answer to a caller — this identifier
+/// cannot be delivered to — and **neither is this server's fault**, so neither
+/// may become a 5xx. They are kept apart only so the message an operator reads
+/// tells an outage from a misconfiguration.
+///
+/// This is an enum rather than `PdsResult<Option<String>>` on purpose. As a
+/// `Result`, the unreachable case was a `PdsError::Storage` sitting one `?`
+/// away from a 500 that blamed this server for another host being down — and
+/// `getSpaceCredential` took that `?`, which is the defect this type exists to
+/// make unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceResolution {
+    /// The DID document was fetched and names a matching service entry.
+    Resolved(String),
+    /// The DID document was fetched and names no matching service entry — or
+    /// the identifier named a DID method this server does not resolve. A
+    /// configuration mistake: the answer will not change until somebody
+    /// changes it.
+    NoServiceEntry,
+    /// The DID document could not be fetched at all. Usually an outage —
+    /// for a `did:web` service identifier the document is served by the named
+    /// host itself, so "the app is down" and "its DID document is unreachable"
+    /// are the same event. The same request may well succeed later.
+    Unreachable,
+}
+
 /// Resolve a service identifier of the form `<did>#<fragment>` (e.g.
 /// `did:web:example.com#forum`) to the service's base endpoint URL by fetching
 /// the DID document and matching the service entry by fragment.
 ///
-/// Returns `Ok(None)` when the DID method is unsupported, the document has no
-/// matching service entry, or the identifier is malformed.
-///
-/// # Errors
-/// Returns [`PdsError::Storage`] on a DID-document fetch failure.
+/// Infallible by design — see [`ServiceResolution`]. The underlying fetch
+/// failure is logged here rather than returned, so every caller states the same
+/// rule about an unresolvable identifier and none can turn one into a server
+/// fault.
 pub async fn resolve_service_endpoint(
     http: &reqwest::Client,
     service_id: &str,
     plc_directory_hostname: Option<&str>,
-) -> PdsResult<Option<String>> {
+) -> ServiceResolution {
     let (did, fragment) = match service_id.split_once('#') {
         Some((did, frag)) => (did, Some(frag)),
         None => (service_id, None),
     };
-    let Some(document) = fetch_did_document(http, did, plc_directory_hostname).await? else {
-        return Ok(None);
+    let document = match fetch_did_document(http, did, plc_directory_hostname).await {
+        Ok(Some(document)) => document,
+        // An unsupported DID method is a fact about the identifier, settled
+        // without asking anybody.
+        Ok(None) => return ServiceResolution::NoServiceEntry,
+        Err(error) => {
+            tracing::warn!(
+                error = ?error,
+                service_id = %service_id,
+                did = %did,
+                "service identifier did not resolve: DID document fetch failed"
+            );
+            return ServiceResolution::Unreachable;
+        }
     };
     // Match the service whose `id` ends with the requested fragment
     // (DID documents render service ids as `<did>#frag` or `#frag`).
@@ -189,7 +228,10 @@ pub async fn resolve_service_endpoint(
         }
         None => Some(svc.service_endpoint.clone()),
     });
-    Ok(endpoint)
+    match endpoint {
+        Some(endpoint) => ServiceResolution::Resolved(endpoint),
+        None => ServiceResolution::NoServiceEntry,
+    }
 }
 
 /// Build the fallback recipient — used both as the result on failure

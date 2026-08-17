@@ -1728,6 +1728,94 @@ async fn delegation_token_then_space_credential_member_allowed() {
     assert!(sc_payload.get("client_id").is_none());
 }
 
+/// A managing app this server cannot reach denies the mint by name, not by
+/// falling over.
+///
+/// `#managingAppPolicy` decides the USER axis by asking the managing app, and
+/// before it can ask it resolves the app's service identifier to an endpoint.
+/// A `did:web` app serves its own DID document, so the app being down and its
+/// DID document being unreachable are one event — the *ordinary* failure of
+/// this configuration, not an exotic one.
+///
+/// It used to answer `500 InternalError` with the body scrubbed to "internal
+/// error", while the rarer misconfiguration (document present, no matching
+/// service entry) answered the well-named 403. That inverts the taxonomy under
+/// load: `NotAuthorized` is the mint's "could not decide", the one refusal a
+/// syncer must retry rather than act on, and a nameless 500 tells a client
+/// applying the ordinary fail-closed rule to stop retrying — so a member's data
+/// stops syncing for the length of the outage with nothing naming a cause.
+///
+/// `.invalid` is reserved by RFC 2606 and resolves nowhere, so this stays
+/// hermetic: no network is reachable from the test and none is wanted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_managing_app_denies_the_mint_by_name() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner_token =
+        create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let _ = create_account_and_token(&app, &manager, "did:plc:alice", "alice.example").await;
+    // `default` because [`read_scope`] names that skey; which space key this
+    // is has no bearing on what the test measures.
+    let uri = create_space(&app, &owner_token, "default").await;
+    post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.addMember",
+        json!({"space": uri, "did": "did:plc:alice"}),
+        Some(&owner_token),
+    )
+    .await;
+
+    // Gate the space on a managing app that resolves nowhere.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.updateSpace",
+        json!({
+            "space": uri,
+            "policy": {
+                "$type": "com.atproto.simplespace.defs#managingAppPolicy",
+                "managingApp": "did:web:purser.na1.invalid#purser",
+            },
+        }),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "updateSpace: {body}");
+
+    let alice_oauth = mint_oauth_access("did:plc:alice", &read_scope());
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getDelegationToken?space={}",
+            urlencode(&uri)
+        ),
+        Some(&alice_oauth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "getDelegationToken: {body}");
+    let grant = body["token"].as_str().unwrap().to_string();
+
+    let (status, body) = exchange_credential(&app, &grant, &uri, &throwaway_key(), None).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an unreachable managing app is a refusal, not a server fault: {body}"
+    );
+    assert_eq!(
+        body["error"], "NotAuthorized",
+        "the refusal must carry the taxonomy's undecided name: {body}"
+    );
+    assert!(
+        body.get("credential").is_none(),
+        "no credential is minted: {body}"
+    );
+    // The message distinguishes the outage from the misconfiguration, since
+    // the status and the error name no longer can.
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("could not fetch managingApp DID document"),
+        "the message must name the cause an operator has to act on: {body}"
+    );
+}
+
 /// A space credential is a capability its holder exercises, not a secret it
 /// hands over: every presentation carries a proof of possession, and the four
 /// ways of not having one are all refused.

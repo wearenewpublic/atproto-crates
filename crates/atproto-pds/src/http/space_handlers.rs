@@ -27,6 +27,29 @@
 //! Credentials (member + owner two-step flow):
 //! - `GET  /xrpc/com.atproto.space.getDelegationToken`  (member-OAuth)
 //! - `POST /xrpc/com.atproto.space.getSpaceCredential`  (no auth — grant *is* the auth)
+//!
+//! # A 5xx means *this* server broke
+//!
+//! Several methods here answer by asking somebody else: a managing app, an
+//! attesting client's metadata host, a member's DID document. Every fact this
+//! server learned from another host — **including "I could not ask them"** —
+//! is a 4xx with a name. A 5xx is reserved for this server failing at its own
+//! job, and nothing else.
+//!
+//! The reason is not tidiness. A 5xx carries no error name to branch on, and
+//! `PdsError::Storage` scrubs its message to the literal `internal error`, so a
+//! client is told nothing and its operator is told less. Worse, the taxonomy
+//! inverts under load: a managing app that is *down* is the ordinary failure,
+//! and if that answers 500 while a mistyped service entry answers a well-named
+//! 403, then the transient case is the one clients cannot retry sensibly.
+//!
+//! Within the mint's denial taxonomy that rule has a second half — *which*
+//! name. `UserNotAuthorized` and `AppNotAuthorized` are answers: this server
+//! asked and was told no, and a client may act on them (drop cached
+//! membership, stop offering the app). `NotAuthorized` is the absence of an
+//! answer: undecided, so a syncer backs off and retries. Anything this server
+//! could not determine belongs in the second bucket, however it failed to
+//! determine it.
 
 use crate::account::AccountManager;
 use crate::actor_store::sql::SqlActorStore;
@@ -2341,20 +2364,46 @@ pub async fn get_space_credential(
                 )
             })?;
             let plc_dir = state.plc_service.as_ref().map(|p| p.directory_hostname());
-            let endpoint = crate::space::recipient::resolve_service_endpoint(
+            // Both ways this resolution can fail leave the mint undecided, so
+            // both answer `NotAuthorized` — the taxonomy's "the host could not
+            // decide", which a syncer retries. Neither is this server breaking.
+            //
+            // The unreachable arm used to propagate through `XrpcError::from`
+            // as a `PdsError::Storage`, so a managing app being *down* — the
+            // ordinary outage, since a `did:web` app serves its own DID
+            // document — answered 500 InternalError with the body scrubbed to
+            // "internal error", while the misconfiguration answered the
+            // well-named 403. Inverted semantics under load, and nothing in a
+            // client's log naming a cause.
+            //
+            // The messages stay distinct because the status and the name no
+            // longer are: an operator reading them needs to tell an outage
+            // from a service entry nobody ever added.
+            let endpoint = match crate::space::recipient::resolve_service_endpoint(
                 &mint_http,
                 managing_app,
                 plc_dir,
             )
             .await
-            .map_err(XrpcError::from)?
-            .ok_or_else(|| {
-                XrpcError::new(
-                    StatusCode::FORBIDDEN,
-                    "NotAuthorized",
-                    format!("could not resolve managingApp service endpoint: {managing_app}"),
-                )
-            })?;
+            {
+                crate::space::recipient::ServiceResolution::Resolved(endpoint) => endpoint,
+                crate::space::recipient::ServiceResolution::Unreachable => {
+                    return Err(XrpcError::new(
+                        StatusCode::FORBIDDEN,
+                        "NotAuthorized",
+                        format!("could not fetch managingApp DID document: {managing_app}"),
+                    ));
+                }
+                crate::space::recipient::ServiceResolution::NoServiceEntry => {
+                    return Err(XrpcError::new(
+                        StatusCode::FORBIDDEN,
+                        "NotAuthorized",
+                        format!(
+                            "managingApp DID document has no matching service entry: {managing_app}"
+                        ),
+                    ));
+                }
+            };
             crate::space::mint_authz::check_user_access(
                 &mint_http,
                 &endpoint,
@@ -3596,14 +3645,9 @@ pub async fn register_notify(
                 match crate::space::recipient::resolve_service_endpoint(&http, service, plc_dir)
                     .await
                 {
-                    Ok(Some(endpoint)) => endpoint,
-                    Ok(None) => return Err(not_resolvable()),
-                    Err(error) => {
-                        tracing::debug!(
-                            error = ?error,
-                            service = %service,
-                            "registerNotify: service identifier did not resolve"
-                        );
+                    crate::space::recipient::ServiceResolution::Resolved(endpoint) => endpoint,
+                    crate::space::recipient::ServiceResolution::NoServiceEntry
+                    | crate::space::recipient::ServiceResolution::Unreachable => {
                         return Err(not_resolvable());
                     }
                 };

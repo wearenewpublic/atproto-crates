@@ -225,8 +225,18 @@ fn now_secs() -> u64 {
 /// JWS signature.
 ///
 /// # Errors
-/// Returns [`MintDenial::InvalidClientAttestation`] for any malformed,
-/// unresolvable, mis-targeted, replayed, or signature-invalid attestation.
+/// Returns [`MintDenial::InvalidClientAttestation`] for a malformed,
+/// mis-targeted, replayed, or signature-invalid attestation — every verdict
+/// this server reached by *looking at the attestation*, which will not change
+/// on a retry.
+///
+/// Returns [`MintDenial::NotAuthorized`] when the client's own documents could
+/// not be read: the metadata or JWKS host refused the connection, timed out, or
+/// answered 5xx. This server did not decide the attestation was bad, it failed
+/// to find out — the same distinction [`check_user_access`] draws for the
+/// managing app, and the reason a client may retry it. A 4xx from those hosts
+/// stays [`MintDenial::InvalidClientAttestation`]: a `client_id` whose metadata
+/// document is not there is a settled fact about the attestation.
 pub async fn verify_client_attestation(
     http: &reqwest::Client,
     jti_guard: &crate::security::JtiReplayGuard,
@@ -324,17 +334,8 @@ pub async fn verify_client_attestation(
         .map_err(|_| invalid("attestation jti already used (replay)".to_string()))?;
 
     // Resolve the client-metadata document.
-    let metadata: ClientMetadata = http
-        .get(&client_id)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| invalid(format!("fetch client-metadata {client_id}: {e}")))?
-        .error_for_status()
-        .map_err(|e| invalid(format!("client-metadata {client_id} status: {e}")))?
-        .json()
-        .await
-        .map_err(|e| invalid(format!("parse client-metadata {client_id}: {e}")))?;
+    let metadata: ClientMetadata =
+        fetch_client_document(http, &client_id, "client-metadata").await?;
 
     // Resolve the JWKS (inline `jwks` wins; else fetch `jwks_uri`).
     let jwks: WrappedJsonWebKeySet = match (metadata.jwks, metadata.jwks_uri) {
@@ -348,16 +349,7 @@ pub async fn verify_client_attestation(
                     "jwks_uri is not a permitted endpoint: {uri}: {err}"
                 ))
             })?;
-            http.get(&uri)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|e| invalid(format!("fetch jwks_uri {uri}: {e}")))?
-                .error_for_status()
-                .map_err(|e| invalid(format!("jwks_uri {uri} status: {e}")))?
-                .json()
-                .await
-                .map_err(|e| invalid(format!("parse jwks_uri {uri}: {e}")))?
+            fetch_client_document(http, &uri, "jwks_uri").await?
         }
         (None, None) => {
             return Err(invalid(
@@ -393,6 +385,60 @@ pub async fn verify_client_attestation(
         .map_err(|e| invalid(format!("attestation signature invalid: {e}")))?;
 
     Ok(client_id)
+}
+
+/// Fetch and decode one of the attesting client's own JSON documents — its
+/// client metadata, or the JWKS that metadata points at.
+///
+/// Splits the failures by who answered, because the two mean opposite things
+/// to a caller:
+///
+/// - Nobody answered (connect refused, timeout, connection dropped mid-body),
+///   or the host answered 5xx / 429 — this server did not learn whether the
+///   attestation is good. [`MintDenial::NotAuthorized`]: undecided, retryable.
+/// - The host answered 4xx, or served something that is not the document —
+///   the attestation names a `client_id` whose documents are not there or not
+///   usable. [`MintDenial::InvalidClientAttestation`]: decided, and a retry
+///   will decide the same.
+///
+/// Collapsing these into "invalid attestation", as this used to, tells a client
+/// its attestation is bad whenever the client's own host has a bad minute.
+async fn fetch_client_document<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    what: &str,
+) -> Result<T, MintDenial> {
+    let response = http
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| MintDenial::NotAuthorized {
+            reason: format!("fetch {what} {url}: {e}"),
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let reason = format!("{what} {url} status: {status}");
+        return Err(
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                MintDenial::NotAuthorized { reason }
+            } else {
+                MintDenial::InvalidClientAttestation { reason }
+            },
+        );
+    }
+
+    response.json::<T>().await.map_err(|e| {
+        let reason = format!("parse {what} {url}: {e}");
+        // `is_decode` separates "served bytes that are not this document" from
+        // a body that never finished arriving.
+        if e.is_decode() {
+            MintDenial::InvalidClientAttestation { reason }
+        } else {
+            MintDenial::NotAuthorized { reason }
+        }
+    })
 }
 
 /// Output of `com.atproto.simplespace.checkUserAccess`.
@@ -738,5 +784,62 @@ mod tests {
                 "{hostile} was refused only after being fetched: {reason}"
             );
         }
+    }
+
+    /// A client whose metadata host cannot be reached leaves the mint
+    /// *undecided*, not decided against the attestation.
+    ///
+    /// The two denials are read differently by anything holding a credential:
+    /// `InvalidClientAttestation` says the attestation is bad, which a client
+    /// should not retry with, while `NotAuthorized` says this server could not
+    /// find out — the same thing [`check_user_access`] returns for its own
+    /// network failures, and the one a syncer backs off on. Reporting an
+    /// outage as the former tells an app its attestation is broken every time
+    /// its own host has a bad minute.
+    ///
+    /// `.invalid` is reserved by RFC 2606, so this reaches no network.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_client_metadata_host_is_undecided_not_invalid() {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let guard = crate::security::JtiReplayGuard::new(64);
+        let space: SpaceUri = "at://did:plc:owner/space/app.bsky.group/default"
+            .parse()
+            .unwrap();
+
+        // Structurally sound and correctly targeted, so verification runs all
+        // the way to the fetch — which is the step under test.
+        let client_id = "https://app.na1.invalid/client-metadata.json";
+        let now = now_secs();
+        let header = B64URL.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "typ": TYP_CLIENT_ATTESTATION,
+                "alg": "ES256",
+            }))
+            .unwrap(),
+        );
+        let payload = B64URL.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "iss": client_id,
+                "sub": client_id,
+                "aud": space_host_audience(&space.space_did),
+                "jti": "unreachable-host-test",
+                "iat": now,
+                "exp": now + 60,
+            }))
+            .unwrap(),
+        );
+        let attestation = format!("{header}.{payload}.c2ln");
+
+        let result = verify_client_attestation(&http, &guard, &attestation, &space).await;
+        let Err(MintDenial::NotAuthorized { reason }) = result else {
+            panic!("an unreachable metadata host must be undecided, got: {result:?}");
+        };
+        assert!(
+            reason.contains("client-metadata"),
+            "the reason must name what could not be fetched: {reason}"
+        );
     }
 }

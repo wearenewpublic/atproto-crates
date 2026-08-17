@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- **An unreachable managing app denies a space-credential mint by name instead of answering 500.**
+  `com.atproto.space.getSpaceCredential` on a `#managingAppPolicy` space resolves the app's service
+  identifier before it can ask `checkUserAccess`, and the two ways that resolution could fail were
+  reported oppositely: a DID document present without a matching service entry answered the correct
+  `403 NotAuthorized`, while a document that could not be fetched at all became `PdsError::Storage` and
+  therefore `500 InternalError` with the body scrubbed to the literal `internal error`.
+
+  That inverted the taxonomy under load. A `did:web` managing app serves its own DID document, so "the app
+  is down" and "its DID document is unreachable" are one event — the ordinary failure of this
+  configuration — while the well-named 403 required the app to be up enough to serve a document but
+  misconfigured within it. `NotAuthorized` is proposal 0016's "the host could not decide", the one refusal
+  a syncer must retry rather than act on; a nameless 500 tells a client applying the ordinary fail-closed
+  rule to stop retrying, so a member's data stopped syncing for the length of the outage with nothing
+  naming a cause. Both outcomes now answer `403 NotAuthorized`, with messages that still separate the
+  outage from the misconfiguration for whoever has to fix one of them.
+
+  `resolve_service_endpoint` no longer returns a `Result` at all. It answers a three-way
+  `ServiceResolution` (`Resolved` / `NoServiceEntry` / `Unreachable`) and logs the underlying fetch
+  failure itself, so the error can no longer sit one `?` away from a 500 that blames this server for
+  another host being down. Both call sites — the mint and `registerNotify` — state the same rule about an
+  unresolvable identifier. **Breaking** for anything outside this workspace calling that function.
+
+- **A client attestation is no longer called invalid because the client's own host had a bad minute.**
+  `verify_client_attestation` mapped every failure while fetching the attesting client's metadata or JWKS
+  to `InvalidClientAttestation` — an authoritative "your attestation is bad" that a client should not
+  retry with. Connection failures, timeouts, 5xx, 429, and a body that stops arriving mid-read now answer
+  `NotAuthorized`, the undecided-and-retryable name, matching what `check_user_access` already returns for
+  its own network failures. A 4xx from those hosts, or a document served that is not the document, stays
+  `InvalidClientAttestation`: those are settled facts about the attestation.
+
+  The rule is now stated in `space_handlers`' module docs and held to across the surface: a 5xx from this
+  server means *this server* broke, and every fact it learned from somebody else — including "I could not
+  ask them" — is a 4xx with a name.
+
 - **`com.atproto.simplespace.createSpace` is idempotent on re-create, as it always said it was.** A
   second create naming the same `skey` answered `400 SpaceError error-atproto-space-members-1 member
   already exists`, because the guard that skips seeding the owner tested `rows_affected() > 0` after an
