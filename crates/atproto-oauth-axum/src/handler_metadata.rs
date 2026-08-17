@@ -95,3 +95,69 @@ pub async fn handle_oauth_metadata(oauth_client_config: OAuthClientConfig) -> im
     };
     Json(resp)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atproto_identity::key::{KeyType, generate_key};
+
+    /// The private key types a confidential client can be configured with.
+    const PRIVATE_KEY_TYPES: [KeyType; 3] = [
+        KeyType::P256Private,
+        KeyType::P384Private,
+        KeyType::K256Private,
+    ];
+
+    /// Render a handler response the way a peer receives it: as bytes.
+    async fn served_body(response: impl IntoResponse) -> String {
+        let body = response.into_response().into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read response body");
+        String::from_utf8(bytes.to_vec()).expect("response body is UTF-8")
+    }
+
+    #[tokio::test]
+    async fn inline_jwks_never_carries_a_private_scalar() {
+        // This handler was already correct. The assertion exists so it stays
+        // that way — it is the same disclosure that `handle_oauth_jwks` had.
+        for key_type in PRIVATE_KEY_TYPES {
+            let signing_key = generate_key(key_type.clone()).expect("generate signing key");
+            let config = OAuthClientConfig {
+                client_id: "https://example.com/oauth/client-metadata.json".to_string(),
+                redirect_uris: "https://example.com/oauth/callback".to_string(),
+                signing_keys: vec![signing_key],
+                ..Default::default()
+            };
+
+            let served = served_body(handle_oauth_metadata(config).await).await;
+
+            assert!(
+                !served.contains("\"d\""),
+                "client metadata for {key_type:?} published a private scalar: {served}"
+            );
+            assert!(
+                served.contains("\"jwks\""),
+                "client metadata for {key_type:?} published no inline jwks: {served}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jwks_uri_replaces_the_inline_key_set() {
+        let signing_key = generate_key(KeyType::P256Private).expect("generate signing key");
+        let config = OAuthClientConfig {
+            client_id: "https://example.com/oauth/client-metadata.json".to_string(),
+            redirect_uris: "https://example.com/oauth/callback".to_string(),
+            jwks_uri: Some("https://example.com/oauth/jwks".to_string()),
+            signing_keys: vec![signing_key],
+            ..Default::default()
+        };
+
+        let served = served_body(handle_oauth_metadata(config).await).await;
+
+        assert!(!served.contains("\"d\""), "{served}");
+        assert!(served.contains("\"jwks_uri\""), "{served}");
+        assert!(!served.contains("\"jwks\":"), "{served}");
+    }
+}
