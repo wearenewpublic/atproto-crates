@@ -296,6 +296,24 @@ pub use crate::space::GetSpaceOutput;
 pub use crate::space::SpaceInfo;
 
 /// `POST /xrpc/com.atproto.simplespace.createSpace`.
+///
+/// **Idempotent on re-create.** A space URI is `did + type + skey`, so a caller
+/// that sends an explicit `skey` is naming a particular space. Sending the same
+/// one twice answers `200 {uri}` both times with the same URI — it does not
+/// error — so a double-submitted create dialog converges on its own. Clients
+/// need no error-matching for this; in particular there is no
+/// `error-atproto-space-members-1` on the replay path, which is what this used
+/// to return.
+///
+/// The replay changes nothing: the space keeps its original `createdAt`, its
+/// member set keeps exactly one owner entry, records written in between
+/// survive, and the stored `policy`/`appAccess` are **left as they are**. A
+/// replay carrying a different config does not apply it — use `updateSpace` to
+/// reconfigure — so a client that cares whether the gates match what it asked
+/// for should read `getSpace` back rather than infer it from the 200.
+///
+/// Omitting `skey` asks for a new space and gets a fresh TID, which is the way
+/// to create rather than converge.
 pub async fn create_space(
     State(state): State<HttpState>,
     parts: Parts,

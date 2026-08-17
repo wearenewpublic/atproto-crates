@@ -55,9 +55,25 @@ impl SpaceService {
 
     /// `createSpace` — owner-side. Inserts a `space` row marked `is_owner=1`
     /// in the owner's per-actor store, seeds the member-list state, and adds
-    /// the owner as the first member of the space. Idempotent: re-creating the
-    /// same URI is a no-op on the second call (the duplicate member-add is
-    /// skipped via the `INSERT OR IGNORE` semantics in `SpaceMembersStorage`).
+    /// the owner as the first member of the space.
+    ///
+    /// # Idempotent on re-create
+    ///
+    /// A space URI is `did + type + skey`, so naming an explicit `skey` names a
+    /// particular space rather than asking for a new one. Re-creating a space
+    /// that already exists therefore **succeeds** and converges on what is
+    /// there: the same URI, the row's original `created_at`, and a member set
+    /// still holding exactly one owner entry. Callers may rely on this — a
+    /// double-submitted create dialog needs no error-matching to converge.
+    ///
+    /// Convergence is deliberately non-destructive. The existing `created_at`
+    /// and the stored config (`mint_policy`, `app_access`, `managing_app`) are
+    /// left alone, so a stale retry carrying an older config cannot quietly
+    /// widen a space's gates; reconfiguration is
+    /// [`update_space`](Self::update_space)'s job. What the conflict branch
+    /// *does* reassert is `is_owner`/`is_member`, which repairs a row some
+    /// other path inserted first with those flags at their defaults (see
+    /// `ensure_space_row` in the repo and member storages).
     pub async fn create_space(
         &self,
         owner_did: &str,
@@ -73,10 +89,12 @@ impl SpaceService {
         let now = Utc::now().to_rfc3339();
         let mint_policy = config.mint_policy.as_str().to_string();
         let app_access = config.app_access.to_storage_json()?;
-        // Use INSERT … ON CONFLICT here so the existing `created_at` is
-        // preserved on re-creation; the conflict branch reasserts the
-        // owner/member flags in case they were unset by a prior takedown.
-        let inserted = sqlx::query(
+        // Use INSERT … ON CONFLICT here so the existing `created_at` and
+        // config are preserved on re-creation; the conflict branch reasserts
+        // the owner/member flags, which is what upgrades a row inserted by one
+        // of the `ensure_space_row` side paths (or left behind by a takedown)
+        // into the authority's own.
+        sqlx::query(
             "INSERT INTO space (uri, is_owner, is_member, created_at, mint_policy, app_access, managing_app)
              VALUES (?, 1, 1, ?, ?, ?, ?)
              ON CONFLICT(uri) DO UPDATE SET is_owner = 1, is_member = 1",
@@ -103,26 +121,60 @@ impl SpaceService {
             reason: format!("createSpace seed member_state: {e}"),
         })?;
 
-        // On first creation, add the owner as the initial member so the
-        // member set contains them from t=0. Skipped on idempotent re-create
-        // (rows_affected == 0) since a second `Add` for the same DID would
-        // fail the SpaceMembers duplicate-add check.
-        if inserted.rows_affected() > 0 {
-            let storage = SqlSpaceMembersStorage::new(store.pool().clone());
-            let members: SpaceMembers<SqlSpaceMembersStorage, PdsSetHash> =
-                SpaceMembers::new(uri.clone(), storage);
-            let prepared = members
-                .format_commit(&[MemberOp {
-                    action: MemberOpAction::Add,
-                    did: owner_did.to_string(),
-                }])
-                .await
-                .map_err(space_err)?;
-            members.apply_commit(prepared).await.map_err(space_err)?;
+        // Add the owner as the initial member so the member set contains them
+        // from t=0. This is written to *tolerate* the owner already being
+        // there rather than to predict it: the goal is a postcondition — the
+        // owner is in the member set — and the member layer is the only thing
+        // that can say whether it already holds.
+        //
+        // The previous shape inferred it instead, skipping the add when
+        // `rows_affected() == 0` after the upsert above. That never happened:
+        // `ON CONFLICT … DO UPDATE` performs an update, which SQLite counts, so
+        // every re-create looked like a first creation and tripped exactly the
+        // duplicate-add the guard existed to avoid.
+        let storage = SqlSpaceMembersStorage::new(store.pool().clone());
+        let members: SpaceMembers<SqlSpaceMembersStorage, PdsSetHash> =
+            SpaceMembers::new(uri.clone(), storage);
+        match members
+            .format_commit(&[MemberOp {
+                action: MemberOpAction::Add,
+                did: owner_did.to_string(),
+            }])
+            .await
+        {
+            Ok(prepared) => {
+                if let Err(err) = members.apply_commit(prepared).await {
+                    // Two creates racing: both read an empty member set, and
+                    // the loser's commit hits the `space_member` primary key.
+                    // Asking whether the postcondition holds is the same
+                    // question as before, so answer it the same way rather
+                    // than reading the storage error.
+                    tracing::debug!(
+                        error = ?err,
+                        space = %uri,
+                        owner = owner_did,
+                        "createSpace owner seed failed; re-checking membership"
+                    );
+                    if !members.is_member(owner_did).await.map_err(space_err)? {
+                        return Err(space_err(err));
+                    }
+                }
+            }
+            // The owner is already a member: this is a re-create, and the
+            // postcondition holds without a second commit.
+            Err(atproto_space::SpaceError::MemberAlreadyExists { .. }) => {
+                tracing::debug!(
+                    space = %uri,
+                    owner = owner_did,
+                    "createSpace converged on an existing space"
+                );
+            }
+            Err(err) => return Err(space_err(err)),
         }
 
-        // Re-read created_at so the response reflects the persisted row even
-        // on idempotent re-create (where the INSERT was a no-op).
+        // Re-read created_at so the response reflects the persisted row rather
+        // than the `now` bound above: on a re-create the conflict branch left
+        // the original timestamp in place, and that is the space's.
         let created_at: String = sqlx::query_scalar("SELECT created_at FROM space WHERE uri = ?")
             .bind(uri.to_string())
             .fetch_one(store.pool())
@@ -753,6 +805,154 @@ mod tests {
             got.app_access["$type"],
             crate::space::config::APP_ACCESS_OPEN_TYPE
         );
+    }
+
+    /// Re-creating the same space converges: same URI, original `created_at`,
+    /// one owner in the member set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_space_replayed_converges_on_the_existing_space() {
+        let (svc, _tmp) = fresh_service().await;
+        let first = svc
+            .create_space(
+                "did:plc:owner",
+                "app.bsky.group",
+                "default",
+                SpaceConfig::default(),
+            )
+            .await
+            .expect("first create");
+        let second = svc
+            .create_space(
+                "did:plc:owner",
+                "app.bsky.group",
+                "default",
+                SpaceConfig::default(),
+            )
+            .await
+            .expect("a replayed create must converge, not refuse");
+
+        assert_eq!(second.uri, first.uri);
+        assert_eq!(
+            second.created_at, first.created_at,
+            "the replay must report the persisted created_at, not `now`"
+        );
+        assert!(second.is_owner);
+        assert!(second.is_member);
+
+        let uri = first.uri.parse::<SpaceUri>().unwrap();
+        let page = svc.list_members(&uri, None, 10).await.unwrap();
+        assert_eq!(page.members.len(), 1, "owner must not be seeded twice");
+        assert_eq!(page.members[0].did, "did:plc:owner");
+    }
+
+    /// Two creates of the same space racing each other both converge.
+    ///
+    /// A double-submitted create dialog can arrive concurrently, in which case
+    /// neither call sees the other's member set and the loser's commit hits the
+    /// `space_member` primary key. Both callers are owed the same answer, and
+    /// the member set is owed exactly one owner entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_creates_of_one_space_both_converge() {
+        let (svc, _tmp) = fresh_service().await;
+        let svc = Arc::new(svc);
+        // Open the per-actor store first. Racing four *first* opens of a fresh
+        // actor database races its migrations instead, which is a different
+        // matter than the one under test here.
+        svc.create_space(
+            "did:plc:owner",
+            "app.bsky.group",
+            "warm",
+            SpaceConfig::default(),
+        )
+        .await
+        .expect("warm the actor store");
+        let calls: Vec<_> = (0..4)
+            .map(|_| {
+                let svc = svc.clone();
+                tokio::spawn(async move {
+                    svc.create_space(
+                        "did:plc:owner",
+                        "app.bsky.group",
+                        "default",
+                        SpaceConfig::default(),
+                    )
+                    .await
+                })
+            })
+            .collect();
+
+        let mut uris = Vec::new();
+        for call in calls {
+            let info = call
+                .await
+                .expect("task should not panic")
+                .expect("every racing create must converge");
+            uris.push(info.uri);
+        }
+        assert!(
+            uris.windows(2).all(|w| w[0] == w[1]),
+            "every caller must be told the same URI: {uris:?}"
+        );
+
+        let uri = uris[0].parse::<SpaceUri>().unwrap();
+        let page = svc.list_members(&uri, None, 10).await.unwrap();
+        assert_eq!(page.members.len(), 1, "one owner entry, not four");
+        assert_eq!(page.members[0].did, "did:plc:owner");
+    }
+
+    /// The conflict branch's reason to exist: a `space` row that some other
+    /// path put there first, with the owner/member flags at their defaults.
+    ///
+    /// `ensure_space_row` in the repo and member storages (and the inbound
+    /// notify path) all insert a bare row the moment they need one, and none of
+    /// them can know the row belongs to the authority. `createSpace` arriving
+    /// afterwards is what makes the row say so — which is why the upsert
+    /// reasserts `is_owner`/`is_member` rather than doing nothing on conflict.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_space_repairs_a_row_seeded_without_the_owner_flags() {
+        let (svc, _tmp) = fresh_service().await;
+        let store = SqlActorStore::open(&svc.data_dir, "did:plc:owner")
+            .await
+            .unwrap();
+        let uri = "at://did:plc:owner/space/app.bsky.group/default";
+        let seeded_at = "2020-01-01T00:00:00+00:00";
+        sqlx::query("INSERT INTO space (uri, is_owner, is_member, created_at) VALUES (?, 0, 0, ?)")
+            .bind(uri)
+            .bind(seeded_at)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let info = svc
+            .create_space(
+                "did:plc:owner",
+                "app.bsky.group",
+                "default",
+                SpaceConfig::default(),
+            )
+            .await
+            .expect("createSpace over a seeded row");
+        assert_eq!(info.uri, uri);
+        assert_eq!(
+            info.created_at, seeded_at,
+            "the seeded row's created_at is the space's"
+        );
+
+        // The flags are repaired, which is what `listSpaces` reads.
+        let page = svc
+            .list_spaces("did:plc:owner", None, None, None, 10)
+            .await
+            .unwrap();
+        let row = page.spaces.iter().find(|s| s.uri == uri).expect("row");
+        assert!(row.is_owner, "createSpace must reassert is_owner");
+        assert!(row.is_member, "createSpace must reassert is_member");
+
+        // And the owner is seeded into the member list, which the bare row had
+        // no way to do.
+        let parsed = uri.parse::<SpaceUri>().unwrap();
+        let page = svc.list_members(&parsed, None, 10).await.unwrap();
+        assert_eq!(page.members.len(), 1);
+        assert_eq!(page.members[0].did, "did:plc:owner");
     }
 
     #[tokio::test(flavor = "multi_thread")]

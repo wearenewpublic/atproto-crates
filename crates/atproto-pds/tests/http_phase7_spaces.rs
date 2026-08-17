@@ -489,6 +489,198 @@ async fn create_space_did_must_match_caller() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// A `createSpace` replayed with the same `skey` converges on the space that
+/// is already there, and takes nothing with it.
+///
+/// The space URI is `did + type + skey`, so a caller that names an explicit
+/// `skey` is naming a particular space rather than asking for a new one — a
+/// double-submitted create dialog is the ordinary case. The contract is a
+/// 200 carrying the same URI and the original `createdAt`; anything the space
+/// had accumulated in between survives.
+///
+/// This used to answer `400 SpaceError error-atproto-space-members-1 member
+/// already exists`, because the owner-seeding guard tested
+/// `rows_affected() > 0` after an `ON CONFLICT … DO UPDATE` — which counts the
+/// updated row, so the guard never fired and the owner was added twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_replay_is_idempotent_and_non_destructive() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    let uri = create_space(&app, &token, "default").await;
+    let created_at = space_created_at(&app, &token, &uri).await;
+
+    // Something accumulates in the space between the two creates.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "repo": "did:plc:owner",
+            "space": uri,
+            "writes": [{
+                "action": "create",
+                "collection": "app.bsky.group.message",
+                "rkey": "before-replay",
+                "value": {"text": "written before the replay"}
+            }]
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed write failed: {body}");
+
+    // The replay: identical input, explicit skey.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": "app.bsky.group", "skey": "default"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a replayed createSpace must converge, not refuse: {body}"
+    );
+    assert_eq!(body["uri"], uri, "the replay must name the same space");
+
+    // Non-destructive: the row keeps its original createdAt.
+    assert_eq!(
+        space_created_at(&app, &token, &uri).await,
+        created_at,
+        "the replay must not restamp createdAt"
+    );
+
+    // Non-destructive: exactly one owner entry in the member set, not two.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}",
+            urlencode(&uri)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let members = body["members"].as_array().expect("members array");
+    assert_eq!(
+        members.len(),
+        1,
+        "the replay must not duplicate the owner's membership: {body}"
+    );
+    assert_eq!(members[0]["did"], "did:plc:owner");
+
+    // Non-destructive: the record written between the creates is still there.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&repo=did:plc:owner&collection=app.bsky.group.message&rkey=before-replay",
+            urlencode(&uri)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["value"]["text"], "written before the replay");
+
+    // A third identical create is stable rather than degrading further.
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": "app.bsky.group", "skey": "default"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the third create must agree: {body}"
+    );
+    assert_eq!(body["uri"], uri);
+    assert_eq!(
+        space_created_at(&app, &token, &uri).await,
+        created_at,
+        "the third create must not restamp createdAt either"
+    );
+    let (status, body) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.simplespace.listMembers?space={}",
+            urlencode(&uri)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["members"].as_array().expect("members").len(), 1);
+}
+
+/// A replay carrying a *different* config leaves the stored config alone.
+///
+/// `createSpace` creates; `updateSpace` reconfigures. Were the conflict branch
+/// to overwrite the config, a stale retry of an old create dialog could quietly
+/// widen a space's gates long after the owner had narrowed them.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_replay_does_not_reconfigure_the_space() {
+    let (app, manager, _tmp) = build_app().await;
+    let token = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": "app.bsky.group", "skey": "default", "policy": "member-list"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let uri = body["uri"].as_str().unwrap().to_string();
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": "app.bsky.group", "skey": "default", "policy": "public"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["uri"], uri);
+
+    let (status, info) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {info}");
+    assert_eq!(
+        info["policy"]["$type"], "com.atproto.simplespace.defs#memberListPolicy",
+        "a replay must not reconfigure the space: {info}"
+    );
+}
+
+/// Read one space's `createdAt` back out of `listSpaces`, which is the only
+/// place the wire surface exposes it (`createSpace` answers `{uri}` alone).
+async fn space_created_at(app: &axum::Router, token: &str, uri: &str) -> String {
+    let (status, body) = get_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.listSpaces",
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "listSpaces failed: {body}");
+    body["spaces"]
+        .as_array()
+        .expect("spaces array")
+        .iter()
+        .find(|s| s["uri"] == uri)
+        .unwrap_or_else(|| panic!("listSpaces did not carry {uri}: {body}"))["createdAt"]
+        .as_str()
+        .expect("createdAt string")
+        .to_string()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn update_space_reflects_in_get_space() {
     let (app, manager, _tmp) = build_app().await;

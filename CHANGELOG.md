@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- **`com.atproto.simplespace.createSpace` is idempotent on re-create, as it always said it was.** A
+  second create naming the same `skey` answered `400 SpaceError error-atproto-space-members-1 member
+  already exists`, because the guard that skips seeding the owner tested `rows_affected() > 0` after an
+  `INSERT … ON CONFLICT(uri) DO UPDATE`. An upsert's conflict branch *performs* an update, which SQLite
+  counts, so the guard never fired: every re-create looked like a first creation and tripped exactly the
+  duplicate-add it existed to prevent. Three comments in that function called the path idempotent, so this
+  was a defect against intent rather than a design choice.
+
+  The owner-seeding step no longer predicts what the member layer will do from a row count — it attempts
+  the add and treats `MemberAlreadyExists` as the postcondition already holding, which cannot be wrong
+  about it however the upsert reports itself. Two creates arriving *concurrently* converge for the same
+  reason: neither sees the other's member set, the loser's commit hits the `space_member` primary key, and
+  the answer is the same question re-asked — is the owner in the member set? — rather than a storage error
+  read for its wording. The contract is now stated where callers can read it: a
+  replayed `createSpace` answers `200 {uri}` with the same URI and the space's original `createdAt`; the
+  member set keeps exactly one owner entry; records written in between survive; and the stored
+  `policy`/`appAccess` are left alone, so a stale retry cannot quietly widen a space's gates.
+  Reconfiguration remains `updateSpace`'s job, and omitting `skey` remains how to ask for a new space.
+
+  Wire-compatible: a call that used to fail now succeeds, and nothing that used to succeed changed. A
+  client converging by matching `error-atproto-space-members-1` on the replay path will no longer see that
+  error and can drop the substring match.
+
 ### Security
 - **The account-portal repository browser escapes the collection/rkey it echoes back, closing a
   reflected XSS.** `GET /account/repository/public/{segment}` (and the record and space variants) rendered
