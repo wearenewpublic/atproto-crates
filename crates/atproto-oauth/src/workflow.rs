@@ -134,7 +134,58 @@ pub fn bind_token_subject(
     expected_subject: &str,
     token_response: &TokenResponse,
 ) -> Result<(), OAuthClientError> {
-    if expected_subject.is_empty() {
+    bind_subject(SubjectBinding::Pinned(expected_subject), token_response).map(|_| ())
+}
+
+/// How the token response's `sub` is bound.
+///
+/// §4.6 of the AT Protocol OAuth specification allows three login-hint shapes.
+/// Two of them -- a handle and a DID -- name an account, so the flow knows
+/// which DID it is for before the redirect and can pin it. The third names a
+/// **server**, and there is no account in it to pin: a caller that only has
+/// [`SubjectBinding::Pinned`] cannot support that shape at all, and refusing
+/// at the callback instead would mean the user types a URL, is redirected,
+/// signs in, comes back, and only then learns it was never going to work.
+#[derive(Debug, Clone, Copy)]
+pub enum SubjectBinding<'a> {
+    /// The DID was known before the redirect. `sub` must equal it.
+    ///
+    /// The default, and what a handle or DID login hint should use. It is what
+    /// makes minting a session for the wrong account impossible.
+    Pinned(&'a str),
+
+    /// The subject was not knowable in advance -- the login hint named a
+    /// server, not an account. `sub` is accepted as whatever the authorization
+    /// server proved, and handed to the caller.
+    ///
+    /// This is **not** weaker by accident. The RFC 9207 `iss` check (see
+    /// [`bind_response_issuer`]) and the PKCE verifier still bind the response
+    /// to this flow; what is given up is only the prior expectation about
+    /// *which* account, which the caller never had. A `sub` that is absent
+    /// altogether is still refused: the token response has to say who it is
+    /// for.
+    Discovered,
+}
+
+/// Bind a token response's `sub` and return the subject it settled on.
+///
+/// # Errors
+///
+/// Returns [`OAuthClientError::MissingExpectedSubject`] for an empty pin,
+/// [`OAuthClientError::TokenResponseMissingSubject`] when the response names
+/// no subject at all, and [`OAuthClientError::TokenSubjectMismatch`] when a
+/// pinned subject does not match.
+pub fn bind_subject(
+    binding: SubjectBinding<'_>,
+    token_response: &TokenResponse,
+) -> Result<String, OAuthClientError> {
+    // Rejected before the comparison, and in `oauth_complete` before any
+    // network work, so the binding can never be a silent no-op. An empty
+    // expectation is a caller that meant to pin and had nothing to pin with,
+    // which is a different thing from `Discovered`.
+    if let SubjectBinding::Pinned(expected) = binding
+        && expected.is_empty()
+    {
         return Err(OAuthClientError::MissingExpectedSubject);
     }
 
@@ -143,14 +194,52 @@ pub fn bind_token_subject(
         .as_deref()
         .ok_or(OAuthClientError::TokenResponseMissingSubject)?;
 
-    if actual != expected_subject {
+    if let SubjectBinding::Pinned(expected) = binding
+        && actual != expected
+    {
         tracing::warn!(
-            expected = %expected_subject,
+            expected = %expected,
             actual = %actual,
             "Token endpoint returned a subject other than the DID the flow began for"
         );
         return Err(OAuthClientError::TokenSubjectMismatch {
-            expected: expected_subject.to_string(),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+
+    Ok(actual.to_string())
+}
+
+/// Check an authorization response's `iss` parameter against the server the
+/// flow was started with (RFC 9207).
+///
+/// AT Protocol requires the parameter, so an absent one is a refusal rather
+/// than a tolerated omission. It matters most under
+/// [`SubjectBinding::Discovered`]: with no prior expectation about the
+/// account, `iss` and the PKCE verifier are what is left binding the response
+/// to this flow.
+///
+/// # Errors
+///
+/// Returns [`OAuthClientError::AuthorizationResponseMissingIssuer`] when the
+/// callback carried no `iss`, and
+/// [`OAuthClientError::AuthorizationResponseIssuerMismatch`] when it named a
+/// different server.
+pub fn bind_response_issuer(
+    expected_issuer: &str,
+    callback_issuer: Option<&str>,
+) -> Result<(), OAuthClientError> {
+    let actual = callback_issuer.ok_or(OAuthClientError::AuthorizationResponseMissingIssuer)?;
+
+    if actual != expected_issuer {
+        tracing::warn!(
+            expected = %expected_issuer,
+            actual = %actual,
+            "Authorization response came from a different issuer than the flow started with"
+        );
+        return Err(OAuthClientError::AuthorizationResponseIssuerMismatch {
+            expected: expected_issuer.to_string(),
             actual: actual.to_string(),
         });
     }
@@ -464,9 +553,42 @@ pub async fn oauth_complete(
     oauth_request: &OAuthRequest,
     authorization_server: &AuthorizationServer,
 ) -> Result<TokenResponse, OAuthClientError> {
-    // Reject an unusable expected subject before doing any network work so the
-    // binding below can never be a silent no-op.
-    if expected_subject.is_empty() {
+    oauth_complete_with_binding(
+        http_client,
+        oauth_client,
+        dpop_key_data,
+        callback_code,
+        SubjectBinding::Pinned(expected_subject),
+        oauth_request,
+        authorization_server,
+    )
+    .await
+}
+
+/// [`oauth_complete`] under a caller-chosen subject binding.
+///
+/// [`oauth_complete`] always pins, which is right for a handle or DID login
+/// hint and forecloses the third shape §4.6 allows: a login hint that names a
+/// server has no account in it to pin. See [`SubjectBinding`].
+///
+/// # Errors
+///
+/// As [`oauth_complete`]; under [`SubjectBinding::Discovered`] the `sub` is
+/// not compared to anything, though a response carrying none is still refused.
+pub async fn oauth_complete_with_binding(
+    http_client: &reqwest::Client,
+    oauth_client: &OAuthClient,
+    dpop_key_data: &KeyData,
+    callback_code: &str,
+    binding: SubjectBinding<'_>,
+    oauth_request: &OAuthRequest,
+    authorization_server: &AuthorizationServer,
+) -> Result<TokenResponse, OAuthClientError> {
+    // Rejected before any network work, so the binding below can never be a
+    // silent no-op.
+    if let SubjectBinding::Pinned(expected) = binding
+        && expected.is_empty()
+    {
         return Err(OAuthClientError::MissingExpectedSubject);
     }
 
@@ -524,7 +646,7 @@ pub async fn oauth_complete(
     let token_response: TokenResponse =
         crate::resources::read_capped(http_response, token_endpoint.as_str()).await?;
 
-    bind_token_subject(expected_subject, &token_response)?;
+    bind_subject(binding, &token_response)?;
 
     Ok(token_response)
 }

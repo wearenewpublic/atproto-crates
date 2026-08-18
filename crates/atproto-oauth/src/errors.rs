@@ -311,6 +311,26 @@ pub enum OAuthClientError {
     )]
     MissingExpectedSubject,
 
+    /// Occurs when an authorization response carried no `iss` parameter.
+    ///
+    /// AT Protocol requires it (RFC 9207), so an absent one is a refusal
+    /// rather than a tolerated omission: without it a response from one
+    /// authorization server can be replayed into a flow started with another.
+    #[error("error-atproto-oauth-client-21 Authorization response carried no iss parameter")]
+    AuthorizationResponseMissingIssuer,
+
+    /// Occurs when an authorization response came from a different issuer than
+    /// the flow was started with.
+    #[error(
+        "error-atproto-oauth-client-22 Authorization response issuer mismatch: expected {expected}, got {actual}"
+    )]
+    AuthorizationResponseIssuerMismatch {
+        /// The issuer the flow was started with.
+        expected: String,
+        /// The issuer the callback named.
+        actual: String,
+    },
+
     /// Error when a discovery document exceeds the size a metadata document
     /// may plausibly be.
     ///
