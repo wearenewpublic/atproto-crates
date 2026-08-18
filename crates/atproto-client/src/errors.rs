@@ -220,7 +220,7 @@ impl std::fmt::Display for UpstreamReason {
 /// mistake, an `InvalidSwap` `400` is a compare-and-swap race that a correct
 /// writer retries, and a `403 ScopeMissingError` is a grant that needs
 /// widening. Callers that only see the body cannot tell these apart, which is
-/// why [`crate::client::DpopResponse`] keeps the status line and this type
+/// why [`crate::client::XrpcResponse`] keeps the status line and this type
 /// reads both halves.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum XrpcError {
@@ -228,7 +228,7 @@ pub enum XrpcError {
     ///
     /// `retry_after_secs` is absent when the server sent no `Retry-After`, or
     /// sent it in the HTTP-date form; see
-    /// [`crate::client::DpopResponse::retry_after_secs`].
+    /// [`crate::client::XrpcResponse::retry_after_secs`].
     #[error("error-atproto-client-xrpc-1 Rate limited: retry after {}", match .retry_after_secs { Some(secs) => format!("{secs}s"), None => "an unstated interval".to_string() })]
     RateLimited {
         /// Seconds to wait before retrying, when the server said.
@@ -286,7 +286,7 @@ impl XrpcError {
     ///
     /// Returns `None` for a 2xx, so a caller can write
     /// `if let Some(error) = XrpcError::from_response(&response)`.
-    pub fn from_response(response: &crate::client::DpopResponse) -> Option<Self> {
+    pub fn from_response(response: &crate::client::XrpcResponse) -> Option<Self> {
         if response.status.is_success() {
             return None;
         }

@@ -70,14 +70,14 @@ pub enum DpopBody<'a> {
     },
 }
 
-/// A DPoP-authenticated response with the status line intact.
+/// An XRPC response with the status line intact.
 ///
 /// [`post_dpop_json`] and its siblings parse the body regardless of status and
 /// return it, which makes a `429` indistinguishable from a `200` except by
 /// guessing at the body shape, and puts `Retry-After` and `DPoP-Nonce` out of
 /// reach. This carries all three.
 #[derive(Debug)]
-pub struct DpopResponse {
+pub struct XrpcResponse {
     /// The HTTP status the server answered with.
     pub status: StatusCode,
     /// Every response header, including `Retry-After` and `DPoP-Nonce`.
@@ -88,9 +88,17 @@ pub struct DpopResponse {
     /// Some deployments front their errors with a proxy that answers HTML, and
     /// a classifier that unwrapped here would turn a bad gateway into a panic.
     pub body: Option<serde_json::Value>,
+    /// The body as it arrived.
+    ///
+    /// Kept alongside the parsed form because several XRPC methods do not
+    /// answer JSON at all: the `com.atproto.sync` exports return CAR files on
+    /// success and an XRPC JSON error otherwise, so the status has to be read
+    /// before the body can be interpreted as either, and a transport that only
+    /// handed back the parse would make those methods need a second one.
+    pub bytes: Bytes,
 }
 
-impl DpopResponse {
+impl XrpcResponse {
     /// Whether the status is 2xx.
     pub fn is_success(&self) -> bool {
         self.status.is_success()
@@ -138,6 +146,9 @@ impl DpopResponse {
         XrpcError::from_response(self)
     }
 }
+
+/// The name [`XrpcResponse`] had when it only served [`dpop_call`].
+pub type DpopResponse = XrpcResponse;
 
 /// Whether a 400 or 401 is a DPoP nonce challenge.
 ///
@@ -200,7 +211,7 @@ pub async fn dpop_call(
     url: &str,
     body: Option<DpopBody<'_>>,
     additional_headers: &HeaderMap,
-) -> Result<DpopResponse, DPoPError> {
+) -> Result<XrpcResponse, DPoPError> {
     dpop_call_with_timeout(
         http_client,
         dpop_auth,
@@ -233,21 +244,11 @@ pub async fn dpop_call_with_timeout(
     body: Option<DpopBody<'_>>,
     additional_headers: &HeaderMap,
     timeout: Option<std::time::Duration>,
-) -> Result<DpopResponse, DPoPError> {
+) -> Result<XrpcResponse, DPoPError> {
     // Serialized once: the retry sends the same bytes, and re-encoding them
     // would be the second place a body could differ from the one the first
     // proof was minted over.
-    let payload = match body {
-        None => None,
-        Some(DpopBody::Json(value)) => {
-            let data = serde_json::to_vec(value)
-                .map_err(|error| DPoPError::BodySerializationFailed { error })?;
-            Some(("application/json".to_string(), Bytes::from(data)))
-        }
-        Some(DpopBody::Bytes { content_type, data }) => {
-            Some((content_type.to_string(), Bytes::from(data)))
-        }
-    };
+    let payload = encode_body(body)?;
 
     let (proof, ..) = request_dpop(
         &dpop_auth.dpop_private_key_data,
@@ -311,34 +312,95 @@ pub async fn dpop_call_with_timeout(
     .await
 }
 
-/// Issue one attempt and read the whole response.
-#[allow(clippy::too_many_arguments)]
-async fn send_dpop_request(
+/// Turn a request body into a content type and the bytes to send.
+///
+/// An empty content type means "send none", which is what the raw-byte helper
+/// did before this transport existed.
+fn encode_body(body: Option<DpopBody<'_>>) -> Result<Option<(String, Bytes)>, DPoPError> {
+    Ok(match body {
+        None => None,
+        Some(DpopBody::Json(value)) => {
+            let data = serde_json::to_vec(value)
+                .map_err(|error| DPoPError::BodySerializationFailed { error })?;
+            Some(("application/json".to_string(), Bytes::from(data)))
+        }
+        Some(DpopBody::Bytes { content_type, data }) => {
+            Some((content_type.to_string(), Bytes::from(data)))
+        }
+    })
+}
+
+/// An XRPC call under whichever authentication the caller holds, with the
+/// status line intact.
+///
+/// [`dpop_call`] for [`Auth::DPoP`], including its one-retry nonce dance; a
+/// plain request otherwise. Prefer this over [`get_json`] and friends anywhere
+/// the answer to "what went wrong" is a status code or a header: a `404` and a
+/// `503` are the difference between "this repository is gone" and "this PDS is
+/// having a bad minute", and a caller that only sees the body cannot tell them
+/// apart.
+///
+/// # Errors
+///
+/// As [`dpop_call`]. A non-2xx status is not an error.
+pub async fn xrpc_call(
     http_client: &reqwest::Client,
-    dpop_auth: &DPoPAuth,
+    auth: &Auth,
+    method: Method,
+    url: &str,
+    body: Option<DpopBody<'_>>,
+    additional_headers: &HeaderMap,
+) -> Result<XrpcResponse> {
+    match auth {
+        Auth::DPoP(dpop_auth) => Ok(dpop_call(
+            http_client,
+            dpop_auth,
+            method,
+            url,
+            body,
+            additional_headers,
+        )
+        .await?),
+        Auth::None => {
+            let payload = encode_body(body)?;
+            Ok(send_request(
+                http_client,
+                &method,
+                url,
+                payload.as_ref(),
+                additional_headers.clone(),
+                None,
+            )
+            .await?)
+        }
+        Auth::AppPassword(app_auth) => {
+            let payload = encode_body(body)?;
+            let mut headers = additional_headers.clone();
+            set_header(
+                &mut headers,
+                reqwest::header::AUTHORIZATION,
+                &format!("Bearer {}", app_auth.access_token),
+            )?;
+            Ok(send_request(http_client, &method, url, payload.as_ref(), headers, None).await?)
+        }
+    }
+}
+
+/// Issue one request and read the whole response.
+///
+/// `headers` carries whatever authentication the caller settled on; nothing
+/// here adds any.
+async fn send_request(
+    http_client: &reqwest::Client,
     method: &Method,
     url: &str,
     payload: Option<&(String, Bytes)>,
-    additional_headers: &HeaderMap,
-    proof: &str,
+    mut headers: HeaderMap,
     timeout: Option<std::time::Duration>,
-) -> Result<DpopResponse, DPoPError> {
-    // Built with `insert` rather than `RequestBuilder::header`, which appends:
-    // a caller that passed its own `Authorization` or `Content-Type` in
-    // `additional_headers` would otherwise get two of them on the wire, and
-    // which one the server honours is its business rather than ours.
-    let mut headers = additional_headers.clone();
-    set_header(
-        &mut headers,
-        reqwest::header::AUTHORIZATION,
-        &format!("DPoP {}", dpop_auth.oauth_access_token),
-    )?;
-    set_header(&mut headers, HeaderName::from_static("dpop"), proof)?;
-
+) -> Result<XrpcResponse, DPoPError> {
     if let Some((content_type, _)) = payload {
-        // An empty content type means "send none", which is what the raw-byte
-        // helper did before this transport existed. The body's own type wins
-        // over anything in `additional_headers`: it is the argument the API is
+        // An empty content type means "send none". The body's own type wins
+        // over anything in the caller's headers: it is the argument the API is
         // built around, and for `uploadBlob` it is the value the server
         // records on the blob.
         if !content_type.is_empty() {
@@ -358,7 +420,7 @@ async fn send_dpop_request(
 
     let response = builder
         .send()
-        .instrument(tracing::debug_span!("dpop_call", method = %method, url = %url))
+        .instrument(tracing::debug_span!("xrpc_call", method = %method, url = %url))
         .await
         .map_err(|error| DPoPError::RequestFailed {
             url: url.to_string(),
@@ -375,11 +437,39 @@ async fn send_dpop_request(
             error,
         })?;
 
-    Ok(DpopResponse {
+    Ok(XrpcResponse {
         status,
         headers,
         body: serde_json::from_slice(&bytes).ok(),
+        bytes,
     })
+}
+
+/// Issue one DPoP attempt and read the whole response.
+#[allow(clippy::too_many_arguments)]
+async fn send_dpop_request(
+    http_client: &reqwest::Client,
+    dpop_auth: &DPoPAuth,
+    method: &Method,
+    url: &str,
+    payload: Option<&(String, Bytes)>,
+    additional_headers: &HeaderMap,
+    proof: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<XrpcResponse, DPoPError> {
+    // Built with `insert` rather than `RequestBuilder::header`, which appends:
+    // a caller that passed its own `Authorization` or `Content-Type` in
+    // `additional_headers` would otherwise get two of them on the wire, and
+    // which one the server honours is its business rather than ours.
+    let mut headers = additional_headers.clone();
+    set_header(
+        &mut headers,
+        reqwest::header::AUTHORIZATION,
+        &format!("DPoP {}", dpop_auth.oauth_access_token),
+    )?;
+    set_header(&mut headers, HeaderName::from_static("dpop"), proof)?;
+
+    send_request(http_client, method, url, payload, headers, timeout).await
 }
 
 /// Set one header, replacing any the caller already supplied.
@@ -391,11 +481,35 @@ fn set_header(headers: &mut HeaderMap, name: HeaderName, value: &str) -> Result<
     Ok(())
 }
 
-/// Read a [`DpopResponse`] body the way the pre-existing helpers do.
+/// Decode a successful XRPC response, or report why it was not one.
+///
+/// The status decides. A body is only parsed when the server said the call
+/// succeeded, so an error body that happens to have the shape of a success --
+/// which `#[serde(untagged)]` response enums make easy to fall into -- cannot
+/// be mistaken for one.
+///
+/// # Errors
+///
+/// Returns [`XrpcError`] on a non-2xx, classified from the status and the
+/// error code together; [`ClientError::ResponseNotJson`] when a success
+/// carried no JSON body; and a `serde_json` error when the body did not fit
+/// `T`.
+pub fn decode_xrpc<T: serde::de::DeserializeOwned>(response: XrpcResponse) -> Result<T> {
+    if let Some(error) = XrpcError::from_response(&response) {
+        return Err(error.into());
+    }
+    let body = response.body.ok_or(ClientError::ResponseNotJson {
+        url: String::new(),
+        status: response.status.as_u16(),
+    })?;
+    Ok(serde_json::from_value(body)?)
+}
+
+/// Read an [`XrpcResponse`] body the way the pre-existing helpers do.
 ///
 /// The body regardless of status, and a parse failure if it was not JSON.
 /// Callers that need the status line should use [`dpop_call`] directly.
-fn body_or_parse_error(url: &str, response: DpopResponse) -> Result<serde_json::Value> {
+fn body_or_parse_error(url: &str, response: XrpcResponse) -> Result<serde_json::Value> {
     response.body.ok_or_else(|| {
         ClientError::ResponseNotJson {
             url: url.to_string(),

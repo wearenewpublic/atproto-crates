@@ -37,12 +37,37 @@ where
             pairs.append_pair(key.as_ref(), value.as_ref());
         }
     }
+    // `query_pairs_mut` sets the query to the empty string whether or not
+    // anything was appended, so a call with no parameters came out with a
+    // trailing `?`. Legal, and every HTTP server accepts it -- but it appeared
+    // in every parameterless URL this workspace builds, including the
+    // WebSocket URL for `subscribeRepos`, where the set of servers that accept
+    // it is smaller.
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
     Ok(url)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No parameters means no query, rather than a bare `?`.
+    #[test]
+    fn a_parameterless_url_has_no_query() {
+        let url = build_url(
+            "example.com",
+            "/xrpc/com.atproto.repo.applyWrites",
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("url build failed");
+
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/xrpc/com.atproto.repo.applyWrites"
+        );
+    }
 
     #[test]
     fn builds_url_with_params() {

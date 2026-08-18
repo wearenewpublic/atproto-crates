@@ -5,6 +5,7 @@
 //! - **`url`**: URL construction and validation utilities for AT Protocol endpoints
 //! - **`com::atproto::repo`**: Repository operations for record management
 //! - **`com::atproto::server`**: Server operations for authentication and session management
+//! - **`com::atproto::sync`**: Repository exports, proofs, and the firehose URL
 //! - **`errors`**: Structured error types for HTTP and authentication failures
 //!
 //! ## Command-Line Tools
@@ -27,6 +28,7 @@ pub use record_resolver::{HttpRecordResolver, RecordResolver};
 mod com_atproto_identity;
 mod com_atproto_repo;
 mod com_atproto_server;
+mod com_atproto_sync;
 
 /// AT Protocol namespace modules.
 pub mod com {
@@ -44,6 +46,11 @@ pub mod com {
         /// Identity operations for AT Protocol handle and DID resolution.
         pub mod identity {
             pub use crate::com_atproto_identity::*;
+        }
+
+        /// Repository synchronization: exports, proofs, and the firehose URL.
+        pub mod sync {
+            pub use crate::com_atproto_sync::*;
         }
     }
 }
