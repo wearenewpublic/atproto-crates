@@ -385,6 +385,20 @@ impl SpacePermission {
     ///
     /// Returns a [`ParseError`] when the grammar or a parameter value is
     /// invalid (0016 spec, lines 373-384).
+    /// Whether this grant's `type` component covers `space_type`.
+    ///
+    /// A grant for `*` covers every type; a grant for a specific NSID covers
+    /// only that one. Separate from the request-time matchers because it asks
+    /// about the grant rather than about an access, which is the question a
+    /// consent screen and a management affordance both have.
+    #[must_use]
+    pub fn covers_space_type(&self, space_type: &str) -> bool {
+        match &self.space_type {
+            SpaceType::All => true,
+            SpaceType::Nsid(nsid) => nsid == space_type,
+        }
+    }
+
     pub(super) fn parse_suffix(suffix: Option<&str>) -> Result<SpacePermission, ParseError> {
         // Split the suffix into the positional `type` value and the query
         // string.

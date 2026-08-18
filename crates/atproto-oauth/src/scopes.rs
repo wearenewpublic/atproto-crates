@@ -1625,6 +1625,79 @@ impl ScopesSet {
             ))
         }
     }
+
+    /// Every `space:` permission in this set that parses.
+    ///
+    /// For asking a question the request-time matchers do not cover -- what a
+    /// consent screen should render, or whether a management affordance is
+    /// worth showing at all -- rather than for deciding a request. A request
+    /// names a space, and [`allows_space`](Self::allows_space) and
+    /// [`allows_space_manage`](Self::allows_space_manage) are the answers for
+    /// that.
+    ///
+    /// Yields nothing for a `space:` scope this build cannot parse. That
+    /// silence is why [`unparsable_space_scopes`](Self::unparsable_space_scopes)
+    /// exists: "not granted" and "granted in a spelling I do not recognise"
+    /// need opposite responses, and an iterator alone cannot tell them apart.
+    pub fn space_permissions(&self) -> impl Iterator<Item = SpacePermission> + '_ {
+        self.scopes
+            .iter()
+            .filter_map(|scope| match Scope::parse(scope) {
+                Ok(Scope::Space(permission)) => Some(permission),
+                _ => None,
+            })
+    }
+
+    /// The `space:` scopes in this set that do not parse.
+    ///
+    /// A grant issued against a revision of the grammar this build predates
+    /// lands here rather than being read as absent. A caller that only reads
+    /// [`space_permissions`](Self::space_permissions) is treating a spelling
+    /// it does not recognise as a permission that was never granted, which is
+    /// the failure mode substring matching has and this is the way out of it.
+    pub fn unparsable_space_scopes(&self) -> impl Iterator<Item = &str> + '_ {
+        self.scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|scope| scope.starts_with("space:") && Scope::parse(scope).is_err())
+    }
+
+    /// Whether any granted permission confers `verb` over `space_type`.
+    ///
+    /// Coarser than [`allows_space_manage`](Self::allows_space_manage), which
+    /// answers about a *particular* space and is the check a request must
+    /// make. This answers "is management of this type on the table at all",
+    /// which is what decides whether to render a Create button before any
+    /// space exists to name.
+    ///
+    /// Asked structurally rather than by looking for `manage=` in the scope
+    /// string: that substring also appears inside a `skey` value, and a token
+    /// for one space type also contains it.
+    pub fn grants_space_manage(&self, space_type: &str, verb: SpaceManageVerb) -> bool {
+        self.space_permissions().any(|permission| {
+            permission.covers_space_type(space_type) && permission.manage.contains(&verb)
+        })
+    }
+
+    /// Whether any granted permission reads records under **any** authority
+    /// for `space_type`.
+    ///
+    /// The `authority=*` question. Asked structurally, because the scope
+    /// string spells the same grant two ways: `authority=*` is the
+    /// specification's name and `did=*` is this crate's deprecated alias, and
+    /// both are in circulation. A substring test for one reads the other as
+    /// not granted.
+    ///
+    /// `read` and not `read_self`: reading *your own* repo under a foreign
+    /// authority is a narrower thing than reading the space, and conflating
+    /// them would report an app as having access it does not have.
+    pub fn grants_foreign_space_read(&self, space_type: &str) -> bool {
+        self.space_permissions().any(|permission| {
+            permission.did == SpaceDid::All
+                && permission.covers_space_type(space_type)
+                && permission.action.contains(&SpaceAction::Read)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3341,5 +3414,112 @@ mod tests {
                 "{original} rendered as {rendered}, which parses differently"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod space_grant_questions {
+    use super::*;
+
+    const SUBJECT: &str = "did:plc:holder";
+
+    fn granted(scope: &str) -> ScopesSet {
+        ScopesSet::from_scope_string_for(scope, SUBJECT)
+    }
+
+    /// `authority=*` and its deprecated alias `did=*` are the same grant.
+    ///
+    /// Both spellings are in circulation -- the parser accepts each precisely
+    /// because they are -- so a substring test for one reads the other as not
+    /// granted. This is the test that version fails.
+    #[test]
+    fn the_authority_wildcard_reads_the_same_under_either_spelling() {
+        for scope in [
+            "space:app.bulleted.space?authority=*&action=read",
+            "space:app.bulleted.space?did=*&action=read",
+        ] {
+            assert!(
+                granted(scope).grants_foreign_space_read("app.bulleted.space"),
+                "{scope}"
+            );
+        }
+    }
+
+    /// A `self` grant is not a foreign-authority grant, however wide its
+    /// actions.
+    #[test]
+    fn a_self_grant_is_not_foreign_access() {
+        let scopes = granted("space:app.bulleted.space?action=read");
+        assert!(!scopes.grants_foreign_space_read("app.bulleted.space"));
+    }
+
+    /// `read_self` under a foreign authority is not reading the space.
+    #[test]
+    fn reading_your_own_repo_elsewhere_is_not_reading_the_space() {
+        let scopes = granted("space:app.bulleted.space?authority=*&action=read_self");
+        assert!(!scopes.grants_foreign_space_read("app.bulleted.space"));
+    }
+
+    /// A grant for another space type answers no question about this one.
+    #[test]
+    fn a_grant_for_another_space_type_does_not_answer_for_this_one() {
+        let scopes = granted("space:app.other.space?authority=*&action=read&manage=create");
+        assert!(!scopes.grants_foreign_space_read("app.bulleted.space"));
+        assert!(!scopes.grants_space_manage("app.bulleted.space", SpaceManageVerb::Create));
+
+        // And a `*` grant answers for every type, which is what makes the
+        // question worth asking structurally rather than by string equality.
+        let wildcard = granted("space:*?authority=*&action=read&manage=create");
+        assert!(wildcard.grants_foreign_space_read("app.bulleted.space"));
+        assert!(wildcard.grants_space_manage("app.bulleted.space", SpaceManageVerb::Create));
+    }
+
+    /// A `manage` substring inside another parameter's value confers nothing.
+    ///
+    /// Whether a `skey` may legitimately be spelled this way matters less
+    /// than the verdict coming from the parsed grammar rather than from where
+    /// the characters happen to fall.
+    #[test]
+    fn a_manage_substring_in_another_parameter_confers_no_management() {
+        let scopes = granted("space:app.bulleted.space?skey=manage-create&action=read");
+        assert!(!scopes.grants_space_manage("app.bulleted.space", SpaceManageVerb::Create));
+        // The grant itself is fine, and its read is still a read.
+        assert_eq!(scopes.space_permissions().count(), 1);
+    }
+
+    /// Each verb is answered separately.
+    #[test]
+    fn management_is_answered_per_verb() {
+        let scopes = granted("space:app.bulleted.space?manage=create&manage=update");
+        assert!(scopes.grants_space_manage("app.bulleted.space", SpaceManageVerb::Create));
+        assert!(scopes.grants_space_manage("app.bulleted.space", SpaceManageVerb::Update));
+        assert!(!scopes.grants_space_manage("app.bulleted.space", SpaceManageVerb::Delete));
+    }
+
+    /// A `space:` scope this build cannot parse is named, not silently absent.
+    ///
+    /// "Not granted" and "granted in a spelling I do not recognise" need
+    /// opposite responses, and a helper that returns `false` for both cannot
+    /// tell a caller which it is looking at.
+    #[test]
+    fn an_unparsable_space_scope_is_reported_rather_than_ignored() {
+        let scopes = granted(
+            "space:app.bulleted.space?action=read space:app.bulleted.space?somethingLater=7",
+        );
+
+        assert_eq!(scopes.space_permissions().count(), 1);
+        assert_eq!(
+            scopes.unparsable_space_scopes().collect::<Vec<_>>(),
+            vec!["space:app.bulleted.space?somethingLater=7"]
+        );
+    }
+
+    /// Non-`space:` scopes are neither permissions nor unparsable space
+    /// scopes.
+    #[test]
+    fn other_scopes_are_left_alone() {
+        let scopes = granted("atproto repo:app.bsky.feed.post rpc:*?aud=*");
+        assert_eq!(scopes.space_permissions().count(), 0);
+        assert_eq!(scopes.unparsable_space_scopes().count(), 0);
     }
 }
