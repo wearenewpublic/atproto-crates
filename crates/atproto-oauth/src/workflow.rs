@@ -550,6 +550,16 @@ pub async fn oauth_complete(
 /// Returns `OAuthClientError` if the token refresh fails, the response cannot
 /// be parsed, or the returned `sub` claim is missing or does not match
 /// `document.id`.
+///
+/// # Racing yourself
+///
+/// This is a bare async function and nothing about one call knows another is
+/// in flight. Under OAuth 2.1 §4.14.2 a replayed refresh token revokes the
+/// whole grant, and the specification does not distinguish a leaked token from
+/// a client racing itself -- so two concurrent requests for one session sign
+/// the user out, with no error anywhere naming the cause. Wrap this in
+/// [`RefreshCoordinator`](crate::refresh::RefreshCoordinator) anywhere more
+/// than one request can reach the same session.
 pub async fn oauth_refresh(
     http_client: &reqwest::Client,
     oauth_client: &OAuthClient,

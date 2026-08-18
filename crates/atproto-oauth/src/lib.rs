@@ -18,6 +18,7 @@ pub mod jwk;
 pub mod jwt;
 /// PKCE (Proof Key for Code Exchange) implementation for OAuth 2.0 security.
 pub mod pkce;
+pub mod refresh;
 /// OAuth resource and authorization server management.
 pub mod resources;
 /// OAuth 2.0 scope definitions and parsing for AT Protocol.
