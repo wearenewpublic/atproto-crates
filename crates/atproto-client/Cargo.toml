@@ -42,6 +42,7 @@ bench = false
 doc = true
 
 [dependencies]
+atproto-dasl.workspace = true
 atproto-identity.workspace = true
 atproto-oauth.workspace = true
 atproto-record.workspace = true

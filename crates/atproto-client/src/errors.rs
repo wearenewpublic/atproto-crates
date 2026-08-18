@@ -6,7 +6,7 @@
 //!
 //! ## Error Categories
 //!
-//! - **`ClientError`** (http-1 to http-5): HTTP client operation errors including request failures and parsing errors
+//! - **`ClientError`** (http-1 to http-6): HTTP client operation errors including request failures and parsing errors
 //! - **`DPoPError`** (auth-1 to auth-7): DPoP authentication related errors
 //! - **`XrpcError`** (xrpc-1 to xrpc-5): An XRPC response classified by status and error code
 //! - **`CliError`** (cli-1 to cli-4): Command-line interface specific errors including file I/O and resolution failures
