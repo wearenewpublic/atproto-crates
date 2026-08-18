@@ -399,4 +399,31 @@ impl atproto_client::record_resolver::RecordResolver for RemoteAttestationResolv
             }
         }
     }
+
+    /// Resolve a record at the CID a `strongRef` pins.
+    ///
+    /// A remote attestation *is* a strongRef, so this is the shape that
+    /// belongs here -- the proof record is named by `(uri, cid)` and fetching
+    /// whatever is at the address now would let a repository substitute a
+    /// different proof for the one the signature covers.
+    ///
+    /// Verified by recomputing the CID over what came back rather than by
+    /// reading the envelope's `cid`, which is the server's claim about the
+    /// bytes it sent.
+    async fn resolve_pinned<T>(&self, aturi: &str, cid: &str) -> anyhow::Result<T>
+    where
+        T: serde::de::DeserializeOwned + Send,
+    {
+        let value: serde_json::Value = self.resolve(aturi).await?;
+
+        let computed = atproto_client::record_resolver::record_cid(&value)?;
+        if computed != cid {
+            return Err(anyhow!(
+                "Pinned record does not match its CID: {aturi} pins {cid}, \
+                 the record fetched hashes to {computed}"
+            ));
+        }
+
+        serde_json::from_value(value).map_err(|e| anyhow!("Failed to deserialize record: {}", e))
+    }
 }
