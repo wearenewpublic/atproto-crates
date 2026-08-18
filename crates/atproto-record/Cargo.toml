@@ -48,6 +48,9 @@ sha2.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+# A DAG-CBOR byte string, so the round-trip test exercises `visit_bytes`
+# rather than an array of integers.
+serde_bytes.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
