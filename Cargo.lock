@@ -586,6 +586,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "atproto-space-client"
+version = "0.15.0-rc.4"
+dependencies = [
+ "anyhow",
+ "atproto-client",
+ "atproto-identity",
+ "atproto-space",
+ "base64 0.23.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "atproto-tap"
 version = "0.15.0-rc.4"
 dependencies = [

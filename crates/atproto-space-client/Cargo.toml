@@ -1,0 +1,35 @@
+[package]
+name = "atproto-space-client"
+version = "0.15.0-rc.4"
+description = "XRPC client for AT Protocol permissioned-data spaces - the 0016 credential exchange, subscriptions, and space management"
+readme = "README.md"
+homepage = "https://tangled.org/ngerakines.me/atproto-crates"
+documentation = "https://docs.rs/atproto-space-client"
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+atproto-client.workspace = true
+atproto-identity.workspace = true
+atproto-space.workspace = true
+
+anyhow.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+
+[lints]
+workspace = true

@@ -6,7 +6,7 @@
 use crate::errors::{ClientError, DPoPError, XrpcError};
 use anyhow::Result;
 use atproto_identity::key::KeyData;
-use atproto_oauth::dpop::{dpop_with_nonce, request_dpop};
+use atproto_oauth::dpop::{auth_dpop, dpop_with_nonce, request_dpop};
 use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode};
@@ -68,6 +68,48 @@ pub enum DpopBody<'a> {
         /// The bytes to send.
         data: Vec<u8>,
     },
+}
+
+/// How a DPoP-protected credential is presented.
+///
+/// The distinction is RFC 9449 §7.1 scheme discipline, and getting it wrong
+/// produces a `401 missing DPoP header` from a server that was never asked the
+/// question the caller cared about -- a refusal that names nothing useful.
+#[derive(Debug, Clone, Copy)]
+pub enum DpopPresentation<'a> {
+    /// A token bound to the proof key: an OAuth access token, or any
+    /// credential whose `cnf.jkt` names that key.
+    ///
+    /// Offered as `Authorization: DPoP <token>`, with the proof carrying `ath`
+    /// over it (RFC 9449 §4.2) so the proof and the token are tied together.
+    Bound(&'a str),
+
+    /// An authorization **grant** rather than an access token -- a delegation
+    /// token being exchanged for something else.
+    ///
+    /// Offered as `Authorization: Bearer <token>`, and the proof carries **no**
+    /// `ath`: there is no bound token to hash, and the proof is here to
+    /// demonstrate possession of the key the *answer* will be bound to rather
+    /// than to bind this request to a token.
+    Grant(&'a str),
+}
+
+impl DpopPresentation<'_> {
+    /// The `Authorization` header value this presentation goes out under.
+    fn authorization(&self) -> String {
+        match self {
+            DpopPresentation::Bound(token) => format!("DPoP {token}"),
+            DpopPresentation::Grant(token) => format!("Bearer {token}"),
+        }
+    }
+
+    /// The token an `ath` claim would be computed over, when there is one.
+    fn bound_token(&self) -> Option<&str> {
+        match self {
+            DpopPresentation::Bound(token) => Some(token),
+            DpopPresentation::Grant(_) => None,
+        }
+    }
 }
 
 /// An XRPC response with the status line intact.
@@ -245,22 +287,51 @@ pub async fn dpop_call_with_timeout(
     additional_headers: &HeaderMap,
     timeout: Option<std::time::Duration>,
 ) -> Result<XrpcResponse, DPoPError> {
+    dpop_call_as(
+        http_client,
+        &dpop_auth.dpop_private_key_data,
+        DpopPresentation::Bound(&dpop_auth.oauth_access_token),
+        method,
+        url,
+        body,
+        additional_headers,
+        timeout,
+    )
+    .await
+}
+
+/// [`dpop_call`] under a caller-chosen presentation.
+///
+/// [`dpop_call`] always offers a bound token. A credential exchange offers a
+/// *grant* instead -- `Bearer`, and a proof with no `ath` -- and the two
+/// differ in both the scheme and the proof, so a caller cannot express one
+/// with the other. Everything else is the same: one retry on a nonce
+/// challenge, the status line kept, the body left unparsed if it is not JSON.
+///
+/// # Errors
+///
+/// As [`dpop_call`].
+#[allow(clippy::too_many_arguments)]
+pub async fn dpop_call_as(
+    http_client: &reqwest::Client,
+    key: &KeyData,
+    presentation: DpopPresentation<'_>,
+    method: Method,
+    url: &str,
+    body: Option<DpopBody<'_>>,
+    additional_headers: &HeaderMap,
+    timeout: Option<std::time::Duration>,
+) -> Result<XrpcResponse, DPoPError> {
     // Serialized once: the retry sends the same bytes, and re-encoding them
     // would be the second place a body could differ from the one the first
     // proof was minted over.
     let payload = encode_body(body)?;
 
-    let (proof, ..) = request_dpop(
-        &dpop_auth.dpop_private_key_data,
-        method.as_str(),
-        url,
-        &dpop_auth.oauth_access_token,
-    )
-    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+    let proof = mint_proof(key, method.as_str(), url, presentation, None)?;
 
     let first = send_dpop_request(
         http_client,
-        dpop_auth,
+        presentation,
         &method,
         url,
         payload.as_ref(),
@@ -290,18 +361,11 @@ pub async fn dpop_call_with_timeout(
         return Ok(first);
     };
 
-    let (retry_proof, ..) = dpop_with_nonce(
-        &dpop_auth.dpop_private_key_data,
-        method.as_str(),
-        url,
-        Some(&dpop_auth.oauth_access_token),
-        &nonce,
-    )
-    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+    let retry_proof = mint_proof(key, method.as_str(), url, presentation, Some(&nonce))?;
 
     send_dpop_request(
         http_client,
-        dpop_auth,
+        presentation,
         &method,
         url,
         payload.as_ref(),
@@ -310,6 +374,27 @@ pub async fn dpop_call_with_timeout(
         timeout,
     )
     .await
+}
+
+/// Mint one DPoP proof for a presentation, with or without a server nonce.
+///
+/// A bound token gets an `ath` over it; a grant does not, because there is no
+/// bound token to hash.
+fn mint_proof(
+    key: &KeyData,
+    method: &str,
+    url: &str,
+    presentation: DpopPresentation<'_>,
+    nonce: Option<&str>,
+) -> Result<String, DPoPError> {
+    let minted = match (presentation.bound_token(), nonce) {
+        (Some(token), None) => request_dpop(key, method, url, token),
+        (None, None) => auth_dpop(key, method, url),
+        (token, Some(nonce)) => dpop_with_nonce(key, method, url, token, nonce),
+    };
+    minted
+        .map(|(proof, ..)| proof)
+        .map_err(|error| DPoPError::ProofGenerationFailed { error })
 }
 
 /// Turn a request body into a content type and the bytes to send.
@@ -449,7 +534,7 @@ async fn send_request(
 #[allow(clippy::too_many_arguments)]
 async fn send_dpop_request(
     http_client: &reqwest::Client,
-    dpop_auth: &DPoPAuth,
+    presentation: DpopPresentation<'_>,
     method: &Method,
     url: &str,
     payload: Option<&(String, Bytes)>,
@@ -465,7 +550,7 @@ async fn send_dpop_request(
     set_header(
         &mut headers,
         reqwest::header::AUTHORIZATION,
-        &format!("DPoP {}", dpop_auth.oauth_access_token),
+        &presentation.authorization(),
     )?;
     set_header(&mut headers, HeaderName::from_static("dpop"), proof)?;
 

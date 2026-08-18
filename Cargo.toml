@@ -13,6 +13,7 @@ members = [
     "crates/atproto-record",
     "crates/atproto-repo",
     "crates/atproto-space",
+    "crates/atproto-space-client",
     "crates/atproto-tap",
     "crates/atproto-xrpcs",
     "crates/atproto-lexicon",
@@ -48,6 +49,7 @@ atproto-pds = { version = "0.15.0-rc.4", path = "crates/atproto-pds" }
 atproto-record = { version = "0.15.0-rc.4", path = "crates/atproto-record" }
 atproto-repo = { version = "0.15.0-rc.4", path = "crates/atproto-repo" }
 atproto-space = { version = "0.15.0-rc.4", path = "crates/atproto-space" }
+atproto-space-client = { version = "0.15.0-rc.4", path = "crates/atproto-space-client" }
 atproto-tap = { version = "0.15.0-rc.4", path = "crates/atproto-tap" }
 atproto-xrpcs = { version = "0.15.0-rc.4", path = "crates/atproto-xrpcs" }
 

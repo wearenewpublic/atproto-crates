@@ -16,8 +16,16 @@ categories.workspace = true
 
 [dependencies]
 atproto-dasl.workspace = true
-atproto-identity.workspace = true
-atproto-record.workspace = true
+# Declared rather than inherited, because Cargo refuses `default-features =
+# false` on an inherited dependency -- and defaults off is what makes this
+# crate's "no network dependencies" a fact rather than an aspiration. It uses
+# `atproto_identity::key` and `atproto_record::tid`, both of which are in the
+# pure half of those crates; the defaults would have pulled an HTTP client, an
+# async runtime and a DNS resolver in behind them. The versions have to be
+# repeated here; a release bump has to touch them, and CI requires them to
+# match the workspace.
+atproto-identity = { version = "0.15.0-rc.4", path = "../atproto-identity", default-features = false }
+atproto-record = { version = "0.15.0-rc.4", path = "../atproto-record", default-features = false }
 
 anyhow.workspace = true
 async-trait.workspace = true

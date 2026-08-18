@@ -110,3 +110,23 @@ fn the_default_build_carries_all_three() {
         NETWORK_CRATES.to_vec(),
     );
 }
+
+/// `atproto-space` says in its own documentation that it has no network
+/// dependencies. Two of the three are gone; the third is named here rather
+/// than quietly excused.
+///
+/// `reqwest` and `hickory-resolver` left when the crate stopped inheriting
+/// `atproto-identity` and `atproto-record` with their default features -- it
+/// uses `key` and `tid`, both in the pure half of those crates. `tokio`
+/// remains, through `atproto-dasl`, whose CAR reader and disk storage are
+/// async-first; gating that is a refactor of a different crate and has not
+/// been done.
+#[test]
+fn the_space_primitives_carry_no_http_client_and_no_resolver() {
+    let found = network_crates_in("atproto-space", true);
+    assert_eq!(
+        found,
+        vec!["tokio"],
+        "expected only the known `atproto-dasl` tokio edge"
+    );
+}

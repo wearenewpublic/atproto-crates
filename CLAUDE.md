@@ -69,6 +69,7 @@ A comprehensive Rust workspace with multiple crates:
 - **atproto-attestation**: CID-first attestation utilities for creating and verifying record signatures
 - **atproto-record**: Record utilities including TID generation, AT-URI parsing, and CID generation
 - **atproto-repo**: AT Protocol repository operations including MST trees, commits, and record access (re-exports CAR/storage from atproto-dasl)
+- **atproto-space-client**: XRPC client for permissioned-data spaces - the 0016 credential exchange and space management
 - **atproto-client**: HTTP client with OAuth and identity integration
 - **atproto-firehose**: `com.atproto.sync.subscribeRepos` consumer - frame decoding, commit verification, and a reconnecting stream
 - **atproto-jetstream**: WebSocket event streaming with compression
