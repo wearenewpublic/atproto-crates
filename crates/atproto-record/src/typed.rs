@@ -714,141 +714,152 @@ mod tests {
         assert_eq!(reserialized["value"], 42);
     }
 
-    /// A record with a `cid-link` field, which is what a lexicon calls a
-    /// `Cid` and what the firehose is full of.
-    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-    struct LinkRecord {
-        subject: atproto_dasl::Cid,
-        text: String,
-    }
+    /// DAG-CBOR behaviour, which needs the encoder.
+    ///
+    /// Gated because `atproto-dasl` is only in the tree with the `resolve`
+    /// feature -- keeping it out is the point of the no-default-features
+    /// build, and these tests are the reason to want it back.
+    #[cfg(feature = "resolve")]
+    mod dag_cbor {
+        use super::*;
 
-    impl LexiconType for LinkRecord {
-        fn lexicon_type() -> &'static str {
-            "test.lexicon.link"
+        /// A record with a `cid-link` field, which is what a lexicon calls a
+        /// `Cid` and what the firehose is full of.
+        #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+        struct LinkRecord {
+            subject: atproto_dasl::Cid,
+            text: String,
         }
-    }
 
-    /// A record with a `bytes` field.
-    #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-    struct BytesRecord {
-        #[serde(with = "serde_bytes")]
-        payload: Vec<u8>,
-    }
-
-    impl LexiconType for BytesRecord {
-        fn lexicon_type() -> &'static str {
-            "test.lexicon.bytes"
+        impl LexiconType for LinkRecord {
+            fn lexicon_type() -> &'static str {
+                "test.lexicon.link"
+            }
         }
-    }
 
-    fn a_cid() -> atproto_dasl::Cid {
-        atproto_dasl::Cid(atproto_dasl::compute_cid_for(&"a block").expect("compute a cid"))
-    }
+        /// A record with a `bytes` field.
+        #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+        struct BytesRecord {
+            #[serde(with = "serde_bytes")]
+            payload: Vec<u8>,
+        }
 
-    /// The failure this change exists for.
-    ///
-    /// DAG-CBOR surfaces a tag-42 CID link through `visit_byte_buf`, which has
-    /// no `serde_json::Value` to be collected into -- so the previous
-    /// implementation could not deserialize any record carrying one, which is
-    /// most records worth indexing. It failed at runtime rather than at
-    /// compile time, which is why two parallel type families were being
-    /// maintained downstream to avoid it.
-    #[test]
-    fn a_cid_link_survives_a_dag_cbor_round_trip() {
-        let record = LinkRecord {
-            subject: a_cid(),
-            text: "hello".to_string(),
-        };
-        let typed = TypedLexicon::new(record.clone());
+        impl LexiconType for BytesRecord {
+            fn lexicon_type() -> &'static str {
+                "test.lexicon.bytes"
+            }
+        }
 
-        let encoded = atproto_dasl::to_vec(&typed).expect("encode");
-        let decoded: TypedLexicon<LinkRecord> = atproto_dasl::from_slice(&encoded).expect("decode");
+        fn a_cid() -> atproto_dasl::Cid {
+            atproto_dasl::Cid(atproto_dasl::compute_cid_for(&"a block").expect("compute a cid"))
+        }
 
-        assert_eq!(decoded.inner, record);
-        assert!(decoded.has_type_field());
-    }
+        /// The failure this change exists for.
+        ///
+        /// DAG-CBOR surfaces a tag-42 CID link through `visit_byte_buf`, which has
+        /// no `serde_json::Value` to be collected into -- so the previous
+        /// implementation could not deserialize any record carrying one, which is
+        /// most records worth indexing. It failed at runtime rather than at
+        /// compile time, which is why two parallel type families were being
+        /// maintained downstream to avoid it.
+        #[test]
+        fn a_cid_link_survives_a_dag_cbor_round_trip() {
+            let record = LinkRecord {
+                subject: a_cid(),
+                text: "hello".to_string(),
+            };
+            let typed = TypedLexicon::new(record.clone());
 
-    /// A `bytes` field stays a byte string on the wire.
-    ///
-    /// The value round-tripped under the old implementation too, which is
-    /// what made this hard to see: `serde_json::Value` has no byte string, so
-    /// the field was encoded as a CBOR *array of integers* and decoded back
-    /// into a `Vec<u8>` unharmed. The bytes differ, so the record's CID
-    /// differs, and a CID is the one thing about a record that has to be
-    /// reproducible. Hence the assertion on the encoded form rather than on
-    /// the value.
-    #[test]
-    fn a_bytes_field_stays_a_byte_string_through_dag_cbor() {
-        let record = BytesRecord {
-            payload: vec![0x00, 0xff, 0x42],
-        };
-        let typed = TypedLexicon::new(record.clone());
+            let encoded = atproto_dasl::to_vec(&typed).expect("encode");
+            let decoded: TypedLexicon<LinkRecord> =
+                atproto_dasl::from_slice(&encoded).expect("decode");
 
-        let encoded = atproto_dasl::to_vec(&typed).expect("encode");
-        let decoded: TypedLexicon<BytesRecord> =
-            atproto_dasl::from_slice(&encoded).expect("decode");
-        assert_eq!(decoded.inner, record);
+            assert_eq!(decoded.inner, record);
+            assert!(decoded.has_type_field());
+        }
 
-        let ipld: atproto_dasl::Ipld = atproto_dasl::from_slice(&encoded).expect("as ipld");
-        let atproto_dasl::Ipld::Map(map) = ipld else {
-            panic!("a record encodes as a map");
-        };
-        assert!(
-            matches!(map.get("payload"), Some(atproto_dasl::Ipld::Bytes(_))),
-            "payload encoded as {:?}",
-            map.get("payload")
-        );
-    }
+        /// A `bytes` field stays a byte string on the wire.
+        ///
+        /// The value round-tripped under the old implementation too, which is
+        /// what made this hard to see: `serde_json::Value` has no byte string, so
+        /// the field was encoded as a CBOR *array of integers* and decoded back
+        /// into a `Vec<u8>` unharmed. The bytes differ, so the record's CID
+        /// differs, and a CID is the one thing about a record that has to be
+        /// reproducible. Hence the assertion on the encoded form rather than on
+        /// the value.
+        #[test]
+        fn a_bytes_field_stays_a_byte_string_through_dag_cbor() {
+            let record = BytesRecord {
+                payload: vec![0x00, 0xff, 0x42],
+            };
+            let typed = TypedLexicon::new(record.clone());
 
-    /// `$type` is written first and the encoding is still canonical.
-    ///
-    /// `$type` is five bytes, so it sorts *after* a shorter key under
-    /// DAG-CBOR's length-first ordering -- writing it first would be wrong if
-    /// the encoder emitted keys in the order it received them. It sorts as it
-    /// encodes, and a strict decode validates that ordering, so a successful
-    /// strict round trip is the assertion.
-    #[test]
-    fn the_type_marker_does_not_disturb_canonical_key_ordering() {
-        let typed = TypedLexicon::new(LinkRecord {
-            subject: a_cid(),
-            text: "hello".to_string(),
-        });
+            let encoded = atproto_dasl::to_vec(&typed).expect("encode");
+            let decoded: TypedLexicon<BytesRecord> =
+                atproto_dasl::from_slice(&encoded).expect("decode");
+            assert_eq!(decoded.inner, record);
 
-        let encoded = atproto_dasl::to_vec(&typed).expect("encode");
+            let ipld: atproto_dasl::Ipld = atproto_dasl::from_slice(&encoded).expect("as ipld");
+            let atproto_dasl::Ipld::Map(map) = ipld else {
+                panic!("a record encodes as a map");
+            };
+            assert!(
+                matches!(map.get("payload"), Some(atproto_dasl::Ipld::Bytes(_))),
+                "payload encoded as {:?}",
+                map.get("payload")
+            );
+        }
 
-        // `text` is four bytes and `$type` five, so canonical order puts the
-        // marker second. Strict decoding refuses anything else.
-        atproto_dasl::from_slice::<TypedLexicon<LinkRecord>>(&encoded).expect("canonical");
-    }
+        /// `$type` is written first and the encoding is still canonical.
+        ///
+        /// `$type` is five bytes, so it sorts *after* a shorter key under
+        /// DAG-CBOR's length-first ordering -- writing it first would be wrong if
+        /// the encoder emitted keys in the order it received them. It sorts as it
+        /// encodes, and a strict decode validates that ordering, so a successful
+        /// strict round trip is the assertion.
+        #[test]
+        fn the_type_marker_does_not_disturb_canonical_key_ordering() {
+            let typed = TypedLexicon::new(LinkRecord {
+                subject: a_cid(),
+                text: "hello".to_string(),
+            });
 
-    /// A wrong `$type` is refused in DAG-CBOR as it is in JSON.
-    #[test]
-    fn a_wrong_type_marker_is_refused_in_dag_cbor() {
-        let encoded = atproto_dasl::to_vec(&TypedLexicon::new(BytesRecord {
-            payload: vec![1, 2, 3],
-        }))
-        .expect("encode");
+            let encoded = atproto_dasl::to_vec(&typed).expect("encode");
 
-        let result: Result<TypedLexicon<LinkRecord>, _> = atproto_dasl::from_slice(&encoded);
-        let error = result.expect_err("a marker for another type").to_string();
-        assert!(error.contains("test.lexicon.link"), "{error}");
-    }
+            // `text` is four bytes and `$type` five, so canonical order puts the
+            // marker second. Strict decoding refuses anything else.
+            atproto_dasl::from_slice::<TypedLexicon<LinkRecord>>(&encoded).expect("canonical");
+        }
 
-    /// An absent marker still round-trips, and still leaves `type_present`
-    /// false for a type that does not require one.
-    #[test]
-    fn an_absent_marker_round_trips_through_dag_cbor() {
-        let typed = TypedLexicon::new_without_type(OptionalTypeRecord {
-            data: "no marker".to_string(),
-        });
+        /// A wrong `$type` is refused in DAG-CBOR as it is in JSON.
+        #[test]
+        fn a_wrong_type_marker_is_refused_in_dag_cbor() {
+            let encoded = atproto_dasl::to_vec(&TypedLexicon::new(BytesRecord {
+                payload: vec![1, 2, 3],
+            }))
+            .expect("encode");
 
-        let encoded = atproto_dasl::to_vec(&typed).expect("encode");
-        let decoded: TypedLexicon<OptionalTypeRecord> =
-            atproto_dasl::from_slice(&encoded).expect("decode");
+            let result: Result<TypedLexicon<LinkRecord>, _> = atproto_dasl::from_slice(&encoded);
+            let error = result.expect_err("a marker for another type").to_string();
+            assert!(error.contains("test.lexicon.link"), "{error}");
+        }
 
-        assert!(!decoded.has_type_field());
-        assert!(decoded.validate().is_ok());
-        assert_eq!(decoded.inner.data, "no marker");
+        /// An absent marker still round-trips, and still leaves `type_present`
+        /// false for a type that does not require one.
+        #[test]
+        fn an_absent_marker_round_trips_through_dag_cbor() {
+            let typed = TypedLexicon::new_without_type(OptionalTypeRecord {
+                data: "no marker".to_string(),
+            });
+
+            let encoded = atproto_dasl::to_vec(&typed).expect("encode");
+            let decoded: TypedLexicon<OptionalTypeRecord> =
+                atproto_dasl::from_slice(&encoded).expect("decode");
+
+            assert!(!decoded.has_type_field());
+            assert!(decoded.validate().is_ok());
+            assert_eq!(decoded.inner.data, "no marker");
+        }
     }
 
     /// This module must not reach for `serde_json` again.

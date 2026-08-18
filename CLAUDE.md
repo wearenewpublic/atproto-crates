@@ -84,6 +84,12 @@ Features:
 - **Modern dependencies** for HTTP, DNS, JSON, cryptographic operations, and WebSocket streaming
 - **Storage abstractions** with LRU caching support (enabled by default via `lru` feature)
 - **DNS resolution** with Hickory DNS support (enabled by default via `hickory-dns` feature)
+- **No-network builds** of `atproto-identity` and `atproto-record` via
+  `default-features = false`, which drops the `resolve` feature and with it
+  `reqwest`, `tokio` and `hickory-resolver`, leaving keys, the DID document
+  model, validation, AT-URI parsing and the lexicon types. Enforced by
+  `crates/atproto-record/tests/lean_dependencies.rs` and a CI step; adding a
+  `use` of the network half to a module that is not feature-gated breaks it.
 - **Secure memory handling** (optional via `zeroize` feature)
 
 ## Error Handling

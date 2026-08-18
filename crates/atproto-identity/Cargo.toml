@@ -80,26 +80,42 @@ lru = { workspace = true, optional = true }
 multibase.workspace = true
 p256 = { workspace = true, features = [] }
 p384 = { workspace = true, features = [] }
-atproto-dasl.workspace = true
-reqwest.workspace = true
+atproto-dasl = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 tracing.workspace = true
 url.workspace = true
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 hex = "0.4"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["lru", "hickory-dns"]
-lru = ["dep:lru"]
-clap = ["dep:clap"]
+default = ["lru", "hickory-dns", "resolve"]
+
+# Identity resolution over the network: handle lookups, the PLC directory,
+# did:web and did:webvh.
+#
+# Off, this crate is pure: key handling and did:key encoding, the DID document
+# model, handle and DID validation, AT-URI input parsing, JWKs, and URL
+# construction -- with no HTTP client, no async runtime, and no DNS resolver in
+# the tree. Consumers that want the types without the network stack build with
+# `default-features = false`; that is not a nicety, it is the difference
+# between depending on this crate and copying its type definitions.
+# `atproto-dasl` is here because the only thing in this crate that encodes
+# DAG-CBOR is `plc::operations`, which signs PLC operations -- part of the
+# resolution half -- and because it is what carries `tokio` into the tree.
+resolve = ["dep:reqwest", "dep:tokio", "dep:atproto-dasl"]
+
+lru = ["dep:lru", "resolve"]
+clap = ["dep:clap", "resolve"]
 zeroize = ["dep:zeroize"]
-hickory-dns = ["dep:hickory-resolver"]
+hickory-dns = ["dep:hickory-resolver", "resolve"]
 
 [lints]
 workspace = true

@@ -9,6 +9,14 @@
 //! - **`atproto-identity-key`**: Generate and manage cryptographic keys (P-256, P-384, K-256)
 //! - **`atproto-identity-sign`**: Create cryptographic signatures of JSON data
 //! - **`atproto-identity-validate`**: Validate cryptographic signatures
+//!
+//! ## Features
+//!
+//! `resolve` (default) turns on identity resolution over the network. Without
+//! it the crate is pure -- keys, the DID document model, validation, AT-URI
+//! input parsing, JWKs and URL construction -- and pulls in no HTTP client,
+//! async runtime, or DNS resolver. Build with `default-features = false` to
+//! depend on the types without the network stack.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -19,6 +27,8 @@ pub mod host;
 pub mod jwk;
 pub mod key;
 pub mod model;
+/// The PLC directory client. Requires the `resolve` feature.
+#[cfg(feature = "resolve")]
 pub mod plc;
 pub mod resolve;
 #[cfg(feature = "lru")]
@@ -26,5 +36,9 @@ pub mod storage_lru;
 pub mod traits;
 pub mod url;
 pub mod validation;
+/// The did:web client. Requires the `resolve` feature.
+#[cfg(feature = "resolve")]
 pub mod web;
+/// The did:webvh client. Requires the `resolve` feature.
+#[cfg(feature = "resolve")]
 pub mod webvh;

@@ -62,6 +62,27 @@ steps:
   - name: "test"
     command: cargo test --workspace
 
+  # `atproto-record` declares `atproto-identity` itself rather than inheriting
+  # it, because Cargo refuses `default-features = false` on a workspace-
+  # inherited dependency and defaults off is the whole point there. That
+  # repeats the version, and a repeated version drifts silently -- the release
+  # bump updates `workspace.dependencies` and this one keeps pointing at the
+  # version before it, which resolves to a stale published crate rather than
+  # the sibling path. This requires the two to agree.
+  - name: "atproto-identity version pin"
+    command: V=$(sed -n 's/^atproto-identity = { version = "\(.*\)", path.*/\1/p' Cargo.toml) && echo "atproto-identity $V" && test -n "$V" && grep -q "^atproto-identity = { version = \"$V\", path = \"../atproto-identity\", default-features = false }$" crates/atproto-record/Cargo.toml
+
+  # `atproto-record` and `atproto-identity` promise a build with no HTTP
+  # client, async runtime, or DNS resolver in the tree, so a consumer with a
+  # no-I/O rule can import the wire types rather than redeclare them. Nothing
+  # in the default build exercises that: features are additive, so the network
+  # half compiles either way and the lean configuration only breaks when
+  # somebody adds a `use`. `--all-targets` so the crates' own tests are held to
+  # it too. The dependency graph itself is asserted by
+  # `atproto-record --test lean_dependencies`, which the "test" step runs.
+  - name: "lean build"
+    command: cargo check -p atproto-record --no-default-features --all-targets && cargo check -p atproto-identity --no-default-features --all-targets
+
   # Everything above runs in the dev profile, which is why a release-only
   # breakage survived: several crates derived `Debug` under
   # `cfg_attr(any(debug_assertions, test), ...)`, so downstream `derive(Debug)`

@@ -508,6 +508,7 @@ dependencies = [
  "multihash",
  "rand 0.10.2",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",

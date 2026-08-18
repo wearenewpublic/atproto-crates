@@ -34,6 +34,7 @@ pub enum WebDIDError {
     #[error("error-atproto-identity-web-2 Invalid DID format: missing hostname component")]
     MissingHostname,
 
+    #[cfg(feature = "resolve")]
     /// Occurs when the HTTP request to fetch the DID document fails
     #[error("error-atproto-identity-web-3 HTTP request failed: {url} {error}")]
     HttpRequestFailed {
@@ -43,6 +44,7 @@ pub enum WebDIDError {
         error: reqwest::Error,
     },
 
+    #[cfg(feature = "resolve")]
     /// Occurs when the DID document cannot be parsed from the HTTP response
     #[error("error-atproto-identity-web-4 Failed to parse DID document: {url} {error}")]
     DocumentParseFailed {
@@ -252,6 +254,7 @@ pub enum ResolveError {
     #[error("error-atproto-identity-resolve-4 DNS resolution failed")]
     DNSResolutionFailed,
 
+    #[cfg(feature = "resolve")]
     /// Occurs when HTTP request to .well-known/atproto-did endpoint fails
     #[error("error-atproto-identity-resolve-5 HTTP resolution failed: {error:?}")]
     HTTPResolutionFailed {
@@ -277,6 +280,7 @@ pub enum ResolveError {
 /// Error types that can occur when working with PLC DIDs
 #[derive(Debug, Error)]
 pub enum PLCDIDError {
+    #[cfg(feature = "resolve")]
     /// Occurs when the HTTP request to the PLC directory fails
     #[error("error-atproto-identity-plc-1 HTTP request failed: {url} {error}")]
     HttpRequestFailed {
@@ -286,6 +290,7 @@ pub enum PLCDIDError {
         error: reqwest::Error,
     },
 
+    #[cfg(feature = "resolve")]
     /// Occurs when the DID document cannot be parsed from the PLC directory response
     #[error("error-atproto-identity-plc-2 Failed to parse DID document: {url} {error}")]
     DocumentParseFailed {
@@ -459,6 +464,7 @@ pub enum PLCDIDError {
         body: String,
     },
 
+    #[cfg(feature = "resolve")]
     /// Occurs when fetching the audit log from the PLC directory fails
     #[error("error-atproto-identity-plc-26 Audit log fetch failed: {url} {error}")]
     AuditLogFetchFailed {
@@ -468,6 +474,7 @@ pub enum PLCDIDError {
         error: reqwest::Error,
     },
 
+    #[cfg(feature = "resolve")]
     /// Occurs when the audit log response cannot be parsed
     #[error("error-atproto-identity-plc-27 Audit log parse failed: {url} {error}")]
     AuditLogParseFailed {
@@ -591,6 +598,7 @@ pub enum WebVHDIDError {
     #[error("error-atproto-identity-webvh-3 Invalid DID format: missing hostname component")]
     MissingHostname,
 
+    #[cfg(feature = "resolve")]
     /// Occurs when the HTTP request to fetch the DID log fails
     #[error("error-atproto-identity-webvh-4 HTTP request failed: {url} {error}")]
     HttpRequestFailed {
@@ -824,7 +832,16 @@ impl WebVHDIDError {
     /// Converts this error to a spec-compliant resolution error.
     pub fn to_resolution_error(&self) -> ResolutionError {
         match self {
-            WebVHDIDError::HttpRequestFailed { .. } | WebVHDIDError::EmptyLog => ResolutionError {
+            #[cfg(feature = "resolve")]
+            WebVHDIDError::HttpRequestFailed { .. } => ResolutionError {
+                error: ResolutionErrorCode::NotFound,
+                problem_details: Some(ProblemDetails {
+                    r#type: None,
+                    title: "DID not found".to_string(),
+                    detail: Some(self.to_string()),
+                }),
+            },
+            WebVHDIDError::EmptyLog => ResolutionError {
                 error: ResolutionErrorCode::NotFound,
                 problem_details: Some(ProblemDetails {
                     r#type: None,

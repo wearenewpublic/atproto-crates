@@ -73,7 +73,9 @@ pub enum VerificationError {
     /// Error when record serialization fails.
     ///
     /// This error occurs when the signed record cannot be serialized
-    /// to IPLD CBOR format for signature verification.
+    /// to IPLD CBOR format for signature verification. Requires the `resolve`
+    /// feature, which is what brings the DAG-CBOR encoder into the tree.
+    #[cfg(feature = "resolve")]
     #[error("error-atproto-record-verification-4 Record serialization failed: {error}")]
     RecordSerializationFailed {
         /// The underlying serialization error

@@ -12,6 +12,7 @@
 //! 3. Validate that both methods return the same DID
 //! 4. For DIDs: return the identifier directly
 
+#[cfg(feature = "resolve")]
 use anyhow::Result;
 #[cfg(feature = "hickory-dns")]
 use hickory_resolver::{
@@ -20,19 +21,29 @@ use hickory_resolver::{
     net::runtime::TokioRuntimeProvider,
     proto::rr::RData,
 };
+#[cfg(feature = "resolve")]
 use reqwest::Client;
+#[cfg(feature = "resolve")]
 use std::collections::HashSet;
+#[cfg(feature = "resolve")]
 use std::ops::Deref;
+#[cfg(feature = "resolve")]
 use std::sync::Arc;
+#[cfg(feature = "resolve")]
 use std::time::Duration;
+#[cfg(feature = "resolve")]
 use tracing::{Instrument, instrument};
 
 use crate::errors::ResolveError;
 use crate::host::did_host;
+#[cfg(feature = "resolve")]
 use crate::model::Document;
+#[cfg(feature = "resolve")]
 use crate::plc::query as plc_query;
 use crate::validation::{is_valid_did_method_plc, is_valid_did_method_webvh, is_valid_handle};
+#[cfg(feature = "resolve")]
 use crate::web::query as web_query;
+#[cfg(feature = "resolve")]
 use crate::webvh::query as webvh_query;
 
 pub use crate::traits::{DnsResolver, IdentityResolver};
@@ -142,6 +153,7 @@ pub enum InputType {
 /// remainder to pass [`is_valid_handle`], which rejects every network address literal
 /// form — dotted-quad, IPv6, and the `inet_aton` decimal, octal, hexadecimal, and short
 /// forms — along with any string carrying URL metacharacters such as `:`, `/`, or `%`.
+#[cfg(feature = "resolve")]
 fn validated_handle(handle: &str) -> Result<String, ResolveError> {
     is_valid_handle(handle.trim()).ok_or(ResolveError::InvalidInput)
 }
@@ -155,6 +167,7 @@ fn validated_handle(handle: &str) -> Result<String, ResolveError> {
 /// interpolated into the `_atproto.{handle}` query name. Address-shaped or
 /// metacharacter-bearing input is rejected with [`ResolveError::InvalidInput`] and no
 /// query is issued.
+#[cfg(feature = "resolve")]
 #[instrument(skip(dns_resolver), err)]
 pub async fn resolve_handle_dns<R: DnsResolver + ?Sized>(
     dns_resolver: &R,
@@ -193,6 +206,7 @@ pub async fn resolve_handle_dns<R: DnsResolver + ?Sized>(
 ///
 /// Validation is purely syntactic. It does not defend against DNS rebinding, nor
 /// against a public hostname whose address record points into a private range.
+#[cfg(feature = "resolve")]
 #[instrument(skip(http_client), err)]
 pub async fn resolve_handle_http(
     http_client: &reqwest::Client,
@@ -258,7 +272,9 @@ pub fn parse_input(input: &str) -> Result<InputType, ResolveError> {
     }
 }
 
-#[cfg(test)]
+// The tests here stand up resolvers and HTTP clients, so they need the
+// network half of the crate.
+#[cfg(all(test, feature = "resolve"))]
 mod tests {
 
     /// A TXT answer yields its payload, not the whole record.
@@ -695,6 +711,7 @@ mod tests {
 /// [`ResolveError::InvalidInput`] rather than fetched. The same check is enforced
 /// independently by [`resolve_handle_http`] and [`resolve_handle_dns`], so it cannot be
 /// bypassed by calling either of those directly.
+#[cfg(feature = "resolve")]
 #[instrument(skip(http_client, dns_resolver), err)]
 pub async fn resolve_handle<R: DnsResolver + ?Sized>(
     http_client: &reqwest::Client,
@@ -726,6 +743,7 @@ pub async fn resolve_handle<R: DnsResolver + ?Sized>(
 
 /// Resolves any subject (handle or DID) to a canonical DID.
 /// Handles all supported identifier formats automatically.
+#[cfg(feature = "resolve")]
 #[instrument(skip(http_client, dns_resolver), err)]
 pub async fn resolve_subject<R: DnsResolver + ?Sized>(
     http_client: &reqwest::Client,
@@ -742,6 +760,7 @@ pub async fn resolve_subject<R: DnsResolver + ?Sized>(
 ///
 /// Contains the networking and configuration components needed to resolve
 /// handles and DIDs to their corresponding DID documents.
+#[cfg(feature = "resolve")]
 pub struct InnerIdentityResolver {
     /// DNS resolver for handle-to-DID resolution via TXT records.
     pub dns_resolver: Arc<dyn DnsResolver>,
@@ -755,9 +774,11 @@ pub struct InnerIdentityResolver {
 ///
 /// Wraps `InnerIdentityResolver` in an Arc for shared access across threads,
 /// enabling resolution of AT Protocol handles and DIDs to DID documents.
+#[cfg(feature = "resolve")]
 #[derive(Clone)]
 pub struct SharedIdentityResolver(pub Arc<InnerIdentityResolver>);
 
+#[cfg(feature = "resolve")]
 impl Deref for SharedIdentityResolver {
     type Target = InnerIdentityResolver;
 
@@ -767,6 +788,7 @@ impl Deref for SharedIdentityResolver {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "resolve")]
 impl IdentityResolver for SharedIdentityResolver {
     async fn resolve(&self, subject: &str) -> Result<Document> {
         self.0.resolve(subject).await
@@ -774,6 +796,7 @@ impl IdentityResolver for SharedIdentityResolver {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "resolve")]
 impl IdentityResolver for InnerIdentityResolver {
     async fn resolve(&self, subject: &str) -> Result<Document> {
         let resolved_did = resolve_subject(&self.http_client, &*self.dns_resolver, subject).await?;
@@ -792,6 +815,7 @@ impl IdentityResolver for InnerIdentityResolver {
     }
 }
 
+#[cfg(feature = "resolve")]
 impl InnerIdentityResolver {
     /// Resolves an AT Protocol subject to its DID document.
     ///
