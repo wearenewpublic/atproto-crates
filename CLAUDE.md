@@ -70,6 +70,7 @@ A comprehensive Rust workspace with multiple crates:
 - **atproto-record**: Record utilities including TID generation, AT-URI parsing, and CID generation
 - **atproto-repo**: AT Protocol repository operations including MST trees, commits, and record access (re-exports CAR/storage from atproto-dasl)
 - **atproto-client**: HTTP client with OAuth and identity integration
+- **atproto-firehose**: `com.atproto.sync.subscribeRepos` consumer - frame decoding, commit verification, and a reconnecting stream
 - **atproto-jetstream**: WebSocket event streaming with compression
 - **atproto-oauth**: OAuth workflow implementation with DPoP, PKCE, JWT, and storage abstractions
 - **atproto-oauth-axum**: Axum web framework integration for OAuth

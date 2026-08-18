@@ -292,6 +292,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "atproto-firehose"
+version = "0.15.0-rc.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "atproto-client",
+ "atproto-dasl",
+ "atproto-identity",
+ "atproto-repo",
+ "futures",
+ "http 1.5.0",
+ "rand 0.10.2",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-websockets",
+ "tracing",
+]
+
+[[package]]
 name = "atproto-identity"
 version = "0.15.0-rc.4"
 dependencies = [
@@ -440,6 +462,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "atproto-dasl",
+ "atproto-firehose",
  "atproto-identity",
  "atproto-lexicon",
  "atproto-oauth",

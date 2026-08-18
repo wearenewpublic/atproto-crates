@@ -13,8 +13,6 @@
 //!
 //! Spec defaults to CBOR — production peers (relays, app-views) require it.
 
-use serde::{Deserialize, Serialize};
-
 /// Frame encoding selection for a subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
@@ -94,23 +92,17 @@ impl Encoding {
 }
 
 /// Per-event frame header — encoded as the first CBOR object in CBOR mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrameHeader {
-    /// `1` = event, `-1` = error frame (the body carries `{name, message}`).
-    pub op: i8,
-    /// Event-type tag with leading `#`, e.g. `#commit`, `#sync`, `#info`.
-    pub t: String,
-}
+///
+/// Taken from `atproto-firehose` rather than declared here, so this encoder
+/// and that decoder cannot drift: an encoder and a decoder in one workspace
+/// that share their types are worth more than either alone, and the interop
+/// test below is a round trip rather than a byte comparison against a
+/// hand-written expectation.
+pub use atproto_firehose::wire::FrameHeader;
 
 /// Hash-prefix the bare event-type discriminator string (`commit` →
 /// `#commit`). Also recognizes already-prefixed input.
-pub fn type_tag(event_type: &str) -> String {
-    if event_type.starts_with('#') {
-        event_type.to_string()
-    } else {
-        format!("#{event_type}")
-    }
-}
+pub use atproto_firehose::wire::type_tag_of as type_tag;
 
 /// Encode an event into a single WebSocket payload (binary in CBOR mode,
 /// text in JSON mode). The caller wraps the bytes in the appropriate
@@ -145,7 +137,7 @@ pub fn encode_event(
             Some((frame.to_string().into_bytes(), true))
         }
         Encoding::Cbor => {
-            let header = FrameHeader { op: 1, t };
+            let header = FrameHeader::message(&t);
             let mut out = atproto_dasl::to_vec(&header).ok()?;
             out.extend_from_slice(&body_bytes);
             Some((out, false))
@@ -223,10 +215,7 @@ pub fn encode_info(encoding: Encoding, name: &str, message: &str) -> (Vec<u8>, b
             (frame.to_string().into_bytes(), true)
         }
         Encoding::Cbor => {
-            let header = FrameHeader {
-                op: 1,
-                t: "#info".to_string(),
-            };
+            let header = FrameHeader::message("#info");
             let mut out = atproto_dasl::to_vec(&header).unwrap_or_default();
             let body = serde_json::json!({
                 "name": name,
@@ -263,9 +252,9 @@ pub fn encode_error(encoding: Encoding, error: &str, message: &str) -> (Vec<u8>,
             (frame.to_string().into_bytes(), true)
         }
         Encoding::Cbor => {
-            // `FrameHeader` always serializes `t`, which an error frame must not
-            // carry, so the header is built directly here.
-            let header = serde_json::json!({ "op": -1 });
+            // `t` is optional and skipped when absent, so the shared header
+            // type encodes the one frame shape that must not carry a type tag.
+            let header = FrameHeader::error();
             let mut out = atproto_dasl::to_vec(&header).unwrap_or_default();
             let body = serde_json::json!({ "error": error, "message": message });
             if let Ok(body_bytes) = atproto_dasl::to_vec(&body) {
@@ -381,15 +370,12 @@ mod tests {
         // rejects trailing data, so we can't decode both halves from the
         // same buffer in one pass — subscribers split the frame using a
         // streaming CBOR reader instead.)
-        let expected_header = FrameHeader {
-            op: 1,
-            t: "#commit".to_string(),
-        };
+        let expected_header = FrameHeader::message("#commit");
         let header_bytes = atproto_dasl::to_vec(&expected_header).unwrap();
         assert!(bytes.starts_with(&header_bytes));
         let header: FrameHeader = atproto_dasl::from_slice(&header_bytes).unwrap();
         assert_eq!(header.op, 1);
-        assert_eq!(header.t, "#commit");
+        assert_eq!(header.t.as_deref(), Some("#commit"));
         let body_bytes = &bytes[header_bytes.len()..];
         let atproto_dasl::Ipld::Map(body) = atproto_dasl::from_slice(body_bytes).unwrap() else {
             panic!("a #commit body is a map")
@@ -418,10 +404,7 @@ mod tests {
     fn cbor_info_frame_is_a_message_frame() {
         let (bytes, is_text) = encode_info(Encoding::Cbor, "OutdatedCursor", "see ya");
         assert!(!is_text);
-        let expected_header = FrameHeader {
-            op: 1,
-            t: "#info".to_string(),
-        };
+        let expected_header = FrameHeader::message("#info");
         let header_bytes = atproto_dasl::to_vec(&expected_header).unwrap();
         assert!(bytes.starts_with(&header_bytes));
         let body_bytes = &bytes[header_bytes.len()..];

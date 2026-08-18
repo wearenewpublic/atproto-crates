@@ -4,6 +4,7 @@ members = [
     "crates/atproto-client",
     "crates/atproto-dasl",
     "crates/atproto-extras",
+    "crates/atproto-firehose",
     "crates/atproto-identity",
     "crates/atproto-jetstream",
     "crates/atproto-oauth-axum",
@@ -37,6 +38,7 @@ atproto-attestation = { version = "0.15.0-rc.4", path = "crates/atproto-attestat
 atproto-client = { version = "0.15.0-rc.4", path = "crates/atproto-client" }
 atproto-dasl = { version = "0.15.0-rc.4", path = "crates/atproto-dasl" }
 atproto-extras = { version = "0.15.0-rc.4", path = "crates/atproto-extras" }
+atproto-firehose = { version = "0.15.0-rc.4", path = "crates/atproto-firehose" }
 atproto-identity = { version = "0.15.0-rc.4", path = "crates/atproto-identity" }
 atproto-jetstream = { version = "0.15.0-rc.4", path = "crates/atproto-jetstream" }
 atproto-lexicon = { version = "0.15.0-rc.4", path = "crates/atproto-lexicon" }
