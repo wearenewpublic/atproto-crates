@@ -77,8 +77,9 @@ pub use mst::{Mst, MstDiff, MstNode, RepoOp, RepoOpAction, TreeEntry, ops_with_p
 
 // Re-export repository types
 pub use repo::{
-    Commit, DiskRepository, InductiveVerification, MemoryRepository, RecordPath, Repository,
-    SignatureVerification, UnsignedCommit, verify_inductive,
+    Commit, DiskRepository, InductiveVerification, MemoryRepository, OpInclusion, RecordPath,
+    Repository, SignatureVerification, UnsignedCommit, verify_inductive, verify_op_inclusion,
+    verify_op_inclusion_in,
 };
 
 #[cfg(test)]
