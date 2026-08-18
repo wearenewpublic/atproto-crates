@@ -90,9 +90,23 @@ impl DpopRetry {
 /// "use_dpop_nonce" errors, extracts the DPoP-Nonce header, and retries
 /// the request with an updated DPoP proof containing the nonce.
 ///
-/// This does not evaluate the response body to determine if a DPoP error was
-/// returned. Only the returned "WWW-Authenticate" header is evaluated. This
-/// is the expected and defined behavior per RFC7235 sections 3.1 and 4.1.
+/// The `WWW-Authenticate` header is consulted first and, when it settles the
+/// question, the body is never touched. That ordering is what lets the
+/// RFC 9449 §7.1 shape work: the challenge is specified as a `401` with a
+/// `DPoP-Nonce` header and `WWW-Authenticate: DPoP error="use_dpop_nonce"`,
+/// and it says nothing about a body. A server that sends none -- which is
+/// conformant, and which real servers do -- used to have its challenge
+/// reported as [`DpopError::ResponseBodyParsingFailed`], so the request was
+/// dropped rather than retried.
+///
+/// The body is read only when [`DpopRetry::check_response_body`] is set and
+/// the header did not answer the question, which is the token-endpoint case:
+/// an authorization server is not a protected resource, so it reports
+/// `use_dpop_nonce` in the body with no challenge header at all. A body that
+/// turns out not to be a DPoP challenge is handed back to the caller as a
+/// response rather than raised as a middleware error -- an ordinary
+/// `400 InvalidSwap` or `403 ScopeMissingError` is the caller's to handle,
+/// and destroying the response leaves it with only an error string.
 #[async_trait::async_trait]
 impl Chainer for DpopRetry {
     type State = ();
@@ -124,60 +138,78 @@ impl Chainer for DpopRetry {
         };
 
         let headers = response.headers().clone();
-        let www_authenticate_header = headers.get("WWW-Authenticate");
-        let www_authenticate_value = www_authenticate_header.and_then(|value| value.to_str().ok());
-        let dpop_header_error = www_authenticate_value.is_some_and(is_dpop_error);
+        let www_authenticate_value = headers
+            .get("WWW-Authenticate")
+            .and_then(|value| value.to_str().ok());
+        let nonce = headers
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
 
-        if !dpop_header_error && !self.check_response_body {
+        // The header first, because it needs no body. A challenge that carries
+        // one is the common case at a resource server, and a challenge that
+        // carries none is still a challenge.
+        let mut challenge = www_authenticate_value.is_some_and(is_dpop_error);
+        let mut response = response;
+
+        if !challenge {
+            if www_authenticate_value.is_some() {
+                // The server named what this is, and it is not a DPoP
+                // challenge. Hand it back untouched.
+                return Ok(Some(response));
+            }
+
+            if !self.check_response_body {
+                return Ok(Some(response));
+            }
+
+            let (rebuilt, body) = read_body_preserving(response).await?;
+            response = rebuilt;
+
+            let error_value = body
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+
+            // An absent, empty, or non-JSON body is not a malformed response.
+            // Paired with a fresh nonce it is the bare challenge shape, and
+            // paired with nothing it is a failure the caller should see.
+            challenge = error_value == "invalid_dpop_proof"
+                || error_value == "use_dpop_nonce"
+                || (error_value.is_empty() && nonce.is_some());
+
+            if !challenge {
+                return Ok(Some(response));
+            }
+        }
+
+        // A challenge with no nonce leaves nothing to retry with. Returning
+        // the response says so with a status and a body; the error this used
+        // to raise said it with neither.
+        let Some(dpop_header) = nonce else {
             return Ok(Some(response));
         };
-
-        if self.check_response_body {
-            let response_body = match response.json::<serde_json::Value>().await {
-                Err(err) => {
-                    return Err(reqwest_middleware::Error::Middleware(
-                        DpopError::ResponseBodyParsingFailed(err).into(),
-                    ));
-                }
-                Ok(value) => value,
-            };
-            if let Some(response_body_obj) = response_body.as_object() {
-                let error_value = response_body_obj
-                    .get("error")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("placeholder_unknown_error");
-
-                if error_value != "invalid_dpop_proof" && error_value != "use_dpop_nonce" {
-                    return Err(reqwest_middleware::Error::Middleware(
-                        DpopError::UnexpectedOAuthError {
-                            error: error_value.to_string(),
-                        }
-                        .into(),
-                    ));
-                }
-            } else {
-                return Err(reqwest_middleware::Error::Middleware(
-                    DpopError::ResponseBodyObjectParsingFailed.into(),
-                ));
-            }
-        };
-
-        let dpop_header = headers
-            .get("DPoP-Nonce")
-            .and_then(|value| value.to_str().ok());
-
-        if dpop_header.is_none() {
-            return Err(reqwest_middleware::Error::Middleware(
-                DpopError::MissingDpopNonceHeader.into(),
-            ));
-        }
-        let dpop_header = dpop_header.unwrap();
+        let dpop_header = dpop_header.as_str();
 
         let dpop_proof_header = self.header.clone();
         let mut dpop_proof_claim = self.claims.clone();
-        dpop_proof_claim
-            .private
-            .insert("nonce".to_string(), dpop_header.to_string().into());
+        dpop_proof_claim.jose.nonce = Some(dpop_header.to_string());
+
+        // A fresh proof rather than the challenged one re-signed. `jti` is
+        // single-use (RFC 9449 §11.1) and servers record it, so reusing the
+        // one just sent invites the retry being refused as a replay -- and the
+        // original `exp` is 30 seconds from a request that has already been
+        // out and back, so a slow first attempt could leave the retry expired
+        // before it is issued.
+        let now = chrono::Utc::now();
+        dpop_proof_claim.jose.json_web_token_id = Some(Ulid::generate().to_string());
+        dpop_proof_claim.jose.issued_at = Some(now.timestamp().cast_unsigned());
+        dpop_proof_claim.jose.expiration = Some(
+            (now + chrono::Duration::seconds(30))
+                .timestamp()
+                .cast_unsigned(),
+        );
 
         let dpop_proof_token = mint(&self.key_data, &dpop_proof_header, &dpop_proof_claim)
             .map_err(|err| {
@@ -195,6 +227,41 @@ impl Chainer for DpopRetry {
     }
 }
 
+/// Read a response body while keeping the response usable.
+///
+/// `reqwest::Response::json` consumes the response, which is why this
+/// middleware could previously only turn a body it did not like into an error:
+/// it had nothing left to hand back. Rebuilding from the parts gives the
+/// caller its response, body included.
+///
+/// The one thing that does not survive is `Response::url`, which reqwest keeps
+/// outside the HTTP parts and offers no way to restore. A rebuilt response
+/// reports a placeholder URL. That is a narrow loss against destroying the
+/// response altogether, and it is confined to the one path that reads the
+/// body: a 400 or 401 with no `WWW-Authenticate` header.
+///
+/// The returned value is `None` when the body was absent, empty, or not JSON.
+async fn read_body_preserving(
+    response: reqwest::Response,
+) -> Result<(reqwest::Response, Option<serde_json::Value>), reqwest_middleware::Error> {
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(reqwest_middleware::Error::Reqwest)?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+
+    let mut rebuilt = http::Response::new(bytes);
+    *rebuilt.status_mut() = status;
+    *rebuilt.version_mut() = version;
+    *rebuilt.headers_mut() = headers;
+
+    Ok((rebuilt.into(), value))
+}
+
 /// Parses the value of the "WWW-Authenticate" header and returns true if the inner "error" field is either "invalid_dpop_proof" or "use_dpop_nonce".
 ///
 /// This function parses DPoP challenge headers to determine if the server is requesting
@@ -208,7 +275,7 @@ impl Chainer for DpopRetry {
 /// * `false` if no DPoP error is found or the header format is invalid
 ///
 /// # Examples
-/// ```no_run
+/// ```
 /// use atproto_oauth::dpop::is_dpop_error;
 ///
 /// // Valid DPoP error: invalid_dpop_proof
@@ -226,45 +293,74 @@ impl Chainer for DpopRetry {
 /// // Non-DPoP authentication scheme
 /// let header4 = r#"Bearer error="invalid_token""#;
 /// assert!(!is_dpop_error(header4));
+///
+/// // RFC 9110 section 11.6.1 lets one header carry several challenges.
+/// let header5 = r#"Bearer realm="pds", DPoP error="use_dpop_nonce""#;
+/// assert!(is_dpop_error(header5));
 /// ```
 pub fn is_dpop_error(value: &str) -> bool {
-    // Check if the header starts with "DPoP"
-    if !value.trim_start().starts_with("DPoP") {
-        return false;
-    }
+    // RFC 9110 section 11.6.1 permits one `WWW-Authenticate` to offer several
+    // challenges, so `Bearer realm="pds", DPoP error="use_dpop_nonce"` is
+    // legal -- and a test that required the header to begin with `DPoP`
+    // refused it, missing the nonce challenge and dropping the request. So
+    // this walks the challenge list rather than assuming there is one.
+    //
+    // The grammar is not parsed in full. Challenges and their parameters are
+    // both comma-separated, and the only thing that distinguishes them is that
+    // a challenge introduces a scheme name before its first parameter. That is
+    // enough to track which scheme each `error` belongs to, which is the whole
+    // question here.
+    let mut scheme: Option<String> = None;
+    let mut error_seen_for_scheme = false;
 
-    // Remove the "DPoP" scheme prefix and parse the parameters
-    let params_part = value.trim_start().strip_prefix("DPoP").unwrap_or("").trim();
+    for part in value.split(',') {
+        let Some((lhs, rhs)) = part.split_once('=') else {
+            continue;
+        };
 
-    // Split by commas and look for error field
-    for part in params_part.split(',') {
-        let trimmed = part.trim();
-
-        // Look for error="value" pattern
-        if let Some(equals_pos) = trimmed.find('=') {
-            let (key, value_part) = trimmed.split_at(equals_pos);
-            let key = key.trim();
-
-            if key == "error" {
-                // Extract the quoted value
-                let value_part = &value_part[1..]; // Skip the '='
-                let value_part = value_part.trim();
-
-                // Remove surrounding quotes if present (handle malformed quotes too)
-                let error_value = if let Some(stripped) = value_part.strip_prefix('"') {
-                    if value_part.ends_with('"') && value_part.len() >= 2 {
-                        &value_part[1..value_part.len() - 1]
-                    } else {
-                        stripped // Remove leading quote even if no closing quote
-                    }
-                } else if let Some(stripped) = value_part.strip_suffix('"') {
-                    stripped // Remove trailing quote if no leading quote
-                } else {
-                    value_part
-                };
-
-                return error_value == "invalid_dpop_proof" || error_value == "use_dpop_nonce";
+        // `DPoP algs="ES256"` puts the scheme and the first parameter in one
+        // comma-separated part; ` error="..."` continues the scheme before it.
+        // Scheme and parameter names are both case-insensitive (section 11.1),
+        // so a server writing `dpop` is issuing the same challenge as one
+        // writing `DPoP` and has to be read as such.
+        let words: Vec<&str> = lhs.split_whitespace().collect();
+        let key = match words.as_slice() {
+            [] => continue,
+            [name] => name.to_ascii_lowercase(),
+            [new_scheme, .., name] => {
+                scheme = Some(new_scheme.to_ascii_lowercase());
+                error_seen_for_scheme = false;
+                name.to_ascii_lowercase()
             }
+        };
+
+        if key != "error" {
+            continue;
+        }
+
+        // A parameter must not repeat within one challenge (section 11.2), so
+        // a second `error` under the same scheme is a malformed header rather
+        // than a second answer. The first one stands.
+        if error_seen_for_scheme {
+            continue;
+        }
+        error_seen_for_scheme = true;
+
+        if scheme.as_deref() != Some("dpop") {
+            continue;
+        }
+
+        // Quoting is at the server's discretion, and a malformed pair with
+        // only one quote should still be read rather than refused.
+        let raw = rhs.trim();
+        let error_value = raw
+            .strip_prefix('"')
+            .unwrap_or(raw)
+            .strip_suffix('"')
+            .unwrap_or_else(|| raw.strip_prefix('"').unwrap_or(raw));
+
+        if error_value == "invalid_dpop_proof" || error_value == "use_dpop_nonce" {
+            return true;
         }
     }
 
@@ -938,10 +1034,26 @@ mod tests {
         assert!(is_dpop_error(header));
     }
 
+    /// An auth scheme is case-insensitive (RFC 9110 section 11.1), so a server
+    /// that writes `dpop` is issuing the challenge a server that writes `DPoP`
+    /// issues. Reading only the second spelling meant the first one's nonce
+    /// challenge was missed and the request dropped -- which is why this test
+    /// now asserts the opposite of what it used to.
     #[test]
-    fn test_is_dpop_error_case_sensitive_scheme() {
+    fn a_lowercase_scheme_is_the_same_challenge() {
         let header = r#"dpop error="invalid_dpop_proof""#;
-        assert!(!is_dpop_error(header));
+        assert!(is_dpop_error(header));
+    }
+
+    /// A `DPoP` challenge offered after a `Bearer` one is still a challenge.
+    #[test]
+    fn a_challenge_beside_another_scheme_is_found() {
+        assert!(is_dpop_error(
+            r#"Bearer realm="pds", DPoP error="use_dpop_nonce""#
+        ));
+        assert!(!is_dpop_error(
+            r#"DPoP realm="pds", Bearer error="use_dpop_nonce""#
+        ));
     }
 
     #[test]

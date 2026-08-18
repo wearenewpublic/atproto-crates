@@ -37,6 +37,9 @@ p256 = { workspace = true, features = ["serde"] }
 p384 = { workspace = true, features = ["serde"] }
 rand.workspace = true
 reqwest-chain.workspace = true
+# `DpopRetry` rebuilds a response after reading its body, so it needs the
+# `http` types `reqwest::Response` converts to and from.
+http.workspace = true
 reqwest-middleware.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
@@ -51,9 +54,10 @@ clap = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Lets the discovery-cap tests build a `reqwest::Response` over a body without
-# standing up a server to serve it.
-http.workspace = true
+# The retry tests script a real socket: whether a challenge is retried, and
+# whether a non-challenge response survives the middleware, are properties of
+# what crosses the wire.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 
 [features]
 default = ["lru", "hickory-dns"]

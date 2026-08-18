@@ -47,7 +47,6 @@ atproto-oauth.workspace = true
 atproto-record.workspace = true
 
 anyhow.workspace = true
-reqwest-chain.workspace = true
 reqwest-middleware.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
@@ -61,6 +60,14 @@ bytes.workspace = true
 clap = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The DPoP transport tests script a real socket: the nonce dance is a property
+# of what goes on the wire and how many times, which a faked response cannot
+# show. A hand-rolled listener keeps that from costing a test-server crate.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# Reads the `nonce` claim back out of a minted proof.
+base64.workspace = true
 
 [features]
 default = ["hickory-dns"]

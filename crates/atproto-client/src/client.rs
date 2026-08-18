@@ -3,14 +3,13 @@
 //! Authenticated and unauthenticated HTTP requests for JSON APIs
 //! with DPoP (Demonstration of Proof-of-Possession) support.
 
-use crate::errors::{ClientError, DPoPError};
+use crate::errors::{ClientError, DPoPError, XrpcError};
 use anyhow::Result;
 use atproto_identity::key::KeyData;
-use atproto_oauth::dpop::{DpopRetry, request_dpop};
+use atproto_oauth::dpop::{dpop_with_nonce, request_dpop};
 use bytes::Bytes;
-use reqwest::header::HeaderMap;
-use reqwest_chain::ChainMiddleware;
-use reqwest_middleware::ClientBuilder;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, StatusCode};
 use tracing::Instrument;
 
 /// DPoP authentication credentials for authenticated HTTP requests.
@@ -46,6 +45,364 @@ pub enum Auth {
     DPoP(DPoPAuth),
     /// App password authentication using JWT bearer tokens
     AppPassword(AppPasswordAuth),
+}
+
+/// The body of a DPoP-authenticated request.
+///
+/// `Bytes` exists because `com.atproto.repo.uploadBlob` is not JSON: it sends
+/// raw bytes and the server records the `Content-Type` it was given on the
+/// blob. A JSON-only transport is why an uploader ends up as a second copy of
+/// the nonce dance rather than a caller of it.
+#[derive(Debug, Clone)]
+pub enum DpopBody<'a> {
+    /// A JSON document, sent as `application/json`.
+    Json(&'a serde_json::Value),
+    /// Raw bytes with a caller-chosen content type.
+    Bytes {
+        /// The `Content-Type` to send.
+        ///
+        /// For `uploadBlob` this is recorded on the blob, so it must be the
+        /// type determined from the bytes and never the one a browser
+        /// declared.
+        content_type: &'a str,
+        /// The bytes to send.
+        data: Vec<u8>,
+    },
+}
+
+/// A DPoP-authenticated response with the status line intact.
+///
+/// [`post_dpop_json`] and its siblings parse the body regardless of status and
+/// return it, which makes a `429` indistinguishable from a `200` except by
+/// guessing at the body shape, and puts `Retry-After` and `DPoP-Nonce` out of
+/// reach. This carries all three.
+#[derive(Debug)]
+pub struct DpopResponse {
+    /// The HTTP status the server answered with.
+    pub status: StatusCode,
+    /// Every response header, including `Retry-After` and `DPoP-Nonce`.
+    pub headers: HeaderMap,
+    /// The parsed body.
+    ///
+    /// `None` when the body was absent, empty, or not JSON -- never an error.
+    /// Some deployments front their errors with a proxy that answers HTML, and
+    /// a classifier that unwrapped here would turn a bad gateway into a panic.
+    pub body: Option<serde_json::Value>,
+}
+
+impl DpopResponse {
+    /// Whether the status is 2xx.
+    pub fn is_success(&self) -> bool {
+        self.status.is_success()
+    }
+
+    /// The `error` and `message` fields of an XRPC error body.
+    ///
+    /// Both are empty when absent. Both are optional in practice -- a proxy
+    /// that answers a 502 sends neither -- so this reports their absence
+    /// rather than failing on it.
+    pub fn xrpc_error_fields(&self) -> (String, String) {
+        let field = |name: &str| {
+            self.body
+                .as_ref()
+                .and_then(|value| value.get(name))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        (field("error"), field("message"))
+    }
+
+    /// The `Retry-After` header in seconds.
+    ///
+    /// RFC 9110 §10.2.3 allows an HTTP-date as well as delta-seconds. Only the
+    /// delta-seconds form is read here; a date returns `None`, which a caller
+    /// handles the same way it handles a server that sent no header at all.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        self.headers
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// The value of the `DPoP-Nonce` header, when the server sent one.
+    pub fn dpop_nonce(&self) -> Option<&str> {
+        self.headers.get("DPoP-Nonce")?.to_str().ok()
+    }
+
+    /// Classify this response as an XRPC error, or `None` if it succeeded.
+    pub fn error(&self) -> Option<XrpcError> {
+        XrpcError::from_response(self)
+    }
+}
+
+/// Whether a 400 or 401 is a DPoP nonce challenge.
+///
+/// Three signals, because one server is not the network:
+///
+/// * the XRPC error code, which is what a token endpoint sends;
+/// * the `WWW-Authenticate` challenge, which is what RFC 9449 §7.1 specifies
+///   and what a resource server sends;
+/// * a `DPoP-Nonce` header with no error code at all, which is the bare shape
+///   some servers answer with.
+///
+/// The third arm is the loosest and is still safe: it is only reached on a 400
+/// or 401, only on the first attempt, and only when a nonce header was
+/// present. The worst case is one retry that fails identically.
+pub fn is_nonce_challenge(code: &str, www_authenticate: &str, has_nonce: bool) -> bool {
+    if code == "use_dpop_nonce" || code == "invalid_dpop_proof" {
+        return true;
+    }
+    // `DPoP error="use_dpop_nonce"`, case-insensitively: the scheme and the
+    // parameter names are case-insensitive per RFC 9110 §11.1, and quoting is
+    // at the server's discretion, so this looks for the token rather than
+    // parsing the whole header.
+    let header = www_authenticate.to_ascii_lowercase();
+    if header.contains("use_dpop_nonce") || header.contains("invalid_dpop_proof") {
+        return true;
+    }
+    has_nonce && code.is_empty()
+}
+
+/// A DPoP-authenticated XRPC call with the status line intact.
+///
+/// Unlike [`post_dpop_json`], this returns the status and the response headers
+/// alongside the body, so a caller can distinguish a `429` from a `200`, read
+/// `Retry-After`, and classify an XRPC error code with
+/// [`XrpcError::from_response`].
+///
+/// The nonce dance is handled here rather than by middleware: exactly one
+/// retry, because a server that demands a nonce from a proof already carrying
+/// the one it just issued is misbehaving, and looping on it turns one bad peer
+/// into an outbound request flood. The retry proof is minted fresh rather than
+/// re-signed, so it carries a new `jti` and `iat` -- a server that tracks
+/// `jti` for replay protection would refuse a re-send of the proof it just
+/// challenged.
+///
+/// A challenge the server sent no `DPoP-Nonce` with is returned as-is rather
+/// than retried or turned into an error: there is nothing to retry with, and
+/// the caller is better placed to say what a nonce-less challenge means.
+///
+/// # Errors
+///
+/// Returns [`DPoPError::ProofGenerationFailed`] if the proof cannot be minted,
+/// [`DPoPError::BodySerializationFailed`] if a JSON body cannot be encoded,
+/// [`DPoPError::RequestFailed`] if the request cannot be sent, and
+/// [`DPoPError::BodyReadFailed`] if the response body cannot be read off the
+/// socket. A non-2xx status is **not** an error -- that is the point.
+pub async fn dpop_call(
+    http_client: &reqwest::Client,
+    dpop_auth: &DPoPAuth,
+    method: Method,
+    url: &str,
+    body: Option<DpopBody<'_>>,
+    additional_headers: &HeaderMap,
+) -> Result<DpopResponse, DPoPError> {
+    dpop_call_with_timeout(
+        http_client,
+        dpop_auth,
+        method,
+        url,
+        body,
+        additional_headers,
+        None,
+    )
+    .await
+}
+
+/// [`dpop_call`] with a deadline that applies to this call alone.
+///
+/// A timeout set on the shared `reqwest::Client` applies to every other thing
+/// that client does -- a firehose socket, a blob fetch -- so a per-call
+/// deadline has to be passed per call. The deadline covers each attempt
+/// separately, so a nonce challenge followed by a retry can take up to twice
+/// `timeout`.
+///
+/// # Errors
+///
+/// As [`dpop_call`]; a deadline overrun arrives as
+/// [`DPoPError::RequestFailed`].
+pub async fn dpop_call_with_timeout(
+    http_client: &reqwest::Client,
+    dpop_auth: &DPoPAuth,
+    method: Method,
+    url: &str,
+    body: Option<DpopBody<'_>>,
+    additional_headers: &HeaderMap,
+    timeout: Option<std::time::Duration>,
+) -> Result<DpopResponse, DPoPError> {
+    // Serialized once: the retry sends the same bytes, and re-encoding them
+    // would be the second place a body could differ from the one the first
+    // proof was minted over.
+    let payload = match body {
+        None => None,
+        Some(DpopBody::Json(value)) => {
+            let data = serde_json::to_vec(value)
+                .map_err(|error| DPoPError::BodySerializationFailed { error })?;
+            Some(("application/json".to_string(), Bytes::from(data)))
+        }
+        Some(DpopBody::Bytes { content_type, data }) => {
+            Some((content_type.to_string(), Bytes::from(data)))
+        }
+    };
+
+    let (proof, ..) = request_dpop(
+        &dpop_auth.dpop_private_key_data,
+        method.as_str(),
+        url,
+        &dpop_auth.oauth_access_token,
+    )
+    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+
+    let first = send_dpop_request(
+        http_client,
+        dpop_auth,
+        &method,
+        url,
+        payload.as_ref(),
+        additional_headers,
+        &proof,
+        timeout,
+    )
+    .await?;
+
+    let challenged = (first.status == StatusCode::BAD_REQUEST
+        || first.status == StatusCode::UNAUTHORIZED)
+        && is_nonce_challenge(
+            &first.xrpc_error_fields().0,
+            first
+                .headers
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+            first.dpop_nonce().is_some(),
+        );
+
+    if !challenged {
+        return Ok(first);
+    }
+
+    let Some(nonce) = first.dpop_nonce().map(str::to_string) else {
+        return Ok(first);
+    };
+
+    let (retry_proof, ..) = dpop_with_nonce(
+        &dpop_auth.dpop_private_key_data,
+        method.as_str(),
+        url,
+        Some(&dpop_auth.oauth_access_token),
+        &nonce,
+    )
+    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+
+    send_dpop_request(
+        http_client,
+        dpop_auth,
+        &method,
+        url,
+        payload.as_ref(),
+        additional_headers,
+        &retry_proof,
+        timeout,
+    )
+    .await
+}
+
+/// Issue one attempt and read the whole response.
+#[allow(clippy::too_many_arguments)]
+async fn send_dpop_request(
+    http_client: &reqwest::Client,
+    dpop_auth: &DPoPAuth,
+    method: &Method,
+    url: &str,
+    payload: Option<&(String, Bytes)>,
+    additional_headers: &HeaderMap,
+    proof: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<DpopResponse, DPoPError> {
+    // Built with `insert` rather than `RequestBuilder::header`, which appends:
+    // a caller that passed its own `Authorization` or `Content-Type` in
+    // `additional_headers` would otherwise get two of them on the wire, and
+    // which one the server honours is its business rather than ours.
+    let mut headers = additional_headers.clone();
+    set_header(
+        &mut headers,
+        reqwest::header::AUTHORIZATION,
+        &format!("DPoP {}", dpop_auth.oauth_access_token),
+    )?;
+    set_header(&mut headers, HeaderName::from_static("dpop"), proof)?;
+
+    if let Some((content_type, _)) = payload {
+        // An empty content type means "send none", which is what the raw-byte
+        // helper did before this transport existed. The body's own type wins
+        // over anything in `additional_headers`: it is the argument the API is
+        // built around, and for `uploadBlob` it is the value the server
+        // records on the blob.
+        if !content_type.is_empty() {
+            set_header(&mut headers, reqwest::header::CONTENT_TYPE, content_type)?;
+        }
+    }
+
+    let mut builder = http_client.request(method.clone(), url).headers(headers);
+
+    if let Some((_, data)) = payload {
+        builder = builder.body(data.clone());
+    }
+
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+
+    let response = builder
+        .send()
+        .instrument(tracing::debug_span!("dpop_call", method = %method, url = %url))
+        .await
+        .map_err(|error| DPoPError::RequestFailed {
+            url: url.to_string(),
+            error,
+        })?;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| DPoPError::BodyReadFailed {
+            url: url.to_string(),
+            error,
+        })?;
+
+    Ok(DpopResponse {
+        status,
+        headers,
+        body: serde_json::from_slice(&bytes).ok(),
+    })
+}
+
+/// Set one header, replacing any the caller already supplied.
+fn set_header(headers: &mut HeaderMap, name: HeaderName, value: &str) -> Result<(), DPoPError> {
+    let value = HeaderValue::from_str(value).map_err(|_| DPoPError::InvalidHeaderValue {
+        name: name.as_str().to_string(),
+    })?;
+    headers.insert(name, value);
+    Ok(())
+}
+
+/// Read a [`DpopResponse`] body the way the pre-existing helpers do.
+///
+/// The body regardless of status, and a parse failure if it was not JSON.
+/// Callers that need the status line should use [`dpop_call`] directly.
+fn body_or_parse_error(url: &str, response: DpopResponse) -> Result<serde_json::Value> {
+    response.body.ok_or_else(|| {
+        ClientError::ResponseNotJson {
+            url: url.to_string(),
+            status: response.status.as_u16(),
+        }
+        .into()
+    })
 }
 
 /// Performs an unauthenticated HTTP GET request and parses the response as JSON.
@@ -219,49 +576,17 @@ pub async fn get_dpop_json_with_headers(
     url: &str,
     additional_headers: &HeaderMap,
 ) -> Result<serde_json::Value> {
-    let (dpop_proof_token, dpop_proof_header, dpop_proof_claim) = request_dpop(
-        &dpop_auth.dpop_private_key_data,
-        "GET",
+    let response = dpop_call(
+        http_client,
+        dpop_auth,
+        Method::GET,
         url,
-        &dpop_auth.oauth_access_token,
+        None,
+        additional_headers,
     )
-    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+    .await?;
 
-    let dpop_retry = DpopRetry::new(
-        dpop_proof_header.clone(),
-        dpop_proof_claim.clone(),
-        dpop_auth.dpop_private_key_data.clone(),
-        true,
-    );
-
-    let dpop_retry_client = ClientBuilder::new(http_client.clone())
-        .with(ChainMiddleware::new(dpop_retry.clone()))
-        .build();
-
-    let http_response = dpop_retry_client
-        .get(url)
-        .headers(additional_headers.clone())
-        .header(
-            "Authorization",
-            &format!("DPoP {}", dpop_auth.oauth_access_token),
-        )
-        .header("DPoP", &dpop_proof_token)
-        .send()
-        .await
-        .map_err(|error| DPoPError::HttpRequestFailed {
-            url: url.to_string(),
-            error,
-        })?;
-
-    let value = http_response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| DPoPError::JsonParseFailed {
-            url: url.to_string(),
-            error,
-        })?;
-
-    Ok(value)
+    body_or_parse_error(url, response)
 }
 
 /// Performs a DPoP-authenticated HTTP POST request with JSON body and parses the response as JSON.
@@ -351,50 +676,17 @@ pub async fn post_dpop_json_with_headers(
     record: serde_json::Value,
     additional_headers: &HeaderMap,
 ) -> Result<serde_json::Value> {
-    let (dpop_proof_token, dpop_proof_header, dpop_proof_claim) = request_dpop(
-        &dpop_auth.dpop_private_key_data,
-        "POST",
+    let response = dpop_call(
+        http_client,
+        dpop_auth,
+        Method::POST,
         url,
-        &dpop_auth.oauth_access_token,
+        Some(DpopBody::Json(&record)),
+        additional_headers,
     )
-    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+    .await?;
 
-    let dpop_retry = DpopRetry::new(
-        dpop_proof_header.clone(),
-        dpop_proof_claim.clone(),
-        dpop_auth.dpop_private_key_data.clone(),
-        true,
-    );
-
-    let dpop_retry_client = ClientBuilder::new(http_client.clone())
-        .with(ChainMiddleware::new(dpop_retry.clone()))
-        .build();
-
-    let http_response = dpop_retry_client
-        .post(url)
-        .headers(additional_headers.clone())
-        .header(
-            "Authorization",
-            &format!("DPoP {}", dpop_auth.oauth_access_token),
-        )
-        .header("DPoP", &dpop_proof_token)
-        .json(&record)
-        .send()
-        .await
-        .map_err(|error| DPoPError::HttpRequestFailed {
-            url: url.to_string(),
-            error,
-        })?;
-
-    let value = http_response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| DPoPError::JsonParseFailed {
-            url: url.to_string(),
-            error,
-        })?;
-
-    Ok(value)
+    body_or_parse_error(url, response)
 }
 
 /// Performs a DPoP-authenticated HTTP POST request with raw bytes body and additional headers, and parses the response as JSON.
@@ -457,50 +749,29 @@ pub async fn post_dpop_bytes_with_headers(
     payload: Bytes,
     additional_headers: &HeaderMap,
 ) -> Result<serde_json::Value> {
-    let (dpop_proof_token, dpop_proof_header, dpop_proof_claim) = request_dpop(
-        &dpop_auth.dpop_private_key_data,
-        "POST",
+    // The content type comes from `additional_headers` on this path, as it
+    // always has. Empty when the caller named none, which sends no
+    // `Content-Type` at all rather than inventing one.
+    let content_type = additional_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    let response = dpop_call(
+        http_client,
+        dpop_auth,
+        Method::POST,
         url,
-        &dpop_auth.oauth_access_token,
+        Some(DpopBody::Bytes {
+            content_type: &content_type,
+            data: payload.to_vec(),
+        }),
+        additional_headers,
     )
-    .map_err(|error| DPoPError::ProofGenerationFailed { error })?;
+    .await?;
 
-    let dpop_retry = DpopRetry::new(
-        dpop_proof_header.clone(),
-        dpop_proof_claim.clone(),
-        dpop_auth.dpop_private_key_data.clone(),
-        true,
-    );
-
-    let dpop_retry_client = ClientBuilder::new(http_client.clone())
-        .with(ChainMiddleware::new(dpop_retry.clone()))
-        .build();
-
-    let http_response = dpop_retry_client
-        .post(url)
-        .headers(additional_headers.clone())
-        .header(
-            "Authorization",
-            &format!("DPoP {}", dpop_auth.oauth_access_token),
-        )
-        .header("DPoP", &dpop_proof_token)
-        .body(payload)
-        .send()
-        .await
-        .map_err(|error| DPoPError::HttpRequestFailed {
-            url: url.to_string(),
-            error,
-        })?;
-
-    let value = http_response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| DPoPError::JsonParseFailed {
-            url: url.to_string(),
-            error,
-        })?;
-
-    Ok(value)
+    body_or_parse_error(url, response)
 }
 
 /// Performs an unauthenticated HTTP POST request with JSON body and parses the response as JSON.

@@ -475,8 +475,11 @@ pub enum AuthServerValidationError {
 pub enum DpopError {
     /// Error when server returns an unexpected OAuth error.
     ///
-    /// This error occurs when the server returns an OAuth error other than
-    /// the expected "use_dpop_nonce" error during DPoP nonce handling.
+    /// No longer produced. [`crate::dpop::DpopRetry`] used to raise this for
+    /// any 400 or 401 whose body named something other than a DPoP error,
+    /// which meant an ordinary `InvalidSwap` or `ScopeMissingError` reached
+    /// the caller as a middleware error rather than as its response. Such a
+    /// response is now returned intact. Kept so existing matches compile.
     #[error("error-atproto-oauth-dpop-1 Unexpected OAuth error: {error}")]
     UnexpectedOAuthError {
         /// The unexpected error returned by the server
@@ -485,8 +488,9 @@ pub enum DpopError {
 
     /// Error when DPoP-Nonce header is missing from server response.
     ///
-    /// This error occurs when the server indicates that a DPoP nonce is required
-    /// but fails to include the DPoP-Nonce header in the response.
+    /// No longer produced. A challenge with no nonce leaves nothing to retry
+    /// with, and the response says more about why than this error did, so it
+    /// is returned to the caller instead. Kept so existing matches compile.
     #[error("error-atproto-oauth-dpop-2 Missing DPoP-Nonce response header")]
     MissingDpopNonceHeader,
 
@@ -506,15 +510,19 @@ pub enum DpopError {
 
     /// Error when response body JSON parsing fails.
     ///
-    /// This error occurs when the server response body cannot be properly
-    /// parsed as JSON, typically due to malformed content or network issues.
+    /// No longer produced. RFC 9449 section 7.1 specifies the nonce challenge
+    /// as headers and says nothing about a body, so a challenge that carries
+    /// none is conformant -- and treating that as a malformed response was
+    /// what silently dropped writes against servers that send the bare shape.
+    /// Kept so existing matches compile.
     #[error("error-atproto-oauth-dpop-5 Response body JSON parsing failed: {0:?}")]
     ResponseBodyParsingFailed(reqwest::Error),
 
     /// Error when response body is not a valid JSON object.
     ///
-    /// This error occurs when the server response body is valid JSON but
-    /// not in the expected object format for OAuth error responses.
+    /// No longer produced, for the same reason as
+    /// [`DpopError::ResponseBodyParsingFailed`]. Kept so existing matches
+    /// compile.
     #[error("error-atproto-oauth-dpop-6 Response body is not a valid JSON object")]
     ResponseBodyObjectParsingFailed,
 }
