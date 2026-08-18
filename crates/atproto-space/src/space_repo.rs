@@ -616,6 +616,97 @@ mod tests {
         ));
     }
 
+    /// A batch may not name one `(collection, rkey)` twice.
+    ///
+    /// The whole reason is that `format_commit` derives every op's SetHash
+    /// delta from pre-batch storage and has no intra-batch view, so a second
+    /// op on the same key folds a delta computed against stale state. The
+    /// check shipped with no test of its own; what noticed it was a
+    /// downstream test it broke.
+    #[tokio::test]
+    async fn duplicate_key_in_batch_rejected() {
+        let space = test_space();
+        let repo: TestRepo = SpaceRepo::new(space, InMemorySpaceRepoStorage::new());
+
+        let create = Op {
+            action: OpAction::Create,
+            collection: "c".to_string(),
+            rkey: "k".to_string(),
+            cid: Some("x".to_string()),
+            value: Some(vec![]),
+        };
+        repo.apply_commit(
+            repo.format_commit(std::slice::from_ref(&create))
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Update then delete the same key: each op is individually valid, and
+        // the pair is what cannot be applied.
+        let batch = vec![
+            Op {
+                action: OpAction::Update,
+                collection: "c".to_string(),
+                rkey: "k".to_string(),
+                cid: Some("y".to_string()),
+                value: Some(vec![]),
+            },
+            Op {
+                action: OpAction::Delete,
+                collection: "c".to_string(),
+                rkey: "k".to_string(),
+                cid: None,
+                value: None,
+            },
+        ];
+
+        assert!(matches!(
+            repo.format_commit(&batch).await,
+            Err(SpaceError::DuplicateKeyInBatch { .. })
+        ));
+
+        // Refused whole, and refused before anything was persisted: the row
+        // the batch would have touched is exactly as it was.
+        let stored = repo.get_record("c", "k").await.unwrap();
+        assert!(stored.is_some());
+    }
+
+    /// The same key in *different* collections is not a duplicate.
+    ///
+    /// The key is the pair, and narrowing the check to `rkey` alone would
+    /// refuse an ordinary batch that writes one record per collection.
+    #[tokio::test]
+    async fn one_key_across_collections_is_not_a_duplicate() {
+        let space = test_space();
+        let repo: TestRepo = SpaceRepo::new(space, InMemorySpaceRepoStorage::new());
+
+        let batch = vec![
+            Op {
+                action: OpAction::Create,
+                collection: "one".to_string(),
+                rkey: "k".to_string(),
+                cid: Some("x".to_string()),
+                value: Some(vec![]),
+            },
+            Op {
+                action: OpAction::Create,
+                collection: "two".to_string(),
+                rkey: "k".to_string(),
+                cid: Some("y".to_string()),
+                value: Some(vec![]),
+            },
+        ];
+
+        repo.apply_commit(repo.format_commit(&batch).await.unwrap())
+            .await
+            .unwrap();
+
+        assert!(repo.get_record("one", "k").await.unwrap().is_some());
+        assert!(repo.get_record("two", "k").await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn update_missing_rejected() {
         let space = test_space();

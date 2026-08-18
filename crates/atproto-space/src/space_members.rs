@@ -92,6 +92,28 @@ impl<S: SpaceMembersStorage, H: SetHash> SpaceMembers<S, H> {
 
     /// Format a batch of member ops into a `PreparedMemberCommit`.
     pub async fn format_commit(&self, ops: &[MemberOp]) -> SpaceResult<PreparedMemberCommit<H>> {
+        // A batch may not name the same DID twice, for the reason
+        // `SpaceRepo::format_commit` may not name the same record key twice:
+        // `already_member` below is read from storage per op with no
+        // intra-batch view, so a second op on one DID folds a second SetHash
+        // delta against pre-batch state while storage keeps a single row --
+        // and the signed commit derived from that hash then describes a member
+        // set that does not exist.
+        //
+        // Latent rather than live: every caller today passes a one-element
+        // slice. The signature takes a slice, so the check belongs here rather
+        // than in the discipline of whoever adds the first real batch.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(ops.len());
+            for op in ops {
+                if !seen.insert(op.did.as_str()) {
+                    return Err(SpaceError::DuplicateMemberInBatch {
+                        did: op.did.clone(),
+                    });
+                }
+            }
+        }
+
         let state = self.storage.current_state(&self.space).await?;
         let mut set_hash = match state.set_hash {
             Some(bytes) => H::from_state_bytes(&bytes)?,
@@ -330,6 +352,59 @@ mod tests {
         .await
         .unwrap();
         assert!(!m.is_member("did:plc:alice").await.unwrap());
+    }
+
+    /// A batch may not name one DID twice.
+    ///
+    /// Same shape as `SpaceRepo`'s duplicate-key refusal and the same reason:
+    /// `already_member` is read per op from pre-batch storage, so two ops on
+    /// one DID fold two SetHash deltas while a single row survives.
+    #[tokio::test]
+    async fn duplicate_member_in_batch_rejected() {
+        let space = test_space();
+        let members: TestMembers = SpaceMembers::new(space, InMemorySpaceMembersStorage::new());
+
+        let batch = vec![
+            MemberOp {
+                action: MemberOpAction::Add,
+                did: "did:plc:twice".to_string(),
+            },
+            MemberOp {
+                action: MemberOpAction::Add,
+                did: "did:plc:twice".to_string(),
+            },
+        ];
+
+        assert!(matches!(
+            members.format_commit(&batch).await,
+            Err(SpaceError::DuplicateMemberInBatch { .. })
+        ));
+    }
+
+    /// Two different DIDs in one batch are not a duplicate.
+    #[tokio::test]
+    async fn distinct_members_in_one_batch_are_allowed() {
+        let space = test_space();
+        let members: TestMembers = SpaceMembers::new(space, InMemorySpaceMembersStorage::new());
+
+        let batch = vec![
+            MemberOp {
+                action: MemberOpAction::Add,
+                did: "did:plc:one".to_string(),
+            },
+            MemberOp {
+                action: MemberOpAction::Add,
+                did: "did:plc:two".to_string(),
+            },
+        ];
+
+        members
+            .apply_commit(members.format_commit(&batch).await.unwrap())
+            .await
+            .unwrap();
+
+        assert!(members.is_member("did:plc:one").await.unwrap());
+        assert!(members.is_member("did:plc:two").await.unwrap());
     }
 
     #[tokio::test]

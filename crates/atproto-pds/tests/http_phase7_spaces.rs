@@ -4961,12 +4961,20 @@ async fn apply_writes_returns_one_typed_result_per_write() {
     let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
     let uri = create_space(&app, &owner, "results").await;
 
+    // Two seeded rows, because the batch below updates one and deletes the
+    // other. It cannot do both to the same key: a batch may not name one
+    // `(collection, rkey)` twice, and this test is about the *results* array,
+    // not about that refusal -- which
+    // `apply_writes_refuses_a_batch_naming_one_key_twice` covers.
     space_write(
         &app,
         &uri,
         "did:plc:owner",
         &owner,
-        json!([{"action": "create", "collection": "app.t.rec", "rkey": "keep", "value": {"v": 1}}]),
+        json!([
+            {"action": "create", "collection": "app.t.rec", "rkey": "keep", "value": {"v": 1}},
+            {"action": "create", "collection": "app.t.rec", "rkey": "gone", "value": {"v": 1}}
+        ]),
     )
     .await;
 
@@ -4979,7 +4987,7 @@ async fn apply_writes_returns_one_typed_result_per_write() {
             "writes": [
                 {"action": "create", "collection": "app.t.rec", "rkey": "fresh", "value": {"v": 2}},
                 {"action": "update", "collection": "app.t.rec", "rkey": "keep", "value": {"v": 3}},
-                {"action": "delete", "collection": "app.t.rec", "rkey": "keep"}
+                {"action": "delete", "collection": "app.t.rec", "rkey": "gone"}
             ]
         }),
         Some(&owner),
@@ -5003,6 +5011,98 @@ async fn apply_writes_returns_one_typed_result_per_write() {
     assert_eq!(
         results[2],
         json!({"$type": "com.atproto.space.applyWrites#deleteResult"})
+    );
+}
+
+/// A batch may not name the same `(collection, rkey)` twice.
+///
+/// `format_commit` derives each op's SetHash delta from pre-batch storage and
+/// has no intra-batch view, so a second op on the same key folds a delta
+/// computed against stale state -- leaving the persisted SetHash, and the
+/// signed commit derived from it, out of step with the one row that survives.
+/// The refusal is the whole defence, and until now nothing exercised it: the
+/// check was added with no test, and the only thing that noticed was a
+/// neighbouring test it broke.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_refuses_a_batch_naming_one_key_twice() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "dupes").await;
+
+    space_write(
+        &app,
+        &uri,
+        "did:plc:owner",
+        &owner,
+        json!([{"action": "create", "collection": "app.t.rec", "rkey": "k", "value": {"v": 1}}]),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "repo": "did:plc:owner",
+            "writes": [
+                {"action": "update", "collection": "app.t.rec", "rkey": "k", "value": {"v": 2}},
+                {"action": "delete", "collection": "app.t.rec", "rkey": "k"}
+            ]
+        }),
+        Some(&owner),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("error-atproto-space-repo-3")),
+        "{body}"
+    );
+
+    // And the batch was refused whole: the seeded row is untouched, not
+    // updated-then-left or deleted.
+    let (status, body) = get_json(
+        app.clone(),
+        &format!(
+            "/xrpc/com.atproto.space.getRecord?space={}&collection=app.t.rec&rkey=k&repo=did:plc:owner",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["value"]["v"], 1, "{body}");
+}
+
+/// The same key in *different* collections is not a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_writes_allows_one_key_across_collections() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "same-key").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.space.applyWrites",
+        json!({
+            "space": uri,
+            "repo": "did:plc:owner",
+            "writes": [
+                {"action": "create", "collection": "app.t.one", "rkey": "k", "value": {"v": 1}},
+                {"action": "create", "collection": "app.t.two", "rkey": "k", "value": {"v": 2}}
+            ]
+        }),
+        Some(&owner),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"].as_array().expect("results").len(),
+        2,
+        "{body}"
     );
 }
 

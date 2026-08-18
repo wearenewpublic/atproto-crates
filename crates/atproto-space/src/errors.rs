@@ -168,6 +168,14 @@ pub enum SpaceError {
         rkey: String,
     },
 
+    /// error-atproto-space-repo-4: a member batch named the same DID more than
+    /// once, which cannot be applied without desyncing the SetHash.
+    #[error("error-atproto-space-repo-4 duplicate member in batch: {did}")]
+    DuplicateMemberInBatch {
+        /// The DID named twice.
+        did: String,
+    },
+
     /// error-atproto-space-members-1: attempt to add a duplicate member.
     #[error("error-atproto-space-members-1 member already exists: {did}")]
     MemberAlreadyExists {
