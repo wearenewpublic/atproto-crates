@@ -3,9 +3,10 @@
 //! Permissioned Data spec.
 //!
 //! This suite exercises the spec-aligned wire shapes:
-//! - `com.atproto.simplespace.createSpace` (`{did?, type, skey?, config?}` ->
-//!   `{uri}`), `updateSpace`, `deleteSpace`, `addMember`, `removeMember`,
-//!   `listMembers`.
+//! - `com.atproto.simplespace.createSpace` (`{did?, type, skey?, policy,
+//!   appAccess}` -> `{uri}`; `policy`/`appAccess` are required, in any of the
+//!   spellings this server accepts), `updateSpace`, `deleteSpace`,
+//!   `addMember`, `removeMember`, `listMembers`.
 //! - `com.atproto.simplespace.getSpace` (`{uri, policy, appAccess}`), `listSpaces`.
 //! - `applyWrites` + single-op `createRecord` / `putRecord` / `deleteRecord`.
 //! - `getRecord` (`{uri, cid, value}`) / `listRecords` (keys-only
@@ -341,7 +342,7 @@ async fn create_space(app: &axum::Router, owner_token: &str, skey: &str) -> Stri
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": skey}),
+        json!({"type": "app.bsky.group", "skey": skey, "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(owner_token),
     )
     .await;
@@ -418,7 +419,7 @@ async fn create_space_round_trip() {
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&token),
     )
     .await;
@@ -450,7 +451,7 @@ async fn create_space_requires_auth() {
     let (status, _) = post_json(
         app,
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         None,
     )
     .await;
@@ -464,7 +465,7 @@ async fn create_space_auto_generates_skey() {
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group"}),
+        json!({"type": "app.bsky.group", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&token),
     )
     .await;
@@ -533,7 +534,7 @@ async fn create_space_replay_is_idempotent_and_non_destructive() {
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&token),
     )
     .await;
@@ -587,7 +588,7 @@ async fn create_space_replay_is_idempotent_and_non_destructive() {
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&token),
     )
     .await;
@@ -627,7 +628,7 @@ async fn create_space_replay_does_not_reconfigure_the_space() {
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default", "policy": "member-list"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": "member-list", "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&token),
     )
     .await;
@@ -637,7 +638,7 @@ async fn create_space_replay_does_not_reconfigure_the_space() {
     let (status, body) = post_json(
         app.clone(),
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default", "policy": "public"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": "public", "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&token),
     )
     .await;
@@ -4613,6 +4614,220 @@ async fn create_space_reads_the_top_level_policy_and_app_access_unions() {
     );
 }
 
+/// A `createSpace` carrying neither required field is refused by name.
+///
+/// This is the regression. `policy` and `appAccess` are required by the
+/// lexicon, and this server accepted their absence and applied the documented
+/// defaults — so a client sending `{"type": ..., "skey": ...}` and nothing
+/// else got a 200, a space configured the way its owner happened to want, and
+/// no indication anywhere that its request was invalid against the schema. It
+/// ran that way in production for months and was found by a reader comparing
+/// the request against the lexicon, because no server ever disagreed with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_refuses_a_body_carrying_neither_required_field() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.createSpace",
+        json!({"type": "app.bulleted.space", "skey": "self"}),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // The name matters as much as the status. `UnsupportedPolicy` means "that
+    // variant, but this host cannot enforce it", and a client acts on it by
+    // sending a different variant — the wrong instruction entirely for one
+    // that sent no field at all.
+    assert_eq!(body["error"], "InvalidRequest", "{body}");
+    let message = body["message"].as_str().expect("message");
+    assert!(
+        message.contains("policy") && message.contains("appAccess"),
+        "the refusal must name both fields, since the client does not know it \
+         is sending an invalid body: {message}"
+    );
+
+    // And nothing was created under the name it asked for.
+    let (status, body) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode("at://did:plc:owner/space/app.bulleted.space/self")
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "SpaceNotFound", "{body}");
+}
+
+/// Half a configuration is refused too, naming the half that is missing.
+///
+/// This is the case a hand-written client actually produces — it learns about
+/// `policy` from the prose and never notices `appAccess` — and an
+/// implementation that checks `policy.is_none() && app_access.is_none()`
+/// lets it through.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_refuses_a_body_carrying_only_one_required_field() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    for (sent, missing) in [
+        (
+            json!({"policy": {"$type": "com.atproto.simplespace.defs#publicPolicy"}}),
+            "appAccess",
+        ),
+        (
+            json!({"appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
+            "policy",
+        ),
+    ] {
+        let mut input = json!({"type": "app.bsky.group", "skey": format!("half-{missing}")});
+        for (key, value) in sent.as_object().expect("object") {
+            input[key.as_str()] = value.clone();
+        }
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.simplespace.createSpace",
+            input,
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "missing {missing}: {body}");
+        assert_eq!(body["error"], "InvalidRequest", "missing {missing}: {body}");
+        assert!(
+            body["message"].as_str().expect("message").contains(missing),
+            "the refusal must name the field that is missing: {body}"
+        );
+    }
+}
+
+/// The requirement is for the *information*, not for one spelling of it.
+///
+/// A nested `config`, the `mintPolicy` key, and the bare `knownValues` policy
+/// string all still satisfy it — retiring those is a separate decision with
+/// its own deprecation window, and a client that carries a full configuration
+/// in an older shape is conformant about the thing that matters.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_space_accepts_the_required_fields_in_the_legacy_spellings() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+
+    for (skey, input) in [
+        (
+            "nested",
+            json!({
+                "type": "app.bsky.group",
+                "skey": "nested",
+                "config": {
+                    "$type": "com.atproto.simplespace.defs#spaceConfig",
+                    "policy": "public",
+                    "appAccess": {"$type": "com.atproto.simplespace.defs#open"},
+                },
+            }),
+        ),
+        (
+            "mint-policy",
+            json!({
+                "type": "app.bsky.group",
+                "skey": "mint-policy",
+                "config": {
+                    "mintPolicy": "public",
+                    "appAccess": {"$type": "com.atproto.simplespace.defs#open"},
+                },
+            }),
+        ),
+        (
+            "split",
+            json!({
+                "type": "app.bsky.group",
+                "skey": "split",
+                "policy": "public",
+                "config": {"appAccess": {"$type": "com.atproto.simplespace.defs#open"}},
+            }),
+        ),
+    ] {
+        let (status, body) = post_json(
+            app.clone(),
+            "/xrpc/com.atproto.simplespace.createSpace",
+            input,
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{skey}: {body}");
+        let uri = body["uri"].as_str().expect("uri").to_string();
+
+        // And the space got what the request said, not the defaults it would
+        // have got by saying nothing.
+        let (status, body) = get_json(
+            app.clone(),
+            &format!(
+                "/xrpc/com.atproto.simplespace.getSpace?space={}",
+                urlencode(&uri)
+            ),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{skey}: {body}");
+        assert_eq!(
+            body["policy"]["$type"], "com.atproto.simplespace.defs#publicPolicy",
+            "{skey}: {body}"
+        );
+        assert_eq!(
+            body["appAccess"]["$type"], "com.atproto.simplespace.defs#open",
+            "{skey}: {body}"
+        );
+    }
+}
+
+/// `updateSpace` still takes one field at a time.
+///
+/// Its optionality is the point — it is a partial update, and an owner
+/// changing only `appAccess` must not have to restate the policy. Tightening
+/// it the way `createSpace` was tightened would break the only method by
+/// which a space can be reconfigured.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_space_still_accepts_a_single_field() {
+    let (app, manager, _tmp) = build_app().await;
+    let owner = create_account_and_token(&app, &manager, "did:plc:owner", "owner.example").await;
+    let uri = create_space(&app, &owner, "partial").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/xrpc/com.atproto.simplespace.updateSpace",
+        json!({
+            "space": uri,
+            "appAccess": {
+                "$type": "com.atproto.simplespace.defs#allowList",
+                "allowed": ["https://app.example/client-metadata.json"],
+            },
+        }),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = get_json(
+        app,
+        &format!(
+            "/xrpc/com.atproto.simplespace.getSpace?space={}",
+            urlencode(&uri)
+        ),
+        Some(&owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["appAccess"]["$type"], "com.atproto.simplespace.defs#allowList",
+        "{body}"
+    );
+    assert_eq!(
+        body["policy"]["$type"], "com.atproto.simplespace.defs#memberListPolicy",
+        "the unnamed field must be left alone: {body}"
+    );
+}
+
 /// A `#managingAppPolicy` carries its own `managingApp`, and one without is
 /// refused at the request that sets it rather than at mint time.
 #[tokio::test(flavor = "multi_thread")]
@@ -4694,7 +4909,15 @@ async fn an_unimplemented_config_variant_is_refused_by_name() {
             "UnsupportedAppAccess",
         ),
     ] {
-        let mut input = json!({ "type": "app.bsky.group", "skey": format!("bad-{field}") });
+        // Both required fields are present and conformant; the one under
+        // test is then replaced with the unimplementable variant, so the
+        // refusal names the variant rather than the absence.
+        let mut input = json!({
+            "type": "app.bsky.group",
+            "skey": format!("bad-{field}"),
+            "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
+            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+        });
         input[field] = value.clone();
         let (status, body) = post_json(
             app.clone(),

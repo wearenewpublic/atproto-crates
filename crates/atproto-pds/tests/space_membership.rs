@@ -152,7 +152,7 @@ async fn owner_space_and_an_outsider(
     let (status, body) = post_json(
         app,
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&owner_token),
     )
     .await;
@@ -340,7 +340,7 @@ async fn a_member_can_still_write() {
     let (status, body) = post_json(
         &app,
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&owner_token),
     )
     .await;
@@ -482,7 +482,7 @@ async fn a_member_can_still_read_the_sync_endpoints() {
     let (status, body) = post_json(
         &app,
         "/xrpc/com.atproto.simplespace.createSpace",
-        json!({"type": "app.bsky.group", "skey": "default"}),
+        json!({"type": "app.bsky.group", "skey": "default", "policy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"}, "appAccess": {"$type": "com.atproto.simplespace.defs#open"}}),
         Some(&owner_token),
     )
     .await;

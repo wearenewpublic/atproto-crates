@@ -340,6 +340,44 @@ impl SpaceConfig {
     }
 }
 
+/// Which of `createSpace`'s two required config fields a request body does
+/// *not* carry, named as the lexicon names them.
+///
+/// The lexicon marks `policy` and `appAccess` required; the prose of proposal
+/// 0016 also gives each a default (`member-list` / `#open`). Those are not in
+/// conflict — a default describes the resulting configuration, `required`
+/// describes the request — but they are close enough that "absent means
+/// default" reads as obviously correct, which is how this server spent its
+/// first releases answering 200 to bodies its own lexicon rejects. A client
+/// omitting both got a silently defaulted space and no way to learn it was
+/// non-conformant, because nothing on the wire disagreed with it.
+///
+/// What is required is the *information*, not a particular spelling: a value
+/// nested in `config`, the deprecated `mintPolicy` key, and the bare
+/// `knownValues` policy string all satisfy it. Only "carries neither,
+/// anywhere" is missing. Retiring those spellings is a separate decision with
+/// its own deprecation window.
+///
+/// `value` is the merged config object [`create_space`] assembles from the
+/// top-level fields and the nested `config`, or `None` when the request
+/// carried no config-bearing field at all.
+///
+/// [`create_space`]: crate::http::space_handlers::create_space
+#[must_use]
+pub fn missing_required_create_fields(value: Option<&serde_json::Value>) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if value.and_then(policy_field).is_none() {
+        missing.push("policy");
+    }
+    let has_app_access = value
+        .and_then(|v| v.get("appAccess"))
+        .is_some_and(|v| !v.is_null());
+    if !has_app_access {
+        missing.push("appAccess");
+    }
+    missing
+}
+
 /// Read the raw user-authorization policy field from a config or `updateSpace`
 /// input object.
 ///
@@ -556,6 +594,58 @@ mod tests {
             }
         );
         assert_eq!(cfg.managing_app.as_deref(), Some("did:web:m.example#svc"));
+    }
+
+    #[test]
+    fn missing_required_create_fields_names_what_is_absent() {
+        assert_eq!(
+            missing_required_create_fields(None),
+            vec!["policy", "appAccess"]
+        );
+        assert_eq!(
+            missing_required_create_fields(Some(&serde_json::json!({}))),
+            vec!["policy", "appAccess"]
+        );
+        // Half a configuration is still missing the other half.
+        assert_eq!(
+            missing_required_create_fields(Some(&serde_json::json!({
+                "policy": { "$type": POLICY_PUBLIC_TYPE },
+            }))),
+            vec!["appAccess"]
+        );
+        assert_eq!(
+            missing_required_create_fields(Some(&serde_json::json!({
+                "appAccess": { "$type": APP_ACCESS_OPEN_TYPE },
+            }))),
+            vec!["policy"]
+        );
+        // An explicit null carries no value, whatever it says syntactically.
+        assert_eq!(
+            missing_required_create_fields(Some(&serde_json::json!({
+                "policy": serde_json::Value::Null,
+                "appAccess": serde_json::Value::Null,
+            }))),
+            vec!["policy", "appAccess"]
+        );
+    }
+
+    #[test]
+    fn missing_required_create_fields_accepts_every_spelling() {
+        // The lexicon union, the deprecated `mintPolicy` key, and the bare
+        // `knownValues` string all carry a policy. The requirement is for the
+        // information, not for one way of writing it.
+        for policy in [
+            serde_json::json!({ "policy": { "$type": POLICY_PUBLIC_TYPE } }),
+            serde_json::json!({ "policy": "public" }),
+            serde_json::json!({ "mintPolicy": "public" }),
+        ] {
+            let mut value = policy;
+            value["appAccess"] = serde_json::json!({ "$type": APP_ACCESS_OPEN_TYPE });
+            assert!(
+                missing_required_create_fields(Some(&value)).is_empty(),
+                "should carry both: {value}"
+            );
+        }
     }
 
     #[test]

@@ -64,6 +64,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client converging by matching `error-atproto-space-members-1` on the replay path will no longer see that
   error and can drop the substring match.
 
+### Changed
+- **`com.atproto.simplespace.createSpace` requires `policy` and `appAccess`, as its lexicon always
+  did.** A request carrying neither — in any spelling — is now `400 InvalidRequest`, with a message
+  naming both fields. This closes the deferred decision recorded in 0.15.0-rc.3.
+
+  The permissive path was not a lenience anyone benefited from; it was a way for a client to be wrong
+  without being told. A shipped client sent `{"type": "app.bulleted.space", "skey": "self"}` for months:
+  invalid against the schema, accepted by this server, and configured exactly as its owner intended,
+  because the defaults this server applied were the ones they wanted. There was no wrong space to notice,
+  no error to search for, and no host that disagreed — it was found by a person comparing the request
+  against the lexicon. A server that says nothing is the only reason that was possible.
+
+  Proposal 0016 both gives the two fields defaults (`member-list` / `#open`) and marks them required.
+  Those are not in conflict — a default describes the resulting configuration, `required` describes the
+  request — but they are close enough that "absent means default" reads as obviously correct while
+  writing the handler, which is how this drifted. That reasoning is now stated where the check lives, so
+  it does not get re-derived into a re-opened decision.
+
+  **What is required is the information, not a spelling.** Every compatible shape still works: the
+  lexicon's top-level unions, the nested `config` object, `mintPolicy` inside it, and the bare
+  `knownValues` policy string. A request satisfying the requirement through any of them is accepted, and
+  only "carries neither, anywhere" is refused. Retiring the legacy spellings is a separate decision with
+  its own deprecation window, and this does not take it.
+
+  The refusal is `InvalidRequest`, deliberately not `UnsupportedPolicy` / `UnsupportedAppAccess`. Those
+  name a well-formed union variant this host cannot enforce, and a caller acts on them by choosing a
+  different variant — the wrong instruction for a caller that sent no field at all.
+
+  `updateSpace` is unchanged. Its `policy`/`appAccess` are optional because it is a partial update: an
+  owner changing only `appAccess` must not have to restate the policy, and tightening it would break the
+  only method by which a space can be reconfigured. `SpaceConfig::default()` is likewise unchanged — the
+  requirement is a property of the HTTP input, not of the config model, which has ~20 in-crate callers
+  that legitimately construct a default.
+
+  **One wrinkle worth stating before it is reported as a bug.** `createSpace` is idempotent on re-create,
+  so a legacy client replaying a create it already made used to converge on `200 {uri}` and will now get
+  `400`. That is the same refusal its *first* call would get today, so it is consistent rather than
+  idempotency breaking — but it does turn a previously-safe retry into an error for a client that never
+  sent the fields. Such a client is already broken against the lexicon; the fix is to send them.
+
 ### Security
 - **The account-portal repository browser escapes the collection/rkey it echoes back, closing a
   reflected XSS.** `GET /account/repository/public/{segment}` (and the record and space variants) rendered
@@ -1305,10 +1345,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was set, rather than leaving the space pointing at an app it no longer asks.
 
   Both older shapes still work: the nested `config` object, the `mintPolicy` spelling, the bare
-  `knownValues` policy string, and the separate top-level `managingApp`. `policy`/`appAccess` are
-  also accepted as absent, where the lexicon marks them required, so a client written against the
-  older shape keeps creating spaces — omitting them applies the documented defaults. Whether to
-  tighten to strictly-required is deferred with the rest of the legacy-surface decision.
+  `knownValues` policy string, and the separate top-level `managingApp`. `policy`/`appAccess` were
+  also accepted as *absent* in this release, where the lexicon marks them required, so a client written
+  against the older shape kept creating spaces — omitting them applied the documented defaults.
+  **That was tightened afterwards:** `createSpace` now refuses a request carrying neither with `400
+  InvalidRequest` (see Unreleased). Retiring the legacy spellings remains a separate decision.
 
 ### Added
 - `atproto-space` / `atproto-pds`: space credentials are DPoP-bound at issuance.

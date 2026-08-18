@@ -281,10 +281,18 @@ async fn require_writable_session_auth(
 /// required before the unions were lifted to the top level; a caller sending
 /// both gets the top-level fields, which are the lexicon's.
 ///
-/// `policy` and `appAccess` are optional here where the lexicon marks them
-/// required, so that a client written against the older shape keeps creating
-/// spaces. Omitting them applies the documented defaults (`member-list` /
-/// `#open`) — which is what the spec prose says an unconfigured space has.
+/// Both are `Option` here because either may arrive nested in `config`
+/// instead — not because either may be left out. A request must carry a
+/// policy and an app-access value *somewhere*; `create_space` refuses one
+/// that carries neither with `400 InvalidRequest`. The lexicon marks both
+/// required, and this server accepted their absence until it was found by a
+/// reader comparing a client's request against the schema rather than by
+/// anything on the wire: proposal 0016's prose also gives each field a
+/// default, so "absent means default" reads as obviously correct while
+/// writing a handler, and the resulting 200 leaves a non-conformant client
+/// with nothing to notice. A default describes the space that results; the
+/// lexicon describes the request that asks for it.
+///
 /// Nothing is silently discarded either way: what a caller sends is what the
 /// space gets.
 #[derive(Debug, Deserialize)]
@@ -337,6 +345,15 @@ pub use crate::space::SpaceInfo;
 ///
 /// Omitting `skey` asks for a new space and gets a fresh TID, which is the way
 /// to create rather than converge.
+///
+/// **`policy` and `appAccess` are required**, in any of the spellings this
+/// server accepts (top level, nested in `config`, `mintPolicy`, or the bare
+/// `knownValues` string). A request carrying neither is `400 InvalidRequest`
+/// — including a replay of a create that succeeded before the requirement
+/// existed. That is the same refusal the original call would get today, so it
+/// is consistent rather than a regression in idempotency, but it does turn a
+/// previously-safe retry into an error for a client that never sent the
+/// fields.
 pub async fn create_space(
     State(state): State<HttpState>,
     parts: Parts,
@@ -393,8 +410,31 @@ pub async fn create_space(
             Some(serde_json::Value::Object(obj))
         }
     };
+    // Both config fields are required by the lexicon. The merge above has
+    // already answered "what config did this request actually carry", across
+    // every spelling this server accepts, so the requirement is one check on
+    // its result rather than a second parse. `InvalidRequest` and not
+    // `UnsupportedPolicy`/`UnsupportedAppAccess`: those name a well-formed
+    // variant this host cannot enforce, and a caller acts on them by choosing
+    // a different variant — advice that means nothing to a caller that sent
+    // no field at all.
+    let missing = crate::space::config::missing_required_create_fields(config_value.as_ref());
+    if !missing.is_empty() {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            format!(
+                "createSpace requires both `policy` and `appAccess`; this request carried no {}. \
+                 Send `policy` as one of com.atproto.simplespace.defs#publicPolicy, \
+                 #memberListPolicy or #managingAppPolicy, and `appAccess` as #open or #allowList.",
+                missing.join(" and no "),
+            ),
+        ));
+    }
     let config = match config_value {
         Some(ref v) => crate::space::SpaceConfig::from_create_input(v).map_err(XrpcError::from)?,
+        // Unreachable while both fields are required: a body carrying no
+        // config-bearing field at all is refused above.
         None => crate::space::SpaceConfig::default(),
     };
     let svc = space_service(&state)?;
