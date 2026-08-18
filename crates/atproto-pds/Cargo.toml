@@ -38,6 +38,7 @@ atproto-oauth.workspace = true
 atproto-record.workspace = true
 atproto-repo.workspace = true
 atproto-space.workspace = true
+atproto-xrpcs.workspace = true
 
 anyhow.workspace = true
 argon2 = "0.5"

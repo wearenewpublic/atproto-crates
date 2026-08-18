@@ -16,3 +16,9 @@
 pub mod authorization;
 /// Structured error types for XRPC operations.
 pub mod errors;
+/// Minting and verifying inter-service auth tokens.
+pub mod service_auth;
+
+pub use service_auth::{
+    RevocationCheck, ServiceAuthClaims, ServiceAuthPolicy, mint_service_auth, verify_service_auth,
+};

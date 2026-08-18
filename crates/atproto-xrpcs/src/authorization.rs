@@ -20,6 +20,21 @@ use crate::errors::AuthorizationError;
 ///
 /// Contains JWT header, validated claims, original token, and validation status.
 /// Resolves DID documents via the configured identity resolver.
+///
+/// # The fourth field is load-bearing
+///
+/// This extractor is deliberately infallible: a token that does not validate
+/// still arrives, with `self.3` set to `false`, so a handler can decide what
+/// an unauthenticated request means for it. That means **the claims in
+/// `self.1` are not verified unless `self.3` is true** -- and on a failed
+/// validation they are `Claims::default()`, so a handler that reads them
+/// without checking sees an empty issuer rather than an attacker's, which
+/// fails closed but says nothing about why.
+///
+/// Reach for [`Authorization::verified_claims`] rather than the tuple fields.
+/// It returns `None` for an unverified token, which makes the distinction
+/// impossible to skip by accident; `self.1` makes it a boolean somebody has to
+/// remember.
 #[derive(Clone)]
 pub struct Authorization(pub Header, pub Claims, pub String, pub bool);
 
@@ -30,6 +45,33 @@ impl Authorization {
             return self.1.jose.issuer.as_deref();
         }
         None
+    }
+
+    /// Whether the token validated against the issuer's published keys.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.3
+    }
+
+    /// The bearer token as it arrived, verified or not.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.2
+    }
+
+    /// The claims, but only if the signature checked out.
+    ///
+    /// The shape to reach for. Every other accessor here hands back something
+    /// that may not have been verified, and this one cannot.
+    #[must_use]
+    pub fn verified_claims(&self) -> Option<&Claims> {
+        self.3.then_some(&self.1)
+    }
+
+    /// The header, but only if the signature checked out.
+    #[must_use]
+    pub fn verified_header(&self) -> Option<&Header> {
+        self.3.then_some(&self.0)
     }
 }
 

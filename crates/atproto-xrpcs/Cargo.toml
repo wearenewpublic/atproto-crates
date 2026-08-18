@@ -34,6 +34,9 @@ tracing.workspace = true
 axum.workspace = true
 http.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [features]
 default = ["hickory-dns"]
 hickory-dns = ["atproto-identity/hickory-dns", "atproto-oauth/hickory-dns"]

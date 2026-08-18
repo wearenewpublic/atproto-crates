@@ -469,6 +469,7 @@ dependencies = [
  "atproto-record",
  "atproto-repo",
  "atproto-space",
+ "atproto-xrpcs",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",

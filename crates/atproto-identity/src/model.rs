@@ -302,13 +302,28 @@ impl Document {
         })
     }
 
-    /// Returns the `publicKeyMultibase` of the Multikey verification method
-    /// whose id ends with `#{fragment}` (e.g. `atproto` or `atproto_space`).
+    /// Returns the `publicKeyMultibase` of **this DID's** Multikey
+    /// verification method named `#{fragment}` (e.g. `atproto` or
+    /// `atproto_space`).
     ///
     /// DID documents render verification-method ids as either the absolute
-    /// `did:plc:xxx#fragment` or the relative `#fragment`; both forms match.
+    /// `did:plc:xxx#fragment` or the relative `#fragment`; both forms match,
+    /// and both name the same key.
+    ///
+    /// # Security
+    ///
+    /// The id must be *this document's own*. Matching on the fragment alone --
+    /// `id.ends_with("#atproto")`, which this used to do -- accepts
+    /// `did:web:somebody-else#atproto`, and a document is free to list a
+    /// method belonging to another DID: a `did:web` document is served by
+    /// whoever controls the domain, so its contents are that party's to
+    /// choose. The key returned is then somebody else's, and every signature
+    /// checked against it verifies for them rather than for the subject. Every
+    /// caller of this is resolving "the key this DID signs with", so the id
+    /// has to be the DID's own.
     pub fn verification_method_multibase(&self, fragment: &str) -> Option<&str> {
-        let suffix = format!("#{fragment}");
+        let relative = format!("#{fragment}");
+        let absolute = format!("{}{relative}", self.id);
         self.verification_method
             .iter()
             .find_map(|method| match method {
@@ -316,7 +331,7 @@ impl Document {
                     id,
                     public_key_multibase,
                     ..
-                } if id.ends_with(&suffix) => Some(public_key_multibase.as_str()),
+                } if *id == relative || *id == absolute => Some(public_key_multibase.as_str()),
                 _ => None,
             })
     }
@@ -377,7 +392,59 @@ pub struct Handle {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Document, Service};
+
+    /// A verification method belonging to another DID is not this DID's key.
+    ///
+    /// A `did:web` document is served by whoever controls the domain, so a
+    /// hostile one can list `did:web:attacker#atproto` and have every
+    /// signature checked against it verify for the attacker. Matching on the
+    /// fragment alone accepted that.
+    #[test]
+    fn a_method_belonging_to_another_did_is_not_ours() {
+        let document = Document {
+            context: vec![],
+            id: "did:web:subject.example".to_string(),
+            also_known_as: vec![],
+            service: vec![],
+            verification_method: vec![VerificationMethod::Multikey {
+                id: "did:web:attacker.example#atproto".to_string(),
+                controller: "did:web:attacker.example".to_string(),
+                public_key_multibase: "zSomebodyElsesKey".to_string(),
+                extra: HashMap::new(),
+            }],
+            extra: HashMap::new(),
+        };
+
+        assert_eq!(document.verification_method_multibase("atproto"), None);
+    }
+
+    /// Both legitimate renderings still match.
+    #[test]
+    fn both_renderings_of_our_own_method_match() {
+        let method = |id: &str| VerificationMethod::Multikey {
+            id: id.to_string(),
+            controller: "did:plc:subject".to_string(),
+            public_key_multibase: "zOurKey".to_string(),
+            extra: HashMap::new(),
+        };
+
+        for id in ["#atproto", "did:plc:subject#atproto"] {
+            let document = Document {
+                context: vec![],
+                id: "did:plc:subject".to_string(),
+                also_known_as: vec![],
+                service: vec![],
+                verification_method: vec![method(id)],
+                extra: HashMap::new(),
+            };
+            assert_eq!(
+                document.verification_method_multibase("atproto"),
+                Some("zOurKey"),
+                "{id}"
+            );
+        }
+    }
+    use crate::model::{Document, Service, VerificationMethod};
     use std::collections::HashMap;
 
     #[test]
