@@ -54,6 +54,10 @@ lru.workspace = true
 elliptic-curve.workspace = true
 fjall = { workspace = true, optional = true }
 hmac = "0.13"
+# RS256 verification of auth-gateway tokens (town.roundabout.server.createSessionFromToken).
+# Nothing else in the workspace verifies RSA: atproto-identity's KeyType covers
+# P-256 / P-384 / K-256 / Ed25519 only.
+jsonwebtoken = { version = "9", default-features = false }
 k256.workspace = true
 p256.workspace = true
 p384.workspace = true

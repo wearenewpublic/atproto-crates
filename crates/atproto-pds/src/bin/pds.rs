@@ -555,6 +555,18 @@ struct Args {
     #[arg(long, env = "PDS_BSKY_APP_VIEW_URL")]
     bsky_app_view_url: Option<String>,
 
+    /// Auth-gateway origin whose RS256 tokens
+    /// `town.roundabout.server.createSessionFromToken` accepts. Its JWKS is
+    /// read from `<url>/.well-known/jwks.json`. Set together with
+    /// `--auth-gateway-audience`; leave both unset to keep the endpoint dark.
+    #[arg(long, env = "PDS_AUTH_GATEWAY_URL")]
+    auth_gateway_url: Option<String>,
+
+    /// The exact `aud` a gateway token must carry: this server's public URL as
+    /// registered in the gateway's PDS map (byte-for-byte, no trailing slash).
+    #[arg(long, env = "PDS_AUTH_GATEWAY_AUDIENCE")]
+    auth_gateway_audience: Option<String>,
+
     /// Operator-wide PLC rotation key, listed on every genesis operation this
     /// server signs.
     ///
@@ -1076,6 +1088,24 @@ async fn main() -> anyhow::Result<()> {
             url, "Atproto-Proxy default: app.bsky.* pinned to AppView"
         );
         state = state.with_bsky_app_view(did.to_string(), url.to_string());
+    }
+    match (
+        args.auth_gateway_url.as_deref(),
+        args.auth_gateway_audience.as_deref(),
+    ) {
+        (Some(url), Some(audience)) => {
+            let config = atproto_pds::http::auth_gateway::AuthGatewayConfig::new(url, audience)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            info!(url = %config.url, audience = %config.audience, "auth-gateway token exchange enabled");
+            state =
+                state.with_auth_gateway(atproto_pds::http::auth_gateway::AuthGateway::new(config));
+        }
+        (None, None) => {}
+        _ => {
+            anyhow::bail!(
+                "PDS_AUTH_GATEWAY_URL and PDS_AUTH_GATEWAY_AUDIENCE must be set together"
+            );
+        }
     }
     if let Some(plc) = plc_service {
         state = state.with_plc_service(plc);

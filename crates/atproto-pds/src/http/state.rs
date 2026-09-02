@@ -401,6 +401,10 @@ pub struct HttpState {
     /// AppView base URL for `app.bsky.*` proxying. Default for the
     /// `Atproto-Proxy` middleware when the header is absent.
     pub bsky_app_view_url: Option<String>,
+    /// Trust for `town.roundabout.server.createSessionFromToken`. `None`
+    /// means the endpoint answers `InvalidToken` for every request — the
+    /// same shape the TS PDS uses when the gateway is unconfigured.
+    pub auth_gateway: Option<std::sync::Arc<crate::http::auth_gateway::AuthGateway>>,
     /// Whether this server can authenticate a delegate against another
     /// server's OAuth, and if not, why. Set via `PDS_DELEGATION_ENABLED` plus
     /// the preconditions [`DelegationStatus::resolve`] checks.
@@ -463,6 +467,7 @@ impl HttpState {
             crawlers: Vec::new(),
             bsky_app_view_did: None,
             bsky_app_view_url: None,
+            auth_gateway: None,
         }
     }
 
@@ -527,6 +532,7 @@ impl HttpState {
             crawlers: Vec::new(),
             bsky_app_view_did: None,
             bsky_app_view_url: None,
+            auth_gateway: None,
         }
     }
 
@@ -868,6 +874,13 @@ impl HttpState {
     pub fn with_bsky_app_view(mut self, did: String, url: String) -> Self {
         self.bsky_app_view_did = Some(did);
         self.bsky_app_view_url = Some(url);
+        self
+    }
+
+    /// Trust tokens from an auth-gateway (see [`crate::http::auth_gateway`]).
+    #[must_use]
+    pub fn with_auth_gateway(mut self, gateway: crate::http::auth_gateway::AuthGateway) -> Self {
+        self.auth_gateway = Some(std::sync::Arc::new(gateway));
         self
     }
 
