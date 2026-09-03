@@ -269,6 +269,23 @@ use them to discover which addresses exist. The logs are the only signal:
 If the first line appears and mail still does not arrive, the problem is past
 the relay and the provider's own log will say so.
 
+### Auth-gateway session exchange
+
+Optional. Set both variables together, or neither — `town.roundabout.server.
+createSessionFromToken` is not this deployment's concern unless you are
+fronting it with an auth-gateway that mints RS256 tokens for it to exchange.
+
+```
+PDS_AUTH_GATEWAY_URL=https://auth.example.com
+PDS_AUTH_GATEWAY_AUDIENCE=https://vesuvius.pyroclastic.cloud
+```
+
+`PDS_AUTH_GATEWAY_URL` is the gateway's origin; its JWKS is read from
+`<url>/.well-known/jwks.json` and cached for 5 minutes. `PDS_AUTH_GATEWAY_AUDIENCE`
+is the exact `aud` a gateway token must carry — this server's public URL, as
+the gateway registers it in its own audience map. The two sides must
+byte-match, or every exchange fails.
+
 ---
 
 ## 3. DNS

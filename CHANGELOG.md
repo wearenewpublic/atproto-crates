@@ -257,6 +257,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path already refused the name; the revoke handler now does too.
 
 ### Added
+- **`town.roundabout.server.createSessionFromToken` mints a session from an auth-gateway token.** This
+  server does not perform sign-in itself for accounts fronted by an auth-gateway (Google OAuth, magic
+  links); the gateway issues a short-lived RS256 JWT instead, and the new endpoint exchanges one of those
+  for a normal session. The token is verified against the gateway's own JWKS (`<url>/.well-known/jwks.json`,
+  cached 5 minutes) and its `aud` must byte-match this server's configured audience; the verified email is
+  then matched, case-insensitively, to an existing account. No account is created by this path — an unknown
+  email is refused rather than provisioned. New `PDS_AUTH_GATEWAY_URL` / `PDS_AUTH_GATEWAY_AUDIENCE`
+  config, set together or not at all, and a new `jsonwebtoken` dependency for the RSA verification this
+  workspace did not previously have.
+
 - **A space type is named on the consent screen in the reader's language.** A space type declaration may
   publish `name:lang`, a map of localised names, and 0016 puts it there for exactly this screen — the one a
   person reads before granting an application access to their spaces. It was parsed and then dropped, so
