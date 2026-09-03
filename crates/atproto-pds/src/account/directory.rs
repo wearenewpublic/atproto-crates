@@ -282,6 +282,82 @@ impl AccountDirectory {
         }
     }
 
+    /// Look up an account by email, case-insensitively.
+    ///
+    /// The column is stored verbatim and is `UNIQUE` only byte-for-byte, so
+    /// two rows may differ only by case. That is refused as a storage error
+    /// rather than resolved by picking one: this lookup mints sessions, and
+    /// "whichever sorted first" is not a person.
+    pub async fn lookup_email(&self, email: &str) -> PdsResult<Option<AccountRow>> {
+        let needle = email.to_ascii_lowercase();
+        let rows: Vec<AccountRow> = match self.pool.kind() {
+            #[cfg(feature = "sqlite")]
+            AccountPoolKind::Sqlite => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                    String,
+                    i64,
+                )> = sqlx::query_as(
+                    "SELECT did, handle, email, email_confirmed_at, password_hash, created_at, state, signing_key_ref, pds_managed_rotation
+                     FROM account WHERE LOWER(email) = ? LIMIT 2",
+                )
+                .bind(&needle)
+                .fetch_all(self.pool.as_sqlite())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("lookup_email: {e}"),
+                })?;
+                rows.into_iter().map(map_row_sqlite).collect()
+            }
+            #[cfg(feature = "postgres")]
+            AccountPoolKind::Postgres => {
+                let rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                    String,
+                    bool,
+                )> = sqlx::query_as(
+                    "SELECT did, handle, email, email_confirmed_at, password_hash, created_at, state, signing_key_ref, pds_managed_rotation
+                     FROM account WHERE LOWER(email) = $1 LIMIT 2",
+                )
+                .bind(&needle)
+                .fetch_all(self.pool.as_postgres())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("lookup_email: {e}"),
+                })?;
+                rows.into_iter().map(map_row_pg).collect()
+            }
+            #[cfg(not(feature = "sqlite"))]
+            AccountPoolKind::Sqlite => unreachable!("AccountPool::Sqlite without `sqlite` feature"),
+            #[cfg(not(feature = "postgres"))]
+            AccountPoolKind::Postgres => {
+                unreachable!("AccountPool::Postgres without `postgres` feature")
+            }
+        };
+        let mut rows = rows.into_iter();
+        let first = rows.next();
+        if rows.next().is_some() {
+            return Err(PdsError::Storage {
+                reason:
+                    "lookup_email: more than one account matches this address case-insensitively"
+                        .to_string(),
+            });
+        }
+        Ok(first)
+    }
+
     /// List accounts, paginated by `did` (cursor is the last DID from the prior page).
     pub async fn list_accounts(
         &self,
