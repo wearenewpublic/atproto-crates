@@ -1,0 +1,101 @@
+{
+  "lexicon": 1,
+  "id": "town.roundabout.server.createSessionFromToken",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create an ATProto session from an auth gateway token. Accepts tokens from any auth provider (Google OAuth, magic link, etc.).",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["authToken"],
+          "properties": {
+            "authToken": {
+              "type": "string",
+              "description": "JWT token from the auth gateway containing verified authentication information"
+            },
+            "utmSource": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Arrival utm_source, stamped on acquisition.email_verified (P-2612)"
+            },
+            "utmMedium": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Arrival utm_medium, stamped on acquisition.email_verified (P-2612)"
+            },
+            "utmCampaign": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Arrival utm_campaign, stamped on acquisition.email_verified (P-2612)"
+            },
+            "utmTerm": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Arrival utm_term, stamped on acquisition.email_verified (P-2612)"
+            },
+            "utmContent": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "Arrival utm_content, stamped on acquisition.email_verified (P-2612)"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["accessJwt", "refreshJwt", "handle", "did"],
+          "properties": {
+            "accessJwt": {
+              "type": "string",
+              "description": "ATProto access JWT for API calls"
+            },
+            "refreshJwt": {
+              "type": "string",
+              "description": "ATProto refresh JWT for token renewal"
+            },
+            "handle": {
+              "type": "string",
+              "format": "handle",
+              "description": "User's ATProto handle"
+            },
+            "did": {
+              "type": "string",
+              "format": "did",
+              "description": "User's DID"
+            },
+            "email": {
+              "type": "string",
+              "description": "User's email address"
+            },
+            "emailConfirmed": {
+              "type": "boolean",
+              "description": "Whether the email is confirmed (always true for external auth)"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidToken",
+          "description": "The auth token is invalid, expired, or could not be verified"
+        },
+        {
+          "name": "AccountNotFound",
+          "description": "No account found for this email and auto-creation is disabled"
+        },
+        {
+          "name": "AccountDeactivated",
+          "description": "The account associated with this email has been deactivated"
+        },
+        {
+          "name": "AccountTakenDown",
+          "description": "The account associated with this email has been taken down"
+        }
+      ]
+    }
+  }
+}

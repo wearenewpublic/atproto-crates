@@ -54,6 +54,10 @@ lru.workspace = true
 elliptic-curve.workspace = true
 fjall = { workspace = true, optional = true }
 hmac = "0.13"
+# RS256 verification of auth-gateway tokens (town.roundabout.server.createSessionFromToken).
+# Nothing else in the workspace verifies RSA: atproto-identity's KeyType covers
+# P-256 / P-384 / K-256 / Ed25519 only.
+jsonwebtoken = { version = "9", default-features = false }
 k256.workspace = true
 p256.workspace = true
 p384.workspace = true
@@ -100,6 +104,10 @@ futures.workspace = true
 hex = "0.4"
 http.workspace = true
 http-body-util = "0.1"
+# `use_pem` here (unified with the `default-features = false` build above)
+# lets the auth-gateway tests sign fixtures with `EncodingKey::from_rsa_pem`;
+# production code only ever verifies against JWKs, never PEM.
+jsonwebtoken = { version = "9", features = ["use_pem"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-websockets.workspace = true

@@ -254,7 +254,10 @@ pub async fn describe_repo(
 /// mid-migration is described here as still living on this one. `describeRepo`
 /// is only meaningful for accounts this server holds, so that window is the
 /// migration itself.
-async fn local_did_document(
+///
+/// Shared with `auth_handlers::create_session_from_token`, whose lexicon also
+/// returns `didDoc`, so both describe an account the same way.
+pub(crate) async fn local_did_document(
     state: &HttpState,
     did: &str,
     handle: &str,

@@ -44,7 +44,7 @@ const ROLES: [&str; 1] = ["pds"];
 ///
 /// Held to the router by `the_described_methods_match_the_router`. Add a route
 /// without adding it here and the tests fail, which is the point.
-const METHODS: [&str; 98] = [
+const METHODS: [&str; 99] = [
     "app.bsky.actor.getPreferences",
     "app.bsky.actor.putPreferences",
     "com.atproto.admin.deleteAccount",
@@ -145,6 +145,7 @@ const METHODS: [&str; 98] = [
     // This method itself: a description that omitted it would be the one
     // claim a caller could disprove from the response in hand.
     "community.lexicon.service.describe",
+    "town.roundabout.server.createSessionFromToken",
 ];
 
 /// Routes served but not described: compatibility aliases for methods the
