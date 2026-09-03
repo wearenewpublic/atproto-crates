@@ -287,9 +287,16 @@ impl AccountDirectory {
     /// The column is stored verbatim and is `UNIQUE` only byte-for-byte, so
     /// two rows may differ only by case. That is refused as a storage error
     /// rather than resolved by picking one: this lookup mints sessions, and
-    /// "whichever sorted first" is not a person.
+    /// "whichever sorted first" is not a person. Folding happens in the
+    /// database on both sides of the comparison (`LOWER(email) =
+    /// LOWER(?)`), not in Rust — SQLite's `LOWER()` is ASCII-only and
+    /// Postgres's is Unicode-aware, so folding the needle in Rust and
+    /// comparing it against a database-folded column would make the two
+    /// backends disagree on non-ASCII addresses. Each backend folds both
+    /// sides with its own `LOWER()`, so it is internally consistent even
+    /// though the two backends may still fold non-ASCII characters
+    /// differently from each other.
     pub async fn lookup_email(&self, email: &str) -> PdsResult<Option<AccountRow>> {
-        let needle = email.to_ascii_lowercase();
         let rows: Vec<AccountRow> = match self.pool.kind() {
             #[cfg(feature = "sqlite")]
             AccountPoolKind::Sqlite => {
@@ -305,9 +312,9 @@ impl AccountDirectory {
                     i64,
                 )> = sqlx::query_as(
                     "SELECT did, handle, email, email_confirmed_at, password_hash, created_at, state, signing_key_ref, pds_managed_rotation
-                     FROM account WHERE LOWER(email) = ? LIMIT 2",
+                     FROM account WHERE LOWER(email) = LOWER(?) LIMIT 2",
                 )
-                .bind(&needle)
+                .bind(email)
                 .fetch_all(self.pool.as_sqlite())
                 .await
                 .map_err(|e| PdsError::Storage {
@@ -329,9 +336,9 @@ impl AccountDirectory {
                     bool,
                 )> = sqlx::query_as(
                     "SELECT did, handle, email, email_confirmed_at, password_hash, created_at, state, signing_key_ref, pds_managed_rotation
-                     FROM account WHERE LOWER(email) = $1 LIMIT 2",
+                     FROM account WHERE LOWER(email) = LOWER($1) LIMIT 2",
                 )
-                .bind(&needle)
+                .bind(email)
                 .fetch_all(self.pool.as_postgres())
                 .await
                 .map_err(|e| PdsError::Storage {
