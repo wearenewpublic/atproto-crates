@@ -79,23 +79,235 @@ impl AuthGatewayConfig {
     }
 }
 
+use std::sync::Mutex;
+use std::time::Instant;
+
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+
+use crate::ttl_cache::TtlCache;
+
+/// What a verified gateway token tells us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayClaims {
+    /// The address the gateway proved, exactly as it appears in the token.
+    pub email: String,
+    /// `google` / `allegro` / `email` — how it was proved.
+    pub provider: String,
+    /// The deployment the client signed in for (its login hostname).
+    pub environment: String,
+}
+
+/// Why a token was refused. The handler collapses every variant to the
+/// lexicon's `InvalidToken`; the distinction exists for logs and for the
+/// unknown-`kid` re-fetch decision.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayTokenError {
+    /// Not a JWT at all.
+    #[error("error-atproto-pds-auth-gateway-10 malformed token: {0}")]
+    Malformed(String),
+    /// The JWKS could not be fetched or parsed.
+    #[error("error-atproto-pds-auth-gateway-11 jwks unavailable: {0}")]
+    Jwks(String),
+    /// The token's `kid` is not in the (current) key set.
+    #[error("error-atproto-pds-auth-gateway-12 unknown kid: {0}")]
+    UnknownKid(String),
+    /// Wrong algorithm or a signature that does not verify.
+    #[error("error-atproto-pds-auth-gateway-13 signature refused: {0}")]
+    Signature(String),
+    /// Signature fine, claims not: issuer, audience, expiry, or a missing
+    /// gateway claim.
+    #[error("error-atproto-pds-auth-gateway-14 claims refused: {0}")]
+    Claims(String),
+}
+
+/// The raw claim set. Everything the gateway signs is a string except the
+/// timestamps, which `jsonwebtoken` validates before we see them.
+#[derive(Debug, serde::Deserialize)]
+struct RawClaims {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default, rename = "googleId")]
+    google_id: Option<String>,
+    #[serde(default, rename = "allegroId")]
+    allegro_id: Option<String>,
+    #[serde(default, rename = "emailId")]
+    email_id: Option<String>,
+}
+
 /// Verifier for gateway tokens. Holds the operator config and the JWKS cache.
 #[derive(Debug)]
 pub struct AuthGateway {
     config: AuthGatewayConfig,
+    /// Keyed by JWKS URL so a future second issuer cannot evict this one.
+    jwks: TtlCache<JwkSet>,
+    /// When an unknown `kid` last forced a re-fetch (see
+    /// [`JWKS_MIN_FORCED_REFETCH`]).
+    last_forced: Mutex<Option<Instant>>,
 }
 
 impl AuthGateway {
     /// Build a verifier from validated config.
     #[must_use]
     pub fn new(config: AuthGatewayConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            jwks: TtlCache::new(JWKS_CACHE_TTL, 4),
+            last_forced: Mutex::new(None),
+        }
     }
 
     /// The operator config this verifier enforces.
     #[must_use]
     pub fn config(&self) -> &AuthGatewayConfig {
         &self.config
+    }
+
+    /// Verify `token` against the gateway's published keys, re-fetching once
+    /// if the token names a `kid` the cached set lacks (a rotation we have not
+    /// seen yet) and the forced-refetch floor allows it.
+    pub async fn verify(&self, token: &str) -> Result<GatewayClaims, GatewayTokenError> {
+        let jwks = self.jwks_cached().await?;
+        match self.verify_with_jwks(token, &jwks) {
+            Err(GatewayTokenError::UnknownKid(kid)) => {
+                if !self.may_force_refetch() {
+                    return Err(GatewayTokenError::UnknownKid(kid));
+                }
+                let fresh = self.fetch_jwks().await?;
+                self.jwks.put(&self.config.jwks_url(), fresh.clone());
+                self.verify_with_jwks(token, &fresh)
+            }
+            other => other,
+        }
+    }
+
+    /// Pure verification against a caller-supplied key set. Signature first,
+    /// claims after — nothing in the payload is read until the signature
+    /// stands (the same rule `oauth::client_auth::verify_assertion` follows).
+    pub fn verify_with_jwks(
+        &self,
+        token: &str,
+        jwks: &JwkSet,
+    ) -> Result<GatewayClaims, GatewayTokenError> {
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| GatewayTokenError::Malformed(e.to_string()))?;
+        if header.alg != Algorithm::RS256 {
+            return Err(GatewayTokenError::Signature(format!(
+                "alg {:?} is not RS256",
+                header.alg
+            )));
+        }
+        let kid = header
+            .kid
+            .ok_or_else(|| GatewayTokenError::Signature("token has no kid".into()))?;
+        let jwk = jwks
+            .find(&kid)
+            .ok_or_else(|| GatewayTokenError::UnknownKid(kid.clone()))?;
+        let key = DecodingKey::from_jwk(jwk)
+            .map_err(|e| GatewayTokenError::Jwks(format!("kid {kid}: {e}")))?;
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[AUTH_GATEWAY_ISSUER]);
+        validation.set_audience(&[self.config.audience.as_str()]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+
+        let data = jsonwebtoken::decode::<RawClaims>(token, &key, &validation).map_err(|e| {
+            use jsonwebtoken::errors::ErrorKind;
+            match e.kind() {
+                ErrorKind::InvalidSignature | ErrorKind::InvalidAlgorithm => {
+                    GatewayTokenError::Signature(e.to_string())
+                }
+                _ => GatewayTokenError::Claims(e.to_string()),
+            }
+        })?;
+        let raw = data.claims;
+
+        let email = match raw.email.as_deref() {
+            Some(e) if !e.is_empty() => e.to_string(),
+            _ => return Err(GatewayTokenError::Claims("no email claim".into())),
+        };
+        let provider = raw
+            .provider
+            .ok_or_else(|| GatewayTokenError::Claims("no provider claim".into()))?;
+        let environment = raw
+            .environment
+            .ok_or_else(|| GatewayTokenError::Claims("no environment claim".into()))?;
+        let id_present = match provider.as_str() {
+            "google" => raw.google_id.is_some(),
+            "allegro" => raw.allegro_id.is_some(),
+            "email" => raw.email_id.is_some(),
+            _ => true,
+        };
+        if !id_present {
+            return Err(GatewayTokenError::Claims(format!(
+                "provider {provider} requires its id claim"
+            )));
+        }
+        Ok(GatewayClaims {
+            email,
+            provider,
+            environment,
+        })
+    }
+
+    async fn jwks_cached(&self) -> Result<JwkSet, GatewayTokenError> {
+        let url = self.config.jwks_url();
+        if let Some(set) = self.jwks.get(&url) {
+            return Ok(set);
+        }
+        let fresh = self.fetch_jwks().await?;
+        self.jwks.put(&url, fresh.clone());
+        Ok(fresh)
+    }
+
+    fn may_force_refetch(&self) -> bool {
+        let mut last = self.last_forced.lock().unwrap_or_else(|p| p.into_inner());
+        let allowed = last.is_none_or(|t| t.elapsed() >= JWKS_MIN_FORCED_REFETCH);
+        if allowed {
+            *last = Some(Instant::now());
+        }
+        allowed
+    }
+
+    /// One bounded, redirect-free GET of the JWKS. The URL is operator
+    /// configuration, not caller input, so the SSRF guard used for OAuth
+    /// client metadata does not apply — the dev stack points this at a
+    /// docker hostname over plain http.
+    async fn fetch_jwks(&self) -> Result<JwkSet, GatewayTokenError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(crate::user_agent())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
+        let response = client
+            .get(self.config.jwks_url())
+            .send()
+            .await
+            .map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(GatewayTokenError::Jwks(format!(
+                "jwks fetch returned {}",
+                response.status()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
+        if bytes.len() > 256 * 1024 {
+            return Err(GatewayTokenError::Jwks("jwks exceeds 256 KiB".into()));
+        }
+        let set: JwkSet =
+            serde_json::from_slice(&bytes).map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
+        if set.keys.is_empty() {
+            return Err(GatewayTokenError::Jwks("jwks has no keys".into()));
+        }
+        Ok(set)
     }
 }
 
@@ -123,6 +335,164 @@ mod tests {
         assert!(matches!(
             AuthGatewayConfig::new("https://auth.example", ""),
             Err(AuthGatewayConfigError::EmptyAudience)
+        ));
+    }
+
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
+    const PRIVATE_PEM: &str = include_str!("../../tests/fixtures/auth_gateway/private.pem");
+    const JWKS_JSON: &str = include_str!("../../tests/fixtures/auth_gateway/jwks.json");
+
+    fn jwks() -> jsonwebtoken::jwk::JwkSet {
+        serde_json::from_str(JWKS_JSON).unwrap()
+    }
+
+    fn gateway() -> AuthGateway {
+        AuthGateway::new(
+            AuthGatewayConfig::new("https://auth.example", "https://pds.example").unwrap(),
+        )
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A token shaped exactly like `services/auth-gateway`'s `sign()`:
+    /// `iss`, `aud`, `sub` = email, `iat`, `exp`, plus the gateway claims.
+    fn sign(kid: &str, claims: serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn good_claims() -> serde_json::Value {
+        serde_json::json!({
+            "iss": AUTH_GATEWAY_ISSUER,
+            "aud": "https://pds.example",
+            "sub": "Admin@Example.com",
+            "email": "Admin@Example.com",
+            "provider": "email",
+            "emailId": "ml_123",
+            "environment": "roundabout-grove.fly.dev",
+            "iat": now(),
+            "exp": now() + 300,
+        })
+    }
+
+    /// The happy path: a gateway-signed token yields its email verbatim
+    /// (lower-casing is the handler's job, at lookup time) and the two
+    /// gateway claims the TS contract requires.
+    #[test]
+    fn verifies_a_gateway_token_and_returns_its_claims() {
+        let claims = gateway()
+            .verify_with_jwks(&sign("test-key-1", good_claims()), &jwks())
+            .unwrap();
+        assert_eq!(claims.email, "Admin@Example.com");
+        assert_eq!(claims.provider, "email");
+        assert_eq!(claims.environment, "roundabout-grove.fly.dev");
+    }
+
+    /// `aud` is what stops a token minted for a community PDS from opening a
+    /// session here. It must match the configured audience byte-for-byte.
+    #[test]
+    fn refuses_a_token_for_another_audience() {
+        let mut c = good_claims();
+        c["aud"] = "https://pds.other".into();
+        assert!(matches!(
+            gateway().verify_with_jwks(&sign("test-key-1", c), &jwks()),
+            Err(GatewayTokenError::Claims(_))
+        ));
+    }
+
+    /// Only the gateway issues these tokens.
+    #[test]
+    fn refuses_a_token_from_another_issuer() {
+        let mut c = good_claims();
+        c["iss"] = "someone-else".into();
+        assert!(matches!(
+            gateway().verify_with_jwks(&sign("test-key-1", c), &jwks()),
+            Err(GatewayTokenError::Claims(_))
+        ));
+    }
+
+    /// Gateway tokens live 300 s; an expired one must not mint a session.
+    #[test]
+    fn refuses_an_expired_token() {
+        let mut c = good_claims();
+        c["exp"] = (now() - 3600).into();
+        c["iat"] = (now() - 3900).into();
+        assert!(
+            gateway()
+                .verify_with_jwks(&sign("test-key-1", c), &jwks())
+                .is_err()
+        );
+    }
+
+    /// The TS contract requires `provider` and `environment`, and a
+    /// per-provider id (`emailId` / `googleId` / `allegroId`). A service token
+    /// the gateway mints for account lookup carries none of these and must
+    /// never open a session.
+    #[test]
+    fn refuses_a_token_missing_the_gateway_claims() {
+        let mut no_provider = good_claims();
+        no_provider.as_object_mut().unwrap().remove("provider");
+        assert!(matches!(
+            gateway().verify_with_jwks(&sign("test-key-1", no_provider), &jwks()),
+            Err(GatewayTokenError::Claims(_))
+        ));
+
+        let mut google_without_id = good_claims();
+        google_without_id["provider"] = "google".into();
+        google_without_id.as_object_mut().unwrap().remove("emailId");
+        assert!(matches!(
+            gateway().verify_with_jwks(&sign("test-key-1", google_without_id), &jwks()),
+            Err(GatewayTokenError::Claims(_))
+        ));
+
+        let mut no_email = good_claims();
+        no_email.as_object_mut().unwrap().remove("email");
+        assert!(matches!(
+            gateway().verify_with_jwks(&sign("test-key-1", no_email), &jwks()),
+            Err(GatewayTokenError::Claims(_))
+        ));
+    }
+
+    /// `alg: none` and HS256 (signed with a guessable secret) must be refused
+    /// before any key lookup — a JWKS lookup keyed off an attacker's header
+    /// is itself a vector.
+    #[test]
+    fn refuses_non_rs256_tokens() {
+        let hs = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &good_claims(),
+            &EncodingKey::from_secret(b"guess"),
+        )
+        .unwrap();
+        assert!(matches!(
+            gateway().verify_with_jwks(&hs, &jwks()),
+            Err(GatewayTokenError::Signature(_))
+        ));
+        assert!(matches!(
+            gateway().verify_with_jwks("not.a.jwt", &jwks()),
+            Err(GatewayTokenError::Malformed(_))
+        ));
+    }
+
+    /// A `kid` the JWKS does not list is a distinct error: the handler uses it
+    /// to decide whether a forced re-fetch is worth trying.
+    #[test]
+    fn reports_an_unknown_kid_distinctly() {
+        assert!(matches!(
+            gateway().verify_with_jwks(&sign("rotated-key", good_claims()), &jwks()),
+            Err(GatewayTokenError::UnknownKid(_))
         ));
     }
 }

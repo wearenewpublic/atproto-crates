@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A cache of `V` keyed by `String`, bounded by entry count and by age.
+#[derive(Debug)]
 pub struct TtlCache<V> {
     ttl: Duration,
     entries: Mutex<lru::LruCache<String, (Instant, V)>>,
