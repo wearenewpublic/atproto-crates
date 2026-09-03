@@ -1096,7 +1096,7 @@ async fn main() -> anyhow::Result<()> {
         (Some(url), Some(audience)) => {
             let config = atproto_pds::http::auth_gateway::AuthGatewayConfig::new(url, audience)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            info!(url = %config.url, audience = %config.audience, "auth-gateway token exchange enabled");
+            tracing::info!(url = %config.url, audience = %config.audience, "auth-gateway token exchange enabled");
             state =
                 state.with_auth_gateway(atproto_pds::http::auth_gateway::AuthGateway::new(config));
         }
