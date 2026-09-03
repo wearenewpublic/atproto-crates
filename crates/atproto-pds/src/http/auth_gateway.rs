@@ -30,6 +30,15 @@ pub const AUTH_GATEWAY_ISSUER: &str = "auth-gateway";
 const MAX_JWKS_BYTES: usize = 256 * 1024;
 
 /// Operator configuration for the gateway trust.
+///
+/// Plain `http` is accepted, because the dev docker stack points this at
+/// `http://auth-gateway:3004` inside a private network. It is a real caveat
+/// rather than a convenience: the JWKS fetched from [`url`](Self::url) is the
+/// entire root of trust for the `Full`-authority sessions
+/// `town.roundabout.server.createSessionFromToken` mints, so over plain http
+/// to a remote host anyone on the path can serve a key set of their own
+/// choosing and mint sessions for any account on this PDS. The binary warns
+/// about exactly that shape at startup — see [`Self::is_plaintext_remote`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthGatewayConfig {
     /// Origin of the gateway, without a trailing slash; the JWKS lives at
@@ -82,6 +91,30 @@ impl AuthGatewayConfig {
     #[must_use]
     pub fn jwks_url(&self) -> String {
         format!("{}/.well-known/jwks.json", self.url)
+    }
+
+    /// Whether this gateway is reached over plain `http` at a host that is
+    /// not loopback — the shape the startup warning exists for.
+    ///
+    /// `http://auth-gateway:3004` (the dev docker stack) and
+    /// `https://auth.example` are both fine in their place; `http://` to a
+    /// host reachable across a network is the one that hands the root of
+    /// trust for token sessions to whoever is on the path. Pure, so the
+    /// decision is testable without booting the binary.
+    #[must_use]
+    pub fn is_plaintext_remote(&self) -> bool {
+        let Ok(parsed) = url::Url::parse(&self.url) else {
+            return false;
+        };
+        if parsed.scheme() != "http" {
+            return false;
+        }
+        match parsed.host() {
+            Some(url::Host::Domain(host)) => host != "localhost",
+            Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+            None => false,
+        }
     }
 }
 
@@ -399,6 +432,29 @@ mod tests {
             AuthGatewayConfig::new("https://auth.example", ""),
             Err(AuthGatewayConfigError::EmptyAudience)
         ));
+    }
+
+    /// The dev stack's `http://auth-gateway:3004` must not be refused, but it
+    /// must be the case that the operator hears about it: the JWKS behind that
+    /// URL is the root of trust for every `Full` session this endpoint mints,
+    /// and over plain http to a routable host anyone on the path can serve
+    /// their own keys. Loopback is exempt (nothing is on that path) and https
+    /// is the intended shape.
+    #[test]
+    fn flags_plain_http_to_a_non_loopback_host() {
+        let plaintext_remote = |url: &str| {
+            AuthGatewayConfig::new(url, "https://pds.example")
+                .unwrap()
+                .is_plaintext_remote()
+        };
+        assert!(plaintext_remote("http://auth-gateway:3004"));
+        assert!(plaintext_remote("http://auth.example"));
+        assert!(plaintext_remote("http://10.0.0.4:3004"));
+        assert!(!plaintext_remote("http://localhost:3004"));
+        assert!(!plaintext_remote("http://127.0.0.1:3004"));
+        assert!(!plaintext_remote("http://[::1]:3004"));
+        assert!(!plaintext_remote("https://auth.example"));
+        assert!(!plaintext_remote("https://localhost:3004"));
     }
 
     use jsonwebtoken::{Algorithm, EncodingKey, Header};

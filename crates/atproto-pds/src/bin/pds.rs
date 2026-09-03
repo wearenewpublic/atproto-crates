@@ -1096,6 +1096,12 @@ async fn main() -> anyhow::Result<()> {
         (Some(url), Some(audience)) => {
             let config = atproto_pds::http::auth_gateway::AuthGatewayConfig::new(url, audience)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if config.is_plaintext_remote() {
+                tracing::warn!(
+                    url = %config.url,
+                    "PDS_AUTH_GATEWAY_URL uses plain http to a non-loopback host; its JWKS is the root of trust for token sessions -- use https outside a private dev network"
+                );
+            }
             tracing::info!(url = %config.url, audience = %config.audience, "auth-gateway token exchange enabled");
             state =
                 state.with_auth_gateway(atproto_pds::http::auth_gateway::AuthGateway::new(config));

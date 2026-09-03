@@ -712,6 +712,12 @@ pub async fn create_session(
 }
 
 /// Input for `town.roundabout.server.createSessionFromToken`.
+///
+/// The lexicon also declares optional `utmSource` / `utmMedium` /
+/// `utmCampaign` / `utmTerm` / `utmContent`, which the xoxo client sends for
+/// acquisition analytics this PDS does not have; there is deliberately no
+/// `deny_unknown_fields` here, so they are accepted and ignored rather than
+/// failing the sign-in of a client that sends them.
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionFromTokenInput {
     /// The gateway-signed RS256 JWT.
@@ -811,7 +817,10 @@ pub async fn create_session_from_token(
         .await
         .map_err(XrpcError::from)?;
     let Some(account) = account else {
-        // Deliberately no email in the log: `tests/log_hygiene.rs`.
+        // Deliberately no email in the log; the addresses that reach this
+        // branch are exactly the ones with no account here. Guarded by
+        // `tests/log_hygiene.rs`'s
+        // `a_gateway_token_for_an_unknown_email_does_not_log_the_address`.
         tracing::info!(
             provider = %claims.provider,
             environment = %claims.environment,

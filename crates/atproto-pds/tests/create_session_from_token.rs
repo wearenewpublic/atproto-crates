@@ -152,6 +152,22 @@ async fn post_json(app: axum::Router, path: &str, body: Value) -> (StatusCode, V
     )
 }
 
+async fn post_bearer(app: axum::Router, path: &str, bearer: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn get_json(app: axum::Router, path: &str, bearer: &str) -> (StatusCode, Value) {
     let request = Request::builder()
         .uri(path)
@@ -394,4 +410,53 @@ async fn unknown_kid_forces_one_refetch() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(h.jwks_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A gateway session must survive its first refresh, an hour after sign-in.
+///
+/// `issue_pair` stamps a synthetic `apw` of `__auth_gateway__` into both
+/// tokens, and no `app_password` row backs it. That is only safe because
+/// nothing joins `apw` against that table today — `require_authn` reads the
+/// claim without looking it up, and so does `refreshSession`. This pins that:
+/// a future lookup keyed on `apw` (revocation, per-app-password scoping,
+/// listing) written on the reasonable assumption that the row exists would not
+/// fail at deploy or at sign-in, but silently lock every org admin out at
+/// their first refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gateway_session_refreshes_despite_its_synthetic_app_password_id() {
+    let h = build(true).await;
+    seed(
+        &h.manager,
+        "did:web:admin.example",
+        "admin.example",
+        "admin@example.com",
+    )
+    .await;
+
+    let (status, minted) = post_json(
+        h.app.clone(),
+        NSID,
+        json!({ "authToken": gateway_token("admin@example.com", "test-key-1", json!({})) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{minted}");
+
+    let (status, refreshed) = post_bearer(
+        h.app.clone(),
+        "/xrpc/com.atproto.server.refreshSession",
+        minted["refreshJwt"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    assert_eq!(refreshed["did"], "did:web:admin.example");
+    assert!(refreshed["accessJwt"].is_string() && refreshed["refreshJwt"].is_string());
+
+    let (status, session) = get_json(
+        h.app.clone(),
+        "/xrpc/com.atproto.server.getSession",
+        refreshed["accessJwt"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert_eq!(session["did"], "did:web:admin.example");
 }
