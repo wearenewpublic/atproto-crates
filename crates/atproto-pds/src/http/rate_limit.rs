@@ -54,8 +54,10 @@ use crate::security::SlidingWindowLimiter;
 /// Everything here either mints a credential or consumes one, so a caller
 /// making many attempts in a minute is doing something other than using the
 /// service.
-const AUTH_PATHS: [&str; 10] = [
+const AUTH_PATHS: [&str; 11] = [
     "/xrpc/com.atproto.server.createSession",
+    // Mints a session pair from an external token; same budget as createSession.
+    "/xrpc/town.roundabout.server.createSessionFromToken",
     "/xrpc/com.atproto.server.createAccount",
     "/xrpc/com.atproto.server.refreshSession",
     "/xrpc/com.atproto.server.requestPasswordReset",

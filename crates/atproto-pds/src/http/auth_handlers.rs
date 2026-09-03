@@ -9,6 +9,7 @@
 //! - `POST /xrpc/com.atproto.server.createAppPassword`
 //! - `GET /xrpc/com.atproto.server.listAppPasswords`
 //! - `POST /xrpc/com.atproto.server.revokeAppPassword`
+//! - `POST /xrpc/town.roundabout.server.createSessionFromToken`
 
 use crate::account::{
     self, AccountState, CreateAccountParams, SessionTokens, app_password, invite, session,
@@ -705,6 +706,188 @@ pub async fn create_session(
         did: account.did,
         email,
         email_confirmed,
+        active,
+        status,
+    }))
+}
+
+/// Input for `town.roundabout.server.createSessionFromToken`.
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionFromTokenInput {
+    /// The gateway-signed RS256 JWT.
+    #[serde(rename = "authToken")]
+    pub auth_token: String,
+}
+
+/// Output for `town.roundabout.server.createSessionFromToken`.
+///
+/// A separate type from [`SessionResponse`]: the lexicon spells
+/// `emailConfirmed` in camelCase (the xoxo client reads that key) and the TS
+/// PDS also returns `didDoc`, which `SessionResponse` never carries.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenSessionResponse {
+    /// Access JWT.
+    pub access_jwt: String,
+    /// Refresh JWT.
+    pub refresh_jwt: String,
+    /// The account's handle (or `handle.invalid`).
+    pub handle: String,
+    /// The account's DID.
+    pub did: String,
+    /// The account's DID document as this server describes it.
+    pub did_doc: serde_json::Value,
+    /// The account's email, as stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Always `true`: the gateway proved the mailbox.
+    pub email_confirmed: bool,
+    /// Whether the account is active.
+    pub active: bool,
+    /// The account's state when not active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Synthetic `apw` claim for sessions minted from a gateway token. No
+/// `app_password` row backs it; the claim is informational (nothing joins on
+/// it -- see `require_authn`) and `refreshSession` carries it forward.
+const AUTH_GATEWAY_APP_PASSWORD_ID: &str = "__auth_gateway__";
+
+/// Handler for `town.roundabout.server.createSessionFromToken`.
+///
+/// Mirrors the TypeScript PDS's endpoint of the same name, minus account
+/// creation: the gateway proved an email; if exactly one account carries it
+/// and that account is active, mint a full session. The gateway's own
+/// contract -- `iss`, `aud`, `provider`, `environment` -- is enforced in
+/// [`crate::http::auth_gateway`].
+///
+/// The route sits in `rate_limit::AUTH_PATHS`, which is the budget that holds
+/// it: the per-key limiter every other credential endpoint reaches for has no
+/// usable key here. The email is attacker input until the signature stands,
+/// and a bucket keyed on the token's own prefix collapses into one global
+/// bucket -- every RS256 JWT starts with the same base64 header.
+///
+/// # Errors
+///
+/// - `InvalidToken` for anything the verifier refuses, and when no gateway
+///   is configured.
+/// - `AccountNotFound` when no account carries the email.
+/// - `AccountTakenDown` / `AccountDeactivated` -- the lexicon's spellings,
+///   which the client switches on, rather than this server's own
+///   `AccountTakedown`.
+pub async fn create_session_from_token(
+    State(state): State<HttpState>,
+    Json(input): Json<CreateSessionFromTokenInput>,
+) -> Result<Json<TokenSessionResponse>, XrpcError> {
+    let invalid_token = || {
+        XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidToken",
+            "invalid or expired auth token",
+        )
+    };
+
+    if input.auth_token.is_empty() {
+        return Err(invalid_token());
+    }
+    let Some(gateway) = state.auth_gateway.as_ref() else {
+        tracing::warn!("createSessionFromToken called but no auth gateway is configured");
+        return Err(invalid_token());
+    };
+
+    let claims = match gateway.verify(&input.auth_token).await {
+        Ok(claims) => claims,
+        Err(err) => {
+            tracing::warn!(error = %err, "auth-gateway token refused");
+            return Err(invalid_token());
+        }
+    };
+
+    let manager = account_manager(&state)?;
+    let directory = state.reader.accounts();
+    let account = directory
+        .lookup_email(&claims.email)
+        .await
+        .map_err(XrpcError::from)?;
+    let Some(account) = account else {
+        // Deliberately no email in the log: `tests/log_hygiene.rs`.
+        tracing::info!(
+            provider = %claims.provider,
+            environment = %claims.environment,
+            "auth-gateway token for an unknown email"
+        );
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "AccountNotFound",
+            "no account found for this email",
+        ));
+    };
+
+    match account.state {
+        AccountState::Active => {}
+        AccountState::Takendown | AccountState::Suspended => {
+            return Err(XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "AccountTakenDown",
+                "account has been taken down",
+            ));
+        }
+        AccountState::Deactivated | AccountState::Deleted => {
+            return Err(XrpcError::new(
+                StatusCode::BAD_REQUEST,
+                "AccountDeactivated",
+                "account has been deactivated",
+            ));
+        }
+    }
+
+    // The gateway proved the mailbox; record that, as the TS PDS does.
+    if account.email_confirmed_at.is_none() {
+        manager
+            .set_email_confirmed_at(&account.did, Some(&chrono::Utc::now().to_rfc3339()))
+            .await
+            .map_err(XrpcError::from)?;
+    }
+
+    let tokens = session::issue_pair(
+        &state.service_did,
+        &account.did,
+        AUTH_GATEWAY_APP_PASSWORD_ID,
+        session::SessionAuthority::Full,
+        &state.jwt_secret,
+        session::DEFAULT_ACCESS_TTL_SECS,
+        session::DEFAULT_REFRESH_TTL_SECS,
+        crate::account::portal::session_epoch(&manager.account_pool(), &account.did)
+            .await
+            .map_err(XrpcError::from)?,
+    )
+    .map_err(XrpcError::from)?;
+
+    let (email, _, active, status) = session_account_fields(&account);
+    let handle = served_handle(
+        &state.reader.accounts().account_pool(),
+        &account.did,
+        &account.handle,
+    )
+    .await;
+    let did_doc = crate::http::handlers::local_did_document(&state, &account.did, &handle).await?;
+
+    tracing::info!(
+        did = %account.did,
+        provider = %claims.provider,
+        environment = %claims.environment,
+        "session minted from auth-gateway token"
+    );
+
+    Ok(Json(TokenSessionResponse {
+        access_jwt: tokens.access_jwt,
+        refresh_jwt: tokens.refresh_jwt,
+        handle,
+        did: account.did,
+        did_doc,
+        email,
+        email_confirmed: true,
         active,
         status,
     }))

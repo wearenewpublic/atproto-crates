@@ -207,6 +207,10 @@ fn build_router_inner(
             post(auth_handlers::create_session),
         )
         .route(
+            "/xrpc/town.roundabout.server.createSessionFromToken",
+            post(auth_handlers::create_session_from_token),
+        )
+        .route(
             "/xrpc/com.atproto.server.getSession",
             get(auth_handlers::get_session),
         )
