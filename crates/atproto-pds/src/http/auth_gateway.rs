@@ -23,6 +23,12 @@ pub const JWKS_MIN_FORCED_REFETCH: Duration = Duration::from_secs(30);
 /// `AUTH_GATEWAY_JWT_ISSUER` is set to it in every environment.
 pub const AUTH_GATEWAY_ISSUER: &str = "auth-gateway";
 
+/// How much of a JWKS document to read before giving up. It is a handful of
+/// RSA keys; without a ceiling the reply is buffered to whatever length the
+/// far end chooses to send, which turns operator configuration the gateway
+/// itself controls into an unbounded allocation on every cold fetch.
+const MAX_JWKS_BYTES: usize = 256 * 1024;
+
 /// Operator configuration for the gateway trust.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthGatewayConfig {
@@ -148,6 +154,13 @@ pub struct AuthGateway {
     /// When an unknown `kid` last forced a re-fetch (see
     /// [`JWKS_MIN_FORCED_REFETCH`]).
     last_forced: Mutex<Option<Instant>>,
+    /// When a cold or expired-cache JWKS fetch last failed (see
+    /// [`JWKS_MIN_FORCED_REFETCH`]). Without this floor, every sign-in
+    /// attempt on this unauthenticated endpoint drives one outbound GET —
+    /// with a 10 s timeout — for as long as the gateway is down or slow, the
+    /// same amplifier the unknown-`kid` floor exists to prevent on the other
+    /// re-fetch path. Cleared on a successful fetch.
+    last_fetch_failed_at: Mutex<Option<Instant>>,
 }
 
 impl AuthGateway {
@@ -158,6 +171,7 @@ impl AuthGateway {
             config,
             jwks: TtlCache::new(JWKS_CACHE_TTL, 4),
             last_forced: Mutex::new(None),
+            last_fetch_failed_at: Mutex::new(None),
         }
     }
 
@@ -254,14 +268,42 @@ impl AuthGateway {
         })
     }
 
+    /// The cached key set, or a fresh fetch on a miss — floored the same way
+    /// `may_force_refetch` floors the unknown-`kid` path: a fetch that failed
+    /// inside [`JWKS_MIN_FORCED_REFETCH`] is not retried, so a down or slow
+    /// gateway cannot be turned into one live request per unauthenticated
+    /// sign-in attempt.
     async fn jwks_cached(&self) -> Result<JwkSet, GatewayTokenError> {
         let url = self.config.jwks_url();
         if let Some(set) = self.jwks.get(&url) {
             return Ok(set);
         }
-        let fresh = self.fetch_jwks().await?;
-        self.jwks.put(&url, fresh.clone());
-        Ok(fresh)
+        let failed_at = *self
+            .last_fetch_failed_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if failed_at.is_some_and(|t| t.elapsed() < JWKS_MIN_FORCED_REFETCH) {
+            return Err(GatewayTokenError::Jwks(
+                "jwks fetch recently failed; retry later".into(),
+            ));
+        }
+        match self.fetch_jwks().await {
+            Ok(fresh) => {
+                self.jwks.put(&url, fresh.clone());
+                *self
+                    .last_fetch_failed_at
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                Ok(fresh)
+            }
+            Err(err) => {
+                *self
+                    .last_fetch_failed_at
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+                Err(err)
+            }
+        }
     }
 
     fn may_force_refetch(&self) -> bool {
@@ -284,7 +326,7 @@ impl AuthGateway {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
-        let response = client
+        let mut response = client
             .get(self.config.jwks_url())
             .send()
             .await
@@ -295,15 +337,36 @@ impl AuthGateway {
                 response.status()
             )));
         }
-        let bytes = response
-            .bytes()
+        // A declared Content-Length over the cap is rejected up front as a
+        // cheap fast path, but is not trusted instead of the running-total
+        // check below: it is the sender's own claim about a body they also
+        // control, and may be absent or wrong.
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_JWKS_BYTES as u64)
+        {
+            return Err(GatewayTokenError::Jwks(format!(
+                "jwks exceeds {MAX_JWKS_BYTES} bytes"
+            )));
+        }
+        // Chunk by chunk rather than `.bytes()`, which buffers the whole
+        // reply before the length check ever runs — the same shape as
+        // `oauth::client_metadata::read_json_bounded`.
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
-        if bytes.len() > 256 * 1024 {
-            return Err(GatewayTokenError::Jwks("jwks exceeds 256 KiB".into()));
+            .map_err(|e| GatewayTokenError::Jwks(e.to_string()))?
+        {
+            if body.len() + chunk.len() > MAX_JWKS_BYTES {
+                return Err(GatewayTokenError::Jwks(format!(
+                    "jwks exceeds {MAX_JWKS_BYTES} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
         }
         let set: JwkSet =
-            serde_json::from_slice(&bytes).map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
+            serde_json::from_slice(&body).map_err(|e| GatewayTokenError::Jwks(e.to_string()))?;
         if set.keys.is_empty() {
             return Err(GatewayTokenError::Jwks("jwks has no keys".into()));
         }
@@ -494,5 +557,55 @@ mod tests {
             gateway().verify_with_jwks(&sign("rotated-key", good_claims()), &jwks()),
             Err(GatewayTokenError::UnknownKid(_))
         ));
+    }
+
+    const OTHER_PRIVATE_PEM: &str =
+        include_str!("../../tests/fixtures/auth_gateway/other-private.pem");
+
+    /// A token naming a real `kid` but signed by a *different* key must be
+    /// refused as a bad signature. Every other `Signature` assertion in this
+    /// file is satisfied by the alg-mismatch pre-check before any crypto
+    /// runs; this is the one that actually exercises RSA verification.
+    #[test]
+    fn refuses_a_token_signed_by_the_wrong_key() {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        let token = jsonwebtoken::encode(
+            &header,
+            &good_claims(),
+            &EncodingKey::from_rsa_pem(OTHER_PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            gateway().verify_with_jwks(&token, &jwks()),
+            Err(GatewayTokenError::Signature(_))
+        ));
+    }
+
+    /// A cold or failed JWKS fetch must not turn every sign-in attempt on
+    /// this unauthenticated endpoint into a fresh outbound request while the
+    /// gateway is down: a second call inside the floor must fail fast, from
+    /// the stamp alone, with no network attempt.
+    #[tokio::test]
+    async fn floors_retries_after_a_failed_jwks_fetch() {
+        // Port 1 on loopback: nothing listens there, so the connection is
+        // refused immediately rather than hanging out to the 10 s timeout —
+        // that fast failure is what lets the second call's near-zero elapsed
+        // time distinguish "floored" from "attempted and also failed fast".
+        let gateway = AuthGateway::new(
+            AuthGatewayConfig::new("http://127.0.0.1:1", "https://pds.example").unwrap(),
+        );
+        assert!(gateway.jwks_cached().await.is_err());
+
+        let start = std::time::Instant::now();
+        let err = gateway.jwks_cached().await.unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "the floor should short-circuit without a network attempt"
+        );
+        assert!(
+            matches!(&err, GatewayTokenError::Jwks(msg) if msg.contains("recently failed")),
+            "expected the floor's own message, got {err}"
+        );
     }
 }
