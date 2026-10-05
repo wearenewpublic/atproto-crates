@@ -75,6 +75,12 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Reads the same trust store the TLS stack verifies against, so the boot-time
 # anchor count cannot drift from what `rustls-platform-verifier` actually sees.
 rustls-native-certs = "0.8"
+# Both `ring` (sqlx, tokio-websockets) and `aws-lc-rs` (reqwest) end up enabled
+# on rustls, so it cannot pick a process-level provider on its own; any client
+# that builds a config without naming one (the `valkey` redis connection) then
+# panics. `main` installs aws-lc-rs explicitly -- the provider reqwest already
+# falls back to, so outbound HTTP is unchanged.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 hex = "0.4"
 sha2.workspace = true
 tracing.workspace = true

@@ -644,6 +644,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls has two crypto providers compiled in (see Cargo.toml), so a client
+    // config built without naming one panics with "Could not automatically
+    // determine the process-level CryptoProvider" -- the redis connection behind
+    // `PDS_VALKEY_URL` does exactly that on its first TLS handshake. Installing
+    // one before anything else runs settles it for every client. aws-lc-rs
+    // because reqwest prefers an installed default and otherwise falls back to
+    // aws-lc-rs itself, so outbound HTTP keeps the provider it always had. `Err`
+    // only means one is already installed, which is the outcome we want.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let mut args = Args::parse();
 
     // Platform-assigned port. Railway, Fly, Heroku and the rest hand the
