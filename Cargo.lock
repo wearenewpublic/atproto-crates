@@ -500,6 +500,7 @@ dependencies = [
  "rand 0.10.2",
  "redis",
  "reqwest",
+ "rustls",
  "rustls-native-certs",
  "serde",
  "serde_bytes",
