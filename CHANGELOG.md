@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- **Concurrent OAuth refreshes no longer answer 500.** `rotate_refresh` read the refresh row in a deferred
+  SQLite transaction and only then asked for the write lock to replace it. If another connection had
+  committed to the accounts DB in between, or held the lock, that upgrade failed at once with
+  `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`, which SQLite does not retry under `busy_timeout`. It surfaced as
+  `PdsError::Storage` and therefore `500 InternalError` from `POST /oauth/token`, for a refresh token
+  that was valid and that the failed attempt had not spent. A client refreshing two sessions for one
+  account at the same instant lost one of the pair to this regularly; any other accounts-DB write landing
+  in the window could do the same.
+
+  The transaction now begins `BEGIN IMMEDIATE`, taking the write lock before it reads, where
+  `busy_timeout` applies, so concurrent rotations queue. Semantics are unchanged: a rotation is still
+  atomic, and one that finds its token already spent by the rotation ahead of it still answers `None`
+  (`400 invalid_grant`). The three other read-then-write transactions on the accounts DB had the same
+  shape and the same failure, and take the same fix: `invite::redeem`, taking a parked delegated sign-in
+  (`delegation_login::take`), and the portal's one-shot `take_flash_secret`. Each has a test that races
+  four callers against a file-backed WAL database and failed on its first round before the change.
 - **An unreachable managing app denies a space-credential mint by name instead of answering 500.**
   `com.atproto.space.getSpaceCredential` on a `#managingAppPolicy` space resolves the app's service
   identifier before it can ask `checkUserAccess`, and the two ways that resolution could fail were

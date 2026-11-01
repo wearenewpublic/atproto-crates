@@ -92,6 +92,21 @@ impl AccountDirectory {
         Self::open_with_url("sqlite::memory:").await
     }
 
+    /// Open a file-backed accounts DB in a fresh temporary directory, the way
+    /// the binary opens one: WAL, an eight-connection pool.
+    ///
+    /// For tests about concurrency. [`Self::open_memory`] is a one-connection
+    /// pool, which serializes every transaction and so can never show two of
+    /// them racing. The directory is deleted when the returned guard drops.
+    #[cfg(all(test, feature = "sqlite"))]
+    pub(crate) async fn open_temp() -> (Self, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = Self::open(&tmp.path().join("accounts.sqlite"))
+            .await
+            .unwrap();
+        (dir, tmp)
+    }
+
     #[cfg(feature = "sqlite")]
     async fn open_with_url(url: &str) -> PdsResult<Self> {
         let opts = SqliteConnectOptions::from_str(url)

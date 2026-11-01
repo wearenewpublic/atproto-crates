@@ -136,6 +136,29 @@ impl From<PgPool> for AccountPool {
     }
 }
 
+/// Begin a SQLite transaction that takes the write lock before it reads.
+///
+/// For every transaction that reads a row and then writes on the strength of
+/// it. A plain `BEGIN` is deferred: the first `SELECT` takes a read snapshot,
+/// and the write lock is requested only at the first write. If another
+/// connection holds that lock, or has committed since the snapshot was taken,
+/// the upgrade fails at once with `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`.
+/// SQLite does not consult `busy_timeout` there, because no amount of waiting
+/// makes a stale snapshot current. So two such transactions arriving together
+/// on the accounts DB -- or one of them and *any* other write to it -- failed
+/// the loser with a storage error, which the HTTP layer answers as 500.
+///
+/// `BEGIN IMMEDIATE` asks for the write lock first, where `busy_timeout` does
+/// apply, so concurrent callers queue and each reads what the one before it
+/// committed. A transaction whose first statement is a write gains nothing
+/// from this; Postgres arms use `SELECT ... FOR UPDATE` for the same purpose.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
