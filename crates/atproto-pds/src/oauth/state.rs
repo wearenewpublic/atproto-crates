@@ -760,9 +760,14 @@ impl SqlBackend {
         old_jti: &str,
         new_jti: String,
     ) -> PdsResult<Option<RefreshHandle>> {
-        let mut tx = self.pool.begin().await.map_err(|e| PdsError::Storage {
-            reason: format!("oauth_refresh begin: {e}"),
-        })?;
+        // Immediate, so a concurrent rotation queues on `busy_timeout` rather
+        // than failing its read-then-write upgrade. One that finds its token
+        // already spent by the rotation ahead of it still answers `None`.
+        let mut tx = crate::account::pool::begin_immediate(&self.pool)
+            .await
+            .map_err(|e| PdsError::Storage {
+                reason: format!("oauth_refresh begin: {e}"),
+            })?;
         let row: Option<RefreshRow> = sqlx::query_as(
             "SELECT did, client_id, dpop_jkt, scope, issued_at, family_id, client_kid,
                     grant_started_at, expires_at, acting_did
@@ -1000,6 +1005,95 @@ mod tests {
     }
 
     use crate::account::AccountDirectory;
+
+    /// The SQL backend over a file-backed accounts DB, for tests that race.
+    async fn file_sql_backend() -> (OAuthState, tempfile::TempDir) {
+        let (dir, tmp) = AccountDirectory::open_temp().await;
+        (OAuthState::sql(dir.pool().clone()), tmp)
+    }
+
+    /// Runs `rotate_refresh(old, new)` for every pair at once, released
+    /// together by a barrier, and returns the results in order.
+    async fn rotate_all_at_once(
+        state: &OAuthState,
+        pairs: Vec<(String, String)>,
+    ) -> Vec<PdsResult<Option<RefreshHandle>>> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(pairs.len()));
+        let tasks = pairs.into_iter().map(|(old, new)| {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                state.rotate_refresh(&old, new).await
+            })
+        });
+        futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap())
+            .collect()
+    }
+
+    /// Rotations of different tokens for one account, at the same instant, all
+    /// rotate.
+    ///
+    /// A client holding two sessions for one account refreshes both at once.
+    /// Each rotation read its row in a deferred transaction and only then
+    /// asked for the write lock; once the other rotation had committed, that
+    /// upgrade failed with `SQLITE_BUSY` without waiting on `busy_timeout`,
+    /// and the token endpoint answered 500 for a token that was perfectly
+    /// good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rotations_of_different_tokens_all_rotate() {
+        let (state, _tmp) = file_sql_backend().await;
+        const SESSIONS: usize = 4;
+        for round in 0..25 {
+            let mut pairs = Vec::new();
+            for session in 0..SESSIONS {
+                let mut h = handle();
+                h.family_id = format!("family-{session}");
+                let old = format!("jti-{round}-{session}");
+                state.register_refresh(old.clone(), h).await.unwrap();
+                pairs.push((old, format!("jti-{round}-{session}-next")));
+            }
+            for (session, result) in rotate_all_at_once(&state, pairs)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                assert!(
+                    matches!(result, Ok(Some(_))),
+                    "round {round}, session {session} should rotate: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// Concurrent presentations of one token: exactly one rotates, and the
+    /// rest learn it was already spent rather than seeing a storage error.
+    ///
+    /// The token endpoint treats `None` as replay and revokes the family;
+    /// `Storage` is a 500. Making the losers wait must not turn the second into
+    /// the first's success, nor lose the distinction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rotations_of_one_token_rotate_it_once() {
+        let (state, _tmp) = file_sql_backend().await;
+        for round in 0..25 {
+            let old = format!("jti-{round}");
+            state.register_refresh(old.clone(), handle()).await.unwrap();
+            let pairs = (0..4)
+                .map(|attempt| (old.clone(), format!("jti-{round}-next-{attempt}")))
+                .collect();
+            let results = rotate_all_at_once(&state, pairs).await;
+            let rotated = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+            let refused = results.iter().filter(|r| matches!(r, Ok(None))).count();
+            assert_eq!(
+                (rotated, refused),
+                (1, 3),
+                "round {round}: one rotation, three refusals: {results:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn par_round_trip_memory() {

@@ -171,10 +171,11 @@ pub async fn redeem(pool: &AccountPool, code: &str, did: &str) -> PdsResult<bool
     match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
-            let p = pool.as_sqlite();
-            let mut tx = p.begin().await.map_err(|e| PdsError::Storage {
-                reason: format!("invite redeem begin: {e}"),
-            })?;
+            let mut tx = crate::account::pool::begin_immediate(pool.as_sqlite())
+                .await
+                .map_err(|e| PdsError::Storage {
+                    reason: format!("invite redeem begin: {e}"),
+                })?;
             let row: Option<(i64, i64)> =
                 sqlx::query_as("SELECT available_uses, disabled FROM invite_code WHERE code = ?")
                     .bind(code)
@@ -608,7 +609,10 @@ mod tests {
     use crate::account::AccountDirectory;
 
     async fn fresh_pool() -> AccountPool {
-        let dir = AccountDirectory::open_memory().await.unwrap();
+        seeded(AccountDirectory::open_memory().await.unwrap()).await
+    }
+
+    async fn seeded(dir: AccountDirectory) -> AccountPool {
         // Insert stub accounts so used_by FK is satisfied for redeem tests.
         for did in [
             "did:plc:alice",
@@ -652,6 +656,41 @@ mod tests {
         assert!(redeem(&pool, &row.code, "did:plc:b").await.unwrap());
         assert!(redeem(&pool, &row.code, "did:plc:c").await.unwrap());
         assert!(!redeem(&pool, &row.code, "did:plc:d").await.unwrap());
+    }
+
+    /// Concurrent redemptions of a multi-use code each take a slot, rather
+    /// than all but one failing on the lock.
+    ///
+    /// Redemption reads the row before writing it. In a deferred transaction
+    /// that read-to-write upgrade fails with `SQLITE_BUSY` the moment another
+    /// connection commits, without waiting on `busy_timeout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_redemptions_each_take_a_slot() {
+        let (dir, _tmp) = AccountDirectory::open_temp().await;
+        let pool = seeded(dir).await;
+        let consumers = ["did:plc:a", "did:plc:b", "did:plc:c", "did:plc:d"];
+        for round in 0..25 {
+            let row = create(&pool, None, consumers.len() as u32).await.unwrap();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(consumers.len()));
+            let tasks = consumers.map(|did| {
+                let (pool, code, barrier) = (pool.clone(), row.code.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    redeem(&pool, &code, did).await
+                })
+            });
+            for (did, joined) in consumers.iter().zip(futures::future::join_all(tasks).await) {
+                let result = joined.unwrap();
+                assert!(
+                    matches!(result, Ok(true)),
+                    "round {round}: {did} should take a slot: {result:?}"
+                );
+            }
+            assert!(
+                !redeem(&pool, &row.code, "did:plc:alice").await.unwrap(),
+                "round {round}: the code should be exhausted"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

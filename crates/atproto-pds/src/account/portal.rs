@@ -657,7 +657,9 @@ pub async fn take_flash_secret(
     match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
-            let mut tx = pool.as_sqlite().begin().await.map_err(fail)?;
+            let mut tx = crate::account::pool::begin_immediate(pool.as_sqlite())
+                .await
+                .map_err(fail)?;
             let found: Option<(Option<String>,)> =
                 sqlx::query_as("SELECT flash_secret FROM portal_session WHERE id = ?")
                     .bind(&id)
@@ -747,7 +749,10 @@ mod tests {
     use chrono::Utc;
 
     async fn pool_with_account(did: &str) -> AccountPool {
-        let dir = AccountDirectory::open_memory().await.unwrap();
+        with_account(AccountDirectory::open_memory().await.unwrap(), did).await
+    }
+
+    async fn with_account(dir: AccountDirectory, did: &str) -> AccountPool {
         sqlx::query(
             "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref, pds_managed_rotation)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -852,6 +857,46 @@ mod tests {
             None,
             "the secret survived being read"
         );
+    }
+
+    /// Sessions collecting their flash secrets at the same instant each get
+    /// theirs.
+    ///
+    /// Taking a secret reads it before clearing it. In a deferred transaction
+    /// that read-to-write upgrade fails with `SQLITE_BUSY` the moment another
+    /// connection commits, without waiting on `busy_timeout`, and the page
+    /// that was to show the secret once answers 500 instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_flash_secret_takes_each_get_theirs() {
+        let (dir, _tmp) = AccountDirectory::open_temp().await;
+        let pool = with_account(dir, "did:plc:flash").await;
+        for round in 0..25 {
+            let cookies: Vec<String> = (0..4).map(|n| format!("cookie-{round}-{n}")).collect();
+            for cookie in &cookies {
+                create_session(&pool, cookie, "did:plc:flash", 0, None)
+                    .await
+                    .unwrap();
+                set_flash_secret(&pool, cookie, &format!("secret-for-{cookie}"))
+                    .await
+                    .unwrap();
+            }
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(cookies.len()));
+            let tasks = cookies.iter().cloned().map(|cookie| {
+                let (pool, barrier) = (pool.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    take_flash_secret(&pool, &cookie).await
+                })
+            });
+            for (cookie, joined) in cookies.iter().zip(futures::future::join_all(tasks).await) {
+                let result = joined.unwrap();
+                assert_eq!(
+                    result.as_ref().ok().cloned().flatten(),
+                    Some(format!("secret-for-{cookie}")),
+                    "{cookie} should get its secret: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -187,7 +187,9 @@ pub async fn take(pool: &AccountPool, state: &str) -> PdsResult<Option<ParkedLog
     let found: Option<Row> = match pool.kind() {
         #[cfg(feature = "sqlite")]
         AccountPoolKind::Sqlite => {
-            let mut tx = pool.as_sqlite().begin().await.map_err(fail)?;
+            let mut tx = crate::account::pool::begin_immediate(pool.as_sqlite())
+                .await
+                .map_err(fail)?;
             let found: Option<Row> = sqlx::query_as(
                 "SELECT core_did, delegate_did, issuer, token_endpoint,
                         request_json, nonce, pkce_verifier, dpop_private_key,
@@ -329,7 +331,10 @@ mod tests {
     use chrono::Utc;
 
     async fn pool_with_account(did: &str) -> AccountPool {
-        let dir = AccountDirectory::open_memory().await.unwrap();
+        with_account(AccountDirectory::open_memory().await.unwrap(), did).await
+    }
+
+    async fn with_account(dir: AccountDirectory, did: &str) -> AccountPool {
         sqlx::query(
             "INSERT INTO account (did, handle, password_hash, created_at, state, signing_key_ref, pds_managed_rotation)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -406,6 +411,40 @@ mod tests {
             take(&pool, "our-state").await.unwrap().is_none(),
             "a delegated sign-in survived being completed"
         );
+    }
+
+    /// Callbacks for different sign-ins arriving together each complete.
+    ///
+    /// Taking a flow reads its row before deleting it. In a deferred
+    /// transaction that read-to-write upgrade fails with `SQLITE_BUSY` the
+    /// moment another connection commits, without waiting on `busy_timeout`,
+    /// and the sign-in fails with a 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callbacks_each_complete() {
+        let (dir, _tmp) = AccountDirectory::open_temp().await;
+        let pool = with_account(dir, "did:plc:core").await;
+        for round in 0..25 {
+            let states: Vec<String> = (0..4).map(|n| format!("state-{round}-{n}")).collect();
+            for state in &states {
+                park(&pool, state, &a_login()).await.unwrap();
+            }
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(states.len()));
+            let tasks = states.iter().cloned().map(|state| {
+                let (pool, barrier) = (pool.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    take(&pool, &state).await
+                })
+            });
+            for (state, joined) in states.iter().zip(futures::future::join_all(tasks).await) {
+                let result = joined.unwrap();
+                assert!(
+                    matches!(result, Ok(Some(_))),
+                    "{state} should complete: {:?}",
+                    result.map(|found| found.is_some())
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
